@@ -54,6 +54,53 @@ recompute. `--recompute-vision` remains shorthand for `full/uniform/1`;
 advanced configurations use `--vision-recompute-granularity`,
 `--vision-recompute-method`, and `--vision-recompute-num-layers`.
 
+## Qwen3.5-VL Energon Data
+
+The `energon` provider consumes prepared Energon datasets and packs source
+documents into fixed-length THD sequences. Image metadata participates in
+packing before image bytes are decoded. The baseline provider then decodes
+every image in the selected pack on each corresponding PP/CP data rank and
+broadcasts the resulting tensors within its TP group.
+Only TP source ranks construct Energon workers; sibling TP ranks consume that
+broadcast without issuing duplicate prefetch or image I/O.
+
+Each CrudeWebDataset sample must contain a `.json` member with `text`,
+`conversation`, `conversations`, or `messages`. Optional
+`image_descriptors` must follow image-token order and provide either
+`grid_thw` or `width` and `height`. A `.jpgs` member may contain a pickled
+list of raw image byte strings in the same order. Its restricted decoder
+rejects pickle globals and non-byte values.
+
+Select the Qwen cooker in a metadataset entry:
+
+```yaml
+datasets:
+  - path: /path/to/prepared-shards
+    weight: 1.0
+    subflavors:
+      crude_type: qwen35
+```
+
+Launch with an external dataloader and micro-batch size one:
+
+```bash
+torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
+    --model-arch qwen35_vl \
+    --dataset-provider energon \
+    --energon-path /path/to/energon-dataset \
+    --dataloader-type external \
+    --micro-batch-size 1 \
+    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-model /path/to/Qwen3.5-VL \
+    ...
+```
+
+`--image-min-pixels` and `--image-max-pixels` control aspect-preserving
+resize by area. A value of zero leaves that bound disabled. Packing is
+controlled by `--energon-packing-buffer-size`,
+`--energon-max-samples-per-sequence`, and the fixed
+`--total-seq-length` container size.
+
 ## Adding a New Model Architecture
 
 Adding a new model (e.g. `llava_next`) requires **no changes** to

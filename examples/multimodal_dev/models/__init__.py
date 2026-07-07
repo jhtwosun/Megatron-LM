@@ -62,6 +62,10 @@ MODEL_REGISTRY = {
                 "examples.multimodal_dev.data.vlm_dataset"
                 ".train_valid_test_datasets_provider"
             ),
+            "energon": (
+                "examples.multimodal_dev.data.qwen35_energon.provider"
+                ".train_valid_test_datasets_provider"
+            ),
         },
     },
     "kimi_k25": {

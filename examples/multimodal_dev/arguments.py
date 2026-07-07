@@ -25,7 +25,7 @@ def add_multimodal_args(parser):
         "--dataset-provider",
         type=str,
         default="mock",
-        help="Dataset provider: mock",
+        help="Dataset provider registered for the selected model architecture",
     )
     group.add_argument(
         "--image-token-id",
@@ -113,6 +113,55 @@ def add_multimodal_args(parser):
         help=(
             "Use vanilla collate function to collate the data."
         ),
+    )
+
+    group.add_argument(
+        "--energon-path",
+        type=str,
+        default=None,
+        help="Prepared Energon dataset or metadataset path",
+    )
+    group.add_argument(
+        "--energon-split",
+        type=str,
+        default="train",
+        help="Energon split used for the training dataset",
+    )
+    group.add_argument(
+        "--energon-packing-buffer-size",
+        type=int,
+        default=1024,
+        help="Number of encoded samples available to Energon packing",
+    )
+    group.add_argument(
+        "--energon-shuffle-buffer-size",
+        type=int,
+        default=1000,
+        help="Energon training shuffle buffer size",
+    )
+    group.add_argument(
+        "--energon-max-samples-per-sequence",
+        type=int,
+        default=100,
+        help="Maximum source documents in one packed sequence",
+    )
+    group.add_argument(
+        "--energon-prefetch-factor",
+        type=int,
+        default=2,
+        help="Energon worker prefetch factor",
+    )
+    group.add_argument(
+        "--image-min-pixels",
+        type=int,
+        default=0,
+        help="Minimum image area; zero disables the lower bound",
+    )
+    group.add_argument(
+        "--image-max-pixels",
+        type=int,
+        default=0,
+        help="Maximum image area; zero disables the upper bound",
     )
 
     return parser
