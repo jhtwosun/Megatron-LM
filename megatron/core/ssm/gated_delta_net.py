@@ -826,10 +826,16 @@ class GatedDeltaNet(MegatronModule):
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
+        A_log_local_cp = get_parameter_local_cp(
+            self.A_log, dim=0, cp_group=self.pg_collection.cp
+        )
         dt_bias_local_cp = get_parameter_local_cp(
             self.dt_bias, dim=0, cp_group=self.pg_collection.cp
         )
+        if self.cp_size > 1:
+            # Materialize CP views so jit_fuser observes their local shapes.
+            A_log_local_cp = A_log_local_cp.clone()
+            dt_bias_local_cp = dt_bias_local_cp.clone()
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
