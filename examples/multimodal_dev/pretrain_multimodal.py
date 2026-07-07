@@ -40,6 +40,51 @@ from examples.multimodal_dev.arguments import add_multimodal_args
 from examples.multimodal_dev.forward_step import forward_step
 
 
+def _configure_vision_recompute(args, vision_config) -> None:
+    """Apply vision activation recompute independently of the decoder."""
+    legacy = bool(getattr(args, "recompute_vision", False))
+    granularity = getattr(args, "vision_recompute_granularity", None)
+    method = getattr(args, "vision_recompute_method", None)
+    num_layers = getattr(args, "vision_recompute_num_layers", None)
+
+    if legacy:
+        if any(value is not None for value in (granularity, method, num_layers)):
+            raise ValueError(
+                "--recompute-vision cannot be combined with explicit "
+                "--vision-recompute-* options"
+            )
+        granularity, method, num_layers = "full", "uniform", 1
+    elif granularity is None:
+        if method is not None or num_layers is not None:
+            raise ValueError(
+                "--vision-recompute-method and --vision-recompute-num-layers "
+                "require --vision-recompute-granularity"
+            )
+        return
+
+    if granularity == "selective":
+        if method is not None or num_layers is not None:
+            raise ValueError(
+                "selective vision recompute does not use "
+                "--vision-recompute-method or --vision-recompute-num-layers"
+            )
+    else:
+        if method is None or num_layers is None:
+            raise ValueError(
+                "full vision recompute requires --vision-recompute-method "
+                "and --vision-recompute-num-layers"
+            )
+        if not 1 <= num_layers <= vision_config.num_layers:
+            raise ValueError(
+                "--vision-recompute-num-layers must be between 1 and the "
+                f"vision depth ({vision_config.num_layers}), got {num_layers}"
+            )
+
+    vision_config.recompute_granularity = granularity
+    vision_config.recompute_method = method
+    vision_config.recompute_num_layers = num_layers
+
+
 def model_provider(
     pre_process: bool = True,
     post_process: bool = True,
@@ -78,11 +123,9 @@ def model_provider(
     )
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
+    vision_config.tensor_model_parallel_size = language_config.tensor_model_parallel_size
 
-    if getattr(args, "recompute_vision", False):
-        vision_config.recompute_granularity = "full"
-        vision_config.recompute_method = "uniform"
-        vision_config.recompute_num_layers = 1
+    _configure_vision_recompute(args, vision_config)
 
     # --- vision FLOPs metadata ---
     vision_flops_fn = registry.get("vision_flops_fn")

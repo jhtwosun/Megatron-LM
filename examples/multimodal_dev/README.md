@@ -49,6 +49,11 @@ The `forward_step` is also model-agnostic — it uses the model's
 `compute_position_ids()` method polymorphically and passes a standard
 batch dict.
 
+Vision activation recompute is configured independently from decoder
+recompute. `--recompute-vision` remains shorthand for `full/uniform/1`;
+advanced configurations use `--vision-recompute-granularity`,
+`--vision-recompute-method`, and `--vision-recompute-num-layers`.
+
 ## Adding a New Model Architecture
 
 Adding a new model (e.g. `llava_next`) requires **no changes** to

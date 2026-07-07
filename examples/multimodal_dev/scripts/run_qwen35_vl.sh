@@ -336,7 +336,9 @@ GPT_MODEL_ARGS=(
     --rotary-percent 0.25
     --rotary-base 10000000
     --rotary-seq-len-interpolation-factor 1
+    --no-rope-fusion
     --qk-layernorm
+    --attention-softmax-in-fp32
     --attention-output-gate
     --attention-dropout 0.0
     --hidden-dropout 0.0
@@ -348,7 +350,6 @@ GPT_MODEL_ARGS=(
     --linear-num-key-heads 16
     --linear-num-value-heads "$LINEAR_NUM_VALUE_HEADS"
     --make-vocab-size-divisible-by 485
-    --moe-router-force-load-balancing
 )
 
 # --- Tied / untied embeddings ---
@@ -382,7 +383,7 @@ if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
         --moe-ffn-hidden-size "$MOE_FFN_HIDDEN"
         --moe-shared-expert-intermediate-size "$MOE_SHARED_HIDDEN"
         --moe-shared-expert-gate
-        --moe-router-load-balancing-type aux_loss
+        --moe-router-load-balancing-type global_aux_loss
         --moe-router-topk "$MOE_TOPK"
         --moe-grouped-gemm
         --moe-aux-loss-coeff 1e-3

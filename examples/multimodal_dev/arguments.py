@@ -80,6 +80,24 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--vision-recompute-granularity",
+        choices=("full", "selective"),
+        default=None,
+        help="Vision-only activation recompute granularity.",
+    )
+    group.add_argument(
+        "--vision-recompute-method",
+        choices=("uniform", "block"),
+        default=None,
+        help="Layer selection method for full vision recompute.",
+    )
+    group.add_argument(
+        "--vision-recompute-num-layers",
+        type=int,
+        default=None,
+        help="Number of vision layers selected by full recompute.",
+    )
+    group.add_argument(
         "--use-packed-sequence",
         action="store_true",
         default=False,

@@ -20,6 +20,11 @@ def post_language_config(language_config, args):
     """
     language_config.mrope_section = list(MROPE_SECTION)
     language_config.mrope_interleaved = True
+    # Qwen-VL supplies batch-specific, per-token absolute MRoPE frequencies.
+    # TE's fused kernels expect a shared position table and cannot preserve
+    # those frequencies across batched or packed sequences.
+    language_config.apply_rope_fusion = False
+    language_config.attention_softmax_in_fp32 = True
 
 
 def set_vision_flops_metadata(args, language_config, vision_config):
