@@ -445,43 +445,40 @@ class MultimodalModel(MegatronModule):
         *,
         pixel_values: Optional[Tensor],
         image_grid_thw: Optional[Tensor],
-    ) -> Tensor:
-        """Encode this rank's owner images and gather canonical vision rows."""
+    ) -> Optional[Tensor]:
+        """Encode assigned images and gather canonical vision embeddings.
+
+        Only PP stage 0 participates in the embedding all-gather.  Non-PP0
+        ranks run the vision encoder locally (so their parameters receive
+        gradients) and then all-reduce those gradients with PP0 via the PP
+        vision sync group.  The return value is ``None`` for non-PP0 ranks.
+        """
         device = (
             pixel_values.device
             if pixel_values is not None
             else next(self.language_model.parameters()).device
         )
-        gather_group = get_mdp_images_to_language_group(self)
         rank_assignment = getattr(self, "_mdp_rank_assignment", None)
-        if gather_group is None:
-            raise RuntimeError("MDP CP-local mode requires an InnerDP process group")
         if rank_assignment is None:
             raise RuntimeError(
-                "MDP requires _mdp_rank_assignment before the vision bridge. "
+                "MDP requires _mdp_rank_assignment before forward. "
                 "The loader must publish its LPT prepartition metadata."
             )
+
+        is_pp0_gather_rank = bool(getattr(self, "_mdp_is_pp0_gather_rank", True))
+        gather_group = get_mdp_images_to_language_group(self)
 
         has_local_imgs = pixel_values is not None and pixel_values.numel() > 0
         zero_dep = None
         if has_local_imgs:
             with get_nvtx_range()("MultimodalModel/vision_encoder"):
                 local_embeddings = self.vision_model(pixel_values, image_grid_thw)
-            if (
-                bool(getattr(self, "_mdp_pp_cp_inner", False))
-                and torch.is_grad_enabled()
-                and not local_embeddings.requires_grad
-            ):
-                # Frozen vision replicas still need the bridge autograd node
-                # so every PP x CP rank enters the gather backward collective.
-                local_embeddings = local_embeddings.detach().requires_grad_(True)
         else:
             lm_param = next(self.language_model.parameters())
             hidden_size = int(getattr(self.config, "hidden_size", 0))
             if hidden_size <= 0:
                 raise RuntimeError(
-                    "MDP could not infer language hidden size for an empty "
-                    "local image shard"
+                    "MDP could not infer language hidden_size for an empty image shard"
                 )
             local_embeddings = torch.empty(
                 (0, hidden_size), dtype=lm_param.dtype, device=device
@@ -490,46 +487,38 @@ class MultimodalModel(MegatronModule):
                 dummy_pixels, dummy_grid = _dummy_vision_inputs(
                     self.vision_model, device, lm_param.dtype
                 )
-                zero_dep = _zero_dep_on_tensor(
-                    self.vision_model(dummy_pixels, dummy_grid)
-                )
+                zero_dep = _zero_dep_on_tensor(self.vision_model(dummy_pixels, dummy_grid))
             else:
                 zero_dep = _zero_dep_on_trainable_params(self.vision_model)
 
-        global_row_counts = getattr(
-            self, "_mdp_rank_assignment_row_counts", None
-        )
+        if not is_pp0_gather_rank:
+            # Non-PP0: encoder ran for gradient flow; no all-gather needed.
+            # Gradients are synced to PP0 via the PP vision sync group after backward.
+            return None
+
+        if gather_group is None:
+            raise RuntimeError(
+                "MDP PP0 gather rank requires _mdp_inner_dp_group to be set."
+            )
+
+        global_row_counts = getattr(self, "_mdp_rank_assignment_row_counts", None)
+        if global_row_counts is None:
+            raise RuntimeError(
+                "MDP gather requires global_per_image_row_counts from the loader. "
+                "Ensure the prepartition metadata path is active."
+            )
+
         vision_embeddings = gather_to_inner_dp_zero(
             local_embeddings=local_embeddings,
             rank_assignment=rank_assignment,
             encoder_dp_group=gather_group,
             global_per_image_row_counts=global_row_counts,
             local_zero_dep=zero_dep if not has_local_imgs else None,
-            return_zero_dependency_only=(
-                not self.pre_process
-                and bool(getattr(self, "_mdp_pp_cp_inner", False))
-            ),
         )
-        if not self.pre_process and bool(
-            getattr(self, "_mdp_pp_cp_inner", False)
-        ):
-            return vision_embeddings
-        if global_row_counts is not None:
-            local_per_image_row_counts = None
-        elif image_grid_thw is not None and image_grid_thw.numel() > 0:
-            merge_size = int(getattr(get_args(), "vision_spatial_merge_size", 2))
-            merge_sq = max(merge_size * merge_size, 1)
-            grid_i64 = image_grid_thw.to(dtype=torch.int64)
-            local_per_image_row_counts = (
-                grid_i64[:, 0] * grid_i64[:, 1] * grid_i64[:, 2]
-            ) // merge_sq
-        else:
-            local_per_image_row_counts = torch.zeros(
-                (0,), dtype=torch.int64, device=local_embeddings.device
-            )
+
         return reorder_gathered_embeddings(
             gathered_embeddings=vision_embeddings,
-            local_per_image_row_counts=local_per_image_row_counts,
+            local_per_image_row_counts=None,
             rank_assignment=rank_assignment,
             group=gather_group,
             global_per_image_row_counts=global_row_counts,

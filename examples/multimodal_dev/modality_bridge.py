@@ -406,111 +406,62 @@ def gather_to_inner_dp_zero(
     local_embeddings,
     rank_assignment: Dict[int, List[Tuple[int, int]]],
     encoder_dp_group,
-    global_per_image_row_counts=None,
+    global_per_image_row_counts,
     local_zero_dep=None,
-    return_zero_dependency_only: bool = False,
 ):
-    """All-gather per-image embeddings across an InnerDP process group.
+    """All-gather per-image embeddings across the encoder CP group (PP0 only).
 
-    Native NCCL ``all_gather`` requires every tensor in ``tensor_list`` to
-    match the input tensor shape, while per-image LPT produces unequal
-    per-rank token counts. This function uses a pad + trim pattern:
+    The gather group spans only CP ranks at PP stage 0.  Non-PP0 ranks run the
+    vision encoder independently and sync gradients via a separate PP
+    all-reduce; they do not call this function.
 
-    1. Determine per-rank counts from BalanceData metadata when available,
-       otherwise all-gather the per-rank counts (fixed-size int64 tensor).
-    2. Compute ``max_count = max(counts)``.
-    3. Pad ``local_embeddings`` to ``[max_count, hidden]`` with zeros.
-    4. All-gather the padded tensor (now equal shape on every rank).
-    5. Trim each rank's slice back to its actual ``counts[r]``.
-    6. Concatenate in rank order (gather order).
+    Per-image LPT produces unequal per-rank token counts.  Row counts are
+    derived from loader-side metadata (``global_per_image_row_counts``) so no
+    extra collective is needed to exchange shapes.  NCCL all-gather requires
+    equal shapes, so each rank pads to ``max_count`` and the receiver trims.
 
     Args:
-        local_embeddings: ``Tensor[local_image_tokens, hidden]`` on this
-            rank. Tokens for the local rank's images concatenated along
-            the sequence axis. ``local_image_tokens`` MAY be zero.
-        rank_assignment: dict from ``balance_per_image_lpt``; reserved
-            for metadata-derived count checks.
-        encoder_dp_group: NCCL ``ProcessGroup`` over the CP ranks.
-        global_per_image_row_counts: optional CPU/list metadata with the
-            projected vision rows for every image in the flattened
-            microbatch. When present, avoids the shape all_gather.
-        local_zero_dep: optional scalar zero dependency attached to padding
-            rows so empty local shards can still keep trainable local modules
-            in the autograd graph.
-        return_zero_dependency_only: when True, return a scalar zero
-            dependency on the gathered tensor immediately after the
-            collective. Non-consuming PP stages need the collective autograd
-            edge, but not canonical gathered rows.
-    Returns:
-        Tensor ``[total_image_tokens, hidden]`` on every group member, or a
-        scalar zero dependency when ``return_zero_dependency_only`` is True.
-    """
-    world_size = dist.get_world_size(group=encoder_dp_group)
-    device = local_embeddings.device
-    dtype = local_embeddings.dtype
+        local_embeddings: ``[local_image_tokens, hidden]`` for this rank's
+            assigned images.  May be ``[0, hidden]`` for ranks with no images.
+        rank_assignment: LPT assignment dict from ``balance_per_image_lpt``.
+        encoder_dp_group: NCCL process group over encoder CP ranks (PP0).
+        global_per_image_row_counts: Per-image row counts for the full batch.
+            Required — the loader-prepartition path always provides this.
+        local_zero_dep: Optional scalar zero tensor to attach to empty shards
+            so trainable vision parameters stay in the autograd graph.
 
-    # Determine hidden dim - must be consistent across ranks. We use
-    # the local rank's shape when local_embeddings has >= 1 image; when
-    # empty (shape [0]), we still need a hidden dim for the padded
-    # buffer. Fall back to local_embeddings.shape[-1] (works for both
-    # [N, H] and [0, H]); raise if local_embeddings is rank-1.
+    Returns:
+        ``[total_image_tokens, hidden]`` with images in gather order (rank-major).
+    """
     if local_embeddings.dim() != 2:
         raise ValueError(
             "gather_to_inner_dp_zero: local_embeddings must be 2-D "
             f"[N, hidden]; got shape {tuple(local_embeddings.shape)}"
         )
+    world_size = dist.get_world_size(group=encoder_dp_group)
+    device = local_embeddings.device
+    dtype = local_embeddings.dtype
     hidden = local_embeddings.shape[1]
 
-    # Step 1 - collect per-rank token counts and hidden sizes. Metadata-only
-    # MDP batches already carry per-image row counts, so production runs
-    # can avoid this small shape all_gather. The fallback keeps the defensive
-    # hidden-size validation for paths without metadata.
-    if global_per_image_row_counts is not None:
-        counts = per_rank_row_counts_from_assignment(
-            rank_assignment, global_per_image_row_counts, world_size
+    counts = per_rank_row_counts_from_assignment(
+        rank_assignment, global_per_image_row_counts, world_size
+    )
+    group_rank = dist.get_rank(group=encoder_dp_group)
+    expected = int(counts[int(group_rank)])
+    actual = int(local_embeddings.shape[0])
+    if actual != expected:
+        raise RuntimeError(
+            f"gather_to_inner_dp_zero: rank {group_rank} has {actual} rows "
+            f"but metadata expects {expected}. counts={counts}"
         )
-        group_rank = dist.get_rank(group=encoder_dp_group)
-        expected_local_rows = int(counts[int(group_rank)])
-        actual_local_rows = int(local_embeddings.shape[0])
-        if actual_local_rows != expected_local_rows:
-            raise RuntimeError(
-                "gather_to_inner_dp_zero: metadata row count mismatch on "
-                f"group_rank={group_rank}: local_embeddings has "
-                f"{actual_local_rows} rows but BalanceData metadata expects "
-                f"{expected_local_rows}. counts={counts}"
-            )
-    else:
-        local_shape = torch.tensor(
-            [local_embeddings.shape[0], hidden], dtype=torch.int64, device=device
-        )
-        shape_list = [torch.zeros(2, dtype=torch.int64, device=device) for _ in range(world_size)]
-        dist.all_gather(shape_list, local_shape, group=encoder_dp_group)
-        counts = [int(t[0].item()) for t in shape_list]
-        hidden_sizes = [int(t[1].item()) for t in shape_list]
-        if len(set(hidden_sizes)) != 1:
-            raise RuntimeError(
-                "gather_to_inner_dp_zero: hidden size mismatch across gather "
-                f"group: hidden_sizes={hidden_sizes}, counts={counts}. Empty "
-                "local image shards must use the projected language hidden size."
-            )
 
-    # Step 2 - pad target.
     max_count = max(counts) if counts else 0
     if max_count == 0:
-        # All ranks have zero images this iter (degenerate but legal -
-        # e.g., text-only batch); return an empty [0, hidden] tensor on
-        # every rank.
         empty = torch.empty((0, hidden), dtype=dtype, device=device)
-        if return_zero_dependency_only:
-            zero = local_embeddings.reshape(-1)[:0].sum() * 0.0
-            if local_zero_dep is not None:
-                zero = zero + local_zero_dep.to(dtype=dtype) * 0.0
-            return zero
         if local_zero_dep is not None:
             empty = empty + local_zero_dep.to(dtype=dtype) * 0.0
         return empty
 
-    # Step 3 - pad ``local_embeddings`` to [max_count, hidden].
     local_n = local_embeddings.shape[0]
     if local_n < max_count:
         pad = torch.zeros((max_count - local_n, hidden), dtype=dtype, device=device)
@@ -518,25 +469,15 @@ def gather_to_inner_dp_zero(
             pad = pad + local_zero_dep.to(dtype=pad.dtype)
         padded_local = torch.cat([local_embeddings, pad], dim=0).contiguous()
     else:
-        # local_n == max_count already; no pad needed.
         padded_local = local_embeddings.contiguous()
         if local_zero_dep is not None:
             padded_local = padded_local + local_zero_dep.to(dtype=padded_local.dtype)
 
-    # Step 4 - all_gather the equal-shape padded tensor with explicit
-    # autograd support.
     padded_cat = _gather_padded_sequence_parallel_region(padded_local, encoder_dp_group)
-    if return_zero_dependency_only:
-        return padded_cat.reshape(-1)[:1].sum() * 0.0
 
     padded_out = [padded_cat.narrow(0, r * max_count, max_count) for r in range(world_size)]
-
-    # Step 5 - trim each rank's slice back to its actual count.
     trimmed = [padded_out[r][: counts[r]] for r in range(world_size)]
-
-    # Step 6 - concatenate in rank order (gather order).
-    gathered = torch.cat(trimmed, dim=0)
-    return gathered
+    return torch.cat(trimmed, dim=0)
 
 
 # ---------------------------------------------------------------------------

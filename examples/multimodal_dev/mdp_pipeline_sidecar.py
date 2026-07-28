@@ -80,9 +80,16 @@ def mark_downstream_pp_vision_params_shared(model, pp_rank: int) -> None:
 
 
 def _build_pp_cp_groups(args):
+    """Build the encoder CP gather group (PP0 only) and PP vision grad-sync group.
+
+    The encoder gather group spans only CP ranks at PP stage 0.  Non-PP0 ranks
+    run the vision encoder for gradient flow but do not receive gathered
+    embeddings.  A separate PP vision sync group allows PP0 to all-reduce its
+    vision gradients with PP1+ replicas after backward.
+    """
     from examples.multimodal_dev.mdp_parallel_groups import (
+        build_encoder_cp_groups,
         build_local_process_group,
-        build_pp_cp_inner_dp_group,
         get_parallel_order,
     )
 
@@ -91,6 +98,8 @@ def _build_pp_cp_groups(args):
     tp_size = int(getattr(args, "tensor_model_parallel_size", 1))
     cp_size = int(getattr(args, "context_parallel_size", 1))
     pp_size = int(getattr(args, "pipeline_model_parallel_size", 1))
+    encoder_cp_size = int(getattr(args, "encoder_context_parallel_size", None) or cp_size)
+
     model_parallel_size = tp_size * cp_size * pp_size
     if model_parallel_size <= 0 or world_size % model_parallel_size:
         raise RuntimeError(
@@ -99,55 +108,74 @@ def _build_pp_cp_groups(args):
             f"CP={cp_size}, PP={pp_size}"
         )
 
-    rank_generator = ps.RankGenerator(
-        tp=tp_size,
-        ep=1,
-        dp=world_size // model_parallel_size,
-        pp=pp_size,
-        cp=cp_size,
-        order=get_parallel_order(args),
+    order = get_parallel_order(args)
+    enc_gather_groups, pp_sync_groups = build_encoder_cp_groups(
+        world_size=world_size,
+        tp_size=tp_size,
+        cp_size=cp_size,
+        pp_size=pp_size,
+        encoder_cp_size=encoder_cp_size,
+        order=order,
     )
-    inner_group, _, _ = build_pp_cp_inner_dp_group(
-        pp_cp_groups=rank_generator.get_ranks("pp-cp"),
-        this_rank=rank,
-    )
+
+    from examples.multimodal_dev.mdp_parallel_groups import build_local_process_group as _blpg
+    enc_gather_group, _, _ = _blpg(rank_groups=enc_gather_groups, this_rank=rank)
+    pp_vision_sync_group, _, _ = _blpg(rank_groups=pp_sync_groups, this_rank=rank)
+
     if tp_size > 1:
-        tp_source_group, _, _ = build_local_process_group(
+        from examples.multimodal_dev.mdp_parallel_groups import (
+            compute_pp_cp_inner_dp_layout,
+            _normalize_parallel_order,
+        )
+        from megatron.core import parallel_state as ps
+
+        rank_generator = ps.RankGenerator(
+            tp=tp_size,
+            ep=1,
+            dp=world_size // model_parallel_size,
+            pp=pp_size,
+            cp=cp_size,
+            order=order,
+        )
+        tp_source_group, _, _ = _blpg(
             rank_groups=rank_generator.get_ranks("tp"),
             this_rank=rank,
             backend="gloo",
         )
     else:
         tp_source_group = None
-    return inner_group, tp_source_group
+
+    return enc_gather_group, pp_vision_sync_group, tp_source_group
 
 
 def configure_pp_cp_replicated_vision(model, args) -> bool:
-    """Attach PP x CP InnerDP, replica, checkpoint, and schedule metadata."""
+    """Attach encoder CP gather group and PP vision grad-sync group to ``model``.
+
+    The encoder gather group (``_mdp_inner_dp_group``) now spans only CP ranks
+    at PP stage 0 instead of the full PP×CP group.  This eliminates the
+    all-gather waste where non-PP0 ranks received and discarded the full
+    embedding tensor.
+
+    Non-PP0 ranks still run the vision encoder (their parameters receive
+    gradients via the PP vision sync group all-reduce after backward) but are
+    not in the embedding gather collective.
+    """
     if not pp_cp_replicated_vision_requested(args):
         return False
-    if getattr(args, "virtual_pipeline_model_parallel_size", None) is not None:
-        raise RuntimeError(
-            "PP x CP replicated vision supports only non-interleaved pipeline schedules"
-        )
     if not bool(getattr(args, "use_packed_sequence", False)):
-        raise RuntimeError(
-            "PP x CP replicated vision requires packed THD input"
-        )
+        raise RuntimeError("PP x CP replicated vision requires --use-packed-sequence")
     if bool(getattr(args, "use_megatron_fsdp", False)) or bool(
         getattr(args, "use_torch_fsdp2", False)
     ):
         raise RuntimeError("PP x CP replicated vision does not support FSDP")
     if not torch.distributed.is_initialized():
-        raise RuntimeError(
-            "PP x CP replicated vision setup requires torch.distributed"
-        )
+        raise RuntimeError("PP x CP replicated vision setup requires torch.distributed")
     if getattr(model, "vision_model", None) is None:
         raise RuntimeError(
             "PP x CP replicated vision requires vision_model on every pipeline stage"
         )
 
-    inner_group, tp_source_group = _build_pp_cp_groups(args)
+    enc_gather_group, pp_vision_sync_group, tp_source_group = _build_pp_cp_groups(args)
     pp_group = ps.get_pipeline_model_parallel_group()
     broadcast_vision_state(model, pp_group)
     mark_downstream_pp_vision_params_shared(
@@ -155,14 +183,19 @@ def configure_pp_cp_replicated_vision(model, args) -> bool:
         ps.get_pipeline_model_parallel_rank(),
     )
 
+    pp_rank = ps.get_pipeline_model_parallel_rank()
     attrs = {
         "_mdp_enabled": True,
-        "_mdp_inner_dp_group": inner_group,
+        # PP0 participates in the encoder CP gather; PP1+ run the encoder
+        # locally but do not join the all-gather collective.
+        "_mdp_inner_dp_group": enc_gather_group if pp_rank == 0 else None,
+        "_mdp_pp_vision_sync_group": pp_vision_sync_group,
         "_mdp_tp_source_group": tp_source_group,
         "_mdp_tp_source_group_device": (
             "cpu" if tp_source_group is not None else None
         ),
         "_mdp_pp_cp_inner": True,
+        "_mdp_is_pp0_gather_rank": pp_rank == 0,
         "_mdp_cp_fused_sidecar": False,
         "_pp_cp_batch_sidecar": False,
         "_pipeline_sidecar_enabled": True,

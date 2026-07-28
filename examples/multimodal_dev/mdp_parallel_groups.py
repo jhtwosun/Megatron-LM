@@ -238,3 +238,84 @@ def build_local_process_group(
             f"rank {this_rank} did not match any rank group {list(rank_groups)}"
         )
     return local_group, local_ranks, local_index
+
+
+def compute_encoder_cp_groups(
+    world_size: int,
+    tp_size: int,
+    cp_size: int,
+    pp_size: int,
+    encoder_cp_size: int,
+    order: str = "tp-cp-ep-dp-pp",
+) -> Tuple[List[List[int]], List[List[int]]]:
+    """Compute encoder CP gather groups (PP0 only) and PP vision sync groups.
+
+    The encoder gathers embeddings only among the CP ranks on PP stage 0.
+    Non-PP0 ranks run the vision encoder (for gradient flow) but do not
+    participate in the embedding all-gather.
+
+    After backward, PP0 vision gradients must be all-reduced with PP1+
+    replicas. The PP vision sync groups cover each (TP, CP, outer-DP) slice
+    across all PP stages for this purpose.
+
+    Returns:
+        encoder_gather_groups: One group per (TP, outer-DP) slice containing
+            the encoder_cp_size CP ranks at PP stage 0.
+        pp_vision_sync_groups: One group per (TP, CP, outer-DP) slice
+            containing one rank per PP stage — used to all-reduce vision grads.
+    """
+    for name, value in (
+        ("world_size", world_size),
+        ("tp_size", tp_size),
+        ("cp_size", cp_size),
+        ("pp_size", pp_size),
+        ("encoder_cp_size", encoder_cp_size),
+    ):
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive int, got {value!r}")
+    if cp_size % encoder_cp_size != 0:
+        raise ValueError(
+            f"encoder_cp_size ({encoder_cp_size}) must divide context_parallel_size ({cp_size})"
+        )
+
+    model_size = tp_size * cp_size * pp_size
+    if world_size % model_size != 0:
+        raise ValueError(
+            f"world_size ({world_size}) must be divisible by tp*cp*pp={model_size}"
+        )
+    dp_size = world_size // model_size
+
+    sizes = {
+        "tp": tp_size,
+        "cp": cp_size,
+        "ep": 1,
+        "dp": dp_size,
+        "pp": pp_size,
+    }
+    tokens = _normalize_parallel_order(order, sizes)
+
+    # PP0 encoder CP gather groups: CP ranks at PP stage 0 within each (TP, DP) slice.
+    encoder_gather_groups = _generate_masked_rank_groups(
+        world_size=world_size,
+        parallel_size=[sizes[t] for t in tokens],
+        mask=[t == "cp" for t in tokens],
+    )
+    # Filter to groups that contain only PP0 ranks.
+    pp_stride = 1
+    for t in tokens:
+        if t == "pp":
+            break
+        pp_stride *= sizes[t]
+    encoder_gather_groups = [
+        g for g in encoder_gather_groups
+        if all((r // pp_stride) % pp_size == 0 for r in g)
+    ]
+
+    # PP vision sync groups: one rank per PP stage within each (TP, CP, DP) slice.
+    pp_vision_sync_groups = _generate_masked_rank_groups(
+        world_size=world_size,
+        parallel_size=[sizes[t] for t in tokens],
+        mask=[t == "pp" for t in tokens],
+    )
+
+    return encoder_gather_groups, pp_vision_sync_groups
