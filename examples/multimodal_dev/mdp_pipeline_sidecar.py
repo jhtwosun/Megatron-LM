@@ -118,8 +118,20 @@ def _build_pp_cp_groups(args):
         order=order,
     )
 
+    # Build enc gather groups: PP0 CP ranks only.  ALL ranks must call
+    # new_group() for collective consistency, but non-PP0 ranks are not in
+    # any enc_gather_group.  We iterate manually to avoid the membership
+    # assertion in build_local_process_group.
+    import torch as _torch
+
+    enc_gather_group = None
+    for _grp in enc_gather_groups:
+        _ranks = [int(r) for r in _grp]
+        _pg = _torch.distributed.new_group(ranks=_ranks)
+        if rank in _ranks:
+            enc_gather_group = _pg
+
     from examples.multimodal_dev.mdp_parallel_groups import build_local_process_group as _blpg
-    enc_gather_group, _, _ = _blpg(rank_groups=enc_gather_groups, this_rank=rank)
     pp_vision_sync_group, _, _ = _blpg(rank_groups=pp_sync_groups, this_rank=rank)
 
     if tp_size > 1:
