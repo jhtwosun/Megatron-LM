@@ -88,7 +88,7 @@ def _build_pp_cp_groups(args):
     vision gradients with PP1+ replicas after backward.
     """
     from examples.multimodal_dev.mdp_parallel_groups import (
-        build_encoder_cp_groups,
+        compute_encoder_cp_groups,
         build_local_process_group,
         get_parallel_order,
     )
@@ -109,7 +109,7 @@ def _build_pp_cp_groups(args):
         )
 
     order = get_parallel_order(args)
-    enc_gather_groups, pp_sync_groups = build_encoder_cp_groups(
+    enc_gather_groups, pp_sync_groups = compute_encoder_cp_groups(
         world_size=world_size,
         tp_size=tp_size,
         cp_size=cp_size,
