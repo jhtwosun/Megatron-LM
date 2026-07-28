@@ -74,18 +74,21 @@ def configure_mdp_model(model, args):
     dataset_provider = getattr(args, "dataset_provider", "energon")
     vision_model = getattr(model, "vision_model", None)
 
-    # VPP: model.vp_stage is set by training.py AFTER model_provider returns,
-    # so we check pre_process instead to identify non-sidecar chunks.
+    # VPP collective safety: torch.distributed.new_group() requires ALL ranks to
+    # call it for the same groups in the same order.  For vp_stage=0 (first VPP
+    # chunk), ALL ranks must participate in group creation even if they are not
+    # the sidecar owner.  For vp_stage>0, NO ranks need group creation.
+    # vp_stage is read from model.language_model.vp_stage (available at
+    # construction time, before training.py sets model.vp_stage afterward).
     virtual_size = getattr(args, "virtual_pipeline_model_parallel_size", None)
     model_pre_process = getattr(model, "pre_process", True)
-    is_vpp_non_sidecar_chunk = (
-        mdp_enabled
-        and pp_size > 1
-        and inner_dp_scope == "pp_cp"
-        and virtual_size is not None
-        and not model_pre_process
+    vp_stage_from_model = getattr(
+        getattr(model, "language_model", None), "vp_stage", None
     )
-    if is_vpp_non_sidecar_chunk:
+    is_vpp = virtual_size is not None and vp_stage_from_model is not None
+    is_higher_vpp_chunk = is_vpp and int(vp_stage_from_model) > 0
+
+    if is_higher_vpp_chunk:
         _set_model_attrs(
             model,
             _mdp_enabled=False,
@@ -225,16 +228,24 @@ def configure_mdp_model(model, args):
             configure_pp_cp_replicated_vision,
         )
 
+        # For VPP chunk 0, PP1 ranks (pre_process=False) must still call
+        # configure_pp_cp_replicated_vision to participate in the NCCL
+        # new_group() collectives — but they should not own the sidecar.
+        is_sidecar_owner = (not is_vpp) or model_pre_process
         if not configure_pp_cp_replicated_vision(model, args):
             raise RuntimeError(
                 "PP x CP replicated vision was selected but sidecar setup was not activated"
             )
-        print_rank_0(
-            "> MDP PPxCP multimodal path enabled: "
-            f"PP={pp_size}, CP={cp_size}, "
-            f"InnerDP={torch.distributed.get_world_size(group=model._mdp_inner_dp_group)}, "
-            "packed THD input, vision encoder replicated on every pipeline stage."
-        )
+        if not is_sidecar_owner:
+            model._pipeline_sidecar_enabled = False
+            model._mdp_enabled = False
+            model._mdp_inner_dp_group = None
+        else:
+            print_rank_0(
+                "> MDP PPxCP multimodal path enabled: "
+                f"PP={pp_size}, CP={cp_size}, "
+                "packed THD input, vision encoder replicated on every pipeline stage."
+            )
         return model
 
     if not torch.distributed.is_initialized():
