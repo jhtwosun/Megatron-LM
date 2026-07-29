@@ -1011,10 +1011,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         )
         if enc_cp_size < int(pp_size) * int(cp_size):
             # Encoder-CP branch: gather group restricted to PP0 CP ranks.
-            # Only PP0 encodes; prepartition assigns images to CP ranks 0..enc_cp-1.
+            # Assign images only to CP ranks 0..enc_cp-1 on PP stage 0.
             prepartition_rank = int(cp_rank)
             prepartition_world = int(enc_cp_size)
-            prepartition_encoder_stage = (pp_rank == 0 or pp_size == 1)
+            # prepartition_encoder_stage keeps its default: True for PP0 only.
         else:
             # Original PP×CP path: all PP stages encode.
             prepartition_rank = _pp_cp_prepartition_rank(args, pp_size, cp_size)

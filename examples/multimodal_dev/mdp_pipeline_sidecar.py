@@ -118,18 +118,14 @@ def _build_pp_cp_groups(args):
         order=order,
     )
 
-    # Build enc gather groups: PP0 CP ranks only.  ALL ranks must call
-    # new_group() for collective consistency, but non-PP0 ranks are not in
-    # any enc_gather_group.  We iterate manually to avoid the membership
-    # assertion in build_local_process_group.
-    import torch as _torch
-
+    # enc_gather_groups contains only PP0 ranks; ALL ranks must call new_group()
+    # for collective consistency even if not included in the group.
     enc_gather_group = None
-    for _grp in enc_gather_groups:
-        _ranks = [int(r) for r in _grp]
-        _pg = _torch.distributed.new_group(ranks=_ranks)
-        if rank in _ranks:
-            enc_gather_group = _pg
+    for grp in enc_gather_groups:
+        ranks = [int(r) for r in grp]
+        pg = torch.distributed.new_group(ranks=ranks)
+        if rank in ranks:
+            enc_gather_group = pg
 
     from examples.multimodal_dev.mdp_parallel_groups import build_local_process_group as _blpg
     pp_vision_sync_group, _, _ = _blpg(rank_groups=pp_sync_groups, this_rank=rank)
@@ -161,41 +157,21 @@ def _build_pp_cp_groups(args):
 
 
 def configure_pp_cp_replicated_vision(model, args) -> bool:
-    """Attach encoder CP gather group and PP vision grad-sync group to ``model``.
+    """Attach encoder-CP gather group and PP vision sync group to ``model``.
 
-    The encoder gather group (``_mdp_inner_dp_group``) now spans only CP ranks
-    at PP stage 0 instead of the full PP×CP group.  This eliminates the
-    all-gather waste where non-PP0 ranks received and discarded the full
-    embedding tensor.
-
-    Non-PP0 ranks still run the vision encoder (their parameters receive
-    gradients via the PP vision sync group all-reduce after backward) but are
-    not in the embedding gather collective.
+    The gather group spans only CP ranks at PP stage 0.  PP1 ranks run the
+    encoder locally (for gradient flow) but are not in the all-gather collective.
+    PP1 vision parameter gradients arrive via param.shared=True + finalize_model_grads
+    PP all-reduce after the full pipeline backward completes.
     """
     if not pp_cp_replicated_vision_requested(args):
         return False
-    if not bool(getattr(args, "use_packed_sequence", False)):
-        raise RuntimeError("PP x CP replicated vision requires --use-packed-sequence")
-    if bool(getattr(args, "use_megatron_fsdp", False)) or bool(
-        getattr(args, "use_torch_fsdp2", False)
-    ):
-        raise RuntimeError("PP x CP replicated vision does not support FSDP")
-    if not torch.distributed.is_initialized():
-        raise RuntimeError("PP x CP replicated vision setup requires torch.distributed")
-    if getattr(model, "vision_model", None) is None:
-        raise RuntimeError(
-            "PP x CP replicated vision requires vision_model on every pipeline stage"
-        )
 
     enc_gather_group, pp_vision_sync_group, tp_source_group = _build_pp_cp_groups(args)
     pp_group = ps.get_pipeline_model_parallel_group()
     broadcast_vision_state(model, pp_group)
-    mark_downstream_pp_vision_params_shared(
-        model,
-        ps.get_pipeline_model_parallel_rank(),
-    )
-
     pp_rank = ps.get_pipeline_model_parallel_rank()
+    mark_downstream_pp_vision_params_shared(model, pp_rank)
     attrs = {
         "_mdp_enabled": True,
         # PP0 participates in the encoder CP gather; PP1+ run the encoder

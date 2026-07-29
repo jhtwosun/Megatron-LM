@@ -448,25 +448,17 @@ class MultimodalModel(MegatronModule):
     ) -> Optional[Tensor]:
         """Encode assigned images and gather canonical vision embeddings.
 
-        Only PP stage 0 participates in the embedding all-gather.  Non-PP0
-        ranks run the vision encoder locally (so their parameters receive
-        gradients) and then all-reduce those gradients with PP0 via the PP
-        vision sync group.  The return value is ``None`` for non-PP0 ranks.
+        PP0 gathers embeddings across the encoder-CP group and returns a
+        ``[total_image_tokens, hidden]`` tensor.  PP1 runs the encoder locally
+        for gradient flow (via param.shared=True + finalize_model_grads) and
+        returns a scalar zero-dep, or ``None`` for fully-frozen encoders.
         """
         device = (
             pixel_values.device
             if pixel_values is not None
             else next(self.language_model.parameters()).device
         )
-        rank_assignment = getattr(self, "_mdp_rank_assignment", None)
-        if rank_assignment is None:
-            raise RuntimeError(
-                "MDP requires _mdp_rank_assignment before forward. "
-                "The loader must publish its LPT prepartition metadata."
-            )
-
         is_pp0_gather_rank = bool(getattr(self, "_mdp_is_pp0_gather_rank", True))
-        gather_group = get_mdp_images_to_language_group(self)
 
         has_local_imgs = pixel_values is not None and pixel_values.numel() > 0
         zero_dep = None
@@ -475,13 +467,9 @@ class MultimodalModel(MegatronModule):
                 local_embeddings = self.vision_model(pixel_values, image_grid_thw)
         else:
             lm_param = next(self.language_model.parameters())
-            hidden_size = int(getattr(self.config, "hidden_size", 0))
-            if hidden_size <= 0:
-                raise RuntimeError(
-                    "MDP could not infer language hidden_size for an empty image shard"
-                )
+            hidden_size = int(getattr(self.config, "hidden_size", 0) or 0)
             local_embeddings = torch.empty(
-                (0, hidden_size), dtype=lm_param.dtype, device=device
+                (0, max(hidden_size, 1)), dtype=lm_param.dtype, device=device
             ).requires_grad_(True)
             if _empty_vision_rank_must_call_module(self.vision_model):
                 dummy_pixels, dummy_grid = _dummy_vision_inputs(
@@ -492,26 +480,16 @@ class MultimodalModel(MegatronModule):
                 zero_dep = _zero_dep_on_trainable_params(self.vision_model)
 
         if not is_pp0_gather_rank:
-            # Non-PP0: encoder ran for gradient flow; no all-gather needed.
-            # Return a zero dep tensor (not None) so mdp_pp_cp_sidecar_activate_cache
+            # PP1: return a scalar zero-dep so mdp_pp_cp_sidecar_activate_cache
             # can populate the backward cache for pipeline_sidecar_post_backward.
+            # None is returned for fully-frozen encoders (no backward needed).
             if has_local_imgs:
                 return _zero_dep_on_tensor(local_embeddings)
-            if zero_dep is not None:
-                return zero_dep
-            return _zero_dep_on_trainable_params(self.vision_model)
+            return zero_dep
 
-        if gather_group is None:
-            raise RuntimeError(
-                "MDP PP0 gather rank requires _mdp_inner_dp_group to be set."
-            )
-
+        gather_group = get_mdp_images_to_language_group(self)
+        rank_assignment = getattr(self, "_mdp_rank_assignment", None)
         global_row_counts = getattr(self, "_mdp_rank_assignment_row_counts", None)
-        if global_row_counts is None:
-            raise RuntimeError(
-                "MDP gather requires global_per_image_row_counts from the loader. "
-                "Ensure the prepartition metadata path is active."
-            )
 
         vision_embeddings = gather_to_inner_dp_zero(
             local_embeddings=local_embeddings,
