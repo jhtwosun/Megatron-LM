@@ -860,7 +860,10 @@ class MultimodalModel(MegatronModule):
             active_vision_embeddings = getattr(
                 self, "_mdp_pp_cp_active_vision_embeddings", None
             )
-            if active_vision_embeddings is None:
+            if active_vision_embeddings is None and self.pre_process:
+                # PP0 (pre_process=True) must have vision embeddings from the sidecar.
+                # PP1+ (pre_process=False) returns None from _run_mdp_vision_bridge
+                # since it doesn't use the gathered embeddings — this is expected.
                 raise RuntimeError(
                     "MDP vision sidecar cache was not activated before model forward"
                 )
