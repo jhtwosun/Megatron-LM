@@ -27,6 +27,17 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--encoder-context-parallel-size",
+        type=int,
+        default=None,
+        help=(
+            "Context-parallel size for the vision encoder.  Defaults to "
+            "--context-parallel-size.  When set to a value smaller than "
+            "--context-parallel-size, each decoder CP rank maps to one encoder "
+            "rank, and the encoder gather group is restricted to PP stage 0."
+        ),
+    )
+    group.add_argument(
         "--mdp-inner-dp-scope",
         type=str,
         choices=["cp", "pp_cp"],
