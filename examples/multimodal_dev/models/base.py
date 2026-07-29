@@ -493,8 +493,13 @@ class MultimodalModel(MegatronModule):
 
         if not is_pp0_gather_rank:
             # Non-PP0: encoder ran for gradient flow; no all-gather needed.
-            # Gradients are synced to PP0 via the PP vision sync group after backward.
-            return None
+            # Return a zero dep tensor (not None) so mdp_pp_cp_sidecar_activate_cache
+            # can populate the backward cache for pipeline_sidecar_post_backward.
+            if has_local_imgs:
+                return _zero_dep_on_tensor(local_embeddings)
+            if zero_dep is not None:
+                return zero_dep
+            return _zero_dep_on_trainable_params(self.vision_model)
 
         if gather_group is None:
             raise RuntimeError(
