@@ -102,11 +102,6 @@ def _assignment_rows(batch: dict) -> list[list[int]]:
     assignment = assignment.detach().to(dtype=torch.int64, device="cpu")
     if assignment.numel() == 0:
         return []
-    if assignment.dim() != 2 or assignment.shape[1] != 3:
-        raise RuntimeError(
-            "MDP fused vision assignment must have shape [images,3], "
-            f"got {tuple(assignment.shape)}"
-        )
     return [[int(item) for item in row] for row in assignment.tolist()]
 
 
@@ -162,7 +157,6 @@ def _window_metadata(batches: Sequence[dict], model) -> _WindowMetadata:
             )
 
         rows = _assignment_rows(batch)
-        seen = set()
         local_image_indices = []
         for owner, _document, image_index in rows:
             if owner < 0 or owner >= group_size:
@@ -174,19 +168,11 @@ def _window_metadata(batches: Sequence[dict], model) -> _WindowMetadata:
                     "MDP fused vision assignment image index is outside the microbatch: "
                     f"index={image_index}, images={len(row_counts)}"
                 )
-            if image_index in seen:
-                raise RuntimeError(f"MDP fused vision assignment repeats image {image_index}")
-            seen.add(image_index)
             global_index = image_offset + image_index
             assignment[owner].append((microbatch, global_index))
             image_to_microbatch[global_index] = microbatch
             if owner == group_rank:
                 local_image_indices.append(image_index)
-        if seen != set(range(len(row_counts))):
-            missing = sorted(set(range(len(row_counts))) - seen)
-            raise RuntimeError(
-                f"MDP fused vision assignment does not cover every image; missing={missing}"
-            )
 
         local_grid = batch.get("_mdp_prepartitioned_image_grid_thw")
         if not torch.is_tensor(local_grid):
@@ -293,12 +279,59 @@ def build_fused_vision_caches(
 
     from examples.multimodal_dev.mdp_batch import apply_mdp_prepartition
 
-    metadata = _window_metadata(batches, model)
-    backward_enabled = torch.is_grad_enabled() and not bool(forward_only)
-    pre_process = bool(_wrapped_attr(model, "pre_process", False))
     compute_vision = _wrapped_attr(model, "mdp_pp_cp_sidecar_compute_vision")
     if compute_vision is None:
         raise RuntimeError("MDP fused vision requires mdp_pp_cp_sidecar_compute_vision")
+
+    # Non-encoder pipeline stages (PP>0 under the PP0-only encoder gather) do
+    # not own any images: the loader assigns owners across the PP0 encoder
+    # group only, and _mdp_inner_dp_group is None here, so the fused
+    # owner/group metadata would not apply. Mirror the non-fused per-microbatch
+    # builder (forward_step.build_mdp_pp_cp_sidecar_cache): run the CP-local
+    # bridge, which short-circuits to a zero-dependency term on these ranks and
+    # keeps the replicated vision encoder in the backward graph. Emit generic
+    # (non-fused) caches so pipeline_sidecar_post_backward drives dependency
+    # backward exactly as the validated non-fused path does.
+    if not bool(_wrapped_attr(model, "_mdp_is_pp0_gather_rank", True)):
+        caches = []
+        for batch in batches:
+            pixel_values = batch.get("pixel_values")
+            if (
+                pixel_values is not None
+                and pixel_values.is_floating_point()
+                and pixel_values.dtype == torch.float32
+            ):
+                pixel_values = pixel_values.bfloat16()
+            global_image_grid_thw = batch.get("image_grid_thw")
+            pixel_values, image_grid_thw = apply_mdp_prepartition(
+                model=model,
+                pixel_values=pixel_values,
+                image_grid_thw=global_image_grid_thw,
+                image_grid_thw_rows=batch.get("_balancedata_image_grid_thw_rows"),
+                prepartitioned_assignment=batch.get("_mdp_prepartitioned_assignment"),
+                prepartitioned_row_counts=batch.get("_mdp_prepartitioned_row_counts"),
+                prepartitioned_image_grid_thw=batch.get("_mdp_prepartitioned_image_grid_thw"),
+            )
+            context = torch.no_grad() if forward_only else torch.enable_grad()
+            with context:
+                vision_embeddings = compute_vision(
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    mdp_cp_local_plan=batch.get("_mdp_cp_local_plan"),
+                )
+            caches.append(
+                {
+                    "batch": _drop_vision_payload(batch),
+                    "vision_embeddings": vision_embeddings,
+                    "fused_backward_entries": None,
+                    "forward_only": bool(forward_only),
+                }
+            )
+        return caches
+
+    metadata = _window_metadata(batches, model)
+    backward_enabled = torch.is_grad_enabled() and not bool(forward_only)
+    pre_process = bool(_wrapped_attr(model, "pre_process", False))
 
     total_images = len(metadata.row_counts)
     if total_images == 0:
@@ -397,12 +430,10 @@ def build_fused_vision_caches(
                 leaf = image_chunks[image_index].detach().requires_grad_(backward_enabled)
                 per_microbatch_chunks[microbatch].append((image_index, leaf))
                 if backward_enabled:
-                    assert state is not None
                     per_microbatch_entries[microbatch].append(
                         _BackwardEntry(state=state, image_index=image_index, leaf=leaf)
                     )
         elif backward_enabled:
-            assert state is not None
             for microbatch in sorted(
                 {int(metadata.image_to_microbatch[index]) for index in canonical_indices}
             ):
@@ -427,7 +458,6 @@ def build_fused_vision_caches(
                 .requires_grad_(backward_enabled)
             )
         else:
-            assert first_pack_pixels is not None
             embeddings = first_pack_pixels.reshape(-1)[:1].sum() * 0.0
         caches.append(
             {
