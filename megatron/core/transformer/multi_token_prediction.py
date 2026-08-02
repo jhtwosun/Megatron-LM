@@ -932,6 +932,45 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
         return input_ids, position_ids, decoder_input, hidden_states
 
+    @staticmethod
+    def _select_cp_sequence(global_input, cp_size, cp_rank):
+        """Select this CP rank's zigzag shard from a global sequence-first tensor.
+
+        Mirrors ``get_batch_on_this_cp_rank``: split the sequence dim into
+        ``2 * cp_size`` chunks and keep chunks ``[cp_rank, 2*cp_size-cp_rank-1]``.
+        (Inlined here because megatron/core cannot import the examples helper.)
+        """
+        seq_len = global_input.shape[0]
+        assert seq_len % (2 * cp_size) == 0, (
+            f"MTP CP select: sequence {seq_len} not divisible by 2*cp_size={2 * cp_size}"
+        )
+        view = global_input.view(
+            2 * cp_size, seq_len // (2 * cp_size), *global_input.shape[1:]
+        )
+        index = torch.tensor(
+            [cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.long, device=global_input.device
+        )
+        view = view.index_select(0, index)
+        return view.reshape(-1, *global_input.shape[1:])
+
+    @staticmethod
+    def _restore_cp_sequence(ranked, cp_size):
+        """Un-zigzag an all-gathered ``[cp_size, local_len, ...]`` tensor to global.
+
+        Inverse of ``_select_cp_sequence``: ``ranked[r]`` holds rank r's two
+        zigzag halves ``concat(chunk[r], chunk[2*cp-1-r])``; reassemble the
+        ``2*cp_size`` chunks in global order.
+        """
+        local_len = ranked.shape[1]
+        half = local_len // 2
+        first = ranked[:, :half]
+        second = ranked[:, half:]
+        chunks = [None] * (2 * cp_size)
+        for r in range(cp_size):
+            chunks[r] = first[r]
+            chunks[2 * cp_size - 1 - r] = second[r]
+        return torch.cat(chunks, dim=0)
+
     def _roll_precomputed_decoder_input(
         self,
         decoder_input: Tensor,
