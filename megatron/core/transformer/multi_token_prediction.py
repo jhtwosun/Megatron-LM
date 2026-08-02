@@ -985,7 +985,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                     global_input, cp_size=cp_size, cp_rank=cp_rank
                 )
             else:
-                cu = packed_seq_params.cu_seqlens_q_padded or packed_seq_params.cu_seqlens_q
+                cu = (
+                    packed_seq_params.cu_seqlens_q_padded
+                    if packed_seq_params.cu_seqlens_q_padded is not None
+                    else packed_seq_params.cu_seqlens_q
+                )
                 if cu is None:
                     raise RuntimeError(
                         "Packed MTP decoder_input rolling requires cu_seqlens_q."

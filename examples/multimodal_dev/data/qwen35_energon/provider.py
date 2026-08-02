@@ -122,9 +122,19 @@ def _resolve_mdp_layout(
     prepartition_world = int(cp_size) if partition_vision else 1
     prepartition_encoder_stage = int(pp_rank) == 0 or int(pp_size) == 1
     if partition_vision and inner_scope == "pp_cp" and int(pp_size) > 1:
-        prepartition_rank = get_pp_cp_local_rank(args, pp_size, cp_size)
-        prepartition_world = int(pp_size) * int(cp_size)
-        prepartition_encoder_stage = True
+        enc_cp_size = int(getattr(args, "encoder_context_parallel_size", None) or cp_size)
+        if enc_cp_size < int(pp_size) * int(cp_size):
+            # PP0-only gather: only PP0 CP ranks encode, so the loader must
+            # partition across enc_cp_size, matching the encoder gather group
+            # built in mdp_pipeline_sidecar._build_pp_cp_groups.  Mirrors the
+            # guard already present in data/blend_dataset.py:1004-1021.
+            prepartition_rank = int(cp_rank)
+            prepartition_world = enc_cp_size
+        else:
+            # Original PP x CP: all PP stages encode.
+            prepartition_rank = get_pp_cp_local_rank(args, pp_size, cp_size)
+            prepartition_world = int(pp_size) * int(cp_size)
+            prepartition_encoder_stage = True
 
     prefetch_windows = int(getattr(args, "mdp_loader_prepartition_prefetch_windows", 1))
     if prefetch_windows < 1:
