@@ -26,10 +26,7 @@ from examples.multimodal_dev.mdp_image_materialize import (
     encode_image_descriptors,
     materialize_descriptor,
 )
-from examples.multimodal_dev.mdp_parallel_groups import (
-    compute_pp_cp_inner_dp_layout,
-    find_pp_cp_inner_dp_group_for_rank,
-)
+from examples.multimodal_dev.mdp_parallel_groups import mdp_prepartition_layout
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VIDEO_TOKEN_ID,
@@ -362,7 +359,9 @@ class Qwen35VLDataset(Dataset):
 
         world = max(1, int(self.mdp_loader_prepartition_world))
         rank = int(self.mdp_loader_prepartition_rank)
-        if rank < 0 or rank >= world:
+        # rank == -1 marks a CP rank outside --encoder-context-parallel-size:
+        # it owns no image and only carries the gather metadata.
+        if rank < -1 or rank >= world:
             raise RuntimeError(
                 "loader_prepartition rank is outside its world: "
                 f"rank={rank} world={world}"
@@ -890,41 +889,6 @@ def _safe_parallel_int(getter, default: int) -> int:
     return int(getter())
 
 
-def _parallel_order(args) -> str:
-    if bool(getattr(args, "use_tp_pp_dp_mapping", False)):
-        return "tp-cp-ep-pp-dp"
-    return "tp-cp-ep-dp-pp"
-
-
-def _pp_cp_prepartition_rank(args, pp_size: int, cp_size: int) -> int:
-    if int(pp_size) <= 1:
-        return _safe_parallel_int(parallel_state.get_context_parallel_rank, 0)
-
-    fallback = (
-        _safe_parallel_int(parallel_state.get_pipeline_model_parallel_rank, 0)
-        * int(cp_size)
-        + _safe_parallel_int(parallel_state.get_context_parallel_rank, 0)
-    )
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return int(fallback)
-    tp_size = _safe_parallel_int(
-        parallel_state.get_tensor_model_parallel_world_size,
-        int(getattr(args, "tensor_model_parallel_size", 1)),
-    )
-    groups = compute_pp_cp_inner_dp_layout(
-        world_size=int(torch.distributed.get_world_size()),
-        tp_size=int(tp_size),
-        cp_size=int(cp_size),
-        pp_size=int(pp_size),
-        order=_parallel_order(args),
-    )
-    _group, local_index = find_pp_cp_inner_dp_group_for_rank(
-        int(torch.distributed.get_rank()),
-        groups,
-    )
-    return int(local_index)
-
-
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Drop-in equivalent of ``mock.train_valid_test_datasets_provider``.
 
@@ -998,28 +962,20 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     else:
         dp_rank = _safe_parallel_int(parallel_state.get_data_parallel_rank, 0)
 
-    prepartition_rank = cp_rank
-    prepartition_world = cp_size
-    prepartition_encoder_stage = (pp_rank == 0 or pp_size == 1)
-    if (
-        loader_prepartition
-        and dataloader_sequence_packing
-        and inner_scope == "pp_cp"
-    ):
-        enc_cp_size = int(
-            getattr(args, "encoder_context_parallel_size", None) or cp_size
+    # Only the first enc_cp_size CP ranks encode; assign images to those owners
+    # only.  enc_cp_size divides cp_size, so the legacy all-PP-stages-encode
+    # layout is unreachable: PP0-only gather is the only pp_cp PP>1 path.
+    prepartition_rank, prepartition_world, prepartition_encoder_stage = (
+        mdp_prepartition_layout(
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            encoder_cp_size=int(
+                getattr(args, "encoder_context_parallel_size", None) or cp_size
+            ),
         )
-        if enc_cp_size < int(pp_size) * int(cp_size):
-            # Encoder-CP branch: gather group restricted to PP0 CP ranks.
-            # Assign images only to CP ranks 0..enc_cp-1 on PP stage 0.
-            prepartition_rank = int(cp_rank)
-            prepartition_world = int(enc_cp_size)
-            # prepartition_encoder_stage keeps its default: True for PP0 only.
-        else:
-            # Original PP×CP path: all PP stages encode.
-            prepartition_rank = _pp_cp_prepartition_rank(args, pp_size, cp_size)
-            prepartition_world = int(pp_size) * int(cp_size)
-            prepartition_encoder_stage = True
+    )
 
     kwargs = dict(
         backend=backend,
