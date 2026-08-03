@@ -46,6 +46,50 @@ from .combined_1f1b import (
 Shape = Union[List[int], torch.Size]
 
 
+def _get_pipeline_sidecar_hooks(model):
+    """Return optional pre-forward and post-backward hooks from a wrapped model."""
+    while model is not None and not hasattr(model, "_pipeline_sidecar_enabled"):
+        model = getattr(model, "module", None)
+    if model is None or not bool(model._pipeline_sidecar_enabled):
+        return None, None
+
+    pre_forward = getattr(model, "pipeline_sidecar_pre_forward", None)
+    if pre_forward is None:
+        raise RuntimeError("_pipeline_sidecar_enabled requires pipeline_sidecar_pre_forward")
+    return pre_forward, getattr(model, "pipeline_sidecar_post_backward", None)
+
+
+def _get_pipeline_sidecar_hooks_by_chunk(model):
+    """Return sidecar hooks per VPP model chunk.
+
+    For interleaved schedules the model is a list of chunks. At most one chunk
+    may own the sidecar; multiple owners would fire the encoder twice per step.
+    """
+    if not isinstance(model, list):
+        return [_get_pipeline_sidecar_hooks(model)]
+    hooks = [_get_pipeline_sidecar_hooks(chunk) for chunk in model]
+    enabled = [i for i, (pre, _) in enumerate(hooks) if pre is not None]
+    if len(enabled) > 1:
+        raise RuntimeError(
+            "Interleaved pipeline schedules support exactly one sidecar owner; "
+            f"enabled model chunks: {enabled}."
+        )
+    return hooks
+
+
+def _prefetch_pipeline_sidecar(pre_forward, *, data_iterator, num_microbatches, forward_only):
+    """Prepare every sidecar microbatch before pipeline communication starts."""
+    if pre_forward is None:
+        return
+    for microbatch_id in range(int(num_microbatches)):
+        pre_forward(
+            data_iterator=data_iterator,
+            current_microbatch=microbatch_id,
+            num_microbatches=num_microbatches,
+            forward_only=forward_only,
+        )
+
+
 def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
@@ -650,6 +694,23 @@ def forward_backward_no_pipelining(
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+    sidecar_pre_forward, sidecar_post_backward = _get_pipeline_sidecar_hooks(model)
+
+    if (
+        sidecar_post_backward is not None
+        and config.overlap_moe_expert_parallel_comm
+        and not forward_only
+    ):
+        raise RuntimeError(
+            "Pipeline sidecars are not supported by the combined no-pipeline "
+            "forward/backward schedule. Disable overlap_moe_expert_parallel_comm."
+        )
+    _prefetch_pipeline_sidecar(
+        sidecar_pre_forward,
+        data_iterator=data_iterator,
+        num_microbatches=num_microbatches,
+        forward_only=forward_only,
+    )
 
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
@@ -687,6 +748,8 @@ def forward_backward_no_pipelining(
                 total_num_tokens += num_tokens
                 if not forward_only:
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+                    if sidecar_post_backward is not None:
+                        sidecar_post_backward()
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(
@@ -709,6 +772,8 @@ def forward_backward_no_pipelining(
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+            if sidecar_post_backward is not None:
+                sidecar_post_backward()
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -1136,6 +1201,17 @@ def forward_backward_pipelining_with_interleaving(
 
     disable_grad_sync()
 
+    sidecar_hooks = _get_pipeline_sidecar_hooks_by_chunk(model)
+    if (
+        any(post is not None for _, post in sidecar_hooks)
+        and config.overlap_moe_expert_parallel_comm
+        and not forward_only
+    ):
+        raise RuntimeError(
+            "Pipeline sidecars are not supported with overlap_moe_expert_parallel_comm "
+            "in interleaved schedules."
+        )
+
     # Model chunk IDs with synchronized grads
     synchronized_model_chunks = set()
 
@@ -1251,6 +1327,10 @@ def forward_backward_pipelining_with_interleaving(
         if not forward:
             model_chunk_id = num_model_chunks - model_chunk_id - 1
         return model_chunk_id
+
+    def get_sidecar_post_backward(virtual_microbatch_id):
+        """Return the sidecar post-backward hook for the chunk owning this microbatch."""
+        return sidecar_hooks[get_model_chunk_id(virtual_microbatch_id, forward=False)][1]
 
     def get_microbatch_id_in_model_chunk(iteration_id, forward):
         """Helper method to get the microbatch_id within model chunk given the iteration number."""
@@ -1542,6 +1622,15 @@ def forward_backward_pipelining_with_interleaving(
         is_vp_last_stage, vp_size=config.virtual_pipeline_model_parallel_size
     )
     pp_group = p2p_communicator.pp_group
+
+    # Run all sidecar pre-forward work before pipeline communication starts.
+    for chunk_id, (sidecar_pre, _) in enumerate(sidecar_hooks):
+        _prefetch_pipeline_sidecar(
+            sidecar_pre,
+            data_iterator=data_iterator[chunk_id],
+            num_microbatches=num_microbatches,
+            forward_only=forward_only,
+        )
 
     # Run warmup forward passes.
     nvtx_range_push(suffix="warmup")
@@ -1898,6 +1987,9 @@ def forward_backward_pipelining_with_interleaving(
                 b_virtual_microbatch_id=backward_k,
                 checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             )
+            sidecar_post = get_sidecar_post_backward(backward_k)
+            if sidecar_post is not None:
+                sidecar_post()
             # Send output_tensor and input_tensor_grad, receive input_tensor
             # and output_tensor_grad.
 
@@ -2004,6 +2096,9 @@ def forward_backward_pipelining_with_interleaving(
                     recv_next_wait_handles.append(bwd_wait_recv_handles.pop("recv_next"))
 
             _, input_tensor_grad = forward_backward_helper_wrapper(b_virtual_microbatch_id=k)
+            sidecar_post = get_sidecar_post_backward(k)
+            if sidecar_post is not None:
+                sidecar_post()
 
             # First virtual stage no activation gradient tensor to send.
             if _is_vp_first_stage(vp_stage=cur_model_chunk_id) and is_pp_first_stage(pp_group):
@@ -2366,6 +2461,13 @@ def forward_backward_pipelining_without_interleaving(
         input_tensors = []
         output_tensors = []
     forward_data_store = []
+    sidecar_pre_forward, sidecar_post_backward = _get_pipeline_sidecar_hooks(model)
+    _prefetch_pipeline_sidecar(
+        sidecar_pre_forward,
+        data_iterator=data_iterator,
+        num_microbatches=num_microbatches,
+        forward_only=forward_only,
+    )
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
@@ -2483,6 +2585,8 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor = p2p_communicator.send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
+            if sidecar_post_backward is not None:
+                sidecar_post_backward()
 
     # Run cooldown backward passes.
     if not forward_only:
@@ -2509,6 +2613,8 @@ def forward_backward_pipelining_without_interleaving(
             )
 
             p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
+            if sidecar_post_backward is not None:
+                sidecar_post_backward()
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
