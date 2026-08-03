@@ -78,25 +78,38 @@ def test_provider_rejects_pipeline_parallelism_for_cp_local_scope(monkeypatch):
         provider._task_encoder(_provider_args(pipeline_model_parallel_size=2), tokenizer=object())
 
 
-def test_provider_uses_pp_cp_inner_rank_for_loader_owner(monkeypatch):
+@pytest.mark.parametrize("pp_rank,expected_encoder_stage", [(0, True), (1, False)])
+def test_provider_uses_cp_rank_and_pp0_gate_for_pp_cp_loader_owner(
+    monkeypatch, pp_rank, expected_encoder_stage
+):
     from examples.multimodal_dev.data.qwen35_energon import provider
 
-    monkeypatch.setattr(provider.parallel_state, "model_parallel_is_initialized", lambda: False)
+    monkeypatch.setattr(provider.parallel_state, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(provider.parallel_state, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(provider.parallel_state, "get_context_parallel_rank", lambda: 1)
+    monkeypatch.setattr(
+        provider.parallel_state, "get_pipeline_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        provider.parallel_state, "get_pipeline_model_parallel_rank", lambda: pp_rank
+    )
+
     encoder = provider._task_encoder(
         _provider_args(
             mdp_inner_dp_scope="pp_cp",
             pipeline_model_parallel_size=2,
             context_parallel_size=2,
-            world_size=4,
-            rank=3,
         ),
         tokenizer=object(),
     )
 
+    # PP0-only gather: the owner is the CP rank inside the encoder-CP group
+    # (world = encoder_cp_size = cp_size), never the pp*cp inner rank, and only
+    # PP stage 0 encodes.
     assert encoder.mdp_loader_prepartition is True
-    assert encoder.mdp_loader_prepartition_rank == 3
-    assert encoder.mdp_loader_prepartition_world == 4
-    assert encoder.mdp_loader_prepartition_encoder_stage is True
+    assert encoder.mdp_loader_prepartition_rank == 1
+    assert encoder.mdp_loader_prepartition_world == 2
+    assert encoder.mdp_loader_prepartition_encoder_stage is expected_encoder_stage
 
 
 @pytest.mark.parametrize("inner_scope", ["cp", "pp_cp"])
@@ -210,7 +223,8 @@ def test_pp1_cp_scope_window_off_keeps_fused_planning_off():
     assert layout.use_planning_prefetch is False
 
 
-def test_pp2_cp2_pp_cp_fused_layout_is_unchanged():
+@pytest.mark.parametrize("pp_rank,expected_encoder_stage", [(0, True), (1, False)])
+def test_pp2_cp2_pp_cp_fused_layout_is_pp0_only_gather(pp_rank, expected_encoder_stage):
     from examples.multimodal_dev.data.qwen35_energon import provider
 
     layout = provider._resolve_mdp_layout(
@@ -218,8 +232,6 @@ def test_pp2_cp2_pp_cp_fused_layout_is_unchanged():
             mdp_inner_dp_scope="pp_cp",
             pipeline_model_parallel_size=2,
             context_parallel_size=2,
-            world_size=4,
-            rank=3,
             mdp_fused_vision_window=True,
             mdp_vision_encoder_max_sequence_length=262_144,
             global_batch_size=512,
@@ -229,14 +241,17 @@ def test_pp2_cp2_pp_cp_fused_layout_is_unchanged():
         cp_size=2,
         cp_rank=1,
         pp_size=2,
-        pp_rank=1,
+        pp_rank=pp_rank,
     )
 
-    assert layout.prepartition_rank == 3
-    assert layout.prepartition_world == 4
-    assert layout.prepartition_encoder_stage is True
+    # Same contract as mdp_prepartition_layout: owner = cp_rank, world =
+    # encoder_cp_size (defaults to cp_size), encoder stage = (pp_rank == 0).
+    # Planning prefetch only runs on the encoding stage.
+    assert layout.prepartition_rank == 1
+    assert layout.prepartition_world == 2
+    assert layout.prepartition_encoder_stage is expected_encoder_stage
     assert layout.planning_microbatches == 16
-    assert layout.use_planning_prefetch is True
+    assert layout.use_planning_prefetch is expected_encoder_stage
 
 
 def test_pp1_pp_cp_requires_a_fused_window():

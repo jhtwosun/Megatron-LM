@@ -157,19 +157,47 @@ def find_pp_cp_inner_dp_group_for_rank(
     )
 
 
-def get_pp_cp_local_rank(args, pp_size: int, cp_size: int) -> int:
-    """Return this process's local rank in its deterministic PP x CP group."""
-    groups = compute_pp_cp_inner_dp_layout(
-        world_size=int(getattr(args, "world_size", 1)),
-        tp_size=int(getattr(args, "tensor_model_parallel_size", 1)),
-        cp_size=int(cp_size),
-        pp_size=int(pp_size),
-        order=get_parallel_order(args),
+def encoder_owner_layout(
+    cp_rank: int, cp_size: int, encoder_cp_size: int
+) -> Tuple[int, int, bool]:
+    """Map a decoder CP rank onto the encoder-CP owner layout.
+
+    CP ranks ``0..encoder_cp_size-1`` of a gather group own the vision work:
+    the loader partitions images across exactly those owners.  The remaining
+    CP ranks encode nothing and still receive every embedding through the
+    unchanged all-gather over all ``cp_size`` CP ranks (ranks without images
+    contribute an empty shard).  ``encoder_cp_size < cp_size`` is therefore a
+    pure work redistribution and leaves the vision math untouched.
+
+    Returns:
+        ``(owner_rank, num_owners, is_owner)``.  ``owner_rank`` is ``-1`` on
+        non-owners: they plan the same owner assignment as everyone else but
+        materialize no image shard of their own.
+    """
+    if int(cp_size) % int(encoder_cp_size) != 0:
+        raise ValueError(
+            f"encoder_cp_size ({encoder_cp_size}) must divide "
+            f"context_parallel_size ({cp_size})"
+        )
+    is_owner = int(cp_rank) < int(encoder_cp_size)
+    return (int(cp_rank) if is_owner else -1, int(encoder_cp_size), is_owner)
+
+
+def mdp_prepartition_layout(
+    *, cp_rank: int, cp_size: int, pp_rank: int, pp_size: int, encoder_cp_size: int
+) -> Tuple[int, int, bool]:
+    """Return ``(owner_rank, num_owners, is_encoder_stage)`` for the loaders.
+
+    Shared by the Energon provider and the direct-blend dataset so both derive
+    the same layout.  ``encoder_cp_size`` divides ``cp_size``, hence
+    ``encoder_cp_size <= cp_size < pp_size * cp_size`` whenever ``pp_size > 1``:
+    the legacy "every PP stage encodes" layout is unreachable, so the PP0-only
+    gather is the only pp_cp PP>1 path and PP=1 CP-only shares its mapping.
+    """
+    owner_rank, num_owners, _is_owner = encoder_owner_layout(
+        cp_rank, cp_size, encoder_cp_size
     )
-    _, local_rank = find_pp_cp_inner_dp_group_for_rank(
-        int(getattr(args, "rank", 0)), groups
-    )
-    return int(local_rank)
+    return owner_rank, num_owners, (int(pp_rank) == 0 or int(pp_size) == 1)
 
 
 def _new_group_with_current_device(torch_module, **kwargs):
@@ -253,6 +281,10 @@ def compute_encoder_cp_groups(
     The encoder gathers embeddings only among the CP ranks on PP stage 0.
     Non-PP0 ranks run the vision encoder for gradient flow but do not
     participate in the embedding all-gather or its backward reduce-scatter.
+
+    ``encoder_cp_size`` sizes the owner set (see ``encoder_owner_layout``), not
+    this group: every decoder CP rank must receive the gathered embeddings, so
+    the gather always spans all ``cp_size`` PP0 CP ranks.
 
     Returns:
         encoder_gather_groups: One group per (TP, outer-DP) slice, PP0 CP ranks only.

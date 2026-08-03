@@ -847,7 +847,9 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
             return out
         world = self.mdp_loader_prepartition_world
         rank = self.mdp_loader_prepartition_rank
-        if rank < 0 or rank >= world:
+        # rank == -1 marks a CP rank outside --encoder-context-parallel-size:
+        # it owns no image and only carries the gather metadata.
+        if rank < -1 or rank >= world:
             raise RuntimeError(
                 "loader prepartition rank is outside its CP world: "
                 f"rank={rank} world={world}"

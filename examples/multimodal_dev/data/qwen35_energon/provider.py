@@ -10,7 +10,7 @@ from examples.multimodal_dev.data.energon_mdp import (
     MDPWindowMaterializingIterator,
     loader_prepartition_window_size,
 )
-from examples.multimodal_dev.mdp_parallel_groups import get_pp_cp_local_rank
+from examples.multimodal_dev.mdp_parallel_groups import mdp_prepartition_layout
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VIDEO_TOKEN_ID,
@@ -118,23 +118,26 @@ def _resolve_mdp_layout(
     if mdp_requested and inner_scope == "pp_cp" and pp_size <= 1 and not pp1_cp_fused:
         raise ValueError("PP=1 pp_cp --mdp-encoder-mode requires CP>1 fused vision prefetch")
 
-    prepartition_rank = int(cp_rank) if partition_vision else 0
-    prepartition_world = int(cp_size) if partition_vision else 1
+    prepartition_rank = 0
+    prepartition_world = 1
     prepartition_encoder_stage = int(pp_rank) == 0 or int(pp_size) == 1
-    if partition_vision and inner_scope == "pp_cp" and int(pp_size) > 1:
-        enc_cp_size = int(getattr(args, "encoder_context_parallel_size", None) or cp_size)
-        if enc_cp_size < int(pp_size) * int(cp_size):
-            # PP0-only gather: only PP0 CP ranks encode, so the loader must
-            # partition across enc_cp_size, matching the encoder gather group
-            # built in mdp_pipeline_sidecar._build_pp_cp_groups.  Mirrors the
-            # guard already present in data/blend_dataset.py:1004-1021.
-            prepartition_rank = int(cp_rank)
-            prepartition_world = enc_cp_size
-        else:
-            # Original PP x CP: all PP stages encode.
-            prepartition_rank = get_pp_cp_local_rank(args, pp_size, cp_size)
-            prepartition_world = int(pp_size) * int(cp_size)
-            prepartition_encoder_stage = True
+    if partition_vision:
+        # Only the first enc_cp_size CP ranks encode, so the loader partitions
+        # across those owners, matching the PP0 encoder gather group built in
+        # mdp_pipeline_sidecar._build_pp_cp_groups.  enc_cp_size divides
+        # cp_size, so the legacy all-PP-stages-encode layout is unreachable:
+        # PP0-only gather is the only pp_cp PP>1 path.
+        prepartition_rank, prepartition_world, prepartition_encoder_stage = (
+            mdp_prepartition_layout(
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                pp_rank=pp_rank,
+                pp_size=pp_size,
+                encoder_cp_size=int(
+                    getattr(args, "encoder_context_parallel_size", None) or cp_size
+                ),
+            )
+        )
 
     prefetch_windows = int(getattr(args, "mdp_loader_prepartition_prefetch_windows", 1))
     if prefetch_windows < 1:
