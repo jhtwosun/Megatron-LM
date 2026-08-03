@@ -107,6 +107,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # Group parameters by their gradient type.
         param_to_name = {}
         dense_params = []
+        dense_params_no_overlap = []
         expert_parallel_params = []
         self.params_with_grad = []
         for name, param in self.module.named_parameters():
@@ -120,14 +121,30 @@ class DistributedDataParallel(_BaseDataParallel):
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
 
-            if getattr(param, 'allreduce', True):
+            if getattr(param, 'allreduce', True) and getattr(param, 'disable_ddp_overlap', False):
+                # Synchronous bucket for vision params whose CP rank image
+                # ownership varies across microbatches (e.g. MDP sidecar).
+                # Expert-parallel params (allreduce=False) do not support
+                # disable_ddp_overlap — they fall through to expert_parallel_params.
+                dense_params_no_overlap.append((param, name))
+            elif getattr(param, 'allreduce', True):
                 dense_params.append((param, name))
             else:
                 expert_parallel_params.append((param, name))
 
         def _allocate_buffers_for_parameters(
-            input_params, data_parallel_group, gradient_scaling_factor
+            input_params,
+            data_parallel_group,
+            gradient_scaling_factor,
+            buffer_ddp_config=None,
+            buffer_bucket_size=None,
         ):
+            _ddp_config = buffer_ddp_config if buffer_ddp_config is not None else self.ddp_config
+            _bucket_size = (
+                buffer_bucket_size
+                if buffer_bucket_size is not None
+                else (self.bucket_size if _ddp_config.overlap_grad_reduce else None)
+            )
             param_and_grad_dtype_to_params = {}
             param_and_grad_dtype_to_offsets = {}
             param_and_grad_dtype_to_indices = {}
@@ -199,16 +216,16 @@ class DistributedDataParallel(_BaseDataParallel):
             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
                 buffers.append(
                     _ParamAndGradBuffer(
-                        self.ddp_config,
+                        _ddp_config,
                         param_dtype,
                         grad_dtype,
                         params,
                         data_parallel_group,
-                        self.bucket_size,
+                        _bucket_size,
                         param_to_name,
                         gradient_scaling_factor,
                         param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
-                        self.ddp_config.nccl_ub,
+                        _ddp_config.nccl_ub,
                         pg_collection,
                     )
                 )
@@ -240,7 +257,7 @@ class DistributedDataParallel(_BaseDataParallel):
             # Note: overlap_param_gather covers both the distributed optimizer and the
             # layer-wise optimizer cases; the latter sets overlap_param_gather=True
             # without use_distributed_optimizer.
-            if self.ddp_config.overlap_param_gather:
+            if _ddp_config.overlap_param_gather:
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
                     bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
@@ -295,6 +312,34 @@ class DistributedDataParallel(_BaseDataParallel):
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
             dense_params, self.intra_dp_cp_group, gradient_scaling_factor=gradient_scaling_factor
         )
+
+        # Allocate a separate synchronous (no-overlap) buffer for params tagged
+        # with disable_ddp_overlap=True (e.g. vision encoder params in multimodal
+        # models where CP rank ownership varies across microbatches).
+        # IMPORTANT: these buffers are NOT merged into self.buffers/self.bucket_groups
+        # because partition_buckets (called by DistributedOptimizer) asserts that
+        # no two buffers share the same param_dtype.  Vision and decoder params both
+        # use BF16, so merging would trigger that assertion.  Instead, we track them
+        # in self.no_overlap_bucket_groups and sync them explicitly in start_grad_sync
+        # and start_param_sync.
+        self.no_overlap_bucket_groups = []
+        if dense_params_no_overlap:
+            from dataclasses import replace as _replace
+
+            no_overlap_config = _replace(
+                self.ddp_config,
+                overlap_grad_reduce=False,
+                overlap_param_gather=False,
+                align_param_gather=False,
+                bucket_size=None,
+            )
+            _no_overlap_buffers, no_overlap_bucket_groups = _allocate_buffers_for_parameters(
+                dense_params_no_overlap,
+                self.intra_dp_cp_group,
+                gradient_scaling_factor=gradient_scaling_factor,
+                buffer_ddp_config=no_overlap_config,
+            )
+            self.no_overlap_bucket_groups = no_overlap_bucket_groups
 
         # Allocate separate param+grad buffers for expert parallel params' grads.
         self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
@@ -412,11 +457,17 @@ class DistributedDataParallel(_BaseDataParallel):
                 # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
                 # If overlapping param all-gather with optimizer step, then all-gather has
                 # already been dispatched in optimizer step.
+                bucket_group = self.param_to_bucket_group[param]
+                if not bucket_group.ddp_config.overlap_param_gather:
+                    # No-overlap params (e.g. vision encoder) use synchronous
+                    # param sync; their all-gather is not launched from the
+                    # optimizer step, so there is nothing to finish here.
+                    continue
                 skip_next_bucket_dispatch = (
                     self.ddp_config.align_param_gather
                     or self.overlap_param_gather_with_optimizer_step
                 )
-                self.param_to_bucket_group[param].finish_param_sync(
+                bucket_group.finish_param_sync(
                     skip_next_bucket_dispatch=skip_next_bucket_dispatch
                 )
 
@@ -435,7 +486,8 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
-                if self.ddp_config.overlap_grad_reduce:
+                bucket_group = self.param_to_bucket_group[param]
+                if bucket_group.ddp_config.overlap_grad_reduce:
                     assert (
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
@@ -445,10 +497,8 @@ class DistributedDataParallel(_BaseDataParallel):
                     param.main_grad.add_(param.grad.data)
                 param.grad = None
 
-                if self.ddp_config.overlap_grad_reduce:
-                    self.param_to_bucket_group[param].register_grad_ready(
-                        param, self.force_all_reduce
-                    )
+                if bucket_group.ddp_config.overlap_grad_reduce:
+                    bucket_group.register_grad_ready(param, self.force_all_reduce)
 
         return hook
 
@@ -456,6 +506,11 @@ class DistributedDataParallel(_BaseDataParallel):
     def no_sync(self):
         """
         Context manager that turns off gradient synchronization.
+
+        ``no_overlap_bucket_groups`` (vision params with ``disable_ddp_overlap=True``)
+        are intentionally excluded: their ``overlap_grad_reduce=False`` config means
+        ``is_last_microbatch`` has no effect on when they sync — they are flushed
+        explicitly by ``start_grad_sync`` after all microbatches complete.
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.is_last_microbatch = False
@@ -465,29 +520,42 @@ class DistributedDataParallel(_BaseDataParallel):
             for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
                 bucket_group.is_last_microbatch = True
 
-    def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
-        """
-        Initiates param sync (all-gather) communication operations for all model parameters.
-
-        By default, when overlap_param_gather is set to True, dispatches asynchronous communication
-        calls; when overlap_param_gather is set to False, calls synchronous communication
-        ops. Can override this default behavior using flags below.
+    def start_param_sync(
+        self,
+        *unused,
+        force_sync: bool = False,
+        force_dispatch: bool = False,
+        bucket_overlap: Optional[bool] = None,
+    ):
+        """Initiate param sync (all-gather) for model parameters.
 
         Args:
-            force_sync (bool, optional): force synchronous collective regardless of
-                other settings.
-            force_dispatch (bool, optional): force dispatch regardless of other settings.
+            force_sync: Force synchronous collective regardless of overlap settings.
+            force_dispatch: Force dispatch even when
+                overlap_param_gather_with_optimizer_step is set.
+            bucket_overlap: When set, sync only bucket groups whose
+                overlap_param_gather setting matches this value.  Use
+                ``True`` to sync overlapping decoder buckets and ``False``
+                to sync synchronous vision buckets independently.
         """
         if not force_sync:
-            # If overlapping param AG with optimizer step, AG should not be dispatched again
-            # in forward_backward_step.
             if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
                 return
 
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        all_groups = (
+            self.bucket_groups
+            + self.no_overlap_bucket_groups
+            + self.expert_parallel_bucket_groups
+        )
+        for bucket_group in all_groups:
+            if (
+                bucket_overlap is not None
+                and bucket_group.ddp_config.overlap_param_gather != bucket_overlap
+            ):
+                continue
             bucket_group.start_param_sync(force_sync=force_sync)
 
-            if not self.ddp_config.overlap_param_gather:
+            if not bucket_group.ddp_config.overlap_param_gather:
                 # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
                 # the param.data, since param buffer is not mapped to model params for MXFP8 case.
                 # The paramaters are cast from bf16 to MXFP8 during copy.
@@ -534,6 +602,9 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_grad_sync()
+        # Synchronously sync no-overlap buckets (vision params) after the overlapping ones.
+        for bucket_group in self.no_overlap_bucket_groups:
+            bucket_group.start_grad_sync()
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
@@ -545,6 +616,8 @@ class DistributedDataParallel(_BaseDataParallel):
         communication ops.
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
+        for bucket_group in self.no_overlap_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
 
     def free_overlap_buffers(self):
