@@ -3,6 +3,7 @@
 """Forward step, TP broadcast, and loss for multimodal_dev training."""
 
 import math
+from collections.abc import Mapping
 from functools import partial
 from itertools import accumulate
 from typing import Any, Dict, Iterator, Optional
@@ -10,6 +11,10 @@ from typing import Any, Dict, Iterator, Optional
 import torch
 import torch.nn.functional as F
 
+from examples.multimodal_dev.models.qwen35_vl.configuration import (
+    QWEN35_VL_IMAGE_TOKEN_ID,
+    VISION_KWARGS,
+)
 from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -34,6 +39,7 @@ _DTYPE_MAP = {
     torch.bool: 5,
 }
 _ID_MAP = {v: k for k, v in _DTYPE_MAP.items()}
+_QWEN35_ENERGON_PREPACKED = "qwen35_energon_prepacked"
 
 
 def _dtype_to_id(dtype):
@@ -182,6 +188,330 @@ def _build_packed_seq_params_from_cu_seqlens(
         qkv_format='thd',
         total_tokens=total_tokens,
     )
+
+
+def _is_qwen35_energon_prepacked(data: Any) -> bool:
+    if not isinstance(data, dict) or _QWEN35_ENERGON_PREPACKED not in data:
+        return False
+    marker = data[_QWEN35_ENERGON_PREPACKED]
+    if isinstance(marker, torch.Tensor):
+        return marker.numel() == 1 and int(marker.reshape(-1)[0]) == 1
+    return marker == 1
+
+
+def _validate_qwen35_energon_prepacked_metadata(
+    batch: Dict[str, Any],
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+) -> None:
+    """Validate document masks and the complete metadata-first vision sidecar."""
+    input_ids = batch["input_ids"]
+    labels = batch["labels"]
+    loss_mask = batch["loss_mask"]
+    padding_mask = batch["padding_mask"]
+    position_ids = batch["position_ids"]
+    if input_ids.dtype != torch.long:
+        raise ValueError("prepacked input_ids must have dtype torch.int64")
+    if labels.dtype != torch.long:
+        raise ValueError("prepacked labels must have dtype torch.int64")
+    if loss_mask.dtype != torch.float32:
+        raise ValueError("prepacked loss_mask must have dtype torch.float32")
+    if padding_mask.dtype != torch.bool:
+        raise ValueError("prepacked padding_mask must have dtype torch.bool")
+    if position_ids.dtype != torch.long:
+        raise ValueError("prepacked position_ids must have dtype torch.int64")
+    if not bool(torch.isfinite(loss_mask).all()) or not bool(
+        ((loss_mask == 0) | (loss_mask == 1)).all()
+    ):
+        raise ValueError("prepacked loss_mask values must be finite zeros or ones")
+    if bool((labels[loss_mask == 0] != -100).any()):
+        raise ValueError("prepacked labels must be -100 wherever loss_mask is zero")
+
+    token_count = int(input_ids.shape[1])
+    expected_padding = torch.ones(token_count, dtype=torch.bool, device=padding_mask.device)
+    for document_index in range(cu_seqlens.numel() - 1):
+        logical_length = int(cu_seqlens[document_index + 1] - cu_seqlens[document_index])
+        physical_start = int(cu_seqlens_padded[document_index])
+        logical_end = physical_start + logical_length
+        expected_padding[physical_start:logical_end] = False
+        if float(loss_mask[0, logical_end - 1]) != 0 or int(labels[0, logical_end - 1]) != -100:
+            raise ValueError("prepacked document last token must not supervise the next document")
+        active = loss_mask[0, physical_start : logical_end - 1] == 1
+        if bool(
+            (
+                labels[0, physical_start : logical_end - 1][active]
+                != input_ids[0, physical_start + 1 : logical_end][active]
+            ).any()
+        ):
+            raise ValueError("prepacked active labels must equal the next input token")
+    if not torch.equal(padding_mask[0], expected_padding):
+        raise ValueError("prepacked padding_mask does not match logical and physical spans")
+    if bool((loss_mask[0, expected_padding] != 0).any()) or bool(
+        (labels[0, expected_padding] != -100).any()
+    ):
+        raise ValueError("prepacked labels and loss_mask must be disabled outside logical rows")
+
+    descriptors = batch["image_descriptors"]
+    if not isinstance(descriptors, (list, tuple)):
+        raise ValueError("prepacked image_descriptors must be a sequence")
+    grids = batch["image_grid_thw"]
+    item_meta = batch["vision_item_meta"]
+    decoder_positions = batch["vision_decoder_positions"]
+    if grids.dtype != torch.long or grids.dim() != 2 or grids.shape[1] != 3:
+        raise ValueError("prepacked image_grid_thw must have dtype int64 and shape [N, 3]")
+    if item_meta.dtype != torch.long or item_meta.dim() != 2 or item_meta.shape[1] != 6:
+        raise ValueError("prepacked vision_item_meta must have dtype int64 and shape [N, 6]")
+    if decoder_positions.dtype != torch.long or decoder_positions.dim() != 1:
+        raise ValueError("prepacked vision_decoder_positions must be a one-dimensional int64 tensor")
+    item_count = int(grids.shape[0])
+    if len(descriptors) != item_count or int(item_meta.shape[0]) != item_count:
+        raise ValueError("prepacked descriptor, grid, and item-meta counts differ")
+    for item_index, descriptor in enumerate(descriptors):
+        if not isinstance(descriptor, Mapping):
+            raise ValueError("prepacked image descriptor must be a metadata mapping")
+        descriptor_grid = descriptor.get("grid_thw")
+        if torch.is_tensor(descriptor_grid):
+            descriptor_grid = descriptor_grid.detach().cpu().reshape(-1).tolist()
+        if (
+            not isinstance(descriptor_grid, (list, tuple))
+            or len(descriptor_grid) != 3
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in descriptor_grid)
+        ):
+            raise ValueError("prepacked image descriptor grid_thw must contain three integers")
+        if tuple(descriptor_grid) != tuple(int(value) for value in grids[item_index]):
+            raise ValueError(
+                "prepacked image descriptor grid_thw does not match image_grid_thw"
+            )
+    if decoder_positions.numel() > 1 and bool(
+        (decoder_positions[1:] <= decoder_positions[:-1]).any()
+    ):
+        raise ValueError("prepacked decoder positions must be strictly increasing")
+    if decoder_positions.numel() and bool(
+        ((decoder_positions < 0) | (decoder_positions >= token_count)).any()
+    ):
+        raise ValueError("prepacked decoder positions lie outside the token sequence")
+    if decoder_positions.numel() and bool(
+        (input_ids[0, decoder_positions] != QWEN35_VL_IMAGE_TOKEN_ID).any()
+    ):
+        raise ValueError("prepacked decoder positions must identify image placeholder tokens")
+
+    document_count = int(cu_seqlens.numel() - 1)
+    image_cu = batch["image_cu_seqlens"]
+    pixel_cu = batch["pixel_cu_seqlens"]
+    output_cu = batch["vision_output_cu_seqlens"]
+    for name, values, expected_length, expected_endpoint in (
+        ("image_cu_seqlens", image_cu, document_count + 1, item_count),
+        ("pixel_cu_seqlens", pixel_cu, item_count + 1, None),
+        (
+            "vision_output_cu_seqlens",
+            output_cu,
+            item_count + 1,
+            int(decoder_positions.numel()),
+        ),
+    ):
+        if values.dtype != torch.int32 or values.dim() != 1:
+            raise ValueError(f"prepacked {name} must be a one-dimensional int32 tensor")
+        if values.numel() != expected_length or int(values[0]) != 0:
+            raise ValueError(f"prepacked {name} has an invalid length or starting boundary")
+        if bool((values[1:] < values[:-1]).any()):
+            raise ValueError(f"prepacked {name} must be monotonic")
+        if expected_endpoint is not None and int(values[-1]) != expected_endpoint:
+            if name == "vision_output_cu_seqlens":
+                raise ValueError(
+                    "prepacked decoder-position coverage does not match the "
+                    "vision_output_cu_seqlens endpoint"
+                )
+            raise ValueError(f"prepacked {name} has an invalid endpoint")
+
+    item_index = 0
+    merge = 2
+    for document_index in range(document_count):
+        document_items = int(image_cu[document_index + 1] - image_cu[document_index])
+        physical_start = int(cu_seqlens_padded[document_index])
+        logical_length = int(cu_seqlens[document_index + 1] - cu_seqlens[document_index])
+        logical_end = physical_start + logical_length
+        for image_index in range(document_items):
+            meta = item_meta[item_index]
+            if (int(meta[0]), int(meta[1])) != (document_index, image_index):
+                raise ValueError("prepacked vision_item_meta is not in document/image order")
+            grid = tuple(int(value) for value in grids[item_index])
+            if tuple(int(value) for value in meta[2:5]) != grid:
+                raise ValueError("prepacked vision_item_meta grid does not match image_grid_thw")
+            time, height, width = grid
+            if min(grid) <= 0 or height % merge or width % merge:
+                raise ValueError("prepacked image grid is invalid for Qwen3.5 spatial merge")
+            patch_rows = time * height * width
+            output_rows = time * (height // merge) * (width // merge)
+            if int(pixel_cu[item_index + 1] - pixel_cu[item_index]) != patch_rows:
+                raise ValueError("prepacked pixel_cu_seqlens does not match image grids")
+            if int(meta[5]) != int(pixel_cu[item_index]):
+                raise ValueError("prepacked vision_item_meta payload_row_start is incorrect")
+            output_start = int(output_cu[item_index])
+            output_end = int(output_cu[item_index + 1])
+            if output_end - output_start != output_rows:
+                raise ValueError("prepacked vision_output_cu_seqlens does not match image grids")
+            positions = decoder_positions[output_start:output_end]
+            if positions.numel() != output_rows or (
+                output_rows and int(positions[-1] - positions[0]) != output_rows - 1
+            ):
+                raise ValueError("prepacked decoder-position span does not match image output rows")
+            if bool(((positions < physical_start) | (positions >= logical_end)).any()):
+                raise ValueError("prepacked decoder-position span lies outside its document")
+            item_index += 1
+    if item_index != item_count:
+        raise ValueError("prepacked image_cu_seqlens does not cover all vision items")
+    if int(pixel_cu[-1]) != sum(int(t * h * w) for t, h, w in grids.tolist()):
+        raise ValueError("prepacked pixel_cu_seqlens has an invalid endpoint")
+    all_image_positions = (input_ids[0] == QWEN35_VL_IMAGE_TOKEN_ID).nonzero(as_tuple=True)[0]
+    if not torch.equal(decoder_positions, all_image_positions):
+        raise ValueError(
+            "prepacked vision_decoder_positions must cover all image placeholder tokens exactly"
+        )
+
+
+def _prepare_qwen35_energon_prepacked_batch(
+    data: Optional[Dict[str, Any]], device="cuda"
+) -> Dict[str, Any]:
+    """Broadcast and normalize one metadata-first Energon packed sequence."""
+    if data is not None:
+        data = dict(data)
+        data["pixel_values"] = None
+    batch = broadcast_data_batch(data, device=device)
+    marker = batch.pop(_QWEN35_ENERGON_PREPACKED, None)
+    if marker is None:
+        raise ValueError("Qwen3.5 Energon batch is missing its prepacked marker")
+    required = (
+        "input_ids",
+        "labels",
+        "loss_mask",
+        "padding_mask",
+        "position_ids",
+        "cu_seqlens",
+        "cu_seqlens_padded",
+        "max_seqlen",
+        "image_grid_thw",
+        "image_descriptors",
+        "vision_item_meta",
+        "vision_decoder_positions",
+        "image_cu_seqlens",
+        "pixel_cu_seqlens",
+        "vision_output_cu_seqlens",
+    )
+    missing = tuple(name for name in required if batch.get(name) is None)
+    if missing:
+        raise ValueError(f"Qwen3.5 Energon prepacked batch is missing fields {missing}")
+
+    def _one_row(name):
+        tensor = batch[name]
+        if tensor.dim() == 1:
+            tensor = tensor.unsqueeze(0)
+        if tensor.dim() != 2 or tensor.shape[0] != 1:
+            raise ValueError(f"prepacked {name} must have shape [T] or [1, T]")
+        batch[name] = tensor
+
+    for name in ("input_ids", "labels", "loss_mask", "padding_mask"):
+        _one_row(name)
+    token_count = int(batch["input_ids"].shape[1])
+    if any(tuple(batch[name].shape) != (1, token_count) for name in required[1:4]):
+        raise ValueError("prepacked input_ids, labels, loss_mask, and padding_mask shapes differ")
+
+    position_ids = batch["position_ids"]
+    if position_ids.dim() == 2 and position_ids.shape[0] == 3:
+        position_ids = position_ids.unsqueeze(1)
+    elif position_ids.dim() == 3 and position_ids.shape[:2] == (1, 3):
+        position_ids = position_ids.permute(1, 0, 2).contiguous()
+    if tuple(position_ids.shape) != (3, 1, token_count):
+        raise ValueError("prepacked position_ids must normalize to shape [3, 1, T]")
+    batch["position_ids"] = position_ids
+
+    image_grid_thw = batch.get("image_grid_thw")
+    if image_grid_thw.dim() == 3:
+        if image_grid_thw.shape[0] != 1:
+            raise ValueError("prepacked image_grid_thw requires micro-batch-size 1")
+        batch["image_grid_thw"] = image_grid_thw[0]
+    vision_item_meta = batch["vision_item_meta"]
+    if vision_item_meta.dim() == 3:
+        if vision_item_meta.shape[0] != 1:
+            raise ValueError("prepacked vision_item_meta requires micro-batch-size 1")
+        batch["vision_item_meta"] = vision_item_meta[0]
+    decoder_positions = batch["vision_decoder_positions"]
+    if decoder_positions.dim() == 2 and decoder_positions.shape[0] == 1:
+        decoder_positions = decoder_positions[0]
+    elif decoder_positions.dim() != 1:
+        raise ValueError("prepacked vision_decoder_positions must be one-dimensional")
+    batch["vision_decoder_positions"] = decoder_positions
+    def _normalize_one_dimensional(name):
+        values = batch[name]
+        if values.dim() == 2 and values.shape[0] == 1:
+            values = values[0]
+        elif values.dim() != 1:
+            raise ValueError(f"prepacked {name} must be one-dimensional")
+        batch[name] = values
+
+    for name in (
+        "cu_seqlens",
+        "cu_seqlens_padded",
+        "image_cu_seqlens",
+        "pixel_cu_seqlens",
+        "vision_output_cu_seqlens",
+    ):
+        _normalize_one_dimensional(name)
+
+    cu_seqlens = batch.pop("cu_seqlens").to(dtype=torch.int32)
+    cu_seqlens_padded = batch.pop("cu_seqlens_padded").to(dtype=torch.int32)
+    max_seqlen = batch.pop("max_seqlen")
+    if max_seqlen.numel() != 1:
+        raise ValueError("prepacked max_seqlen must contain exactly one value")
+    if max_seqlen.dim() > 2 or (max_seqlen.dim() == 2 and tuple(max_seqlen.shape) != (1, 1)):
+        raise ValueError("prepacked max_seqlen must be a scalar or have shape [1] or [1, 1]")
+    max_seqlen_value = int(max_seqlen.reshape(-1)[0])
+    if cu_seqlens.numel() < 2 or cu_seqlens.shape != cu_seqlens_padded.shape:
+        raise ValueError("prepacked logical and padded cu_seqlens must have equal length >= 2")
+    if int(cu_seqlens[0]) != 0 or int(cu_seqlens_padded[0]) != 0:
+        raise ValueError("prepacked cu_seqlens must start at zero")
+    logical_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    padded_lengths = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+    if bool((logical_lengths <= 0).any()) or bool((padded_lengths <= 0).any()):
+        raise ValueError("prepacked documents must have positive logical and padded lengths")
+    if bool((logical_lengths > padded_lengths).any()):
+        raise ValueError("prepacked logical document lengths exceed their physical spans")
+    if int(cu_seqlens_padded[-1]) != token_count:
+        raise ValueError("prepacked final padded boundary must equal the input token count")
+    expected_max = int(padded_lengths.max())
+    if max_seqlen_value != expected_max:
+        raise ValueError(
+            f"prepacked max_seqlen {max_seqlen_value} does not match physical maximum {expected_max}"
+        )
+    _validate_qwen35_energon_prepacked_metadata(batch, cu_seqlens, cu_seqlens_padded)
+    from megatron.core.mdp.window import pixel_capture_suppressed
+
+    descriptors = batch["image_descriptors"]
+    if descriptors and not pixel_capture_suppressed():
+        from examples.multimodal_dev.data.qwen35_energon.materializer import (
+            materialize_image_descriptors,
+        )
+
+        pixel_values = materialize_image_descriptors(
+            descriptors,
+            batch["image_grid_thw"],
+            patch_size=int(VISION_KWARGS["patch_size"]),
+            temporal_patch_size=int(VISION_KWARGS["temporal_patch_size"]),
+            spatial_merge_size=int(VISION_KWARGS["spatial_merge_size"]),
+        )
+        batch["pixel_values"] = pixel_values.to(device, non_blocking=pixel_values.is_pinned())
+    else:
+        batch["pixel_values"] = None
+    batch["packed_seq_params"] = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=max_seqlen_value,
+        max_seqlen_kv=max_seqlen_value,
+        total_tokens=token_count,
+    )
+    return batch
 
 
 def build_vision_sidecar(
@@ -548,7 +878,7 @@ def pack_or_pad_batch(
 # -------------------------------------------------------------------
 
 
-def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
+def get_batch(data_iterator: Iterator[Any]):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
@@ -580,14 +910,33 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
         if has_data.item() == 0:
             return None
 
-    # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
-    batch = pack_or_pad_batch(
-        data,
-        args.use_packed_sequence,
-        args.seq_length,
-        device=device,
-        with_vision_sidecar=getattr(args, "mdp_enable", False),
-    )
+    if torch.distributed.get_world_size(group=group) == 1:
+        is_prepacked = _is_qwen35_energon_prepacked(data)
+    else:
+        if get_tensor_model_parallel_rank() == 0:
+            prepacked_flag = torch.tensor(
+                [int(_is_qwen35_energon_prepacked(data))], dtype=torch.uint8, device=device
+            )
+        else:
+            prepacked_flag = torch.empty(1, dtype=torch.uint8, device=device)
+        torch.distributed.broadcast(
+            prepacked_flag, get_tensor_model_parallel_src_rank(), group=group
+        )
+        is_prepacked = bool(prepacked_flag.item())
+
+    if is_prepacked:
+        if not args.use_packed_sequence:
+            raise ValueError("Qwen3.5 Energon prepacked batches require --use-packed-sequence")
+        batch = _prepare_qwen35_energon_prepacked_batch(data, device=device)
+    else:
+        # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
+        batch = pack_or_pad_batch(
+            data,
+            args.use_packed_sequence,
+            args.seq_length,
+            device=device,
+            with_vision_sidecar=getattr(args, "mdp_enable", False),
+        )
 
     # Fix shapes produced by default_collate.
     if "position_ids" in batch and batch["position_ids"] is not None:

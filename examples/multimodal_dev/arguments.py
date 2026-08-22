@@ -25,7 +25,49 @@ def add_multimodal_args(parser):
         "--dataset-provider",
         type=str,
         default="mock",
-        help="Dataset provider: mock",
+        help="Dataset provider: mock or energon",
+    )
+    group.add_argument(
+        "--energon-path",
+        type=str,
+        default=None,
+        help="Energon dataset directory (required for --dataset-provider energon).",
+    )
+    group.add_argument(
+        "--energon-split",
+        type=str,
+        default="train",
+        help="Energon training split name.",
+    )
+    group.add_argument(
+        "--energon-val-split",
+        type=str,
+        default="val",
+        help="Energon validation split name.",
+    )
+    group.add_argument(
+        "--energon-packing-buffer-size",
+        type=int,
+        default=32,
+        help="Number of preencoded samples available to the Energon pack selector.",
+    )
+    group.add_argument(
+        "--energon-max-samples-per-sequence",
+        type=int,
+        default=8,
+        help="Maximum source documents in one Energon packed sequence.",
+    )
+    group.add_argument(
+        "--energon-shuffle-buffer-size",
+        type=int,
+        default=100,
+        help="Energon training shuffle-buffer size.",
+    )
+    group.add_argument(
+        "--energon-prefetch-factor",
+        type=int,
+        default=2,
+        help="Energon loader prefetch factor.",
     )
     group.add_argument(
         "--image-token-id",
