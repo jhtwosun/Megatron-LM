@@ -82,6 +82,73 @@ def test_storage_pop_grad_requires_populated_grad():
         storage.pop_grad(0)
 
 
+def test_storage_pop_grad_error_retains_exact_allocation_base():
+    class _RecordingAllocator(DirectBufferAllocator):
+        def __init__(self):
+            super().__init__()
+            self.released = []
+
+        def release(self, tensor):
+            self.released.append(tensor)
+            super().release(tensor)
+
+    allocator = _RecordingAllocator()
+    storage = MdpEmbeddingStorage(allocator)
+    base = allocator.acquire(
+        rows=8, width=8, dtype=torch.float32, device=torch.device("cpu"), tag="leaf"
+    )
+    leaf = base[:4].requires_grad_(True)
+    storage.put_leaf(0, leaf, allocation_base=base)
+    with pytest.raises(MdpStateError, match="has .grad"):
+        storage.pop_grad(0)
+    assert storage.get_leaf(0) is leaf
+    storage.release(0)
+    assert len(allocator.released) == 1
+    assert allocator.released[0] is base
+    storage.assert_empty()
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_storage_release_failure_retains_exact_base_for_retry(training):
+    class _FailOnceAllocator(DirectBufferAllocator):
+        def __init__(self):
+            super().__init__()
+            self.attempts = []
+            self.released = []
+            self.failed = False
+
+        def release(self, tensor):
+            self.attempts.append(tensor)
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("injected release failure")
+            self.released.append(tensor)
+            super().release(tensor)
+
+    allocator = _FailOnceAllocator()
+    storage = MdpEmbeddingStorage(allocator)
+    base = allocator.acquire(
+        rows=8, width=8, dtype=torch.float32, device=torch.device("cpu"), tag="leaf"
+    )
+    leaf = base[:4].requires_grad_(True)
+    storage.put_leaf(0, leaf, allocation_base=base)
+    if training:
+        leaf.sum().backward()
+        operation = lambda: storage.pop_grad(0)
+    else:
+        operation = lambda: storage.release(0)
+
+    with pytest.raises(RuntimeError, match="injected release failure"):
+        operation()
+    assert storage.get_leaf(0) is leaf
+    result = operation()
+    if training:
+        torch.testing.assert_close(result, torch.ones_like(leaf))
+    assert allocator.attempts == [base, base]
+    assert allocator.released == [base]
+    storage.assert_empty()
+
+
 def test_storage_assert_empty_names_leftovers():
     storage = MdpEmbeddingStorage(DirectBufferAllocator())
     storage.put_leaf(4, _leaf())

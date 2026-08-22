@@ -20,9 +20,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
-def _apply_rope_fp32(
-    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
-):
+def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None):
     """Apply rotary positional embedding in fp32, then cast back to original dtype.
 
     Mirrors ``Qwen3VLSelfAttention.apply_rotary_pos_emb_absolute`` in Megatron-Bridge
@@ -84,24 +82,37 @@ def _apply_rope_fp32(
 def _apply_rope_fp32_no_cp(
     t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
 ):
-    """Same as ``_apply_rope_fp32`` but forces CP-size=1.
+    """Apply vision RoPE without consulting the decoder's global CP state.
 
-    The vision encoder uses THD packed sequences for variable-resolution
-    images.  When the language model uses CP>1, the global CP group would
-    incorrectly split the vision seqlens.  This wrapper substitutes a
-    trivial group so the vision RoPE sees the full packed sequence.
+    The unsharded vision path substitutes a trivial group. Encoder CP first
+    materializes exact packed-row frequencies and slices them with the same
+    THD index as the hidden rows; that local path applies them directly and
+    therefore must not reinterpret global ``cu_seqlens`` a second time.
     """
     range_name = "qwen35_vl.vision_encoder.rope_apply"
     nvtx_range_push(range_name)
     try:
+        if (
+            cu_seqlens is not None
+            and t.dim() == 3
+            and freqs.dim() == 4
+            and freqs.size(0) == t.size(0)
+            and freqs.size(1) == 1
+            and freqs.size(2) == 1
+        ):
+            from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
+
+            orig_dtype = t.dtype
+            out = _apply_rotary_pos_emb_bshd(
+                t.float().unsqueeze(1),
+                freqs,
+                rotary_interleaved=config.rotary_interleaved,
+                mla_rotary_interleaved=getattr(config, "multi_latent_attention", False),
+                mscale=mscale,
+            ).squeeze(1)
+            return out.to(orig_dtype)
         return _apply_rope_fp32(
-            t,
-            freqs,
-            config,
-            cu_seqlens,
-            mscale,
-            cp_group=_NO_CP_GROUP,
-            max_seqlen=max_seqlen,
+            t, freqs, config, cu_seqlens, mscale, cp_group=_NO_CP_GROUP, max_seqlen=max_seqlen
         )
     finally:
         nvtx_range_pop(range_name)
@@ -129,9 +140,7 @@ class Qwen35VLVisionSelfAttention(SelfAttention):
 
 
 def get_qwen35_vl_language_spec(
-    config: TransformerConfig,
-    vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> TransformerBlockSubmodules:
     """Transformer block spec for the Qwen3.5-VL language decoder.
 
@@ -147,9 +156,7 @@ def get_qwen35_vl_language_spec(
         TransformerBlockSubmodules with per-layer specs.
     """
     return get_transformer_block_with_experimental_attention_variant_spec(
-        config=config,
-        vp_stage=vp_stage,
-        pp_rank=pp_rank,
+        config=config, vp_stage=vp_stage, pp_rank=pp_rank
     )
 
 

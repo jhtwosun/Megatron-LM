@@ -18,10 +18,10 @@ from megatron.core.mdp.observability import nvtx_phase
 from megatron.core.mdp.protocols import CapturedMicrobatch, MdpModelAdapter, VisionDescriptor
 
 # Owner-sharded pixel reading: while ``capture`` fetches one microbatch, this
-# holds ``(microbatch_owner_worker_id, my_worker_id)`` so the model's collate
-# path (which has no microbatch context in its signature) can skip pixel
-# materialization on non-owner workers. Unset outside a sharded capture, so
-# the native and shard-off paths are byte-identical. Thread-local because the
+# holds ``(microbatch_owner_worker_id, my_worker_id, is_worker_leader)`` so the
+# model's collate path (which has no microbatch context in its signature) can
+# skip pixel materialization on non-owner workers and encoder-CP followers.
+# Unset outside capture. Thread-local because the
 # window-capture prefetch thread may capture the next train window while the
 # main thread captures an eval window.
 _PIXEL_OWNERSHIP = threading.local()
@@ -36,8 +36,8 @@ def pixel_capture_suppressed() -> bool:
     context = getattr(_PIXEL_OWNERSHIP, "value", None)
     if context is None:
         return False
-    owner_worker_id, my_worker_id = context
-    return owner_worker_id != my_worker_id
+    owner_worker_id, my_worker_id, is_worker_leader = context
+    return owner_worker_id != my_worker_id or not is_worker_leader
 
 
 @dataclass(frozen=True)
@@ -125,6 +125,7 @@ class MdpIterationWindow:
         my_worker_id: Optional[int] = None,
         num_workers: Optional[int] = None,
         endpoint_worker_id: int = 0,
+        is_worker_leader: bool = True,
     ) -> "MdpIterationWindow":
         """Consume one real iterator and build records, descriptors, and sidecar.
 
@@ -134,11 +135,9 @@ class MdpIterationWindow:
         planning group (one endpoint per group generates them).
 
         The pixel sidecar is cut by the endpoint when ``pixel_owner_shard`` is
-        off (today's behavior). With sharding on, every worker materializes and
-        cuts pixels only for the microbatches it owns
-        (``microbatch_id % num_workers == my_worker_id``); the ownership context
-        set around each ``adapter.get_batch`` call lets the model collate path
-        skip pixel materialization on non-owners.
+        off. In either mode only the owning logical worker's physical leader
+        materializes pixels; every rank still captures identical metadata. With
+        sharding on, ownership is ``microbatch_id % num_workers``.
         """
         if isinstance(data_iterators, (list, tuple)):
             iterator = data_iterators[0] if data_iterators else None
@@ -158,13 +157,18 @@ class MdpIterationWindow:
         for microbatch_id in range(num_microbatches):
             if pixel_owner_shard:
                 owner_worker_id = microbatch_id % num_workers
-                owns_pixels = owner_worker_id == my_worker_id
+                owns_pixels = owner_worker_id == my_worker_id and is_worker_leader
             else:
                 owner_worker_id = endpoint_worker_id
-                owns_pixels = lane_id is not None
+                owns_pixels = lane_id is not None and is_worker_leader
+            has_explicit_worker = my_worker_id is not None
             try:
-                if pixel_owner_shard:
-                    _PIXEL_OWNERSHIP.value = (owner_worker_id, my_worker_id)
+                if pixel_owner_shard or has_explicit_worker:
+                    _PIXEL_OWNERSHIP.value = (
+                        owner_worker_id,
+                        my_worker_id,
+                        is_worker_leader,
+                    )
                 with nvtx_phase("p1_get_batch"):
                     captured = adapter.get_batch(iterator)
             finally:
@@ -178,7 +182,9 @@ class MdpIterationWindow:
                 captured,
                 microbatch_id,
                 merge,
-                expect_pixels=owns_pixels if pixel_owner_shard else None,
+                expect_pixels=owns_pixels
+                if pixel_owner_shard or has_explicit_worker
+                else None,
             )
             vision_records = []
             for item in captured.vision_items:
@@ -276,10 +282,11 @@ def _validate_captured(
 ) -> None:
     """Endpoint-local consistency checks performed before any P2P.
 
-    ``expect_pixels`` is ``None`` outside owner-sharded pixel reading (pixels
-    accompany items on every rank). With sharding, an owned microbatch must
-    carry pixels for its items and a non-owned one must not (its collate pixel
-    branch is suppressed), so both wiring failures are diagnosed here.
+    ``expect_pixels`` is true only on the canonical physical leader of the
+    logical worker that owns the microbatch; every other rank captures the same
+    metadata without materializing pixels. ``None`` preserves compatibility for
+    captures without explicit worker identity, where items and pixels accompany
+    one another. Both wiring failures are diagnosed here.
     """
     params = captured.decoder_packed_seq_params
     if params is not None and getattr(params, "qkv_format", None) != "thd":

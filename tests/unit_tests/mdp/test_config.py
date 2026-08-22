@@ -57,7 +57,7 @@ def test_disabled_mdp_skips_all_checks():
 @pytest.mark.parametrize(
     "config_kwargs, match",
     [
-        (dict(encoder_cp=2), "encoder_cp"),
+        (dict(encoder_cp=0), "encoder_cp"),
         (dict(encoder_max_payload_rows=0), "encoder_max_payload_rows"),
         (dict(locality_slack_permille=1000), "locality_slack_permille"),
         (dict(locality_slack_permille=-1), "locality_slack_permille"),
@@ -87,6 +87,13 @@ def test_disabled_mdp_skips_all_checks():
 def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
     with pytest.raises(MdpConfigurationError, match=match):
         validate_mdp_config(MdpConfig(enable=True, **config_kwargs), _options())
+
+
+def test_encoder_cp_accepts_divisors_of_the_inner_pp_cp_domain():
+    validate_mdp_config(MdpConfig(enable=True, encoder_cp=2), _options())
+
+    with pytest.raises(MdpConfigurationError, match=r"encoder_cp divides PP \* CP"):
+        validate_mdp_config(MdpConfig(enable=True, encoder_cp=3), _options())
 
 
 @pytest.mark.parametrize(

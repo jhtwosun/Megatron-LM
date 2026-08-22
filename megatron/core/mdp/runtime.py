@@ -24,21 +24,12 @@ import torch
 
 from megatron.core.mdp.activation import EncoderForwardHandle
 from megatron.core.mdp.allocator import MdpBufferAllocator
-from megatron.core.mdp.bridge import (
-    BridgeBufferKey,
-    BridgePhase,
-    BridgeTensorSpec,
-    ModalityBridge,
-)
+from megatron.core.mdp.bridge import BridgeBufferKey, BridgePhase, BridgeTensorSpec, ModalityBridge
 from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
-from megatron.core.mdp.observability import (
-    MdpIterationMetrics,
-    nvtx_phase,
-    worker_loads_from_plan,
-)
+from megatron.core.mdp.observability import MdpIterationMetrics, nvtx_phase, worker_loads_from_plan
 from megatron.core.mdp.plan import MdpBatchPlan, split_encoder_layout
 from megatron.core.mdp.planner import MdpPlanner, assert_consistent_plan
 from megatron.core.mdp.protocols import MdpModelAdapter
@@ -47,6 +38,60 @@ from megatron.core.mdp.storage import MdpEmbeddingStorage
 from megatron.core.mdp.window import MdpIterationWindow
 
 logger = logging.getLogger(__name__)
+
+
+def _release_allocator_bases(allocator, bases, *, label):
+    """Attempt every exact base twice, returning persistent failures and first error."""
+    pending = tuple(bases)
+    first_error = None
+    for attempt in range(2):
+        if not pending:
+            break
+        failed = []
+        for index, base in enumerate(pending):
+            try:
+                allocator.release(base)
+            except BaseException as error:
+                logger.exception(
+                    "MDP: failed to release %s base %d (attempt %d)", label, index, attempt + 1
+                )
+                failed.append(base)
+                if first_error is None:
+                    first_error = error
+        pending = tuple(failed)
+    return pending, first_error
+
+
+def _allocate_endpoint_leaves(plan, *, allocator, hidden_size, params_dtype, device):
+    """Allocate endpoint leaves, releasing exact bases after a partial failure."""
+    emb_dest = {}
+    leaves = []
+    owned_leaf_bases = {}
+    try:
+        for layout in plan.layouts:
+            if layout.text_only:
+                continue
+            leaf = allocator.acquire(
+                rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
+                width=hidden_size,
+                dtype=params_dtype,
+                device=device,
+                tag="leaf",
+            )
+            owned_leaf_bases[id(leaf)] = leaf
+            for segment in layout.segments:
+                emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
+                    segment.leaf_row_start : segment.leaf_row_start + segment.output_rows
+                ]
+            leaves.append((layout.microbatch_id, leaf, leaf[: layout.total_output_rows]))
+    except BaseException:
+        pending, _ = _release_allocator_bases(
+            allocator, tuple(owned_leaf_bases.values()), label="leaf allocation"
+        )
+        if pending:
+            logger.error("MDP: %d leaf allocation base(s) remain unreleased", len(pending))
+        raise
+    return emb_dest, leaves, owned_leaf_bases
 
 
 class MdpRuntimeState(Enum):
@@ -104,6 +149,8 @@ class MdpRuntime:
         self._eval_outputs: Sequence = ()
         self._chunk_layouts: Sequence = ()
         self._chunk_of_item: dict = {}
+        self._chunk_payload_bases: Sequence = ()
+        self._cleanup_bases: Sequence = ()
         self._captured_num_tokens: Optional[torch.Tensor] = None
         self._token_capture_count = 0
         self._token_consumed = False
@@ -151,6 +198,29 @@ class MdpRuntime:
         so inconsistent values cannot be passed at two call sites.
         """
         self._require_state(MdpRuntimeState.EMPTY, "begin_iteration")
+        try:
+            return self._begin_iteration(
+                data_iterators, num_microbatches=num_microbatches, forward_only=forward_only
+            )
+        except BaseException:
+            try:
+                self._cleanup_failed_iteration()
+            except BaseException:
+                logger.exception("MDP: cleanup after begin_iteration failure also failed")
+            raise
+
+    def _begin_iteration(
+        self,
+        data_iterators: Union[Iterator, Sequence[Iterator]],
+        *,
+        num_microbatches: int,
+        forward_only: bool,
+    ) -> Sequence[Iterator]:
+        if self._chunk_payload_bases or self._cleanup_bases:
+            raise MdpStateError(
+                "MDP: begin_iteration violates: no unreleased allocator bases from "
+                "a prior failed iteration."
+            )
         self._forward_only = forward_only
 
         # P0: clear encoder gradients and iteration state.
@@ -160,6 +230,7 @@ class MdpRuntime:
         self._captured_num_tokens = None
         self._token_capture_count = 0
         self._token_consumed = False
+        self._chunk_payload_bases = ()
 
         # P1: window capture, descriptor broadcast, plan, pixel dispatch.
         plan_start = time.monotonic()
@@ -210,9 +281,7 @@ class MdpRuntime:
         for phase in (BridgePhase.PIXEL, BridgePhase.EMBEDDING, BridgePhase.GRADIENT):
             specs = pixel_specs if phase is BridgePhase.PIXEL else io_specs
             self._iter_specs[phase] = specs
-            self._iter_ledgers[phase] = self.bridge.build_ledger(
-                phase, plan, self.rank_map, specs
-            )
+            self._iter_ledgers[phase] = self.bridge.build_ledger(phase, plan, self.rank_map, specs)
         self._plan_build_ms = (time.monotonic() - plan_start) * 1000.0
 
         # The producer chunk layouts are known from the plan alone; carve the
@@ -237,10 +306,10 @@ class MdpRuntime:
                     tag="packed_pixels",
                 )
                 chunk_payloads.append(payload)
+                self._chunk_payload_bases = tuple(chunk_payloads)
                 for segment in chunk.segments:
                     pixel_dest[BridgeBufferKey(segment.global_item_id)] = payload[
-                        segment.payload_row_start : segment.payload_row_start
-                        + segment.payload_rows
+                        segment.payload_row_start : segment.payload_row_start + segment.payload_rows
                     ]
                     self._chunk_of_item[segment.global_item_id] = (chunk_index, segment)
 
@@ -274,6 +343,14 @@ class MdpRuntime:
                     global_rank=self.rank_view.global_rank,
                     dest_views=pixel_dest,
                 )
+            if len(self.process_groups.encoder_cp_group_ranks) > 1:
+                with nvtx_phase("p1_encoder_cp_pixel_broadcast"):
+                    for chunk_index, chunk in enumerate(self._chunk_layouts):
+                        torch.distributed.broadcast(
+                            chunk_payloads[chunk_index][: chunk.total_payload_rows],
+                            src=self.process_groups.encoder_cp_leader_rank,
+                            group=self.process_groups.encoder_cp_group,
+                        )
             window.release_pixels()
 
         # P2: grad-enabled encoder forward per chunk (no_grad for evaluation).
@@ -313,50 +390,65 @@ class MdpRuntime:
 
         # P3: embedding exchange straight into the endpoint leaves.
         emb_dest = {}
-        leaves = []  # (microbatch_id, valid leaf view)
+        leaves = []  # (microbatch_id, allocator base, valid leaf view)
+        owned_leaf_bases = {}
+        stored_leaf_microbatches = []
         if self.rank_view.lane_id is not None:
             with nvtx_phase("p3_leaf_assembly"):
-                for layout in plan.layouts:
-                    if layout.text_only:
-                        continue
-                    leaf = self.allocator.acquire(
-                        rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
-                        width=self.hidden_size,
-                        dtype=self.params_dtype,
-                        device=self.device,
-                        tag="leaf",
-                    )
-                    for segment in layout.segments:
-                        emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
-                            segment.leaf_row_start : segment.leaf_row_start
+                emb_dest, leaves, owned_leaf_bases = _allocate_endpoint_leaves(
+                    plan,
+                    allocator=self.allocator,
+                    hidden_size=self.hidden_size,
+                    params_dtype=self.params_dtype,
+                    device=self.device,
+                )
+        try:
+            with nvtx_phase("p3_embedding_exchange"):
+                emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
+                emb_local = {}
+                is_worker_leader = (
+                    self.rank_view.global_rank == self.process_groups.encoder_cp_leader_rank
+                )
+                if is_worker_leader:
+                    for item_id, (chunk_index, segment) in self._chunk_of_item.items():
+                        emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
+                            segment.output_row_start : segment.output_row_start
                             + segment.output_rows
                         ]
-                    leaves.append((layout.microbatch_id, leaf[: layout.total_output_rows]))
-        with nvtx_phase("p3_embedding_exchange"):
-            emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
-            emb_local = {}
-            for item_id, (chunk_index, segment) in self._chunk_of_item.items():
-                emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
-                    segment.output_row_start : segment.output_row_start + segment.output_rows
-                ]
-            # One alltoall instead of batched P2P: same ledger and payload,
-            # but no per-edge kernel pairs and no torch.cuda.synchronize
-            # workaround (all_to_all_single stream-orders its receive buffer).
-            self.bridge.exchange_all_to_all(
-                self._iter_ledgers[BridgePhase.EMBEDDING],
-                emb_local,
-                tensor_specs=emb_specs,
-                group=self.process_groups.planning_group,
-                group_ranks=self.rank_view.planning_group_ranks,
-                global_rank=self.rank_view.global_rank,
-                dtype=self.params_dtype,
-                device=self.device,
-                dest_views=emb_dest,
+                # One alltoall instead of batched P2P: same ledger and payload,
+                # but no per-edge kernel pairs and no torch.cuda.synchronize
+                # workaround (all_to_all_single stream-orders its receive buffer).
+                self.bridge.exchange_all_to_all(
+                    self._iter_ledgers[BridgePhase.EMBEDDING],
+                    emb_local,
+                    tensor_specs=emb_specs,
+                    group=self.process_groups.planning_group,
+                    group_ranks=self.rank_view.planning_group_ranks,
+                    global_rank=self.rank_view.global_rank,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                    dest_views=emb_dest,
+                )
+            # requires_grad only after every exchange copy into the leaf is done.
+            for microbatch_id, leaf_base, leaf_valid in leaves:
+                leaf_valid.requires_grad_(True)
+                self.storage.put_leaf(microbatch_id, leaf_valid, allocation_base=leaf_base)
+                owned_leaf_bases.pop(id(leaf_base))
+                stored_leaf_microbatches.append(microbatch_id)
+        except BaseException:
+            for microbatch_id in reversed(stored_leaf_microbatches):
+                try:
+                    self.storage.release(microbatch_id)
+                except BaseException:
+                    logger.exception(
+                        "MDP: failed to release stored leaf microbatch %d after P3 failure",
+                        microbatch_id,
+                    )
+            pending, _ = _release_allocator_bases(
+                self.allocator, tuple(owned_leaf_bases.values()), label="unhanded P3 leaf"
             )
-        # requires_grad only after every exchange copy into the leaf is done.
-        for microbatch_id, leaf_valid in leaves:
-            leaf_valid.requires_grad_(True)
-            self.storage.put_leaf(microbatch_id, leaf_valid)
+            self._cleanup_bases = tuple(self._cleanup_bases) + pending
+            raise
         if forward_only and self._eval_outputs:
             # Evaluation releases producer outputs once the bridge completed.
             self._eval_outputs = ()
@@ -379,8 +471,7 @@ class MdpRuntime:
             )
         if self._token_capture_count != 0:
             raise MdpStateError(
-                "MDP: the global token tensor was captured more than once this "
-                "iteration."
+                "MDP: the global token tensor was captured more than once this " "iteration."
             )
         self._captured_num_tokens = token_tensor
         self._token_capture_count = 1
@@ -399,11 +490,22 @@ class MdpRuntime:
     def end_iteration(self) -> None:
         """P5 (training) or cleanup (evaluation), then lifecycle asserts."""
         self._require_state(MdpRuntimeState.DECODER_DONE, "end_iteration")
+        try:
+            self._end_iteration()
+        except BaseException:
+            try:
+                self._cleanup_failed_iteration()
+            except BaseException:
+                logger.exception("MDP: cleanup after end_iteration failure also failed")
+            raise
+
+    def _end_iteration(self) -> None:
         plan = self._plan
         backward_start = time.monotonic()
         if self._forward_only:
             for layout in plan.layouts:
                 self.storage.release(layout.microbatch_id)
+            self._release_chunk_payload_bases()
         else:
             # P5: gradient exchange, producer multi-tensor backward, WORLD
             # encoder-gradient reduction and 1/T_global normalization.
@@ -412,55 +514,83 @@ class MdpRuntime:
             # destination copy casts to the chunk output dtype, exactly like
             # the former two-step unpack + regroup did).
             chunk_grads = []
+            chunk_grad_bases = []
             grad_dest = {}
-            if self._handle is not None:
-                with nvtx_phase("p5_grad_regroup"):
-                    for chunk_index, chunk in enumerate(self._chunk_layouts):
-                        # Match the chunk output dtype: a mixed-precision wrapper
-                        # (Float16Module) returns fp32 at the module boundary even
-                        # when parameters and transport run in bf16.
-                        output_dtype = self._handle.chunk_outputs[chunk_index].dtype
-                        grad_buffer = self.allocator.acquire(
-                            rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
-                            width=self.hidden_size,
-                            dtype=output_dtype,
-                            device=self.device,
-                            tag="grad_regroup",
+            p5_error = None
+            try:
+                if self._handle is not None:
+                    with nvtx_phase("p5_grad_regroup"):
+                        is_worker_leader = (
+                            self.rank_view.global_rank == self.process_groups.encoder_cp_leader_rank
                         )
-                        for segment in chunk.segments:
-                            grad_dest[BridgeBufferKey(segment.global_item_id)] = grad_buffer[
-                                segment.output_row_start : segment.output_row_start
-                                + segment.output_rows
-                            ]
-                        chunk_grads.append(grad_buffer[: chunk.total_output_rows])
-            with nvtx_phase("p5_grad_exchange"):
-                grad_specs = self._iter_specs[BridgePhase.GRADIENT]
-                grad_local = {}
-                if self.rank_view.lane_id is not None:
-                    for layout in plan.layouts:
-                        if layout.text_only:
-                            continue
-                        grad = self.storage.pop_grad(layout.microbatch_id)
-                        for segment in layout.segments:
-                            grad_local[BridgeBufferKey(segment.global_item_id)] = grad[
-                                segment.leaf_row_start : segment.leaf_row_start
-                                + segment.output_rows
-                            ]
-                self.bridge.exchange_all_to_all(
-                    self._iter_ledgers[BridgePhase.GRADIENT],
-                    grad_local,
-                    tensor_specs=grad_specs,
-                    group=self.process_groups.planning_group,
-                    group_ranks=self.rank_view.planning_group_ranks,
-                    global_rank=self.rank_view.global_rank,
-                    dtype=self.params_dtype,
-                    device=self.device,
-                    dest_views=grad_dest,
-                )
-            if self._handle is not None:
-                with nvtx_phase("p5_encoder_backward"):
-                    self._handle.backward(chunk_grads)
-                    self._handle.release()
+                        for chunk_index, chunk in enumerate(self._chunk_layouts):
+                            # Match the chunk output dtype: a mixed-precision wrapper
+                            # returns fp32 even when transport runs in bf16.
+                            output_dtype = self._handle.chunk_outputs[chunk_index].dtype
+                            grad_buffer = self.allocator.acquire(
+                                rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
+                                width=self.hidden_size,
+                                dtype=output_dtype,
+                                device=self.device,
+                                tag="grad_regroup",
+                            )
+                            chunk_grad_bases.append(grad_buffer)
+                            chunk_grad = grad_buffer[: chunk.total_output_rows]
+                            if is_worker_leader:
+                                for segment in chunk.segments:
+                                    grad_dest[BridgeBufferKey(segment.global_item_id)] = (
+                                        grad_buffer[
+                                            segment.output_row_start : segment.output_row_start
+                                            + segment.output_rows
+                                        ]
+                                    )
+                            else:
+                                chunk_grad.zero_()
+                            chunk_grads.append(chunk_grad)
+                with nvtx_phase("p5_grad_exchange"):
+                    grad_specs = self._iter_specs[BridgePhase.GRADIENT]
+                    grad_local = {}
+                    if self.rank_view.lane_id is not None:
+                        for layout in plan.layouts:
+                            if layout.text_only:
+                                continue
+                            grad = self.storage.pop_grad(layout.microbatch_id)
+                            for segment in layout.segments:
+                                grad_local[BridgeBufferKey(segment.global_item_id)] = grad[
+                                    segment.leaf_row_start : segment.leaf_row_start
+                                    + segment.output_rows
+                                ]
+                    self.bridge.exchange_all_to_all(
+                        self._iter_ledgers[BridgePhase.GRADIENT],
+                        grad_local,
+                        tensor_specs=grad_specs,
+                        group=self.process_groups.planning_group,
+                        group_ranks=self.rank_view.planning_group_ranks,
+                        global_rank=self.rank_view.global_rank,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                        dest_views=grad_dest,
+                    )
+                if self._handle is not None:
+                    with nvtx_phase("p5_encoder_backward"):
+                        self._handle.backward(chunk_grads)
+                        self._handle.release()
+            except BaseException as error:
+                p5_error = error
+            pending, cleanup_error = _release_allocator_bases(
+                self.allocator, tuple(chunk_grad_bases), label="grad regroup"
+            )
+            self._cleanup_bases = tuple(self._cleanup_bases) + pending
+            packed_pending, packed_error = _release_allocator_bases(
+                self.allocator, tuple(self._chunk_payload_bases), label="packed pixel"
+            )
+            self._chunk_payload_bases = packed_pending
+            if cleanup_error is None:
+                cleanup_error = packed_error
+            if p5_error is not None:
+                raise p5_error.with_traceback(p5_error.__traceback__)
+            if cleanup_error is not None:
+                raise cleanup_error.with_traceback(cleanup_error.__traceback__)
             with nvtx_phase("p5_finalize_encoder_grads"):
                 finalize_encoder_grads(
                     self.encoder_domain.encoder_ddp,
@@ -494,6 +624,8 @@ class MdpRuntime:
         self._eval_outputs = ()
         self._chunk_layouts = ()
         self._chunk_of_item = {}
+        self._chunk_payload_bases = ()
+        self._cleanup_bases = ()
         self._captured_num_tokens = None
         self._iteration += 1
         self._state = MdpRuntimeState.EMPTY
@@ -521,7 +653,66 @@ class MdpRuntime:
             my_worker_id=self.rank_view.my_worker_id,
             num_workers=len(self.rank_view.worker_ids),
             endpoint_worker_id=endpoint_worker_id(self.rank_view),
+            is_worker_leader=(
+                self.rank_view.global_rank == self.process_groups.encoder_cp_leader_rank
+            ),
         )
+
+    def _release_chunk_payload_bases(self) -> None:
+        """Release the exact allocator bases after encoder graph consumption."""
+        pending, error = _release_allocator_bases(
+            self.allocator, tuple(self._chunk_payload_bases), label="packed pixel"
+        )
+        self._chunk_payload_bases = pending
+        if error is not None:
+            raise error.with_traceback(error.__traceback__)
+
+    def _cleanup_failed_iteration(self) -> None:
+        """Best-effort exact-base cleanup while preserving the original error."""
+
+        def _attempt(label, operation):
+            try:
+                operation()
+                return True
+            except BaseException:
+                logger.exception("MDP: failed to clean %s after iteration error", label)
+                return False
+
+        if self._window is not None:
+            _attempt("pixel window", self._window.release_pixels)
+        if self._plan is not None:
+            pending_microbatches = tuple(layout.microbatch_id for layout in self._plan.layouts)
+            for _ in range(2):
+                failed = []
+                for microbatch_id in pending_microbatches:
+                    if not _attempt(
+                        f"leaf microbatch {microbatch_id}",
+                        lambda mb_id=microbatch_id: self.storage.release(mb_id),
+                    ):
+                        failed.append(microbatch_id)
+                pending_microbatches = tuple(failed)
+                if not pending_microbatches:
+                    break
+        self._handle = None
+        self._eval_outputs = ()
+        packed_pending, _ = _release_allocator_bases(
+            self.allocator,
+            tuple(self._chunk_payload_bases),
+            label="packed pixel after iteration error",
+        )
+        self._chunk_payload_bases = packed_pending
+        cleanup_pending, _ = _release_allocator_bases(
+            self.allocator, tuple(self._cleanup_bases), label="owned cleanup after iteration error"
+        )
+        self._cleanup_bases = cleanup_pending
+        self._window = None
+        self._plan = None
+        self._iter_specs = {}
+        self._iter_ledgers = {}
+        self._chunk_layouts = ()
+        self._chunk_of_item = {}
+        self._captured_num_tokens = None
+        self._state = MdpRuntimeState.EMPTY
 
     @staticmethod
     def _window_prefetch_key(data_iterators, num_microbatches: int):
@@ -566,8 +757,12 @@ class MdpRuntime:
             for value in record.model_payload.values():
                 _record(value)
             params = record.decoder_packed_seq_params
-            for name in ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded",
-                         "cu_seqlens_kv_padded"):
+            for name in (
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
+            ):
                 _record(getattr(params, name, None))
         for tensor in window.payload_sidecar().values():
             _record(tensor)
@@ -599,9 +794,7 @@ class MdpRuntime:
                 torch.cuda.set_device(self.device)
                 with torch.cuda.stream(stream):
                     with nvtx_phase("p1_window_capture_prefetch"):
-                        box["window"] = self._capture_window(
-                            data_iterators, num_microbatches
-                        )
+                        box["window"] = self._capture_window(data_iterators, num_microbatches)
                     event = torch.cuda.Event()
                     event.record(stream)
                     box["event"] = event
@@ -646,7 +839,7 @@ class MdpRuntime:
             )
         self.storage.assert_empty()
         self.bridge.assert_idle()
+        if self._chunk_payload_bases or self._cleanup_bases:
+            raise MdpStateError("MDP: allocator-owned bases survived the iteration boundary.")
         if not self._forward_only and not self._token_consumed:
-            raise MdpStateError(
-                "MDP: the global token tensor was captured but never consumed."
-            )
+            raise MdpStateError("MDP: the global token tensor was captured but never consumed.")

@@ -10,7 +10,7 @@ domain. The encoder never enters the decoder schedule model list.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Sequence
 
 import torch
@@ -35,32 +35,36 @@ class EncoderDomain:
     effective_config: Any
 
 
+def build_effective_encoder_config(model_config, mdp_config: MdpConfig):
+    """Return an immutable sidecar config whose CP dimension is encoder CP."""
+    return replace(
+        apply_vision_config_overrides(model_config, mdp_config.vision_config_overrides),
+        context_parallel_size=mdp_config.encoder_cp,
+    )
+
+
 def build_encoder_pg_collection(
     rank_map: MdpRankMap, *, encoder_cp: int, process_groups: MdpProcessGroups
 ) -> ProcessGroupCollection:
     """Process groups for the encoder domain.
 
-    With ``encoder_cp=1``: ``dp = dp_cp = intra_dp_cp = intra_dist_opt = WORLD``
-    (replicated parameters reduced once over all ranks, ZeRO-1 sharded over the
-    same domain), ``tp/pp/ep`` are rank-local singletons, and
-    ``mp/expt_dp/tp_ep_pp`` are ``None`` (``get_pg_rank(None) == 0``,
-    ``get_pg_size(None) == 1`` — exactly the intended meaning).
-
-    The singleton is created the way Megatron itself does it: each rank calls
-    ``new_group`` once with its own rank list. The ``encoder_cp>1`` evolution
-    (cp = each logical worker's ranks, dp = workers sharing a cp coordinate)
-    changes only this function, but its DDP/ZeRO semantics still require
-    revalidation and are rejected here.
+    ``cp`` is the local logical worker's encoder-CP group. Replicated
+    parameters and optimizer state retain the existing WORLD domains through
+    ``dp = dp_cp = intra_dp_cp = intra_dist_opt = WORLD``. ``tp/pp/ep/expt_dp``
+    reuse the canonical rank-local singleton installed by
+    :func:`install_mdp_process_groups`; no rank-dependent group creation occurs
+    here. Model/expert composite groups remain unset.
     """
-    if encoder_cp != 1:
+    if encoder_cp != rank_map.spec.encoder_cp:
         raise MdpConfigurationError(
-            f"MDP: encoder_cp={encoder_cp} violates: encoder_cp == 1. The encoder-CP "
-            "group construction requires revalidating MCore CP gradient semantics."
+            f"MDP: encoder_cp={encoder_cp} violates: encoder_cp matches the rank-map "
+            f"spec ({rank_map.spec.encoder_cp})."
         )
     world = process_groups.world_group
-    mine = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
+    mine = process_groups.singleton_group
 
     pgs = ProcessGroupCollection()
+    pgs.cp = process_groups.encoder_cp_group
     pgs.dp = world
     pgs.dp_cp = world
     pgs.intra_dp_cp = world
@@ -69,9 +73,9 @@ def build_encoder_pg_collection(
     pgs.pp = mine
     pgs.ep = mine
     pgs.mp = None
-    # The encoder has no experts. Set expt_dp explicitly so DDP's fallback
-    # does not create another singleton group with a warning.
-    pgs.expt_dp = None
+    # DDP treats a missing expert-DP group as permission to create a
+    # rank-dependent singleton. Reuse the canonical singleton instead.
+    pgs.expt_dp = mine
     pgs.tp_ep_pp = None
     pgs.inter_dist_opt = None
     return pgs
@@ -107,12 +111,11 @@ def build_encoder_domain(
             "shards its optimizer state over WORLD."
         )
 
-    effective_config = apply_vision_config_overrides(
-        model_config, mdp_config.vision_config_overrides
-    )
+    effective_config = build_effective_encoder_config(model_config, mdp_config)
     logger.info(
-        "MDP: effective vision config overrides: %s",
+        "MDP: effective vision config overrides: %s; encoder context parallel size: %s",
         list(mdp_config.vision_config_overrides),
+        mdp_config.encoder_cp,
     )
     encoder = adapter.build_encoder(effective_config, pg_collection=encoder_pgs)
     if wrap_mixed_precision and (

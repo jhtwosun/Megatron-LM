@@ -27,6 +27,10 @@ class MdpProcessGroups:
     """The process groups one rank participates in."""
 
     planning_group: dist.ProcessGroup
+    encoder_cp_group: dist.ProcessGroup
+    encoder_cp_group_ranks: tuple
+    encoder_cp_leader_rank: int
+    singleton_group: dist.ProcessGroup
     encoder_reduction_group: dist.ProcessGroup
     world_group: dist.ProcessGroup
 
@@ -35,8 +39,9 @@ class MdpGroupRegistry:
     """Deduplicating registry for MDP-created process groups.
 
     Reinstalling the same specification returns the existing handle;
-    ``dist.new_group`` is never called twice for one key. The registry exposes
-    leaks during teardown and tests.
+    ``dist.new_group`` is never called twice for one key. Different semantic
+    keys receive distinct communicators unless :meth:`register_alias` records
+    an intentional alias. The registry exposes leaks during teardown and tests.
     """
 
     def __init__(self) -> None:
@@ -63,13 +68,20 @@ class MdpGroupRegistry:
 
     def register_alias(self, key: tuple, ranks: Sequence[int], group) -> None:
         """Record an existing group (e.g. WORLD) under a key without creating one."""
-        if key not in self._groups:
-            self._groups[key] = (tuple(ranks), group)
+        ranks = tuple(ranks)
+        if key in self._groups:
+            existing_ranks, existing_group = self._groups[key]
+            if existing_ranks != ranks or existing_group is not group:
+                raise MdpConfigurationError(
+                    f"MDP: group alias {key} violates: one rank list and handle per key."
+                )
+            return
+        self._groups[key] = (ranks, group)
 
     def assert_no_leak(self) -> None:
-        """Every created key must be a planning group or a registered alias."""
+        """Every key must be an expected MDP group or a registered alias."""
         for key in self._groups:
-            if key[0] not in ("planning", "world_alias"):
+            if key[0] not in ("planning", "encoder_cp", "singleton", "world_alias"):
                 raise MdpConfigurationError(
                     f"MDP: group registry violates: no unexpected groups (found {key})."
                 )
@@ -80,32 +92,64 @@ def install_mdp_process_groups(
 ) -> MdpProcessGroups:
     """Install MDP process groups; every rank creates groups in the same order.
 
-    One planning group per outer-DP group, in ascending ``outer_dp_rank`` order.
-    With ``encoder_cp=1`` the encoder reduction group aliases WORLD; no duplicate
-    same-sized group is created.
+    All WORLD ranks create rank singletons, outer-DP planning groups, and logical
+    worker encoder-CP groups in canonical order. Only an ``encoder_cp=1`` group
+    aliases its canonical rank singleton; planning groups and ``encoder_cp>1``
+    groups retain semantically distinct communicators. The encoder reduction
+    group always aliases WORLD.
     """
-    if rank_map.spec.encoder_cp != 1:
-        raise MdpConfigurationError(
-            f"MDP: encoder_cp={rank_map.spec.encoder_cp} violates: encoder_cp == 1. "
-            "Encoder-CP group construction requires revalidating DDP/ZeRO semantics."
-        )
     world = dist.group.WORLD
     my_rank = dist.get_rank()
+
+    singleton_groups = {}
+    my_singleton_group = None
+    for rank in range(rank_map.spec.world_size):
+        group = group_registry.get_or_create(("singleton", rank), (rank,))
+        singleton_groups[rank] = group
+        if my_rank == rank:
+            my_singleton_group = group
+
     my_planning_group = None
     for outer_dp_rank, ranks in enumerate(rank_map.planning_groups()):
         group = group_registry.get_or_create(("planning", outer_dp_rank), ranks)
         if my_rank in ranks:
             my_planning_group = group
-    group_registry.register_alias(
-        ("world_alias",), tuple(range(rank_map.spec.world_size)), world
-    )
-    if my_planning_group is None:
+
+    my_encoder_cp_group = None
+    my_encoder_cp_group_ranks = None
+    my_encoder_cp_leader_rank = None
+    for outer_dp_rank, _ in enumerate(rank_map.planning_groups()):
+        for worker_id in range(rank_map.num_workers_per_group):
+            ranks = rank_map.worker_ranks(outer_dp_rank, worker_id)
+            key = ("encoder_cp", outer_dp_rank, worker_id)
+            if rank_map.spec.encoder_cp == 1:
+                group = singleton_groups[ranks[0]]
+                group_registry.register_alias(key, ranks, group)
+            else:
+                group = group_registry.get_or_create(key, ranks)
+            if my_rank in ranks:
+                my_encoder_cp_group = group
+                my_encoder_cp_group_ranks = ranks
+                my_encoder_cp_leader_rank = ranks[0]
+
+    group_registry.register_alias(("world_alias",), tuple(range(rank_map.spec.world_size)), world)
+    if (
+        my_singleton_group is None
+        or my_planning_group is None
+        or my_encoder_cp_group is None
+        or my_encoder_cp_group_ranks is None
+        or my_encoder_cp_leader_rank is None
+    ):
         raise MdpConfigurationError(
-            f"MDP: rank {my_rank} violates: every rank belongs to exactly one planning "
-            "group."
+            f"MDP: rank {my_rank} violates: every rank belongs to one singleton, "
+            "planning, and encoder-CP group."
         )
     return MdpProcessGroups(
         planning_group=my_planning_group,
+        encoder_cp_group=my_encoder_cp_group,
+        encoder_cp_group_ranks=my_encoder_cp_group_ranks,
+        encoder_cp_leader_rank=my_encoder_cp_leader_rank,
+        singleton_group=my_singleton_group,
         encoder_reduction_group=world,
         world_group=world,
     )
@@ -181,7 +225,7 @@ def broadcast_descriptors(
     """Broadcast the endpoint's descriptors to its planning group.
 
     Two collectives: a small header (descriptor count and per-microbatch
-    ``text_only`` flags), then the fixed-width ``int64[count, 11]`` payload.
+    ``text_only`` flags), then the fixed-width ``int64[count, 12]`` payload.
     Pickle and object collectives are forbidden. The endpoint emits in
     ``(microbatch_id, sample_id, image_ordinal)`` order, so every member's input
     is byte-identical by construction.
@@ -224,9 +268,7 @@ def broadcast_descriptors(
 
     payload = torch.zeros(count, DESCRIPTOR_SLOTS, dtype=torch.int64, device=device)
     if is_endpoint and count:
-        records = torch.tensor(
-            descriptors_to_records(local_descriptors), dtype=torch.int64
-        )
+        records = torch.tensor(descriptors_to_records(local_descriptors), dtype=torch.int64)
         # Pinned staging: a pageable H2D here blocks until the compute
         # stream drains; pinned + non_blocking stays stream-ordered ahead
         # of the broadcast below without a host wait.

@@ -74,6 +74,9 @@ def test_extension_hook_encoder_cp2():
         assert len(group) == 4
         expansion = [rank_map.worker_ranks(outer_dp_rank, w) for w in (0, 1)]
         assert all(len(ranks) == 2 for ranks in expansion)
+        assert [rank_map.worker_leader_rank(outer_dp_rank, w) for w in (0, 1)] == [
+            ranks[0] for ranks in expansion
+        ]
         # The expansion partitions the group with no overlap.
         flat = [rank for ranks in expansion for rank in ranks]
         assert sorted(flat) == sorted(group)
@@ -86,6 +89,15 @@ def test_extension_hook_encoder_cp2():
             assert view.worker_ids == (0, 1)
             assert rank in rank_map.worker_ranks(outer_dp_rank, view.my_worker_id)
     assert seen == set(range(16))
+
+
+def test_encoder_cp4_worker_groups_follow_planning_group_order():
+    rank_map = build_rank_map(_spec(world_size=8, pp=4, encoder_cp=4))
+    assert rank_map.num_workers_per_group == 1
+    assert rank_map.planning_groups() == ((0, 2, 4, 6), (1, 3, 5, 7))
+    for outer_dp_rank, planning_ranks in enumerate(rank_map.planning_groups()):
+        assert rank_map.worker_ranks(outer_dp_rank, 0) == planning_ranks
+        assert rank_map.worker_ranks(outer_dp_rank, 0)[0] == planning_ranks[0]
 
 
 def test_local_view_has_no_global_lists():

@@ -22,7 +22,7 @@ Key design choices:
 
 import os
 from contextlib import contextmanager
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +43,8 @@ def _nvtx(name: str):
         torch.cuda.nvtx.range_pop()
 
 from examples.multimodal_dev.models.qwen35_vl.vision_pos_cache import GridCache
+from megatron.core.extensions.transformer_engine import TENorm, get_thd_partitioned_indices
+from megatron.core.fusions.fused_mrope import mrope_freqs_to_rotary_emb
 from megatron.core.models.common.vision_module.vision_module import (
     VisionModule,
 )
@@ -51,7 +53,7 @@ from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
-from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -310,11 +312,25 @@ class Qwen35VLVisionEncoder(VisionModule):
         spatial_merge_size: int = 2,
         out_hidden_size: int = 3584,
         max_num_positions: int = 2304,
+        pg_collection=None,
     ):
         super().__init__(config=config)
 
         self.hidden_size = config.hidden_size
         self.spatial_merge_size = spatial_merge_size
+        self.pg_collection = pg_collection
+        self.encoder_cp_group = (
+            pg_collection.cp if pg_collection is not None else None
+        )
+        if (
+            self.encoder_cp_group is not None
+            and self.encoder_cp_group.size() != config.context_parallel_size
+        ):
+            raise ValueError(
+                "Vision encoder ProcessGroupCollection.cp size must match "
+                f"config.context_parallel_size ({self.encoder_cp_group.size()} != "
+                f"{config.context_parallel_size})."
+            )
 
         # --- Patch embedding (Conv3d) ---
         self.patch_embed = Qwen35VLPatchEmbed(
@@ -350,6 +366,7 @@ class Qwen35VLVisionEncoder(VisionModule):
             pre_process=True,
             post_process=True,
             post_layer_norm=False,
+            pg_collection=pg_collection,
         )
 
         # --- Patch merger ---
@@ -607,7 +624,9 @@ class Qwen35VLVisionEncoder(VisionModule):
     # PackedSeqParams for variable-length attention
     # ---------------------------------------------------------------
 
-    def _build_packed_seq_params(self, grid_thw: Tensor) -> PackedSeqParams:
+    def _build_packed_seq_params(
+        self, grid_thw: Tensor, *, cp_size: int = 1
+    ) -> PackedSeqParams:
         """Build ``PackedSeqParams`` from grid dimensions.
 
         Each temporal frame of each image forms a separate sub-sequence
@@ -621,34 +640,246 @@ class Qwen35VLVisionEncoder(VisionModule):
         Returns:
             ``PackedSeqParams`` for ``TransformerBlock``.
         """
+        if cp_size < 1:
+            raise ValueError(
+                f"Vision encoder cp_size must be positive, got {cp_size}."
+            )
+
+        cu_seqlens_padded = None
         if not _GRID_CACHE_ENABLED:
             # This fallback does tensor math on grid_thw; MDP may pass it on
             # the CPU (the cached path needs only its Python values).
             grid_thw = grid_thw.to(self.pos_embed.weight.device)
-            cu_seqlens = torch.repeat_interleave(
+            seqlens = torch.repeat_interleave(
                 grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-            ).cumsum(dim=0, dtype=torch.int32)
-            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-            max_seqlen = int((grid_thw[:, 1] * grid_thw[:, 2]).max().item())
-            return PackedSeqParams(
-                qkv_format="thd",
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_kv=max_seqlen,
             )
-
-        grids = tuple(tuple(int(v) for v in row) for row in grid_thw.tolist())
-        cu_seqlens, max_seqlen = self._grid_cache.packed_seq(
-            grids, self.pos_embed.weight.device
-        )
+            cu_seqlens = F.pad(
+                seqlens.cumsum(dim=0, dtype=torch.int32),
+                (1, 0),
+                value=0,
+            )
+            max_seqlen = int(seqlens.max().item())
+            if cp_size > 1:
+                pad_to = 2 * cp_size
+                padded_seqlens = (
+                    (seqlens + pad_to - 1) // pad_to
+                ) * pad_to
+                cu_seqlens_padded = F.pad(
+                    padded_seqlens.cumsum(dim=0, dtype=torch.int32),
+                    (1, 0),
+                    value=0,
+                )
+                max_seqlen = int(padded_seqlens.max().item())
+        else:
+            grids = tuple(
+                tuple(int(v) for v in row) for row in grid_thw.tolist()
+            )
+            cu_seqlens, max_seqlen = self._grid_cache.packed_seq(
+                grids, self.pos_embed.weight.device
+            )
+            if cp_size > 1:
+                pad_to = 2 * cp_size
+                padded_seqlens = [
+                    ((h * w + pad_to - 1) // pad_to) * pad_to
+                    for t, h, w in grids
+                    for _ in range(t)
+                ]
+                padded_cumulative = [0]
+                for seqlen in padded_seqlens:
+                    padded_cumulative.append(
+                        padded_cumulative[-1] + seqlen
+                    )
+                cu_seqlens_padded = torch.tensor(
+                    padded_cumulative,
+                    dtype=torch.int32,
+                    device=self.pos_embed.weight.device,
+                )
+                max_seqlen = max(padded_seqlens)
 
         return PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+        )
+
+    # ---------------------------------------------------------------
+    # Vision context parallel helpers
+    # ---------------------------------------------------------------
+
+    @staticmethod
+    def _pad_context_parallel_sequence(
+        hidden_states: Tensor,
+        rotary_pos_emb: Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+        """Pad each packed frame to TE's ``2 * CP`` THD alignment."""
+        if rotary_pos_emb.size(0) != hidden_states.size(0):
+            raise RuntimeError(
+                "Vision encoder CP requires materialized rotary rows in "
+                "exact hidden-row order; "
+                f"got hidden={hidden_states.size(0)}, "
+                f"rotary={rotary_pos_emb.size(0)}."
+            )
+
+        cu_seqlens = packed_seq_params.cu_seqlens_q
+        cu_seqlens_padded = packed_seq_params.cu_seqlens_q_padded
+        if cu_seqlens_padded is None:
+            return hidden_states, rotary_pos_emb, None
+
+        total_tokens = hidden_states.size(0)
+        total_padded_tokens = int(cu_seqlens_padded[-1].item())
+        if total_tokens == total_padded_tokens:
+            return hidden_states, rotary_pos_emb, None
+
+        seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+        seq_starts = cu_seqlens[:-1]
+        padded_starts = cu_seqlens_padded[:-1]
+        token_offsets = torch.arange(
+            total_tokens,
+            dtype=torch.int64,
+            device=hidden_states.device,
+        ) - torch.repeat_interleave(seq_starts, seqlens).to(torch.int64)
+        valid_index = (
+            torch.repeat_interleave(padded_starts, seqlens).to(torch.int64)
+            + token_offsets
+        )
+
+        padded_hidden = hidden_states.new_zeros(
+            total_padded_tokens, hidden_states.size(-1)
+        )
+        padded_hidden.index_copy_(0, valid_index, hidden_states)
+        padded_rotary = rotary_pos_emb.new_zeros(
+            (total_padded_tokens,) + tuple(rotary_pos_emb.shape[1:])
+        )
+        padded_rotary.index_copy_(0, valid_index, rotary_pos_emb)
+        return padded_hidden, padded_rotary, valid_index
+
+    @staticmethod
+    def _context_parallel_partition_indices(
+        packed_seq_params: PackedSeqParams,
+        total_tokens: int,
+        cp_group,
+    ) -> Tuple[Tensor, List[int]]:
+        """Compute every rank's TE THD index from the encoder CP group."""
+        cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+        if cu_seqlens is None:
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+
+        index_parts = []
+        split_sizes = []
+        for rank in range(cp_group.size()):
+            index = get_thd_partitioned_indices(
+                cu_seqlens,
+                total_tokens,
+                cp_group.size(),
+                rank,
+            ).to(dtype=torch.int64)
+            index_parts.append(index)
+            split_sizes.append(index.numel())
+        return torch.cat(index_parts, dim=0), split_sizes
+
+    @staticmethod
+    def _partition_context_parallel_sequence(
+        hidden_states: Tensor,
+        rotary_pos_emb: Tensor,
+        packed_seq_params: PackedSeqParams,
+        cp_group,
+    ) -> Tuple[Tensor, Tensor, Tensor, Optional[List[int]]]:
+        """Select this encoder-CP rank's hidden and exact rotary rows."""
+        gathered_index, split_sizes = (
+            Qwen35VLVisionEncoder._context_parallel_partition_indices(
+                packed_seq_params, hidden_states.size(0), cp_group
+            )
+        )
+        local_start = sum(split_sizes[: cp_group.rank()])
+        local_index = gathered_index.narrow(
+            0, local_start, split_sizes[cp_group.rank()]
+        )
+        output_split_sizes = split_sizes
+        if len(set(split_sizes)) == 1:
+            output_split_sizes = None
+        return (
+            hidden_states.index_select(0, local_index),
+            rotary_pos_emb.index_select(0, local_index),
+            gathered_index,
+            output_split_sizes,
+        )
+
+    @staticmethod
+    def _restore_context_parallel_sequence(
+        hidden_states: Tensor,
+        total_tokens: int,
+        cp_group,
+        gathered_index: Tensor,
+        output_split_sizes: Optional[List[int]],
+    ) -> Tensor:
+        """Autograd-gather CP rows and restore padded THD order."""
+        gathered = gather_from_sequence_parallel_region(
+            hidden_states.contiguous(),
+            tensor_parallel_output_grad=True,
+            group=cp_group,
+            output_split_sizes=output_split_sizes,
+        )
+        if (
+            gathered_index.numel() != total_tokens
+            or gathered.size(0) != total_tokens
+        ):
+            raise RuntimeError(
+                "Vision encoder CP restore expected "
+                f"{total_tokens} rows, got index={gathered_index.numel()}, "
+                f"hidden={gathered.size(0)}."
+            )
+        restored = hidden_states.new_empty(
+            total_tokens, hidden_states.size(-1)
+        )
+        return restored.index_copy(0, gathered_index, gathered)
+
+    @staticmethod
+    def _context_parallel_split_sizes(
+        total_rows: int, cp_group
+    ) -> List[int]:
+        """Split contiguous rows across the explicit encoder CP group."""
+        base, remainder = divmod(total_rows, cp_group.size())
+        return [
+            base + (rank < remainder) for rank in range(cp_group.size())
+        ]
+
+    def _sharded_context_parallel_patch_merger(
+        self, hidden_states: Tensor, cp_group
+    ) -> Tensor:
+        """Shard complete merge groups, then autograd-gather outputs."""
+        merge_group_size = self.spatial_merge_size ** 2
+        if hidden_states.size(0) % merge_group_size != 0:
+            raise RuntimeError(
+                "Vision encoder CP PatchMerger requires complete merge "
+                f"groups: rows={hidden_states.size(0)}, "
+                f"group={merge_group_size}."
+            )
+
+        total_merged_rows = hidden_states.size(0) // merge_group_size
+        if total_merged_rows < cp_group.size():
+            return self.merger(hidden_states)
+
+        split_sizes = self._context_parallel_split_sizes(
+            total_merged_rows, cp_group
+        )
+        local_start = sum(split_sizes[: cp_group.rank()])
+        local_count = split_sizes[cp_group.rank()]
+        local_hidden = hidden_states.narrow(
+            0,
+            local_start * merge_group_size,
+            local_count * merge_group_size,
+        )
+        local_output = self.merger(local_hidden)
+        return gather_from_sequence_parallel_region(
+            local_output.contiguous(),
+            tensor_parallel_output_grad=True,
+            group=cp_group,
+            output_split_sizes=split_sizes,
         )
 
     # ---------------------------------------------------------------
@@ -686,9 +917,47 @@ class Qwen35VLVisionEncoder(VisionModule):
                 emb = torch.cat((rot_freqs, rot_freqs), dim=-1)
                 rot_freqs = emb.unsqueeze(1).unsqueeze(1)
 
+        cp_group = self.encoder_cp_group
+        cp_size = cp_group.size() if cp_group is not None else 1
+        if (
+            cp_size > 1
+            and getattr(self.config, "mrope_section", None) is not None
+        ):
+            rot_freqs = mrope_freqs_to_rotary_emb(
+                rot_freqs,
+                self.config.mrope_section,
+                interleaved_mrope=self.config.mrope_interleaved,
+                rotary_interleaved=self.config.rotary_interleaved,
+            )
+
         # 4. Transformer blocks with PackedSeqParams
         with _nvtx("build_packed_seq_params"):
-            packed_seq_params = self._build_packed_seq_params(grid_thw)
+            packed_seq_params = self._build_packed_seq_params(
+                grid_thw, cp_size=cp_size
+            )
+        valid_index = None
+        gathered_index = None
+        output_split_sizes = None
+        total_padded_tokens = hidden_states.size(0)
+        if cp_size > 1:
+            with _nvtx("context_parallel_partition"):
+                hidden_states, rot_freqs, valid_index = (
+                    self._pad_context_parallel_sequence(
+                        hidden_states, rot_freqs, packed_seq_params
+                    )
+                )
+                total_padded_tokens = hidden_states.size(0)
+                (
+                    hidden_states,
+                    rot_freqs,
+                    gathered_index,
+                    output_split_sizes,
+                ) = self._partition_context_parallel_sequence(
+                    hidden_states,
+                    rot_freqs,
+                    packed_seq_params,
+                    cp_group,
+                )
         with _nvtx("transformer_blocks"):
             hidden_states = hidden_states.unsqueeze(1)
             hidden_states = self.decoder(
@@ -698,7 +967,24 @@ class Qwen35VLVisionEncoder(VisionModule):
                 packed_seq_params=packed_seq_params,
             )
             hidden_states = hidden_states.squeeze(1)
+        if cp_size > 1:
+            with _nvtx("context_parallel_restore"):
+                hidden_states = self._restore_context_parallel_sequence(
+                    hidden_states,
+                    total_padded_tokens,
+                    cp_group,
+                    gathered_index,
+                    output_split_sizes,
+                )
+                if valid_index is not None:
+                    hidden_states = hidden_states.index_select(
+                        0, valid_index
+                    )
 
         # 5. Patch merger
         with _nvtx("patch_merger"):
+            if cp_size > 1:
+                return self._sharded_context_parallel_patch_merger(
+                    hidden_states, cp_group
+                )
             return self.merger(hidden_states)
