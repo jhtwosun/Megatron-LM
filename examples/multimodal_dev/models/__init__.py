@@ -61,6 +61,10 @@ MODEL_REGISTRY = {
                 "examples.multimodal_dev.data.mdp_mock"
                 ".train_valid_test_datasets_provider"
             ),
+            "energon": (
+                "examples.multimodal_dev.data.qwen35_energon.provider"
+                ".train_valid_test_datasets_provider"
+            ),
         },
     },
 }
