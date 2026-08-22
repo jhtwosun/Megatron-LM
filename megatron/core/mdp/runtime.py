@@ -24,24 +24,19 @@ import torch
 
 from megatron.core.mdp.activation import EncoderForwardHandle
 from megatron.core.mdp.allocator import MdpBufferAllocator
-from megatron.core.mdp.bridge import (
-    BridgeBufferKey,
-    BridgePhase,
-    BridgeTensorSpec,
-    ModalityBridge,
-)
+from megatron.core.mdp.bridge import BridgeBufferKey, BridgePhase, BridgeTensorSpec, ModalityBridge
 from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
-from megatron.core.mdp.observability import (
-    MdpIterationMetrics,
-    nvtx_phase,
-    worker_loads_from_plan,
-)
+from megatron.core.mdp.observability import MdpIterationMetrics, nvtx_phase, worker_loads_from_plan
 from megatron.core.mdp.plan import MdpBatchPlan, split_encoder_layout
 from megatron.core.mdp.planner import MdpPlanner, assert_consistent_plan
-from megatron.core.mdp.protocols import MdpModelAdapter
+from megatron.core.mdp.protocols import (
+    MdpEncoderOutput,
+    MdpModelAdapter,
+    validate_output_plane_widths,
+)
 from megatron.core.mdp.rank_mapping import MdpRankMap, MdpRankView, endpoint_worker_id
 from megatron.core.mdp.storage import MdpEmbeddingStorage
 from megatron.core.mdp.window import MdpIterationWindow
@@ -83,6 +78,7 @@ class MdpRuntime:
         self.rank_view = rank_view
         self.process_groups = process_groups
         self.adapter = adapter
+        self.output_plane_widths = validate_output_plane_widths(adapter)
         self.encoder_domain = encoder_domain
         self.planner = planner
         self.bridge = bridge
@@ -104,6 +100,7 @@ class MdpRuntime:
         self._eval_outputs: Sequence = ()
         self._chunk_layouts: Sequence = ()
         self._chunk_of_item: dict = {}
+        self._chunk_payload_bases: dict = {}
         self._captured_num_tokens: Optional[torch.Tensor] = None
         self._token_capture_count = 0
         self._token_consumed = False
@@ -151,6 +148,25 @@ class MdpRuntime:
         so inconsistent values cannot be passed at two call sites.
         """
         self._require_state(MdpRuntimeState.EMPTY, "begin_iteration")
+        try:
+            return self._begin_iteration(
+                data_iterators, num_microbatches=num_microbatches, forward_only=forward_only
+            )
+        except BaseException:
+            try:
+                self.abort_iteration()
+            except BaseException:
+                logger.exception("MDP: packed-pixel cleanup failed while preserving P1-P3 error")
+            raise
+
+    def _begin_iteration(
+        self,
+        data_iterators: Union[Iterator, Sequence[Iterator]],
+        *,
+        num_microbatches: int,
+        forward_only: bool,
+    ) -> Sequence[Iterator]:
+        """Implementation of :meth:`begin_iteration` under its ownership guard."""
         self._forward_only = forward_only
 
         # P0: clear encoder gradients and iteration state.
@@ -210,9 +226,7 @@ class MdpRuntime:
         for phase in (BridgePhase.PIXEL, BridgePhase.EMBEDDING, BridgePhase.GRADIENT):
             specs = pixel_specs if phase is BridgePhase.PIXEL else io_specs
             self._iter_specs[phase] = specs
-            self._iter_ledgers[phase] = self.bridge.build_ledger(
-                phase, plan, self.rank_map, specs
-            )
+            self._iter_ledgers[phase] = self.bridge.build_ledger(phase, plan, self.rank_map, specs)
         self._plan_build_ms = (time.monotonic() - plan_start) * 1000.0
 
         # The producer chunk layouts are known from the plan alone; carve the
@@ -227,22 +241,32 @@ class MdpRuntime:
         self._chunk_of_item = {}
         chunk_payloads = []
         pixel_dest = {}
-        with nvtx_phase("p2_pack_payload"):
-            for chunk_index, chunk in enumerate(self._chunk_layouts):
-                payload = self.allocator.acquire(
-                    rows=plan.capacity_policy.capacity_of(chunk.total_payload_rows),
-                    width=self.adapter.payload_width,
-                    dtype=self.params_dtype,
-                    device=self.device,
-                    tag="packed_pixels",
-                )
-                chunk_payloads.append(payload)
-                for segment in chunk.segments:
-                    pixel_dest[BridgeBufferKey(segment.global_item_id)] = payload[
-                        segment.payload_row_start : segment.payload_row_start
-                        + segment.payload_rows
-                    ]
-                    self._chunk_of_item[segment.global_item_id] = (chunk_index, segment)
+        payload_error = None
+        try:
+            with nvtx_phase("p2_pack_payload"):
+                for chunk_index, chunk in enumerate(self._chunk_layouts):
+                    payload = self.allocator.acquire(
+                        rows=plan.capacity_policy.capacity_of(chunk.total_payload_rows),
+                        width=self.adapter.payload_width,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                        tag="packed_pixels",
+                    )
+                    self._chunk_payload_bases[id(payload)] = payload
+                    chunk_payloads.append(payload)
+                    for segment in chunk.segments:
+                        pixel_dest[BridgeBufferKey(segment.global_item_id)] = payload[
+                            segment.payload_row_start : segment.payload_row_start
+                            + segment.payload_rows
+                        ]
+                        self._chunk_of_item[segment.global_item_id] = (chunk_index, segment)
+        except BaseException as exc:
+            payload_error = exc
+        self._coordinated_preflight(
+            "P2 payload assembly",
+            payload_error,
+            lambda: self._release_exact_bases(self._chunk_payload_bases),
+        )
 
         with nvtx_phase("p1_pixel_dispatch"):
             pixel_specs = self._iter_specs[BridgePhase.PIXEL]
@@ -280,21 +304,48 @@ class MdpRuntime:
         chunk_outputs = []
         encoder = self.encoder_domain.encoder_ddp
         forward_start = time.monotonic()
-        for chunk_index, chunk in enumerate(self._chunk_layouts):
-            payload = chunk_payloads[chunk_index]
-            payload_valid = payload[: chunk.total_payload_rows]
-            if forward_only:
-                with torch.no_grad(), nvtx_phase("p2_encoder_forward"):
-                    output = self.adapter.encode(encoder, payload_valid, chunk)
-            else:
-                with nvtx_phase("p2_encoder_forward"):
-                    output = self.adapter.encode(encoder, payload_valid, chunk)
-                if output.shape[0] and (not output.requires_grad or output.grad_fn is None):
+        encoder_error = None
+        try:
+            for chunk_index, chunk in enumerate(self._chunk_layouts):
+                payload = chunk_payloads[chunk_index]
+                payload_valid = payload[: chunk.total_payload_rows]
+                if forward_only:
+                    with torch.no_grad(), nvtx_phase("p2_encoder_forward"):
+                        output = self.adapter.encode(encoder, payload_valid, chunk)
+                else:
+                    with nvtx_phase("p2_encoder_forward"):
+                        output = self.adapter.encode(encoder, payload_valid, chunk)
+                outputs = output.planes if isinstance(output, MdpEncoderOutput) else (output,)
+                if len(outputs) != len(self.output_plane_widths):
                     raise MdpStateError(
-                        "MDP: encoder chunk output is not graph-connected in training; "
-                        "adapter.encode must run with gradients enabled."
+                        f"MDP: encoder chunk {chunk_index} returned {len(outputs)} planes; "
+                        f"adapter declared {len(self.output_plane_widths)}."
                     )
-            chunk_outputs.append(output)
+                for plane_id, (plane, width) in enumerate(zip(outputs, self.output_plane_widths)):
+                    if plane.dim() != 2 or tuple(plane.shape) != (chunk.total_output_rows, width):
+                        raise MdpStateError(
+                            f"MDP: encoder chunk {chunk_index} plane {plane_id} shape "
+                            f"{tuple(plane.shape)} violates: "
+                            f"({chunk.total_output_rows}, {width})."
+                        )
+                    if (
+                        not forward_only
+                        and plane.shape[0]
+                        and (not plane.requires_grad or plane.grad_fn is None)
+                    ):
+                        raise MdpStateError(
+                            f"MDP: encoder chunk {chunk_index} plane {plane_id} is not "
+                            "graph-connected in training; adapter.encode must run with "
+                            "gradients enabled."
+                        )
+                chunk_outputs.append(tuple(outputs))
+        except BaseException as exc:
+            encoder_error = exc
+        self._coordinated_preflight(
+            "P2 encoder forward",
+            encoder_error,
+            lambda: self._release_exact_bases(self._chunk_payload_bases),
+        )
 
         self._encoder_forward_ms = (time.monotonic() - forward_start) * 1000.0
 
@@ -306,60 +357,128 @@ class MdpRuntime:
                 chunk_layouts=tuple(self._chunk_layouts),
             )
             detached = self._handle.detached_outputs()
+            if len(self.output_plane_widths) == 1:
+                detached = tuple((output,) for output in detached)
         else:
             self._handle = None
             self._eval_outputs = tuple(chunk_outputs)
-            detached = tuple(output.detach() for output in chunk_outputs)
+            detached = tuple(
+                tuple(output.detach() for output in outputs) for outputs in chunk_outputs
+            )
 
         # P3: embedding exchange straight into the endpoint leaves.
         emb_dest = {}
-        leaves = []  # (microbatch_id, valid leaf view)
-        if self.rank_view.lane_id is not None:
-            with nvtx_phase("p3_leaf_assembly"):
-                for layout in plan.layouts:
-                    if layout.text_only:
-                        continue
-                    leaf = self.allocator.acquire(
-                        rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
-                        width=self.hidden_size,
-                        dtype=self.params_dtype,
-                        device=self.device,
-                        tag="leaf",
-                    )
-                    for segment in layout.segments:
-                        emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
-                            segment.leaf_row_start : segment.leaf_row_start
-                            + segment.output_rows
-                        ]
-                    leaves.append((layout.microbatch_id, leaf[: layout.total_output_rows]))
-        with nvtx_phase("p3_embedding_exchange"):
-            emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
-            emb_local = {}
+        leaf_entries = []  # (microbatch_id, valid leaf views, exact bases)
+        owned_leaf_bases = {}
+        leaf_error = None
+        try:
+            if self.rank_view.lane_id is not None:
+                with nvtx_phase("p3_leaf_assembly"):
+                    for layout in plan.layouts:
+                        if layout.text_only:
+                            continue
+                        plane_leaves = []
+                        plane_bases = []
+                        for plane_id, width in enumerate(self.output_plane_widths):
+                            base = self.allocator.acquire(
+                                rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
+                                width=width,
+                                dtype=self.params_dtype,
+                                device=self.device,
+                                tag="leaf",
+                            )
+                            owned_leaf_bases[id(base)] = base
+                            for segment in layout.segments:
+                                emb_dest[
+                                    BridgeBufferKey(segment.global_item_id, plane_id=plane_id)
+                                ] = base[
+                                    segment.leaf_row_start : segment.leaf_row_start
+                                    + segment.output_rows
+                                ]
+                            plane_leaves.append(base[: layout.total_output_rows])
+                            plane_bases.append(base)
+                        leaf_entries.append(
+                            (layout.microbatch_id, tuple(plane_leaves), tuple(plane_bases))
+                        )
+        except BaseException as exc:
+            leaf_error = exc
+        self._coordinated_preflight(
+            "P3 leaf assembly", leaf_error, lambda: self._release_exact_bases(owned_leaf_bases)
+        )
+
+        emb_local = {}
+        embedding_prepare_error = None
+        try:
             for item_id, (chunk_index, segment) in self._chunk_of_item.items():
-                emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
-                    segment.output_row_start : segment.output_row_start + segment.output_rows
-                ]
-            # One alltoall instead of batched P2P: same ledger and payload,
-            # but no per-edge kernel pairs and no torch.cuda.synchronize
-            # workaround (all_to_all_single stream-orders its receive buffer).
-            self.bridge.exchange_all_to_all(
-                self._iter_ledgers[BridgePhase.EMBEDDING],
-                emb_local,
-                tensor_specs=emb_specs,
-                group=self.process_groups.planning_group,
-                group_ranks=self.rank_view.planning_group_ranks,
-                global_rank=self.rank_view.global_rank,
-                dtype=self.params_dtype,
-                device=self.device,
-                dest_views=emb_dest,
-            )
-        # requires_grad only after every exchange copy into the leaf is done.
-        for microbatch_id, leaf_valid in leaves:
-            leaf_valid.requires_grad_(True)
-            self.storage.put_leaf(microbatch_id, leaf_valid)
+                for plane_id, output in enumerate(detached[chunk_index]):
+                    emb_local[BridgeBufferKey(item_id, plane_id=plane_id)] = output[
+                        segment.output_row_start : segment.output_row_start + segment.output_rows
+                    ]
+        except BaseException as exc:
+            embedding_prepare_error = exc
+        self._coordinated_preflight(
+            "P3 embedding preparation",
+            embedding_prepare_error,
+            lambda: self._release_exact_bases(owned_leaf_bases),
+        )
+
+        # A transport exception may mean its communicator is poisoned or that
+        # peers are still inside the exchange. Never launch another collective
+        # from this path; release only local ownership and preserve the error.
+        try:
+            with nvtx_phase("p3_embedding_exchange"):
+                emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
+                self.bridge.exchange_all_to_all(
+                    self._iter_ledgers[BridgePhase.EMBEDDING],
+                    emb_local,
+                    tensor_specs=emb_specs,
+                    group=self.process_groups.planning_group,
+                    group_ranks=self.rank_view.planning_group_ranks,
+                    global_rank=self.rank_view.global_rank,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                    dest_views=emb_dest,
+                )
+        except BaseException:
+            try:
+                self._release_exact_bases(owned_leaf_bases)
+            except BaseException:
+                logger.exception(
+                    "MDP: local cleanup failed while preserving the P3 bridge exception"
+                )
+            raise
+
+        stored_microbatches = []
+        handoff_error = None
+        try:
+            # requires_grad only after every exchange copy into the leaf is done.
+            for microbatch_id, leaf_planes, leaf_bases in leaf_entries:
+                for leaf in leaf_planes:
+                    leaf.requires_grad_(True)
+                self.storage.put_leaves(microbatch_id, leaf_planes, bases=leaf_bases)
+                stored_microbatches.append(microbatch_id)
+                for base in leaf_bases:
+                    owned_leaf_bases.pop(id(base))
+        except BaseException as exc:
+            handoff_error = exc
+
+        def _cleanup_leaf_handoff():
+            for microbatch_id in stored_microbatches:
+                try:
+                    self.storage.release(microbatch_id)
+                except BaseException:
+                    logger.exception(
+                        "MDP: cleanup after P3 failure could not release microbatch %s",
+                        microbatch_id,
+                    )
+            self._release_exact_bases(owned_leaf_bases)
+
+        self._coordinated_preflight("P3 embedding handoff", handoff_error, _cleanup_leaf_handoff)
         if forward_only and self._eval_outputs:
             # Evaluation releases producer outputs once the bridge completed.
             self._eval_outputs = ()
+        if forward_only:
+            self._release_exact_bases(self._chunk_payload_bases)
 
         self._state = MdpRuntimeState.DECODER_READY
         self._decoder_start = time.monotonic()
@@ -379,8 +498,7 @@ class MdpRuntime:
             )
         if self._token_capture_count != 0:
             raise MdpStateError(
-                "MDP: the global token tensor was captured more than once this "
-                "iteration."
+                "MDP: the global token tensor was captured more than once this " "iteration."
             )
         self._captured_num_tokens = token_tensor
         self._token_capture_count = 1
@@ -399,6 +517,54 @@ class MdpRuntime:
     def end_iteration(self) -> None:
         """P5 (training) or cleanup (evaluation), then lifecycle asserts."""
         self._require_state(MdpRuntimeState.DECODER_DONE, "end_iteration")
+        try:
+            self._end_iteration()
+        except BaseException:
+            try:
+                self.abort_iteration()
+            except BaseException:
+                logger.exception("MDP: packed-pixel cleanup failed while preserving P5 error")
+            raise
+
+    def abort_iteration(self) -> None:
+        """Locally abandon one failed iteration without launching collectives."""
+        first_error = None
+        self._handle = None
+        self._eval_outputs = ()
+        if self._plan is not None:
+            for layout in self._plan.layouts:
+                try:
+                    self.storage.release(layout.microbatch_id)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        if self._window is not None:
+            self._window.release_pixels()
+        try:
+            self._release_exact_bases(self._chunk_payload_bases)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        try:
+            self.bridge.assert_idle()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        self._window = None
+        self._plan = None
+        self._iter_specs = {}
+        self._iter_ledgers = {}
+        self._chunk_layouts = ()
+        self._chunk_of_item = {}
+        self._captured_num_tokens = None
+        self._token_capture_count = 0
+        self._token_consumed = False
+        self._state = MdpRuntimeState.EMPTY
+        if first_error is not None:
+            raise first_error
+
+    def _end_iteration(self) -> None:
+        """Implementation of :meth:`end_iteration` under its ownership guard."""
         plan = self._plan
         backward_start = time.monotonic()
         if self._forward_only:
@@ -413,54 +579,129 @@ class MdpRuntime:
             # the former two-step unpack + regroup did).
             chunk_grads = []
             grad_dest = {}
-            if self._handle is not None:
-                with nvtx_phase("p5_grad_regroup"):
-                    for chunk_index, chunk in enumerate(self._chunk_layouts):
-                        # Match the chunk output dtype: a mixed-precision wrapper
-                        # (Float16Module) returns fp32 at the module boundary even
-                        # when parameters and transport run in bf16.
-                        output_dtype = self._handle.chunk_outputs[chunk_index].dtype
-                        grad_buffer = self.allocator.acquire(
-                            rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
-                            width=self.hidden_size,
-                            dtype=output_dtype,
-                            device=self.device,
-                            tag="grad_regroup",
-                        )
-                        for segment in chunk.segments:
-                            grad_dest[BridgeBufferKey(segment.global_item_id)] = grad_buffer[
-                                segment.output_row_start : segment.output_row_start
-                                + segment.output_rows
-                            ]
-                        chunk_grads.append(grad_buffer[: chunk.total_output_rows])
-            with nvtx_phase("p5_grad_exchange"):
-                grad_specs = self._iter_specs[BridgePhase.GRADIENT]
-                grad_local = {}
+            grad_local = {}
+            owned_grad_bases = {}
+            grad_prepare_error = None
+            try:
+                if self._handle is not None:
+                    with nvtx_phase("p5_grad_regroup"):
+                        for chunk_index, chunk in enumerate(self._chunk_layouts):
+                            plane_grads = []
+                            for plane_id, (output, width) in enumerate(
+                                zip(
+                                    self._handle.chunk_outputs[chunk_index],
+                                    self.output_plane_widths,
+                                )
+                            ):
+                                # Float16Module may return fp32 at the module boundary.
+                                grad_base = self.allocator.acquire(
+                                    rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
+                                    width=width,
+                                    dtype=output.dtype,
+                                    device=self.device,
+                                    tag="grad_regroup",
+                                )
+                                owned_grad_bases[id(grad_base)] = grad_base
+                                for segment in chunk.segments:
+                                    grad_dest[
+                                        BridgeBufferKey(segment.global_item_id, plane_id=plane_id)
+                                    ] = grad_base[
+                                        segment.output_row_start : segment.output_row_start
+                                        + segment.output_rows
+                                    ]
+                                plane_grads.append(grad_base[: chunk.total_output_rows])
+                            chunk_grads.append(tuple(plane_grads))
                 if self.rank_view.lane_id is not None:
                     for layout in plan.layouts:
                         if layout.text_only:
                             continue
-                        grad = self.storage.pop_grad(layout.microbatch_id)
-                        for segment in layout.segments:
-                            grad_local[BridgeBufferKey(segment.global_item_id)] = grad[
-                                segment.leaf_row_start : segment.leaf_row_start
-                                + segment.output_rows
-                            ]
-                self.bridge.exchange_all_to_all(
-                    self._iter_ledgers[BridgePhase.GRADIENT],
-                    grad_local,
-                    tensor_specs=grad_specs,
-                    group=self.process_groups.planning_group,
-                    group_ranks=self.rank_view.planning_group_ranks,
-                    global_rank=self.rank_view.global_rank,
-                    dtype=self.params_dtype,
-                    device=self.device,
-                    dest_views=grad_dest,
-                )
-            if self._handle is not None:
-                with nvtx_phase("p5_encoder_backward"):
-                    self._handle.backward(chunk_grads)
-                    self._handle.release()
+                        grads = self.storage.pop_grads(layout.microbatch_id)
+                        for plane_id, grad in enumerate(grads):
+                            for segment in layout.segments:
+                                grad_local[
+                                    BridgeBufferKey(segment.global_item_id, plane_id=plane_id)
+                                ] = grad[
+                                    segment.leaf_row_start : segment.leaf_row_start
+                                    + segment.output_rows
+                                ]
+            except BaseException as exc:
+                grad_prepare_error = exc
+
+            def _cleanup_grad_prepare():
+                try:
+                    self._release_exact_bases(owned_grad_bases)
+                except BaseException:
+                    logger.exception(
+                        "MDP: cleanup after P5 preparation failure could not release "
+                        "one or more regroup bases"
+                    )
+                for layout in plan.layouts:
+                    try:
+                        self.storage.release(layout.microbatch_id)
+                    except BaseException:
+                        logger.exception(
+                            "MDP: cleanup after P5 preparation failure could not release "
+                            "microbatch %s",
+                            layout.microbatch_id,
+                        )
+
+            self._coordinated_preflight(
+                "P5 gradient preparation", grad_prepare_error, _cleanup_grad_prepare
+            )
+
+            def _cleanup_backward():
+                first_error = None
+                try:
+                    self._release_exact_bases(owned_grad_bases)
+                except BaseException as exc:
+                    first_error = exc
+                self._handle = None
+                try:
+                    self._release_exact_bases(self._chunk_payload_bases)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                if first_error is not None:
+                    raise first_error
+
+            # As in P3, an exchange failure permits local cleanup only. A new
+            # planning-group collective here could deadlock against a peer
+            # still inside the failed transport.
+            try:
+                with nvtx_phase("p5_grad_exchange"):
+                    grad_specs = self._iter_specs[BridgePhase.GRADIENT]
+                    self.bridge.exchange_all_to_all(
+                        self._iter_ledgers[BridgePhase.GRADIENT],
+                        grad_local,
+                        tensor_specs=grad_specs,
+                        group=self.process_groups.planning_group,
+                        group_ranks=self.rank_view.planning_group_ranks,
+                        global_rank=self.rank_view.global_rank,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                        dest_views=grad_dest,
+                    )
+            except BaseException:
+                try:
+                    _cleanup_backward()
+                except BaseException:
+                    logger.exception(
+                        "MDP: local cleanup failed while preserving the P5 bridge exception"
+                    )
+                raise
+
+            backward_error = None
+            try:
+                if self._handle is not None:
+                    with nvtx_phase("p5_encoder_backward"):
+                        self._handle.backward(chunk_grads)
+                        self._handle.release()
+            except BaseException as exc:
+                backward_error = exc
+
+            self._coordinated_preflight("P5 encoder backward", backward_error, _cleanup_backward)
+            self._release_exact_bases(owned_grad_bases)
+            self._release_exact_bases(self._chunk_payload_bases)
             with nvtx_phase("p5_finalize_encoder_grads"):
                 finalize_encoder_grads(
                     self.encoder_domain.encoder_ddp,
@@ -566,8 +807,12 @@ class MdpRuntime:
             for value in record.model_payload.values():
                 _record(value)
             params = record.decoder_packed_seq_params
-            for name in ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded",
-                         "cu_seqlens_kv_padded"):
+            for name in (
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
+            ):
                 _record(getattr(params, name, None))
         for tensor in window.payload_sidecar().values():
             _record(tensor)
@@ -599,9 +844,7 @@ class MdpRuntime:
                 torch.cuda.set_device(self.device)
                 with torch.cuda.stream(stream):
                     with nvtx_phase("p1_window_capture_prefetch"):
-                        box["window"] = self._capture_window(
-                            data_iterators, num_microbatches
-                        )
+                        box["window"] = self._capture_window(data_iterators, num_microbatches)
                     event = torch.cuda.Event()
                     event.record(stream)
                     box["event"] = event
@@ -623,19 +866,52 @@ class MdpRuntime:
                 f"(current: {self._state.name})."
             )
 
+    def _release_exact_bases(self, owned: dict) -> None:
+        """Release every exact base once, attempting all entries."""
+        first_error = None
+        bases = tuple(owned.values())
+        owned.clear()
+        for base in bases:
+            try:
+                self.allocator.release(base)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def _coordinated_preflight(self, phase: str, local_error, cleanup) -> None:
+        """Fail every planning-group rank before the next bridge collective."""
+        failed = torch.tensor(
+            [1 if local_error is not None else 0], dtype=torch.int32, device=self.device
+        )
+        torch.distributed.all_reduce(
+            failed, op=torch.distributed.ReduceOp.MAX, group=self.process_groups.planning_group
+        )
+        if not bool(failed.item()):
+            return
+        peer_error = MdpStateError(f"MDP: coordinated {phase} failure before bridge exchange.")
+        active_error = local_error if local_error is not None else peer_error
+        try:
+            cleanup()
+        except BaseException:
+            logger.exception("MDP: cleanup failed while preserving the %s exception", phase)
+        raise active_error
+
     def _tensor_specs(self, plan: MdpBatchPlan, *, pixels: bool) -> dict:
         specs = {}
         for route in plan.routes:
             segment = plan.segment_for_item(route.global_item_id)
             valid = segment.payload_rows if pixels else segment.output_rows
-            width = self.adapter.payload_width if pixels else self.hidden_size
-            specs[BridgeBufferKey(route.global_item_id)] = BridgeTensorSpec(
-                valid_rows=valid,
-                capacity_rows=plan.capacity_policy.capacity_of(valid),
-                width=width,
-                dtype=self.params_dtype,
-                device=self.device,
-            )
+            widths = (self.adapter.payload_width,) if pixels else self.output_plane_widths
+            for plane_id, width in enumerate(widths):
+                specs[BridgeBufferKey(route.global_item_id, plane_id=plane_id)] = BridgeTensorSpec(
+                    valid_rows=valid,
+                    capacity_rows=plan.capacity_policy.capacity_of(valid),
+                    width=width,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                )
         return specs
 
     def _assert_iteration_boundary(self) -> None:
@@ -644,9 +920,9 @@ class MdpRuntime:
             raise MdpStateError(
                 "MDP: an unconsumed producer forward handle survived the iteration."
             )
+        if self._chunk_payload_bases:
+            raise MdpStateError("MDP: packed-pixel allocator bases survived the iteration.")
         self.storage.assert_empty()
         self.bridge.assert_idle()
         if not self._forward_only and not self._token_consumed:
-            raise MdpStateError(
-                "MDP: the global token tensor was captured but never consumed."
-            )
+            raise MdpStateError("MDP: the global token tensor was captured but never consumed.")

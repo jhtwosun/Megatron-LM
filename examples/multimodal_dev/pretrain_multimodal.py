@@ -27,10 +27,7 @@ import importlib
 import os
 import sys
 
-sys.path.insert(
-    0,
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
-)
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from examples.multimodal_dev.arguments import add_multimodal_args
 from examples.multimodal_dev.forward_step import forward_step
@@ -40,11 +37,7 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 
 
-def model_provider(
-    pre_process: bool = True,
-    post_process: bool = True,
-    **kwargs,
-):
+def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs):
     """Build a multimodal model from ``--model-arch``.
 
     The language ``TransformerConfig`` is built from CLI args so that
@@ -59,8 +52,7 @@ def model_provider(
 
     if model_arch not in MODEL_REGISTRY:
         raise ValueError(
-            f"Unknown model arch '{model_arch}'. "
-            f"Available: {list(MODEL_REGISTRY.keys())}"
+            f"Unknown model arch '{model_arch}'. " f"Available: {list(MODEL_REGISTRY.keys())}"
         )
 
     registry = MODEL_REGISTRY[model_arch]
@@ -112,9 +104,7 @@ def _resolve_provider_fn(provider_fn):
     """Resolve a provider that may be a dotted import path string."""
     if isinstance(provider_fn, str):
         module_path, func_name = provider_fn.rsplit(".", 1)
-        provider_fn = getattr(
-            importlib.import_module(module_path), func_name,
-        )
+        provider_fn = getattr(importlib.import_module(module_path), func_name)
     return provider_fn
 
 
@@ -135,8 +125,7 @@ def datasets_provider(train_val_test_num_samples, vp_stage=None):
 
     if model_arch not in MODEL_REGISTRY:
         raise ValueError(
-            f"Unknown model arch '{model_arch}'. "
-            f"Available: {list(MODEL_REGISTRY.keys())}"
+            f"Unknown model arch '{model_arch}'. " f"Available: {list(MODEL_REGISTRY.keys())}"
         )
 
     registry = MODEL_REGISTRY[model_arch]
@@ -153,15 +142,16 @@ def datasets_provider(train_val_test_num_samples, vp_stage=None):
 
 
 def _mdp_adapter_builder(args):
-    """Build the Qwen3.5-VL MDP adapter plus its vision TransformerConfig.
+    """Build the registered model's MDP adapter and vision config.
 
     Mirrors model_provider's vision-config assembly so the MDP encoder is
     built from exactly the same configuration as the native path.
     """
-    from examples.multimodal_dev.mdp_adapter import build_mdp_adapter
-    from examples.multimodal_dev.models import MODEL_REGISTRY
+    from examples.multimodal_dev.models import MODEL_REGISTRY, resolve_mdp_model_hooks
 
-    registry = MODEL_REGISTRY[getattr(args, "model_arch", "qwen35_vl")]
+    model_arch = getattr(args, "model_arch", "qwen35_vl")
+    registry = MODEL_REGISTRY[model_arch]
+    adapter_factory, _ = resolve_mdp_model_hooks(model_arch)
     language_config = core_transformer_config_from_args(args)
     post_language_config_fn = registry.get("post_language_config_fn")
     if post_language_config_fn is not None:
@@ -177,12 +167,24 @@ def _mdp_adapter_builder(args):
     # The encoder DDP derives its gradient prescale from this flag; MDP
     # requires prescale 1 (WORLD sum, normalized once by 1/T_global).
     vision_config.calculate_per_token_loss = language_config.calculate_per_token_loss
-    return build_mdp_adapter(args, language_config), vision_config
+    vision_config_validator = registry.get("mdp_vision_config_validator_fn")
+    if vision_config_validator is not None:
+        from megatron.core.mdp.config import apply_vision_config_overrides
+        from megatron.core.mdp.integration import mdp_config_from_args
+
+        effective_vision_config = apply_vision_config_overrides(
+            vision_config, mdp_config_from_args(args).vision_config_overrides
+        )
+        vision_config_validator(args, language_config, effective_vision_config)
+    return adapter_factory(args, language_config), vision_config
 
 
 def _setup_mdp(args):
     """Validate the MDP configuration and register the adapter builder."""
+    from examples.multimodal_dev.models import resolve_mdp_model_hooks
     from megatron.core.mdp import integration as mdp_integration
+
+    _, replay_fn = resolve_mdp_model_hooks(getattr(args, "model_arch", "qwen35_vl"))
 
     if not getattr(args, "use_packed_sequence", False):
         raise RuntimeError(
@@ -205,15 +207,13 @@ def _setup_mdp(args):
 
     assert_weight_only_checkpoint(args)
     mdp_integration.set_adapter_builder(_mdp_adapter_builder)
+    mdp_integration.set_model_replay(replay_fn)
 
 
 if __name__ == "__main__":
     datasets_provider.is_distributed = True
 
-    args = parse_and_validate_args(
-        extra_args_provider=add_multimodal_args,
-        args_defaults={},
-    )
+    args = parse_and_validate_args(extra_args_provider=add_multimodal_args, args_defaults={})
     if getattr(args, "mdp_enable", False):
         _setup_mdp(args)
     full_config = pretrain_cfg_container_from_args(args)

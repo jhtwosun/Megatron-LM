@@ -41,11 +41,15 @@ class BridgePhase(Enum):
 
 @dataclass(frozen=True)
 class BridgeBufferKey:
-    """Identifies one transported buffer. ``slice_id`` is always 0 in v1 and
-    distinguishes multiple slices of one item once decoder CP lands."""
+    """Identifies one transported buffer.
+
+    ``slice_id`` is reserved for decoder-CP slices. ``plane_id`` identifies
+    ordered encoder outputs without duplicating the item's route or cost.
+    """
 
     global_item_id: int
     slice_id: int = 0
+    plane_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,7 @@ def _entry_sort_key(entry: BridgeLedgerEntry):
         entry.dst_global_rank,
         entry.key.global_item_id,
         entry.key.slice_id,
+        entry.key.plane_id,
         entry.plan_offset,
     )
 
@@ -132,6 +137,11 @@ class ModalityBridge:
         never a linear scan).
         """
         entries = []
+        keys_by_item = {}
+        for key in tensor_specs:
+            keys_by_item.setdefault(key.global_item_id, []).append(key)
+        for keys in keys_by_item.values():
+            keys.sort(key=lambda key: (key.slice_id, key.plane_id))
         for route in plan.routes:
             producer_ranks = rank_map.worker_ranks(plan.outer_dp_rank, route.producer_worker_id)
             if len(producer_ranks) != 1:
@@ -150,9 +160,7 @@ class ModalityBridge:
                 if route.owner_worker_id is None:
                     owner_rank = route.endpoint_rank
                 else:
-                    owner_ranks = rank_map.worker_ranks(
-                        plan.outer_dp_rank, route.owner_worker_id
-                    )
+                    owner_ranks = rank_map.worker_ranks(plan.outer_dp_rank, route.owner_worker_id)
                     if len(owner_ranks) != 1:
                         raise MdpBridgeError(
                             f"MDP: owner_worker_id={route.owner_worker_id} resolves to "
@@ -163,26 +171,28 @@ class ModalityBridge:
                 src, dst = owner_rank, producer_rank
             else:  # GRADIENT flows owner endpoint -> producer
                 src, dst = route.endpoint_rank, producer_rank
-            key = BridgeBufferKey(global_item_id=route.global_item_id)
-            spec = tensor_specs.get(key)
-            if spec is None:
+            route_keys = keys_by_item.get(route.global_item_id, ())
+            if not route_keys:
                 raise MdpBridgeError(
-                    f"MDP: key {key} violates: every routed item has a tensor spec."
+                    f"MDP: item {route.global_item_id} violates: every routed item "
+                    "has at least one tensor spec."
                 )
-            element_count = spec.valid_rows * max(1, spec.width)
-            if element_count == 0:
-                continue  # empty edges are omitted
-            entries.append(
-                BridgeLedgerEntry(
-                    phase=phase,
-                    src_global_rank=src,
-                    dst_global_rank=dst,
-                    dtype=spec.dtype,
-                    element_count=element_count,
-                    plan_offset=0,  # assigned below in canonical order
-                    key=key,
+            for key in route_keys:
+                spec = tensor_specs[key]
+                element_count = spec.valid_rows * max(1, spec.width)
+                if element_count == 0:
+                    continue  # empty edges are omitted
+                entries.append(
+                    BridgeLedgerEntry(
+                        phase=phase,
+                        src_global_rank=src,
+                        dst_global_rank=dst,
+                        dtype=spec.dtype,
+                        element_count=element_count,
+                        plan_offset=0,  # assigned below in canonical order
+                        key=key,
+                    )
                 )
-            )
 
         entries.sort(key=_entry_sort_key)
         # Assign each entry its element offset inside the coalesced (src, dst)
@@ -261,9 +271,7 @@ class ModalityBridge:
             if entry.src_global_rank == entry.dst_global_rank:
                 continue
             edge = (entry.src_global_rank, entry.dst_global_rank)
-            edge_bytes[edge] = (
-                edge_bytes.get(edge, 0) + entry.element_count * entry.dtype.itemsize
-            )
+            edge_bytes[edge] = edge_bytes.get(edge, 0) + entry.element_count * entry.dtype.itemsize
         for edge, nbytes in edge_bytes.items():
             if nbytes < MIN_REMOTE_MSG_BYTES:
                 small += 1
@@ -321,8 +329,15 @@ class ModalityBridge:
         start = time.monotonic()
         try:
             received = self._exchange_all_to_all_impl(
-                ledger, local_tensors, tensor_specs, group, group_ranks, global_rank,
-                dtype, device, dest_views,
+                ledger,
+                local_tensors,
+                tensor_specs,
+                group,
+                group_ranks,
+                global_rank,
+                dtype,
+                device,
+                dest_views,
             )
         finally:
             self._in_flight = False
@@ -403,9 +418,7 @@ class ModalityBridge:
         received: dict = {}
 
         def _unpack(entry: BridgeLedgerEntry, flat: Tensor):
-            self._unpack_entry(
-                entry, flat, tensor_specs, dest_views, received, ledger.phase.value
-            )
+            self._unpack_entry(entry, flat, tensor_specs, dest_views, received, ledger.phase.value)
 
         # Issue the collective asynchronously and unpack the local edges while
         # it is in flight: the local copies run on the current stream, the
@@ -514,9 +527,7 @@ class ModalityBridge:
         received: dict = {}
 
         def _unpack(entry: BridgeLedgerEntry, flat: Tensor):
-            self._unpack_entry(
-                entry, flat, tensor_specs, dest_views, received, ledger.phase.value
-            )
+            self._unpack_entry(entry, flat, tensor_specs, dest_views, received, ledger.phase.value)
 
         for entry in local_entries:
             _unpack(entry, self._entry_payload(local_tensors, entry))
@@ -546,9 +557,7 @@ class ModalityBridge:
         intermediate capacity-sized buffer is allocated as before.
         """
         if entry.key in received:
-            raise MdpBridgeError(
-                f"MDP: key {entry.key} violates: one received buffer per key."
-            )
+            raise MdpBridgeError(f"MDP: key {entry.key} violates: one received buffer per key.")
         dest = dest_views.get(entry.key) if dest_views is not None else None
         if dest is not None:
             if dest.numel() != entry.element_count:

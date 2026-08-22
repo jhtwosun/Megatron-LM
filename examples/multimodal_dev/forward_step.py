@@ -253,12 +253,9 @@ def build_vision_sidecar(
             slot_cursor += slots
             if slots and int(item_positions[-1] - item_positions[0]) != slots - 1:
                 raise ValueError(
-                    f"sample {sample_index} item {ordinal}: image-token slots are not "
-                    "contiguous"
+                    f"sample {sample_index} item {ordinal}: image-token slots are not " "contiguous"
                 )
-            meta_rows.append(
-                [sample_index, ordinal, t, h, w, payload_row_start]
-            )
+            meta_rows.append([sample_index, ordinal, t, h, w, payload_row_start])
             payload_row_start += t * h * w
             position_chunks.append(item_positions.to(torch.int64) + cu_seqlens_padded[sample_index])
     if meta_rows:
@@ -329,9 +326,7 @@ def pack_or_pad_batch(
         # bytes are identical to the generic path. torch's caching host
         # allocator recycles the pinned blocks and event-tracks their reuse.
         try:
-            use_pinned = (
-                bool(getattr(get_args(), "mdp_enable", False)) and tp_size == 1
-            )
+            use_pinned = bool(getattr(get_args(), "mdp_enable", False)) and tp_size == 1
         except AssertionError:
             use_pinned = False
 
@@ -440,9 +435,7 @@ def pack_or_pad_batch(
                 else:
                     packed_batch["pixel_values"] = torch.concat(pixel_values_list)
             grid_thw = torch.concat(image_grid_thw_list)
-            packed_batch["image_grid_thw"] = (
-                grid_thw.pin_memory() if use_pinned else grid_thw
-            )
+            packed_batch["image_grid_thw"] = grid_thw.pin_memory() if use_pinned else grid_thw
             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
             # so each rank can build an identical PackedSeqParams.
             if use_pinned:
@@ -548,7 +541,7 @@ def pack_or_pad_batch(
 # -------------------------------------------------------------------
 
 
-def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
+def get_batch(data_iterator: Iterator[list[Dict[str, Any]]], raw_batch_validator=None):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
@@ -579,6 +572,9 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
 
         if has_data.item() == 0:
             return None
+
+    if raw_batch_validator is not None and data is not None:
+        raw_batch_validator(data)
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
     batch = pack_or_pad_batch(
@@ -641,27 +637,21 @@ def mdp_forward_step(runtime, data_iterator, model):
     record = next(data_iterator)
     batch = dict(record.model_payload)
 
-    vision_embeddings = None
+    encoder_leaves = ()
     if is_pipeline_first_stage() and not record.text_only:
-        vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
-        if vision_embeddings is None:
+        encoder_leaves = runtime.storage.get_leaves(record.microbatch_id)
+        if encoder_leaves is None:
             raise RuntimeError(
                 f"MDP: microbatch {record.microbatch_id} has vision items but no "
                 "leaf in endpoint storage; P3 embedding routing did not complete"
             )
 
-    output_tensor = model(
-        input_ids=batch["input_ids"],
-        position_ids=batch.get("position_ids"),
-        attention_mask=batch.get("attention_mask", None),
-        labels=batch.get("labels", None),
-        loss_mask=batch.get("loss_mask", None),
-        padding_mask=batch.get("padding_mask", None),
-        pixel_values=None,
-        image_grid_thw=batch.get("image_grid_thw", None),
-        packed_seq_params=record.decoder_packed_seq_params,
-        vision_embeddings=vision_embeddings,
-    )
+    from megatron.core.mdp import integration as mdp_integration
+
+    replay_fn = mdp_integration.get_model_replay()
+    if replay_fn is None:
+        raise RuntimeError("MDP: no model replay hook was registered before decoder replay.")
+    output_tensor = replay_fn(model, batch, record, encoder_leaves)
 
     loss_mask = batch.get("loss_mask", None)
     if loss_mask is None:
@@ -669,9 +659,7 @@ def mdp_forward_step(runtime, data_iterator, model):
     if is_pipeline_last_stage():
         from examples.multimodal_dev.models.base import MultimodalModel
 
-        loss_mask = MultimodalModel.cp_split_loss_mask(
-            loss_mask, record.decoder_packed_seq_params
-        )
+        loss_mask = MultimodalModel.cp_split_loss_mask(loss_mask, record.decoder_packed_seq_params)
     return output_tensor, partial(loss_func, loss_mask)
 
 
@@ -683,7 +671,11 @@ def forward_step(data_iterator, model):
     if mdp_runtime is not None:
         return mdp_forward_step(mdp_runtime, data_iterator, model)
 
-    batch = get_batch(data_iterator)
+    args = get_args()
+    from examples.multimodal_dev.models import MODEL_REGISTRY
+
+    registry = MODEL_REGISTRY.get(getattr(args, "model_arch", "qwen35_vl"), {})
+    batch = get_batch(data_iterator, raw_batch_validator=registry.get("raw_batch_validator_fn"))
 
     if batch is None:
         return None, None

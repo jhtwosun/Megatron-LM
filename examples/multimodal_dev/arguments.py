@@ -5,15 +5,13 @@
 
 def add_multimodal_args(parser):
     """Add multimodal-specific arguments to the Megatron argument parser."""
-    group = parser.add_argument_group(
-        "Multimodal", "Multimodal model arguments",
-    )
+    group = parser.add_argument_group("Multimodal", "Multimodal model arguments")
 
     group.add_argument(
         "--model-arch",
         type=str,
         default="qwen35_vl",
-        help="Model architecture. Available: qwen35_vl",
+        help="Model architecture. Available: qwen35_vl, qwen3_vl, nemotron_omni",
     )
     group.add_argument(
         "--model-variant",
@@ -22,51 +20,32 @@ def add_multimodal_args(parser):
         help="Model variant (size). E.g. proxy, 9b, 397b_a17b",
     )
     group.add_argument(
-        "--dataset-provider",
-        type=str,
-        default="mock",
-        help="Dataset provider: mock",
+        "--dataset-provider", type=str, default="mock", help="Dataset provider: mock"
     )
     group.add_argument(
-        "--image-token-id",
-        type=int,
-        default=248056,
-        help="Token ID for image placeholder tokens",
+        "--image-token-id", type=int, default=248056, help="Token ID for image placeholder tokens"
     )
     group.add_argument(
-        "--image-size",
-        type=int,
-        default=224,
-        help="Image size (height and width) for mock data",
+        "--image-size", type=int, default=224, help="Image size (height and width) for mock data"
     )
     group.add_argument(
-        "--total-seq-length",
-        type=int,
-        default=1024,
-        help="Total sequence length for mock data",
+        "--total-seq-length", type=int, default=1024, help="Total sequence length for mock data"
     )
     group.add_argument(
-        "--image-seq-length",
-        type=int,
-        default=256,
-        help="Number of image tokens in mock data",
+        "--image-seq-length", type=int, default=256, help="Number of image tokens in mock data"
     )
     group.add_argument(
         "--vision-num-layers",
         type=int,
         default=None,
-        help=(
-            "Override for vision backbone depth. "
-            "Useful for proxy perf runs."
-        ),
+        help=("Override for vision backbone depth. " "Useful for proxy perf runs."),
     )
     group.add_argument(
         "--hf-processor-path",
         type=str,
         default=None,
         help=(
-            "HuggingFace processor path for real VLM datasets "
-            "(e.g. Qwen/Qwen2.5-VL-7B-Instruct)"
+            "HuggingFace processor path for real VLM datasets " "(e.g. Qwen/Qwen2.5-VL-7B-Instruct)"
         ),
     )
     group.add_argument(
@@ -80,13 +59,22 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--nemotron-omni-input-contract",
+        type=str,
+        default="expanded_sequence_v1",
+        help="Nemotron Omni input contract (only expanded_sequence_v1 is supported).",
+    )
+    group.add_argument(
+        "--nemotron-omni-enable-sound",
+        action="store_true",
+        default=False,
+        help="Enable Nemotron Omni sound input (unsupported by this image-only integration).",
+    )
+    group.add_argument(
         "--use-packed-sequence",
         action="store_true",
         default=False,
-        help=(
-            "Pack variable-length sequences into THD format to eliminate "
-            "padding waste."
-        ),
+        help=("Pack variable-length sequences into THD format to eliminate " "padding waste."),
     )
     group.add_argument(
         "--mdp-enable",
@@ -191,9 +179,7 @@ def add_multimodal_args(parser):
         "--use-vanilla-collate-fn",
         action="store_true",
         default=False,
-        help=(
-            "Use vanilla collate function to collate the data."
-        ),
+        help=("Use vanilla collate function to collate the data."),
     )
 
     return parser

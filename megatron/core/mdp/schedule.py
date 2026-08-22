@@ -16,6 +16,7 @@ Two wrappers, neither of which modifies MCore:
   hold this lane's partial count.
 """
 
+import logging
 from inspect import signature
 from typing import Callable
 
@@ -23,6 +24,7 @@ from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.runtime import MdpRuntime
 
 _WRAPPED_MARKER = "_mdp_wrapped"
+logger = logging.getLogger(__name__)
 
 
 def wrap_forward_backward(forward_backward_func: Callable, runtime: MdpRuntime) -> Callable:
@@ -48,9 +50,22 @@ def wrap_forward_backward(forward_backward_func: Callable, runtime: MdpRuntime) 
         else:
             bound.arguments["data_iterator"] = replay_iterators[0]
 
-        result = forward_backward_func(*bound.args, **bound.kwargs)
-
-        runtime.mark_decoder_complete()
+        try:
+            result = forward_backward_func(*bound.args, **bound.kwargs)
+        except BaseException:
+            try:
+                runtime.abort_iteration()
+            except BaseException:
+                logger.exception("MDP: local abort failed while preserving schedule exception")
+            raise
+        try:
+            runtime.mark_decoder_complete()
+        except BaseException:
+            try:
+                runtime.abort_iteration()
+            except BaseException:
+                logger.exception("MDP: local abort failed while preserving completion exception")
+            raise
         runtime.end_iteration()
         return result
 

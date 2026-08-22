@@ -5,8 +5,8 @@
 import pytest
 import torch
 
-from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.activation import EncoderForwardHandle, build_encoder_packed_seq_params
+from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.errors import MdpStateError
 from megatron.core.mdp.plan import EncoderThdLayout, EncoderThdSegment, split_encoder_layout
 
@@ -82,10 +82,7 @@ def test_multi_tensor_backward_matches_unchunked_backward():
     weight = weight_ref.detach().clone().requires_grad_(True)
     outputs = _run_encoder(weight, [c.total_output_rows for c in chunks])
     handle = EncoderForwardHandle(
-        iteration=0,
-        producer_worker_id=0,
-        chunk_outputs=tuple(outputs),
-        chunk_layouts=chunks,
+        iteration=0, producer_worker_id=0, chunk_outputs=tuple(outputs), chunk_layouts=chunks
     )
     detached = handle.detached_outputs()
     assert all(t.grad_fn is None and not t.requires_grad for t in detached)
@@ -102,10 +99,7 @@ def test_handle_validates_shapes_and_lifecycle():
     weight = torch.randn(4, 4, requires_grad=True)
     (output,) = _run_encoder(weight, [layout.total_output_rows])
     handle = EncoderForwardHandle(
-        iteration=0,
-        producer_worker_id=0,
-        chunk_outputs=(output,),
-        chunk_layouts=(layout,),
+        iteration=0, producer_worker_id=0, chunk_outputs=(output,), chunk_layouts=(layout,)
     )
     with pytest.raises(MdpStateError, match="release only after backward"):
         handle.release()
@@ -135,10 +129,29 @@ def test_forward_only_release_needs_no_backward():
         weight = torch.randn(4, 4)
         (output,) = _run_encoder(weight, [layout.total_output_rows])
     handle = EncoderForwardHandle(
-        iteration=0,
-        producer_worker_id=0,
-        chunk_outputs=(output,),
-        chunk_layouts=(layout,),
+        iteration=0, producer_worker_id=0, chunk_outputs=(output,), chunk_layouts=(layout,)
     )
     handle.release_forward_only()
     assert handle.consumed
+
+
+def test_multiple_width_planes_accumulate_exact_shared_trunk_parameter_grad():
+    layout = _layout()
+    rows = layout.total_output_rows
+    inputs = torch.arange(rows * 4, dtype=torch.float64).reshape(rows, 4) / 17.0
+    weight = torch.arange(16, dtype=torch.float64).reshape(4, 4).requires_grad_(True)
+    trunk = inputs @ weight.T
+    outputs = (trunk, 3.0 * trunk[:, :2])
+    grads = (torch.full_like(outputs[0], 2.0), torch.full_like(outputs[1], 5.0))
+
+    handle = EncoderForwardHandle(
+        iteration=0, producer_worker_id=0, chunk_outputs=(outputs,), chunk_layouts=(layout,)
+    )
+    handle.backward((grads,))
+
+    reference_weight = weight.detach().clone().requires_grad_(True)
+    reference_trunk = inputs @ reference_weight.T
+    reference_loss = (2.0 * reference_trunk).sum() + (5.0 * (3.0 * reference_trunk[:, :2])).sum()
+    reference_loss.backward()
+    assert torch.equal(weight.grad, reference_weight.grad)
+    handle.release()

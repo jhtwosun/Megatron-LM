@@ -60,6 +60,33 @@ class CapturedMicrobatch:
 
 
 @dataclass(frozen=True)
+class MdpEncoderOutput:
+    """Ordered encoder output planes for one chunk.
+
+    Plane order is adapter-owned. The first plane is the final vision output;
+    any supplemental planes follow in the model's canonical order (for
+    Qwen3-VL, DeepStack layer-index order). Every plane has the existing
+    layout's row count, but may have its own frozen width.
+    """
+
+    planes: tuple
+
+
+def validate_output_plane_widths(adapter: "MdpModelAdapter") -> tuple:
+    """Return the adapter's immutable, non-empty tuple of positive widths."""
+    widths = getattr(adapter, "output_plane_widths", None)
+    if not isinstance(widths, tuple) or not widths:
+        raise ValueError(
+            "MDP: adapter.output_plane_widths must be a non-empty tuple of " "positive integers."
+        )
+    if any(isinstance(width, bool) or not isinstance(width, int) or width <= 0 for width in widths):
+        raise ValueError(
+            "MDP: adapter.output_plane_widths must be a non-empty tuple of " "positive integers."
+        )
+    return widths
+
+
+@dataclass(frozen=True)
 class VisionDescriptor:
     """The planner's only input type; assembled by the window, broadcast as
     fixed-width int64 records.
@@ -91,6 +118,7 @@ class MdpModelAdapter(Protocol):
     """Everything model-specific MDP core needs, and nothing more."""
 
     payload_width: int
+    output_plane_widths: tuple
     spatial_merge_size: int
 
     def get_batch(self, data_iterator: Iterator) -> Optional[CapturedMicrobatch]:
@@ -109,7 +137,7 @@ class MdpModelAdapter(Protocol):
 
     def encode(
         self, encoder: "Module", payload: "Tensor", layout: "EncoderThdLayout"
-    ) -> "Tensor":
+    ) -> "Tensor | MdpEncoderOutput":
         """Run encoder forward on one already-rebased chunk sub-layout.
 
         The adapter reads the ordered ``grid_thw`` from ``layout.segments`` and
