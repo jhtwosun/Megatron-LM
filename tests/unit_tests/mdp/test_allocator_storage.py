@@ -82,6 +82,36 @@ def test_storage_pop_grad_requires_populated_grad():
         storage.pop_grad(0)
 
 
+class _IdentityAllocator:
+    def __init__(self):
+        self.released = []
+
+    def release(self, tensor):
+        self.released.append(tensor)
+
+
+def test_storage_validates_every_plane_before_removing_exact_base_ownership():
+    allocator = _IdentityAllocator()
+    storage = MdpEmbeddingStorage(allocator)
+    bases = tuple(torch.empty(8, width) for width in (8, 4))
+    leaves = tuple(base[:4].requires_grad_(True) for base in bases)
+    storage.put_leaves(0, leaves, bases=bases)
+
+    leaves[0].sum().backward()
+    with pytest.raises(MdpStateError, match="leaf plane 1"):
+        storage.pop_grads(0)
+    assert storage.get_leaves(0) == leaves
+    assert allocator.released == []
+
+    leaves[1].sum().backward()
+    grads = storage.pop_grads(0)
+    assert tuple(grad.shape for grad in grads) == ((4, 8), (4, 4))
+    assert len(allocator.released) == 2
+    assert all(released is base for released, base in zip(allocator.released, bases))
+    assert all(released is not leaf for released, leaf in zip(allocator.released, leaves))
+    storage.assert_empty()
+
+
 def test_storage_assert_empty_names_leftovers():
     storage = MdpEmbeddingStorage(DirectBufferAllocator())
     storage.put_leaf(4, _leaf())

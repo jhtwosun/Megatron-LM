@@ -40,6 +40,7 @@ from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
 from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
+from megatron.core.mdp.protocols import validate_output_plane_widths
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 from megatron.core.mdp.runtime import MdpRuntime
 from megatron.core.mdp.schedule import wrap_finalize_model_grads, wrap_forward_backward
@@ -50,6 +51,9 @@ logger = logging.getLogger(__name__)
 #: Registered by the model entry point: ``builder(args) -> (adapter, vision_config)``.
 _ADAPTER_BUILDER: Optional[Callable] = None
 
+#: Registered model-owned decoder replay. Kept opaque to core.
+_MODEL_REPLAY: Optional[Callable] = None
+
 #: The runtime for this process, once built. Module-level because the seams
 #: are far apart in the training loop.
 _RUNTIME: Optional[MdpRuntime] = None
@@ -59,6 +63,17 @@ def set_adapter_builder(builder: Callable) -> None:
     """Register the model-side adapter builder (call before ``pretrain()``)."""
     global _ADAPTER_BUILDER
     _ADAPTER_BUILDER = builder
+
+
+def set_model_replay(replay: Callable) -> None:
+    """Register the model-owned decoder replay hook before ``pretrain()``."""
+    global _MODEL_REPLAY
+    _MODEL_REPLAY = replay
+
+
+def get_model_replay() -> Optional[Callable]:
+    """Return the registered model-owned decoder replay hook."""
+    return _MODEL_REPLAY
 
 
 def get_runtime() -> Optional[MdpRuntime]:
@@ -78,8 +93,7 @@ def mdp_config_from_args(args) -> MdpConfig:
         key, _, raw = entry.partition("=")
         if not _:
             raise MdpConfigurationError(
-                f"MDP: --mdp-vision-config-override entry {entry!r} violates: "
-                "KEY=VALUE format."
+                f"MDP: --mdp-vision-config-override entry {entry!r} violates: " "KEY=VALUE format."
             )
         value: object = raw
         if raw in ("None", "null"):
@@ -124,9 +138,7 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
     # validate_mdp_config's rejection can fire instead of building planning
     # groups that no longer match the decoder replicas.
     rank_order = (
-        "tp-cp-ep-pp-dp"
-        if getattr(args, "use_tp_pp_dp_mapping", False)
-        else SUPPORTED_RANK_ORDER
+        "tp-cp-ep-pp-dp" if getattr(args, "use_tp_pp_dp_mapping", False) else SUPPORTED_RANK_ORDER
     )
     return MdpCompatibilityOptions(
         world_size=args.world_size,
@@ -135,14 +147,10 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         context_parallel_size=args.context_parallel_size,
         expert_parallel_size=getattr(args, "expert_model_parallel_size", 1),
         rank_order=rank_order,
-        virtual_pipeline_parallel_size=getattr(
-            args, "virtual_pipeline_model_parallel_size", None
-        ),
+        virtual_pipeline_parallel_size=getattr(args, "virtual_pipeline_model_parallel_size", None),
         calculate_per_token_loss=getattr(args, "calculate_per_token_loss", False),
         use_distributed_optimizer=getattr(args, "use_distributed_optimizer", False),
-        distributed_optimizer_instances=getattr(
-            args, "num_distributed_optimizer_instances", 1
-        ),
+        distributed_optimizer_instances=getattr(args, "num_distributed_optimizer_instances", 1),
         fp16=bool(args.fp16),
         bf16=bool(args.bf16),
         fsdp_enabled=fsdp,
@@ -180,9 +188,20 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
             "model entry point must call set_adapter_builder() before pretrain(); "
             "core cannot import the model package."
         )
+    if _MODEL_REPLAY is None:
+        raise MdpConfigurationError(
+            "MDP: --mdp-enable is set but no model replay hook was registered. "
+            "The model registry must provide mdp_replay_fn before any MDP runtime "
+            "resources are constructed."
+        )
 
     mdp_config = mdp_config_from_args(args)
     validate_mdp_config(mdp_config, compatibility_options_from_args(args))
+
+    # Adapter metadata is pure model-side configuration. Validate it before
+    # constructing any process groups, planner, bridge, storage, or encoder.
+    adapter, vision_config = _ADAPTER_BUILDER(args)
+    validate_output_plane_widths(adapter)
 
     rank_map = build_rank_map(
         MdpRankSpec(
@@ -195,14 +214,11 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         )
     )
     rank_view = rank_map.view(torch.distributed.get_rank())
-    process_groups = install_mdp_process_groups(
-        rank_map, group_registry=MdpGroupRegistry()
-    )
+    process_groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
     encoder_pgs = build_encoder_pg_collection(
         rank_map, encoder_cp=mdp_config.encoder_cp, process_groups=process_groups
     )
 
-    adapter, vision_config = _ADAPTER_BUILDER(args)
     encoder_domain = build_encoder_domain(
         adapter=adapter,
         model_config=vision_config,
@@ -278,6 +294,7 @@ def maybe_wrap_forward_backward(forward_backward_func: Callable, config=None) ->
 
 def reset_for_testing() -> None:
     """Drop module state between tests."""
-    global _RUNTIME, _ADAPTER_BUILDER
+    global _RUNTIME, _ADAPTER_BUILDER, _MODEL_REPLAY
     _RUNTIME = None
     _ADAPTER_BUILDER = None
+    _MODEL_REPLAY = None

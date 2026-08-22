@@ -140,6 +140,9 @@ class _FakeRuntime:
     def end_iteration(self):
         self.events.append(("end",))
 
+    def abort_iteration(self):
+        self.events.append(("abort",))
+
 
 def test_forward_backward_wrapper_order_and_double_wrap():
     runtime = _FakeRuntime()
@@ -159,3 +162,16 @@ def test_forward_backward_wrapper_order_and_double_wrap():
     ]
     with pytest.raises(MdpConfigurationError, match="wrapped twice"):
         wrap_forward_backward(wrapped, runtime)
+
+
+def test_forward_backward_wrapper_preserves_schedule_error_after_local_abort():
+    runtime = _FakeRuntime()
+
+    def schedule(*, data_iterator, num_microbatches, forward_only):
+        runtime.events.append(("schedule", next(data_iterator)))
+        raise RuntimeError("native schedule failure")
+
+    wrapped = wrap_forward_backward(schedule, runtime)
+    with pytest.raises(RuntimeError, match="native schedule failure"):
+        wrapped(data_iterator="real-iter", num_microbatches=2, forward_only=False)
+    assert runtime.events == [("begin", 2, False), ("schedule", "real-iter"), ("abort",)]

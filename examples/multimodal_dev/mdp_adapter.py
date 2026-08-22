@@ -37,6 +37,7 @@ class Qwen35VLMdpAdapter:
             * self._vision_kwargs["temporal_patch_size"]
             * self._vision_kwargs["patch_size"] ** 2
         )
+        self.output_plane_widths = (out_hidden_size,)
 
     # ------------------------------------------------------------------
     # Capture
@@ -145,12 +146,32 @@ class Qwen35VLMdpAdapter:
         # (~2.4 ms/iter measured) followed by D2H readbacks inside the
         # encoder. The encoder moves it to the device itself on the uncached
         # (QWEN35_VL_GRID_CACHE=0) fallback paths that do tensor math on it.
-        grid_thw = torch.tensor(
-            [segment.grid_thw for segment in layout.segments], dtype=torch.long
-        )
+        grid_thw = torch.tensor([segment.grid_thw for segment in layout.segments], dtype=torch.long)
         return encoder(payload, grid_thw)
 
 
 def build_mdp_adapter(args, language_config) -> Qwen35VLMdpAdapter:
     """Adapter factory used by the pretrain entry point."""
     return Qwen35VLMdpAdapter(out_hidden_size=language_config.hidden_size)
+
+
+def qwen35_mdp_replay(model, batch, record, encoder_leaves: tuple):
+    """Replay Qwen3.5-VL with its unchanged singleton vision embedding input."""
+    if len(encoder_leaves) > 1:
+        raise RuntimeError(
+            "Qwen3.5-VL MDP replay accepts at most one encoder output plane; "
+            f"received {len(encoder_leaves)}."
+        )
+    vision_embeddings = encoder_leaves[0] if encoder_leaves else None
+    return model(
+        input_ids=batch["input_ids"],
+        position_ids=batch.get("position_ids"),
+        attention_mask=batch.get("attention_mask", None),
+        labels=batch.get("labels", None),
+        loss_mask=batch.get("loss_mask", None),
+        padding_mask=batch.get("padding_mask", None),
+        pixel_values=None,
+        image_grid_thw=batch.get("image_grid_thw", None),
+        packed_seq_params=record.decoder_packed_seq_params,
+        vision_embeddings=vision_embeddings,
+    )

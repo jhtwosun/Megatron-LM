@@ -210,15 +210,25 @@ class MultimodalModel(MegatronModule):
                 "mis-fill the sequence"
             )
         mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
-        combined = combined.masked_scatter(
-            mask_expanded, vision_embeddings.to(combined.dtype)
-        )
+        combined = combined.masked_scatter(mask_expanded, vision_embeddings.to(combined.dtype))
         combined = combined.transpose(0, 1).contiguous()
 
         if sp:
             combined = tensor_parallel.scatter_to_sequence_parallel_region(combined)
 
         return combined
+
+    def prepare_decoder_inputs(self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings):
+        """Build decoder inputs and optional model-owned block arguments.
+
+        The default singleton path is intentionally the existing Qwen3.5-VL
+        scatter. Models with supplemental encoder planes may override this
+        hook without teaching the base model or MDP core their semantics.
+        """
+        return (
+            self._scatter_vision_embeddings(input_ids, text_embeddings, vision_embeddings),
+            None,
+        )
 
     def compute_position_ids(
         self, input_ids: Tensor, image_grid_thw: Optional[Tensor] = None, packed_seq_params=None
@@ -256,8 +266,13 @@ class MultimodalModel(MegatronModule):
         cp_size = parallel_state.get_context_parallel_world_size()
         if cp_size <= 1:
             return (
-                decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids, padding_mask,
+                decoder_input,
+                input_ids,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                padding_mask,
             )
         cp_rank = parallel_state.get_context_parallel_rank()
 
@@ -295,8 +310,13 @@ class MultimodalModel(MegatronModule):
             padding_mask = _split(padding_mask, 1)
 
         return (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         )
 
     @staticmethod
@@ -355,7 +375,7 @@ class MultimodalModel(MegatronModule):
         image_grid_thw: Tensor = None,
         decoder_input: Tensor = None,
         packed_seq_params=None,
-        vision_embeddings: Tensor = None,
+        vision_embeddings=None,
         **kwargs,
     ):
         """Forward pass.
@@ -389,10 +409,11 @@ class MultimodalModel(MegatronModule):
                 packed_seq_params=packed_seq_params,
             )
 
+        decoder_block_kwargs = None
         if self.pre_process:
-            # An MDP endpoint hands the pre-encoded detached leaf in through
-            # vision_embeddings; the native path encodes pixels here. Both
-            # feed the same scatter below.
+            # An MDP endpoint hands model-owned detached encoder output in
+            # through vision_embeddings; the native path encodes pixels here.
+            # Both feed the same model-owned decoder-input hook below.
             if vision_embeddings is None:
                 if self.vision_model is not None and pixel_values is not None:
                     torch.cuda.nvtx.range_push("native.vision_encoder_forward")
@@ -409,7 +430,7 @@ class MultimodalModel(MegatronModule):
                 if vision_embeddings is not None:
                     torch.cuda.nvtx.range_push("native.scatter_vision_embeddings")
                     try:
-                        decoder_input = self._scatter_vision_embeddings(
+                        decoder_input, decoder_block_kwargs = self.prepare_decoder_inputs(
                             input_ids, text_embeddings, vision_embeddings
                         )
                     finally:
@@ -431,8 +452,13 @@ class MultimodalModel(MegatronModule):
             decoder_input = None
 
         (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         ) = self._cp_split_for_forward(
             decoder_input=decoder_input,
             input_ids=input_ids,
@@ -444,6 +470,10 @@ class MultimodalModel(MegatronModule):
             padding_mask=padding_mask,
         )
 
+        model_specific_kwargs = {}
+        if decoder_block_kwargs is not None:
+            model_specific_kwargs["extra_block_kwargs"] = decoder_block_kwargs
+
         with self._thd_mrope_no_cp_override(packed_seq_params):
             return self.language_model(
                 input_ids=input_ids,
@@ -454,4 +484,5 @@ class MultimodalModel(MegatronModule):
                 loss_mask=loss_mask,
                 padding_mask=padding_mask,
                 packed_seq_params=packed_seq_params,
+                **model_specific_kwargs,
             )

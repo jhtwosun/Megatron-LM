@@ -64,13 +64,9 @@ class _TinyAdapter:
 
 def _build_domain():
     world = torch.distributed.get_world_size()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1))
     groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
-    encoder_pgs = build_encoder_pg_collection(
-        rank_map, encoder_cp=1, process_groups=groups
-    )
+    encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
     model_config = TransformerConfig(
         num_layers=1,
         hidden_size=8,
@@ -79,9 +75,7 @@ def _build_domain():
         use_cpu_initialization=True,
     )
     ddp_config = DistributedDataParallelConfig(
-        use_distributed_optimizer=True,
-        overlap_grad_reduce=False,
-        overlap_param_gather=False,
+        use_distributed_optimizer=True, overlap_grad_reduce=False, overlap_param_gather=False
     )
     optimizer_config = OptimizerConfig(
         optimizer="adam", lr=1e-3, use_distributed_optimizer=True, clip_grad=1.0
@@ -98,6 +92,19 @@ def _build_domain():
     return domain
 
 
+def test_encoder_model_parallel_groups_are_the_same_rank_local_singleton():
+    world = torch.distributed.get_world_size()
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1))
+    groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
+    encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
+
+    assert encoder_pgs.tp is encoder_pgs.pp
+    assert encoder_pgs.tp is encoder_pgs.ep
+    assert encoder_pgs.tp is encoder_pgs.cp
+    assert encoder_pgs.tp is encoder_pgs.expt_dp
+    assert torch.distributed.get_world_size(encoder_pgs.cp) == 1
+
+
 def _build_allreduce_ddp():
     """A plain all-reduce DDP over the encoder groups, so the full summed
     gradient is observable on every rank (the ZeRO-1 path reduce-scatters and
@@ -106,13 +113,9 @@ def _build_allreduce_ddp():
     from megatron.core.distributed import DistributedDataParallel
 
     world = torch.distributed.get_world_size()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1))
     groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
-    encoder_pgs = build_encoder_pg_collection(
-        rank_map, encoder_cp=1, process_groups=groups
-    )
+    encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
     model_config = TransformerConfig(
         num_layers=1,
         hidden_size=8,
@@ -121,9 +124,7 @@ def _build_allreduce_ddp():
         use_cpu_initialization=True,
     )
     ddp_config = DistributedDataParallelConfig(
-        use_distributed_optimizer=False,
-        overlap_grad_reduce=False,
-        overlap_param_gather=False,
+        use_distributed_optimizer=False, overlap_grad_reduce=False, overlap_param_gather=False
     )
     return DistributedDataParallel(
         config=model_config,
@@ -170,9 +171,7 @@ def test_zero_token_count_means_no_scaling():
     param = next(ddp.module.parameters())
     summed = param.main_grad.clone()
     torch.distributed.all_reduce(summed)
-    finalize_encoder_grads(
-        ddp, globally_reduced_num_tokens=torch.tensor(0.0, device="cuda")
-    )
+    finalize_encoder_grads(ddp, globally_reduced_num_tokens=torch.tensor(0.0, device="cuda"))
     assert torch.allclose(param.main_grad, summed, rtol=1e-6, atol=1e-6)
 
 
@@ -182,9 +181,7 @@ def test_optimizer_steps_identically_on_all_ranks():
     ddp.zero_grad_buffer()
     out = ddp(torch.ones(2, 8, device="cuda"))
     out.sum().backward()
-    finalize_encoder_grads(
-        ddp, globally_reduced_num_tokens=torch.tensor(16.0, device="cuda")
-    )
+    finalize_encoder_grads(ddp, globally_reduced_num_tokens=torch.tensor(16.0, device="cuda"))
     success, _, _ = domain.encoder_optimizer.step()
     assert success
     param = next(ddp.module.parameters())
@@ -209,6 +206,4 @@ def test_disjointness_assertion_catches_leaked_parameter():
     with pytest.raises(MdpConfigurationError, match="contains encoder parameters"):
         assert_parameter_disjointness(domain.encoder_ddp, [chunk])
     # And a clean chunk passes.
-    assert_parameter_disjointness(
-        domain.encoder_ddp, [torch.nn.Linear(4, 4).cuda()]
-    )
+    assert_parameter_disjointness(domain.encoder_ddp, [torch.nn.Linear(4, 4).cuda()])

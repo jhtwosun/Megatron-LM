@@ -45,7 +45,7 @@ def build_encoder_packed_seq_params(
 
 @dataclass
 class EncoderForwardHandle:
-    """The producer's retained P2 state: graph-connected chunk outputs.
+    """The producer's retained P2 state: graph-connected chunk output planes.
 
     Chunk outputs stay in a list and are never concatenated: ``torch.cat`` would
     allocate a second full copy while all chunk outputs are alive, cancelling
@@ -58,27 +58,45 @@ class EncoderForwardHandle:
     chunk_layouts: tuple
 
     def __post_init__(self):
+        self.chunk_outputs = tuple(
+            (output,) if torch.is_tensor(output) else output for output in self.chunk_outputs
+        )
         if len(self.chunk_outputs) != len(self.chunk_layouts):
             raise MdpStateError(
                 "MDP: forward handle violates: one layout per chunk output "
                 f"({len(self.chunk_outputs)} outputs, {len(self.chunk_layouts)} layouts)."
             )
-        for index, (output, layout) in enumerate(
-            zip(self.chunk_outputs, self.chunk_layouts)
-        ):
-            if output.shape[0] != layout.total_output_rows:
+        plane_count = None
+        for index, (outputs, layout) in enumerate(zip(self.chunk_outputs, self.chunk_layouts)):
+            if not isinstance(outputs, tuple) or not outputs:
                 raise MdpStateError(
-                    f"MDP: chunk {index} violates: output rows == "
-                    f"layout.total_output_rows ({output.shape[0]} != "
-                    f"{layout.total_output_rows})."
+                    f"MDP: chunk {index} violates: a non-empty tuple of output planes."
                 )
+            if plane_count is None:
+                plane_count = len(outputs)
+            elif len(outputs) != plane_count:
+                raise MdpStateError(
+                    "MDP: forward handle violates: identical plane count per chunk."
+                )
+            for plane_id, output in enumerate(outputs):
+                if output.shape[0] != layout.total_output_rows:
+                    raise MdpStateError(
+                        f"MDP: chunk {index} plane {plane_id} violates: output rows "
+                        f"== layout.total_output_rows ({output.shape[0]} != "
+                        f"{layout.total_output_rows})."
+                    )
         self._backward_done = False
         self._released = False
 
     def detached_outputs(self) -> tuple:
         """Detached views for the EMBEDDING bridge; cross-rank communication
         never joins the autograd graph."""
-        return tuple(output.detach() for output in self.chunk_outputs)
+        detached = tuple(
+            tuple(output.detach() for output in outputs) for outputs in self.chunk_outputs
+        )
+        if detached and all(len(outputs) == 1 for outputs in detached):
+            return tuple(outputs[0] for outputs in detached)
+        return detached
 
     def backward(self, chunk_grads: Sequence[Tensor]) -> None:
         """One multi-tensor backward over all chunk outputs."""
@@ -89,20 +107,32 @@ class EncoderForwardHandle:
                 f"MDP: backward violates: one gradient per chunk output "
                 f"({len(chunk_grads)} grads, {len(self.chunk_outputs)} outputs)."
             )
-        for index, (output, grad) in enumerate(zip(self.chunk_outputs, chunk_grads)):
-            if grad.shape != output.shape or grad.dtype != output.dtype:
+        flat_outputs = []
+        flat_grads = []
+        for index, (outputs, grads) in enumerate(zip(self.chunk_outputs, chunk_grads)):
+            if torch.is_tensor(grads):
+                grads = (grads,)
+            if not isinstance(grads, tuple) or len(grads) != len(outputs):
                 raise MdpStateError(
-                    f"MDP: chunk {index} gradient violates: shape and dtype match the "
-                    f"output ({tuple(grad.shape)}/{grad.dtype} vs "
-                    f"{tuple(output.shape)}/{output.dtype})."
+                    f"MDP: chunk {index} gradient violates: one gradient per output plane."
                 )
-            if grad.device != output.device:
-                raise MdpStateError(
-                    f"MDP: chunk {index} gradient violates: device matches the output."
-                )
+            for plane_id, (output, grad) in enumerate(zip(outputs, grads)):
+                if grad.shape != output.shape or grad.dtype != output.dtype:
+                    raise MdpStateError(
+                        f"MDP: chunk {index} plane {plane_id} gradient violates: shape "
+                        f"and dtype match the output ({tuple(grad.shape)}/{grad.dtype} "
+                        f"vs {tuple(output.shape)}/{output.dtype})."
+                    )
+                if grad.device != output.device:
+                    raise MdpStateError(
+                        f"MDP: chunk {index} plane {plane_id} gradient violates: "
+                        "device matches the output."
+                    )
+                flat_outputs.append(output)
+                flat_grads.append(grad)
         # MCore checkpoint nodes replay selected/full layers here as configured;
         # retain_graph must not be used.
-        torch.autograd.backward(self.chunk_outputs, tuple(chunk_grads))
+        torch.autograd.backward(tuple(flat_outputs), tuple(flat_grads))
         self._backward_done = True
 
     def release(self) -> None:
