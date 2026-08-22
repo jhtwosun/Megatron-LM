@@ -74,10 +74,14 @@ if _DISTRIBUTED:
 
     @pytest.fixture(scope="module", autouse=True)
     def _init_parallel():
+        Utils.set_world_size(int(os.environ["WORLD_SIZE"]), rank=int(os.environ["RANK"]))
         Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        assert torch.distributed.get_rank() == int(os.environ["RANK"])
         model_parallel_cuda_manual_seed(1234)
         yield
         Utils.destroy_model_parallel()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 HIDDEN = 128
@@ -238,6 +242,7 @@ def _captured_microbatch(pixel_values, slots):
         payload_start += rows
     return CapturedMicrobatch(
         decoder_packed_seq_params=None,
+        decoder_input_shape=(1, SEQ),
         vision_items=tuple(items),
         flat_pixel_payload=pixel_values,
         model_payload=MappingProxyType({}),
@@ -246,9 +251,7 @@ def _captured_microbatch(pixel_values, slots):
 
 def _build_runtime(vision_config, microbatches):
     world = torch.distributed.get_world_size()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=1, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=1, cp=1, ep=1, encoder_cp=1))
     view = rank_map.view(torch.distributed.get_rank())
     groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
     encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
@@ -279,9 +282,7 @@ def _build_runtime(vision_config, microbatches):
         encoder_domain=EncoderDomain(
             encoder_ddp=encoder_ddp, encoder_optimizer=None, effective_config=vision_config
         ),
-        planner=MdpPlanner(
-            view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy()
-        ),
+        planner=MdpPlanner(view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy()),
         bridge=ModalityBridge(allocator),
         storage=MdpEmbeddingStorage(allocator),
         allocator=allocator,
@@ -352,8 +353,7 @@ def _run_mdp(vision_config, batch, *, native_model, corrupt_leaf_grad=False):
 
     rng_before_p5 = torch.cuda.get_rng_state()
     tracker_before_p5 = {
-        name: state.clone()
-        for name, state in get_cuda_rng_tracker().get_states().items()
+        name: state.clone() for name, state in get_cuda_rng_tracker().get_states().items()
     }
     tokens = torch.tensor(float(torch.distributed.get_world_size()), device="cuda")
     runtime.capture_global_num_tokens(tokens)
@@ -362,9 +362,9 @@ def _run_mdp(vision_config, batch, *, native_model, corrupt_leaf_grad=False):
     rng_after_p5 = torch.cuda.get_rng_state()
     tracker_after_p5 = get_cuda_rng_tracker().get_states()
 
-    assert torch.equal(rng_before_p5, rng_after_p5), (
-        "P5 backward (checkpoint replay) must not perturb the global RNG stream"
-    )
+    assert torch.equal(
+        rng_before_p5, rng_after_p5
+    ), "P5 backward (checkpoint replay) must not perturb the global RNG stream"
     for name, state in tracker_before_p5.items():
         assert torch.equal(state, tracker_after_p5[name]), name
 
@@ -434,10 +434,7 @@ def test_g1_fault_injection_detects_broken_reverse_routing():
     vision_config = _vision_config(dropout=0.0)
     native_model, _ = _seeded(_run_native, vision_config, batch)
     _, _, encoder_ddp = _run_mdp(
-        _vision_config(dropout=0.0),
-        batch,
-        native_model=native_model,
-        corrupt_leaf_grad=True,
+        _vision_config(dropout=0.0), batch, native_model=native_model, corrupt_leaf_grad=True
     )
     native_encoder_grads = {
         name: param.grad.float()
@@ -445,14 +442,16 @@ def test_g1_fault_injection_detects_broken_reverse_routing():
         if param.grad is not None
     }
     mismatches = sum(
-        0
-        if torch.allclose(
-            param.main_grad.float(),
-            native_encoder_grads[name],
-            rtol=8e-3,
-            atol=max(1e-5, 2e-3 * float(native_encoder_grads[name].abs().max())),
+        (
+            0
+            if torch.allclose(
+                param.main_grad.float(),
+                native_encoder_grads[name],
+                rtol=8e-3,
+                atol=max(1e-5, 2e-3 * float(native_encoder_grads[name].abs().max())),
+            )
+            else 1
         )
-        else 1
         for name, param in encoder_ddp.module.named_parameters()
     )
     assert mismatches > 0, "corrupting the leaf gradient must change encoder grads"
@@ -486,9 +485,7 @@ def test_g1_recompute_modes_match_reference(overrides):
     native_model, _ = _seeded(_run_native, _vision_config(dropout=0.0), batch)
 
     reference_config = _vision_config(dropout=0.1)
-    _, reference_loss, reference_ddp = _run_mdp(
-        reference_config, batch, native_model=native_model
-    )
+    _, reference_loss, reference_ddp = _run_mdp(reference_config, batch, native_model=native_model)
     reference_grads = {
         name: param.main_grad.float().clone()
         for name, param in reference_ddp.module.named_parameters()
@@ -496,10 +493,7 @@ def test_g1_recompute_modes_match_reference(overrides):
 
     mode_config = apply_vision_config_overrides(_vision_config(dropout=0.1), overrides)
     _, mode_loss, mode_ddp = _run_mdp(mode_config, batch, native_model=native_model)
-    assert torch.equal(reference_loss, mode_loss), (
-        float(reference_loss),
-        float(mode_loss),
-    )
+    assert torch.equal(reference_loss, mode_loss), (float(reference_loss), float(mode_loss))
     for name, param in mode_ddp.module.named_parameters():
         assert torch.equal(param.main_grad.float(), reference_grads[name]), name
 

@@ -121,12 +121,25 @@ def test_split_rejects_nonpositive_cap():
 # ------------------------- digest -------------------------
 
 
-def _entry(item_id, worker=0, order=0, endpoint=0, grid=(1, 4, 4)):
+def _entry(item_id, worker=0, order=0, endpoint=0, slice_id=0, owner=0, grid=(1, 4, 4)):
     t, h, w = grid
-    return (item_id, worker, order, endpoint, t * h * w, t * (h // 2) * (w // 2), t, h, w)
+    return (
+        item_id,
+        worker,
+        order,
+        endpoint,
+        slice_id,
+        owner,
+        t * h * w,
+        t * (h // 2) * (w // 2),
+        t,
+        h,
+        w,
+    )
 
 
 def test_digest_is_deterministic_and_16_bytes():
+    assert PLAN_SCHEMA_VERSION == 7
     policy = RowCapacityPolicy()
     a = compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0), _entry(1, worker=1)])
     b = compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0), _entry(1, worker=1)])
@@ -139,16 +152,17 @@ def test_digest_covers_the_minimal_sufficient_set():
     base = compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0)])
     # Same payload_rows, different grid -> different frame boundaries -> the
     # digest must change (design doc 7.4).
-    same_rows_other_grid = (0, 0, 0, 0, 16, 4, 1, 2, 8)
-    assert compute_plan_digest(
-        PLAN_SCHEMA_VERSION, policy, [same_rows_other_grid]
-    ) != base
+    same_rows_other_grid = (0, 0, 0, 0, 0, 0, 16, 4, 1, 2, 8)
+    assert compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [same_rows_other_grid]) != base
     # Worker assignment changes the digest.
     assert compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, worker=1)]) != base
+    # Decoder endpoint slice identity changes the digest.
+    assert compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, slice_id=1)]) != base
+    # DataLoader-source ownership changes which physical worker may carry
+    # pixels even when the LPT assignment and tensor layout stay identical.
+    assert compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, owner=2)]) != base
     # The capacity policy is part of the digest.
-    assert (
-        compute_plan_digest(PLAN_SCHEMA_VERSION, RowCapacityPolicy(16), [_entry(0)]) != base
-    )
+    assert compute_plan_digest(PLAN_SCHEMA_VERSION, RowCapacityPolicy(16), [_entry(0)]) != base
     # Schema version is part of the digest.
     assert compute_plan_digest(PLAN_SCHEMA_VERSION + 1, policy, [_entry(0)]) != base
 
@@ -204,6 +218,71 @@ def test_plan_indexes_are_dictionaries():
         plan.segment_for_item(42)
     with pytest.raises(MdpPlanError):
         plan.layout_for_microbatch(42)
+
+
+def test_plan_indexes_arbitrary_producer_endpoint_route_product():
+    routes = (
+        RouteSlice(global_item_id=0, producer_worker_id=1, endpoint_rank=3, slice_id=0),
+        RouteSlice(global_item_id=0, producer_worker_id=1, endpoint_rank=9, slice_id=1),
+        RouteSlice(global_item_id=1, producer_worker_id=0, endpoint_rank=3, slice_id=0),
+        RouteSlice(global_item_id=1, producer_worker_id=0, endpoint_rank=9, slice_id=1),
+    )
+    plan = MdpBatchPlan(
+        schema_version=PLAN_SCHEMA_VERSION,
+        iteration=0,
+        outer_dp_rank=0,
+        capacity_policy=RowCapacityPolicy(),
+        routes=routes,
+        layouts=(
+            MicrobatchLayout(
+                microbatch_id=0,
+                text_only=False,
+                total_output_rows=8,
+                segments=(
+                    LayoutSegment(global_item_id=0, leaf_row_start=0, output_rows=4),
+                    LayoutSegment(global_item_id=1, leaf_row_start=4, output_rows=4),
+                ),
+            ),
+        ),
+        encoder_layouts=(
+            EncoderThdLayout(producer_worker_id=0, segments=(_segment(1, (1, 4, 4)),)),
+            EncoderThdLayout(producer_worker_id=1, segments=(_segment(0, (1, 4, 4)),)),
+        ),
+        digest=b"\x00" * 16,
+    )
+
+    assert plan.route_for_item_slice(0, 0) is routes[0]
+    assert plan.route_for_item_slice(0, 1) is routes[1]
+    assert plan.route_for_item_slice(1, 0) is routes[2]
+    assert plan.route_for_item_slice(1, 1) is routes[3]
+    assert plan.routes_for_producer(0) == routes[2:]
+    assert plan.routes_for_endpoint(9) == (routes[1], routes[3])
+    with pytest.raises(MdpPlanError, match="route"):
+        plan.route_for_item_slice(1, 2)
+
+
+def test_plan_rejects_duplicate_route_identity_before_index_install():
+    route = RouteSlice(global_item_id=0, producer_worker_id=0, endpoint_rank=3, slice_id=0)
+    with pytest.raises(MdpPlanError, match=r"unique.*global_item_id.*slice_id"):
+        MdpBatchPlan(
+            schema_version=PLAN_SCHEMA_VERSION,
+            iteration=0,
+            outer_dp_rank=0,
+            capacity_policy=RowCapacityPolicy(),
+            routes=(route, route),
+            layouts=(
+                MicrobatchLayout(
+                    microbatch_id=0,
+                    text_only=False,
+                    total_output_rows=4,
+                    segments=(LayoutSegment(global_item_id=0, leaf_row_start=0, output_rows=4),),
+                ),
+            ),
+            encoder_layouts=(
+                EncoderThdLayout(producer_worker_id=0, segments=(_segment(0, (1, 4, 4)),)),
+            ),
+            digest=b"\x00" * 16,
+        )
 
 
 def test_plan_rejects_duplicate_item_assignment():

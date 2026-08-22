@@ -10,13 +10,18 @@ before any encoder-CP runtime exists.
 import pytest
 
 from megatron.core.mdp.errors import MdpConfigurationError
-from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
+from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map, endpoint_worker_id
 
 
 def _spec(**kwargs):
     base = dict(world_size=8, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
     base.update(kwargs)
     return MdpRankSpec(**base)
+
+
+def _global_rank(*, tp_rank, cp_rank, dp_rank, pp_rank, tp, cp, dp):
+    """Independent oracle for the supported tp-cp-ep-dp-pp rank order."""
+    return tp_rank + tp * cp_rank + tp * cp * dp_rank + tp * cp * dp * pp_rank
 
 
 def test_design_doc_example_w8_pp2():
@@ -88,6 +93,95 @@ def test_extension_hook_encoder_cp2():
     assert seen == set(range(16))
 
 
+@pytest.mark.parametrize("tp", (1, 2))
+@pytest.mark.parametrize("cp", (1, 2))
+@pytest.mark.parametrize("pp", (1, 2))
+def test_tp_cp_pp_topology_and_decoder_endpoint_order(tp, cp, pp):
+    decoder_dp = 2
+    world_size = tp * cp * pp * decoder_dp
+    rank_map = build_rank_map(_spec(world_size=world_size, tp=tp, cp=cp, pp=pp, encoder_cp=1))
+
+    for outer_dp_rank in range(decoder_dp):
+        expected_group = tuple(
+            _global_rank(
+                tp_rank=tp_rank,
+                cp_rank=cp_rank,
+                dp_rank=outer_dp_rank,
+                pp_rank=pp_rank,
+                tp=tp,
+                cp=cp,
+                dp=decoder_dp,
+            )
+            for pp_rank in range(pp)
+            for cp_rank in range(cp)
+            for tp_rank in range(tp)
+        )
+        expected_endpoints = tuple(
+            _global_rank(
+                tp_rank=0,
+                cp_rank=cp_rank,
+                dp_rank=outer_dp_rank,
+                pp_rank=0,
+                tp=tp,
+                cp=cp,
+                dp=decoder_dp,
+            )
+            for cp_rank in range(cp)
+        )
+
+        assert rank_map.planning_groups()[outer_dp_rank] == expected_group
+        assert rank_map.decoder_endpoint_ranks(outer_dp_rank) == expected_endpoints
+        assert rank_map.primary_endpoint_rank(outer_dp_rank) == expected_endpoints[0]
+        assert rank_map.endpoint_rank(outer_dp_rank) == expected_endpoints[0]
+        for cp_rank, endpoint in enumerate(expected_endpoints):
+            assert rank_map.decoder_endpoint_rank(outer_dp_rank, cp_rank) == endpoint
+
+        assert rank_map.num_workers_per_group == tp * cp * pp
+        for worker_id, rank in enumerate(expected_group):
+            assert rank_map.worker_ranks(outer_dp_rank, worker_id) == (rank,)
+            tp_rank = worker_id % tp
+            cp_rank = (worker_id // tp) % cp
+            pp_rank = worker_id // (tp * cp)
+            expected_tp_group = tuple(
+                _global_rank(
+                    tp_rank=group_tp_rank,
+                    cp_rank=cp_rank,
+                    dp_rank=outer_dp_rank,
+                    pp_rank=pp_rank,
+                    tp=tp,
+                    cp=cp,
+                    dp=decoder_dp,
+                )
+                for group_tp_rank in range(tp)
+            )
+            view = rank_map.view(rank)
+            assert rank_map.tp_group_ranks(rank) == expected_tp_group
+            assert view.tp_group_ranks == expected_tp_group
+            assert view.my_worker_id == worker_id
+            assert view.is_decoder_endpoint == (rank in expected_endpoints)
+            assert tp_rank == expected_tp_group.index(rank)
+            assert endpoint_worker_id(view) == 0
+
+
+def test_encoder_workers_include_every_physical_tp_rank():
+    rank_map = build_rank_map(_spec(world_size=8, tp=2, cp=2, pp=2, encoder_cp=1))
+    assert rank_map.num_workers_per_group == 8
+    assert [rank_map.worker_ranks(0, worker_id) for worker_id in range(8)] == [
+        (rank,) for rank in range(8)
+    ]
+    assert [rank_map.view(rank).my_worker_id for rank in range(8)] == list(range(8))
+
+
+def test_tp2_dataloader_sources_exclude_tp_followers():
+    rank_map = build_rank_map(_spec(world_size=4, tp=2, cp=2, pp=1, encoder_cp=1))
+
+    # RankGenerator order is TP-fastest: workers 0/2 are TP0 and may advance
+    # the real DataLoader; workers 1/3 are TP followers and only consume the
+    # native TP broadcast.
+    assert rank_map.data_loader_source_worker_ids(0) == (0, 2)
+    assert {rank_map.view(rank).data_loader_source_worker_ids for rank in range(4)} == {(0, 2)}
+
+
 def test_local_view_has_no_global_lists():
     # O(W^2) guard: a view carries only its own group, not all groups.
     rank_map = build_rank_map(_spec(world_size=8, pp=2))
@@ -98,7 +192,7 @@ def test_local_view_has_no_global_lists():
 @pytest.mark.parametrize(
     "kwargs, match",
     [
-        (dict(tp=2, world_size=16), "tp"),
+        (dict(tp=0), "tp"),
         (dict(world_size=6, pp=4), "world_size"),
         (dict(encoder_cp=3, world_size=16, cp=2), "encoder_cp"),
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),

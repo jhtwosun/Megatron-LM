@@ -60,6 +60,7 @@ class Qwen35VLMdpAdapter:
                 "MDP adapter needs the vision sidecar; the collator must run with "
                 "with_vision_sidecar=True (set by --mdp-enable)."
             )
+        decoder_input_shape = tuple(int(dim) for dim in batch["input_ids"].shape)
         meta = batch.pop("vision_item_meta")
         positions = batch.pop("vision_decoder_positions")
         pixels = batch.pop("pixel_values", None)
@@ -100,6 +101,7 @@ class Qwen35VLMdpAdapter:
             pixels = pixels.bfloat16()
         return CapturedMicrobatch(
             decoder_packed_seq_params=packed_seq_params,
+            decoder_input_shape=decoder_input_shape,
             vision_items=tuple(items),
             flat_pixel_payload=pixels,
             model_payload=MappingProxyType(batch),
@@ -119,7 +121,6 @@ class Qwen35VLMdpAdapter:
 
     def build_encoder(self, model_config, *, pg_collection) -> torch.nn.Module:
         """Same factory as the non-MDP path (models/qwen35_vl/model.py)."""
-        del pg_collection  # the encoder has no model parallelism in v1
         kwargs = self._vision_kwargs
         return Qwen35VLVisionEncoder(
             config=model_config,
@@ -130,6 +131,7 @@ class Qwen35VLMdpAdapter:
             spatial_merge_size=kwargs["spatial_merge_size"],
             out_hidden_size=kwargs["out_hidden_size"],
             max_num_positions=kwargs["max_num_positions"],
+            pg_collection=pg_collection,
         )
 
     def encode(self, encoder: torch.nn.Module, payload: torch.Tensor, layout) -> torch.Tensor:
@@ -145,9 +147,7 @@ class Qwen35VLMdpAdapter:
         # (~2.4 ms/iter measured) followed by D2H readbacks inside the
         # encoder. The encoder moves it to the device itself on the uncached
         # (QWEN35_VL_GRID_CACHE=0) fallback paths that do tensor math on it.
-        grid_thw = torch.tensor(
-            [segment.grid_thw for segment in layout.segments], dtype=torch.long
-        )
+        grid_thw = torch.tensor([segment.grid_thw for segment in layout.segments], dtype=torch.long)
         return encoder(payload, grid_thw)
 
 

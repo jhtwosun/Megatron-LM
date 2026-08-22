@@ -139,6 +139,30 @@ def broadcast_data_batch(data, device="cuda"):
     return result
 
 
+def _broadcast_with_owner_local_pixels(data, *, device, is_src, owner_state):
+    """Broadcast tensor metadata while retaining owner pixels only on TP0.
+
+    Outside owner-sharded capture (``owner_state is None``), this is exactly the
+    native full-batch broadcast. During capture, ``pixel_values`` is excluded
+    from the TP payload; the owning TP source reattaches its local tensor after
+    the metadata broadcast, while followers and non-owner sources receive no
+    pixel key.
+    """
+    owner_pixels = None
+    broadcast_payload = data
+    if owner_state is not None:
+        broadcast_payload = dict(data)
+        if is_src and owner_state:
+            owner_pixels = broadcast_payload.pop("pixel_values", None)
+        else:
+            broadcast_payload.pop("pixel_values", None)
+
+    result = broadcast_data_batch(broadcast_payload, device=device)
+    if owner_pixels is not None:
+        result["pixel_values"] = owner_pixels.to(device, non_blocking=owner_pixels.is_pinned())
+    return result
+
+
 # -------------------------------------------------------------------
 # THD (packed sequence) helpers
 # -------------------------------------------------------------------
@@ -253,12 +277,9 @@ def build_vision_sidecar(
             slot_cursor += slots
             if slots and int(item_positions[-1] - item_positions[0]) != slots - 1:
                 raise ValueError(
-                    f"sample {sample_index} item {ordinal}: image-token slots are not "
-                    "contiguous"
+                    f"sample {sample_index} item {ordinal}: image-token slots are not " "contiguous"
                 )
-            meta_rows.append(
-                [sample_index, ordinal, t, h, w, payload_row_start]
-            )
+            meta_rows.append([sample_index, ordinal, t, h, w, payload_row_start])
             payload_row_start += t * h * w
             position_chunks.append(item_positions.to(torch.int64) + cu_seqlens_padded[sample_index])
     if meta_rows:
@@ -294,6 +315,11 @@ def pack_or_pad_batch(
     cp_size = mpu.get_context_parallel_world_size()
     is_src = mpu.get_tensor_model_parallel_rank() == 0
 
+    from megatron.core.mdp.window import pixel_capture_owner_state
+
+    capture_owner_state = pixel_capture_owner_state()
+    suppress_pixels = capture_owner_state is False
+
     # SP is an explicit runtime option; TP>1 does not imply SP is enabled.
     # get_args() itself raises in test contexts where megatron globals are
     # not initialised.
@@ -317,10 +343,6 @@ def pack_or_pad_batch(
         # materialization + H2D wholesale. All text tensors and vision item
         # metadata (grid_thw, sidecar) are still built from input_ids/grids,
         # so every offset stays valid. False outside a sharded MDP capture.
-        from megatron.core.mdp.window import pixel_capture_suppressed
-
-        suppress_pixels = pixel_capture_suppressed()
-
         # MDP capture fast path (TP=1): build each packed field directly in
         # one pinned buffer (no per-sample F.pad + concat churn) and move it
         # with a non-blocking copy. Pageable H2D copies each carry an implicit
@@ -329,9 +351,7 @@ def pack_or_pad_batch(
         # bytes are identical to the generic path. torch's caching host
         # allocator recycles the pinned blocks and event-tracks their reuse.
         try:
-            use_pinned = (
-                bool(getattr(get_args(), "mdp_enable", False)) and tp_size == 1
-            )
+            use_pinned = bool(getattr(get_args(), "mdp_enable", False)) and tp_size == 1
         except AssertionError:
             use_pinned = False
 
@@ -440,9 +460,7 @@ def pack_or_pad_batch(
                 else:
                     packed_batch["pixel_values"] = torch.concat(pixel_values_list)
             grid_thw = torch.concat(image_grid_thw_list)
-            packed_batch["image_grid_thw"] = (
-                grid_thw.pin_memory() if use_pinned else grid_thw
-            )
+            packed_batch["image_grid_thw"] = grid_thw.pin_memory() if use_pinned else grid_thw
             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
             # so each rank can build an identical PackedSeqParams.
             if use_pinned:
@@ -469,7 +487,9 @@ def pack_or_pad_batch(
                 if key in packed_batch:
                     sidecar_cpu[key] = packed_batch.pop(key)
 
-        packed_batch = broadcast_data_batch(packed_batch, device=device)
+        packed_batch = _broadcast_with_owner_local_pixels(
+            packed_batch, device=device, is_src=is_src, owner_state=capture_owner_state
+        )
         packed_batch.update(sidecar_cpu)
 
         cu_seqlens_t = packed_batch.pop("cu_seqlens")
@@ -537,10 +557,13 @@ def pack_or_pad_batch(
         if has_padding:
             positions = torch.arange(target_seqlens).unsqueeze(0)
             padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
-        padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
+        if not suppress_pixels:
+            padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
 
-    return broadcast_data_batch(padded_batch, device=device)
+    return _broadcast_with_owner_local_pixels(
+        padded_batch, device=device, is_src=is_src, owner_state=capture_owner_state
+    )
 
 
 # -------------------------------------------------------------------
@@ -642,12 +665,25 @@ def mdp_forward_step(runtime, data_iterator, model):
     batch = dict(record.model_payload)
 
     vision_embeddings = None
+    vision_embedding_local_positions = None
     if is_pipeline_first_stage() and not record.text_only:
         vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
         if vision_embeddings is None:
             raise RuntimeError(
                 f"MDP: microbatch {record.microbatch_id} has vision items but no "
                 "leaf in endpoint storage; P3 embedding routing did not complete"
+            )
+        if runtime.config.decoder_cp_routing == "cp_local":
+            microbatch_slice = runtime.decoder_cp_microbatch_slice(record.microbatch_id)
+            if microbatch_slice is None:
+                raise RuntimeError(
+                    f"MDP: microbatch {record.microbatch_id} has compact vision routing "
+                    "but no endpoint slice metadata"
+                )
+            vision_embedding_local_positions = tuple(
+                position
+                for item_slice in microbatch_slice.items
+                for position in item_slice.local_decoder_positions
             )
 
     output_tensor = model(
@@ -661,6 +697,7 @@ def mdp_forward_step(runtime, data_iterator, model):
         image_grid_thw=batch.get("image_grid_thw", None),
         packed_seq_params=record.decoder_packed_seq_params,
         vision_embeddings=vision_embeddings,
+        vision_embedding_local_positions=vision_embedding_local_positions,
     )
 
     loss_mask = batch.get("loss_mask", None)
@@ -669,9 +706,7 @@ def mdp_forward_step(runtime, data_iterator, model):
     if is_pipeline_last_stage():
         from examples.multimodal_dev.models.base import MultimodalModel
 
-        loss_mask = MultimodalModel.cp_split_loss_mask(
-            loss_mask, record.decoder_packed_seq_params
-        )
+        loss_mask = MultimodalModel.cp_split_loss_mask(loss_mask, record.decoder_packed_seq_params)
     return output_tensor, partial(loss_func, loss_mask)
 
 

@@ -15,7 +15,7 @@ from typing import Optional, Sequence
 
 from megatron.core.mdp.errors import MdpPlanError
 
-PLAN_SCHEMA_VERSION = 5
+PLAN_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -47,14 +47,16 @@ class RouteSlice:
     dispatch time (the PIXEL phase source); ``None`` falls back to the
     endpoint rank, which is the pre-owner-sharding behavior.
 
-    In v1 every item has exactly one slice. When a real split lands (decoder CP),
-    the route gains explicit sub-interval fields; they are not added speculatively.
+    ``slice_id`` is the endpoint's stable index in the planning group's
+    ``decoder_endpoint_ranks``. Full-leaf routing has one route per endpoint but
+    does not split item rows.
     """
 
     global_item_id: int
     producer_worker_id: int
     endpoint_rank: int
     owner_worker_id: Optional[int] = None
+    slice_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -199,16 +201,17 @@ def compute_plan_digest(
 ) -> bytes:
     """Digest of the minimal sufficient set with fixed-width packing plus blake2b.
 
-    ``entries`` are 9-int tuples in ascending ``global_item_id`` order:
+    ``entries`` are 11-int tuples in ascending ``(global_item_id, slice_id)`` order:
     ``(global_item_id, producer_worker_id, order_in_producer, endpoint_rank,
-    payload_rows, output_rows, grid_t, grid_h, grid_w)``. ``hash()`` and pickle are
-    forbidden: they vary across Python environments and would produce false
-    positives in the cross-rank consistency check.
+    slice_id, owner_worker_id, payload_rows, output_rows, grid_t, grid_h,
+    grid_w)``. ``hash()`` and pickle are forbidden: they vary across Python
+    environments and would produce false positives in the cross-rank consistency
+    check.
     """
     hasher = hashlib.blake2b(digest_size=16)
     hasher.update(struct.pack("<2q", schema_version, capacity_policy.alignment_rows))
     for entry in entries:
-        hasher.update(struct.pack("<9q", *entry))
+        hasher.update(struct.pack("<11q", *entry))
     return hasher.digest()
 
 
@@ -230,11 +233,22 @@ class MdpBatchPlan:
     digest: bytes
     _routes_by_producer: dict = field(init=False, repr=False, compare=False)
     _routes_by_endpoint: dict = field(init=False, repr=False, compare=False)
+    _route_by_item_slice: dict = field(init=False, repr=False, compare=False)
     _encoder_layout_by_producer: dict = field(init=False, repr=False, compare=False)
     _layout_by_microbatch: dict = field(init=False, repr=False, compare=False)
     _segment_by_item: dict = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
+        route_by_item_slice = {}
+        for route in self.routes:
+            key = (route.global_item_id, route.slice_id)
+            if key in route_by_item_slice:
+                raise MdpPlanError(
+                    "MDP: routes violate: unique (global_item_id, slice_id) identity "
+                    "for every route."
+                )
+            route_by_item_slice[key] = route
+
         routes_by_producer = {}
         routes_by_endpoint = {}
         for route in self.routes:
@@ -270,6 +284,7 @@ class MdpBatchPlan:
         object.__setattr__(
             self, "_routes_by_endpoint", {k: tuple(v) for k, v in routes_by_endpoint.items()}
         )
+        object.__setattr__(self, "_route_by_item_slice", route_by_item_slice)
         object.__setattr__(self, "_encoder_layout_by_producer", encoder_layout_by_producer)
         object.__setattr__(self, "_layout_by_microbatch", layout_by_microbatch)
         object.__setattr__(self, "_segment_by_item", segment_by_item)
@@ -281,6 +296,16 @@ class MdpBatchPlan:
     def routes_for_endpoint(self, rank: int) -> Sequence[RouteSlice]:
         """Routes received by one endpoint rank."""
         return self._routes_by_endpoint.get(rank, ())
+
+    def route_for_item_slice(self, item_id: int, slice_id: int) -> RouteSlice:
+        """Return the unique route identified by one item and endpoint slice."""
+        try:
+            return self._route_by_item_slice[(item_id, slice_id)]
+        except KeyError:
+            raise MdpPlanError(
+                f"MDP: route (global_item_id={item_id}, slice_id={slice_id}) violates: "
+                "route is part of this plan."
+            ) from None
 
     def encoder_layout_for_producer(self, worker_id: int) -> EncoderThdLayout:
         """One producer's encoder THD layout; empty layout if it has no work."""

@@ -8,7 +8,7 @@ fixed-width descriptor records inside each planning group.
 """
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -29,6 +29,7 @@ class MdpProcessGroups:
     planning_group: dist.ProcessGroup
     encoder_reduction_group: dist.ProcessGroup
     world_group: dist.ProcessGroup
+    decoder_tp_group: Optional[dist.ProcessGroup] = None
 
 
 class MdpGroupRegistry:
@@ -76,7 +77,10 @@ class MdpGroupRegistry:
 
 
 def install_mdp_process_groups(
-    rank_map: MdpRankMap, *, group_registry: MdpGroupRegistry
+    rank_map: MdpRankMap,
+    *,
+    group_registry: MdpGroupRegistry,
+    decoder_tp_group: Optional[dist.ProcessGroup] = None,
 ) -> MdpProcessGroups:
     """Install MDP process groups; every rank creates groups in the same order.
 
@@ -91,23 +95,34 @@ def install_mdp_process_groups(
         )
     world = dist.group.WORLD
     my_rank = dist.get_rank()
+    if rank_map.spec.tp > 1:
+        if decoder_tp_group is None:
+            raise MdpConfigurationError(
+                f"MDP: tensor_parallel_size={rank_map.spec.tp} requires the already-created "
+                "native decoder TP process group; MDP never creates a duplicate TP group."
+            )
+        expected_tp_ranks = rank_map.tp_group_ranks(my_rank)
+        actual_tp_ranks = tuple(dist.get_process_group_ranks(decoder_tp_group))
+        if actual_tp_ranks != expected_tp_ranks:
+            raise MdpConfigurationError(
+                f"MDP: native decoder TP group ranks {actual_tp_ranks} violate: "
+                f"RankGenerator TP order {expected_tp_ranks}."
+            )
     my_planning_group = None
     for outer_dp_rank, ranks in enumerate(rank_map.planning_groups()):
         group = group_registry.get_or_create(("planning", outer_dp_rank), ranks)
         if my_rank in ranks:
             my_planning_group = group
-    group_registry.register_alias(
-        ("world_alias",), tuple(range(rank_map.spec.world_size)), world
-    )
+    group_registry.register_alias(("world_alias",), tuple(range(rank_map.spec.world_size)), world)
     if my_planning_group is None:
         raise MdpConfigurationError(
-            f"MDP: rank {my_rank} violates: every rank belongs to exactly one planning "
-            "group."
+            f"MDP: rank {my_rank} violates: every rank belongs to exactly one planning " "group."
         )
     return MdpProcessGroups(
         planning_group=my_planning_group,
         encoder_reduction_group=world,
         world_group=world,
+        decoder_tp_group=decoder_tp_group,
     )
 
 
@@ -224,9 +239,7 @@ def broadcast_descriptors(
 
     payload = torch.zeros(count, DESCRIPTOR_SLOTS, dtype=torch.int64, device=device)
     if is_endpoint and count:
-        records = torch.tensor(
-            descriptors_to_records(local_descriptors), dtype=torch.int64
-        )
+        records = torch.tensor(descriptors_to_records(local_descriptors), dtype=torch.int64)
         # Pinned staging: a pageable H2D here blocks until the compute
         # stream drains; pinned + non_blocking stays stream-ordered ahead
         # of the broadcast below without a host wait.

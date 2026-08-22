@@ -23,6 +23,7 @@ def _options(**overrides):
         tensor_parallel_size=1,
         pipeline_parallel_size=2,
         context_parallel_size=1,
+        sequence_parallel=False,
         expert_parallel_size=1,
         rank_order="tp-cp-ep-dp-pp",
         virtual_pipeline_parallel_size=None,
@@ -58,6 +59,7 @@ def test_disabled_mdp_skips_all_checks():
     "config_kwargs, match",
     [
         (dict(encoder_cp=2), "encoder_cp"),
+        (dict(decoder_cp_routing="unknown"), "decoder_cp_routing"),
         (dict(encoder_max_payload_rows=0), "encoder_max_payload_rows"),
         (dict(locality_slack_permille=1000), "locality_slack_permille"),
         (dict(locality_slack_permille=-1), "locality_slack_permille"),
@@ -93,8 +95,6 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
     "option_kwargs, match",
     [
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),
-        (dict(tensor_parallel_size=2), "tensor_parallel_size"),
-        (dict(context_parallel_size=2), "context_parallel_size"),
         (dict(world_size=6, pipeline_parallel_size=4), "world_size"),
         (dict(calculate_per_token_loss=False), "calculate_per_token_loss"),
         (dict(use_distributed_optimizer=False), "use_distributed_optimizer"),
@@ -107,14 +107,8 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
         (dict(overlap_grad_reduce=True), "overlap_grad_reduce"),
         (dict(overlap_param_gather=True), "overlap_param_gather"),
         (dict(delay_grad_reduce=True), "delay_grad_reduce"),
-        (
-            dict(checkpoint_mode="fully_parallel", save_requested=True),
-            "checkpoint_mode",
-        ),
-        (
-            dict(checkpoint_mode="local", load_requested=True),
-            "checkpoint_mode",
-        ),
+        (dict(checkpoint_mode="fully_parallel", save_requested=True), "checkpoint_mode"),
+        (dict(checkpoint_mode="local", load_requested=True), "checkpoint_mode"),
     ],
 )
 def test_rejection_list(option_kwargs, match):
@@ -126,15 +120,53 @@ def test_unsupported_checkpoint_mode_allowed_without_save_or_load():
     validate_mdp_config(MdpConfig(enable=True), _options(checkpoint_mode="local"))
 
 
+@pytest.mark.parametrize("sequence_parallel", (False, True))
+def test_tp2_cp2_full_leaf_configuration_is_explicitly_supported(sequence_parallel):
+    validate_mdp_config(
+        MdpConfig(enable=True, decoder_cp_routing="full_leaf"),
+        _options(
+            world_size=4,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            context_parallel_size=2,
+            sequence_parallel=sequence_parallel,
+        ),
+    )
+
+
+def test_tp2_cp2_cp_local_configuration_is_supported_without_sequence_parallel():
+    validate_mdp_config(
+        MdpConfig(enable=True, decoder_cp_routing="cp_local"),
+        _options(
+            world_size=4,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            context_parallel_size=2,
+            sequence_parallel=False,
+        ),
+    )
+
+
+def test_tp2_cp2_cp_local_configuration_supports_sequence_parallel():
+    validate_mdp_config(
+        MdpConfig(enable=True, decoder_cp_routing="cp_local"),
+        _options(
+            world_size=4,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            context_parallel_size=2,
+            sequence_parallel=True,
+        ),
+    )
+
+
 def test_fp16_configuration_accepted_for_overflow_tests():
     validate_mdp_config(MdpConfig(enable=True), _options(bf16=False, fp16=True))
 
 
 def test_error_messages_carry_option_value_and_suggestion():
     try:
-        validate_mdp_config(
-            MdpConfig(enable=True), _options(calculate_per_token_loss=False)
-        )
+        validate_mdp_config(MdpConfig(enable=True), _options(calculate_per_token_loss=False))
     except MdpConfigurationError as error:
         message = str(error)
         assert "calculate_per_token_loss=False" in message
@@ -162,8 +194,7 @@ class _FakeTransformerConfig:
 def test_apply_overrides_uses_dataclasses_replace():
     base = _FakeTransformerConfig()
     result = apply_vision_config_overrides(
-        base,
-        (("recompute_granularity", "full"), ("recompute_num_layers", 1)),
+        base, (("recompute_granularity", "full"), ("recompute_num_layers", 1))
     )
     assert result is not base
     assert result.recompute_granularity == "full"
@@ -200,6 +231,7 @@ def _fake_args(**overrides):
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=2,
         context_parallel_size=1,
+        sequence_parallel=False,
         expert_model_parallel_size=1,
         use_tp_pp_dp_mapping=False,
         virtual_pipeline_model_parallel_size=None,
@@ -238,9 +270,24 @@ def test_snapshot_reports_the_real_rank_order():
     assert default_options.rank_order == "tp-cp-ep-dp-pp"
     validate_mdp_config(MdpConfig(enable=True), default_options)
 
-    remapped_options = compatibility_options_from_args(
-        _fake_args(use_tp_pp_dp_mapping=True)
-    )
+    remapped_options = compatibility_options_from_args(_fake_args(use_tp_pp_dp_mapping=True))
     assert remapped_options.rank_order == "tp-cp-ep-pp-dp"
     with pytest.raises(MdpConfigurationError, match="rank_order"):
         validate_mdp_config(MdpConfig(enable=True), remapped_options)
+
+
+def test_decoder_cp_routing_argument_is_registered_and_plumbed():
+    import argparse
+
+    from examples.multimodal_dev.arguments import add_multimodal_args
+    from megatron.core.mdp.integration import mdp_config_from_args
+
+    parser = argparse.ArgumentParser()
+    add_multimodal_args(parser)
+    default_args = parser.parse_args([])
+    assert default_args.mdp_decoder_cp_routing == "full_leaf"
+    assert mdp_config_from_args(default_args).decoder_cp_routing == "full_leaf"
+    explicit_args = parser.parse_args(["--mdp-decoder-cp-routing", "full_leaf"])
+    assert mdp_config_from_args(explicit_args).decoder_cp_routing == "full_leaf"
+    compact_args = parser.parse_args(["--mdp-decoder-cp-routing", "cp_local"])
+    assert mdp_config_from_args(compact_args).decoder_cp_routing == "cp_local"

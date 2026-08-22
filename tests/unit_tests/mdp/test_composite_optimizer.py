@@ -107,10 +107,7 @@ def _member(config, optimizer_config, data_group, seed):
     )
     module = Float16Module(model_config, _Tiny(model_config, seed).cuda())
     ddp = DistributedDataParallel(
-        config=model_config,
-        ddp_config=config,
-        module=module,
-        pg_collection=_pgs(data_group),
+        config=model_config, ddp_config=config, module=module, pg_collection=_pgs(data_group)
     )
     optimizer = get_megatron_optimizer(
         config=optimizer_config,
@@ -123,9 +120,7 @@ def _member(config, optimizer_config, data_group, seed):
 
 def _build(composite_cls):
     ddp_config = DistributedDataParallelConfig(
-        use_distributed_optimizer=True,
-        overlap_grad_reduce=False,
-        overlap_param_gather=False,
+        use_distributed_optimizer=True, overlap_grad_reduce=False, overlap_param_gather=False
     )
     optimizer_config = OptimizerConfig(
         optimizer="adam",
@@ -228,8 +223,42 @@ def test_member_order_is_flat_dense_expert_encoder():
     _, _, composite = _build(MdpChainedOptimizer)
     assert isinstance(composite, MdpChainedOptimizer)
     assert len(composite.chained_optimizers) == 2
-    assert not any(
-        isinstance(member, ChainedOptimizer) for member in composite.chained_optimizers
-    )
+    assert not any(isinstance(member, ChainedOptimizer) for member in composite.chained_optimizers)
     # get_loss_scale asserts the members agree before returning member 0's.
+    assert float(composite.get_loss_scale()) == 2.0**16
+
+
+def test_nested_decoder_dense_expert_is_flattened_before_encoder():
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True, overlap_grad_reduce=False, overlap_param_gather=False
+    )
+    optimizer_config = OptimizerConfig(
+        optimizer="adam",
+        lr=1e-3,
+        use_distributed_optimizer=True,
+        clip_grad=1.0,
+        fp16=True,
+        loss_scale=None,
+        initial_loss_scale=2.0**16,
+        min_loss_scale=1.0,
+        hysteresis=1,
+    )
+    _dense_ddp, dense = _member(ddp_config, optimizer_config, _subgroup(), seed=11)
+    _expert_ddp, expert = _member(ddp_config, optimizer_config, _singleton_group(), seed=12)
+    _encoder_ddp, encoder = _member(
+        ddp_config, optimizer_config, torch.distributed.group.WORLD, seed=13
+    )
+    for domain_optimizer in (dense, expert, encoder):
+        assert isinstance(domain_optimizer, ChainedOptimizer)
+        assert len(domain_optimizer.chained_optimizers) == 1
+    dense_leaf = dense.chained_optimizers[0]
+    expert_leaf = expert.chained_optimizers[0]
+    encoder_leaf = encoder.chained_optimizers[0]
+
+    nested_decoder = ChainedOptimizer([dense, expert])
+    composite = build_mdp_composite_optimizer(nested_decoder, encoder)
+
+    assert isinstance(composite, MdpChainedOptimizer)
+    assert composite.chained_optimizers == [dense_leaf, expert_leaf, encoder_leaf]
+    assert not any(isinstance(member, ChainedOptimizer) for member in composite.chained_optimizers)
     assert float(composite.get_loss_scale()) == 2.0**16

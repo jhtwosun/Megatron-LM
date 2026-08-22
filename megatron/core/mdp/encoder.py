@@ -42,7 +42,7 @@ def build_encoder_pg_collection(
 
     With ``encoder_cp=1``: ``dp = dp_cp = intra_dp_cp = intra_dist_opt = WORLD``
     (replicated parameters reduced once over all ranks, ZeRO-1 sharded over the
-    same domain), ``tp/pp/ep`` are rank-local singletons, and
+    same domain), ``cp/tp/pp/ep`` are the same rank-local singleton, and
     ``mp/expt_dp/tp_ep_pp`` are ``None`` (``get_pg_rank(None) == 0``,
     ``get_pg_size(None) == 1`` — exactly the intended meaning).
 
@@ -66,6 +66,7 @@ def build_encoder_pg_collection(
     pgs.intra_dp_cp = world
     pgs.intra_dist_opt = world
     pgs.tp = mine
+    pgs.cp = mine
     pgs.pp = mine
     pgs.ep = mine
     pgs.mp = None
@@ -111,8 +112,7 @@ def build_encoder_domain(
         model_config, mdp_config.vision_config_overrides
     )
     logger.info(
-        "MDP: effective vision config overrides: %s",
-        list(mdp_config.vision_config_overrides),
+        "MDP: effective vision config overrides: %s", list(mdp_config.vision_config_overrides)
     )
     encoder = adapter.build_encoder(effective_config, pg_collection=encoder_pgs)
     if wrap_mixed_precision and (
@@ -125,10 +125,7 @@ def build_encoder_domain(
         encoder = encoder.cuda()
 
     encoder_ddp = DistributedDataParallel(
-        config=effective_config,
-        ddp_config=ddp_config,
-        module=encoder,
-        pg_collection=encoder_pgs,
+        config=effective_config, ddp_config=ddp_config, module=encoder, pg_collection=encoder_pgs
     )
     assert_encoder_prescale_is_one(encoder_ddp)
 
@@ -186,7 +183,8 @@ def assert_parameter_disjointness(
         decoder_ids.update(id(p) for p in chunk.parameters())
     if all_trainable_parameters is not None:
         missing = [
-            id(p) for p in all_trainable_parameters
+            id(p)
+            for p in all_trainable_parameters
             if id(p) not in encoder_ids and id(p) not in decoder_ids
         ]
         if missing:
