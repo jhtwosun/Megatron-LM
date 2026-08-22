@@ -119,11 +119,11 @@ class Qwen35VLMdpAdapter:
 
     def build_encoder(self, model_config, *, pg_collection) -> torch.nn.Module:
         """Same factory as the non-MDP path (models/qwen35_vl/model.py)."""
-        del pg_collection  # the encoder has no model parallelism in v1
         kwargs = self._vision_kwargs
         return Qwen35VLVisionEncoder(
             config=model_config,
             transformer_layer_spec=get_qwen35_vl_vision_spec(),
+            pg_collection=pg_collection,
             in_channels=kwargs["in_channels"],
             patch_size=kwargs["patch_size"],
             temporal_patch_size=kwargs["temporal_patch_size"],

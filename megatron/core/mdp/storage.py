@@ -21,12 +21,13 @@ class MdpEmbeddingStorage:
         self._allocator = allocator
         self._leaves: dict = {}
 
-    def put_leaf(self, mb_id: int, leaf: Tensor) -> None:
+    def put_leaf(
+        self, mb_id: int, leaf: Tensor, *, allocation_base: Optional[Tensor] = None
+    ) -> None:
         """Store one detached leaf; duplicate insertion for the same id fails."""
         if mb_id in self._leaves:
             raise MdpStateError(
-                f"MDP: microbatch_id={mb_id} violates: one leaf per microbatch per "
-                "iteration."
+                f"MDP: microbatch_id={mb_id} violates: one leaf per microbatch per " "iteration."
             )
         if not leaf.is_leaf or not leaf.requires_grad or leaf.grad_fn is not None:
             raise MdpStateError(
@@ -34,17 +35,19 @@ class MdpEmbeddingStorage:
                 "requires_grad with no grad_fn. Only detached leaves cross into the "
                 "decoder domain."
             )
-        self._leaves[mb_id] = leaf
+        self._leaves[mb_id] = (leaf, allocation_base if allocation_base is not None else leaf)
 
     def get_leaf(self, mb_id: int) -> Optional[Tensor]:
         """Non-destructive read; ``None`` for text-only microbatches."""
-        return self._leaves.get(mb_id)
+        entry = self._leaves.get(mb_id)
+        return None if entry is None else entry[0]
 
     def pop_grad(self, mb_id: int) -> Optional[Tensor]:
         """Take the leaf gradient and release the entry; ``None`` if no leaf."""
-        leaf = self._leaves.pop(mb_id, None)
-        if leaf is None:
+        entry = self._leaves.get(mb_id)
+        if entry is None:
             return None
+        leaf, allocation_base = entry
         if leaf.grad is None:
             raise MdpStateError(
                 f"MDP: leaf for microbatch_id={mb_id} violates: a non-empty training "
@@ -52,14 +55,17 @@ class MdpEmbeddingStorage:
                 "written the unnormalized numerator gradient into the leaf."
             )
         grad = leaf.grad
-        self._allocator.release(leaf)
+        self._allocator.release(allocation_base)
+        self._leaves.pop(mb_id)
         return grad
 
     def release(self, mb_id: int) -> None:
         """Explicit release for the evaluation path."""
-        leaf = self._leaves.pop(mb_id, None)
-        if leaf is not None:
-            self._allocator.release(leaf)
+        entry = self._leaves.get(mb_id)
+        if entry is not None:
+            _, allocation_base = entry
+            self._allocator.release(allocation_base)
+            self._leaves.pop(mb_id)
 
     def assert_empty(self) -> None:
         """Lifecycle invariant: storage returns to zero at each iteration boundary."""

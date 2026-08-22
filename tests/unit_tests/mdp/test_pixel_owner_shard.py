@@ -85,6 +85,7 @@ class _ShardAwareAdapter:
         # microbatch_items: list of (items, total_rows) per microbatch.
         self._microbatches = list(microbatch_items)
         self._suppress = suppress
+        self.materialized_count = 0
 
     def get_batch(self, iterator):
         next(iterator)
@@ -92,6 +93,7 @@ class _ShardAwareAdapter:
         pixels = None
         if items and not (self._suppress and pixel_capture_suppressed()):
             pixels = _pixels_for(items, total_rows)
+            self.materialized_count += 1
         return CapturedMicrobatch(
             decoder_packed_seq_params=SimpleNamespace(qkv_format="thd"),
             vision_items=tuple(items),
@@ -158,6 +160,41 @@ def test_capture_with_fewer_microbatches_than_workers():
     )
     assert window.payload_sidecar() == {}
     assert len(window.records()) == 2
+
+
+@pytest.mark.parametrize("pixel_owner_shard", [False, True])
+def test_capture_materializes_pixels_only_on_worker_leader(pixel_owner_shard):
+    leader_adapter = _ShardAwareAdapter(_window_microbatches()[:1])
+    leader_window = MdpIterationWindow.capture(
+        iter(range(10)),
+        num_microbatches=1,
+        adapter=leader_adapter,
+        num_vpp_chunks=1,
+        lane_id=0,
+        pixel_owner_shard=pixel_owner_shard,
+        my_worker_id=0,
+        num_workers=2,
+        is_worker_leader=True,
+    )
+    follower_adapter = _ShardAwareAdapter(_window_microbatches()[:1])
+    follower_window = MdpIterationWindow.capture(
+        iter(range(10)),
+        num_microbatches=1,
+        adapter=follower_adapter,
+        num_vpp_chunks=1,
+        lane_id=None,
+        pixel_owner_shard=pixel_owner_shard,
+        my_worker_id=0,
+        num_workers=2,
+        is_worker_leader=False,
+    )
+
+    assert set(leader_window.payload_sidecar()) == {0, 1}
+    assert leader_adapter.materialized_count == 1
+    assert follower_window.payload_sidecar() == {}
+    assert follower_adapter.materialized_count == 0
+    assert len(follower_window.records()[0].vision_items) == 2
+    assert pixel_capture_suppressed() is False
 
 
 def test_capture_rejects_unsuppressed_pixels_on_non_owner():

@@ -126,21 +126,17 @@ class ModalityBridge:
     ) -> BridgeLedger:
         """Deterministically build the full-group ledger for one phase.
 
-        The plan's ``producer_worker_id`` is a logical worker; ``worker_ranks()``
-        is the only resolution point to physical ranks. Item rows come from the
-        caller's tensor specs (which the caller derives via ``segment_for_item``,
-        never a linear scan).
+        Producer and owner ids name logical workers. Each payload crosses the
+        planning group exactly once through that worker's stable encoder-CP
+        leader; replication inside encoder CP is owned by the runtime. Item rows
+        come from the caller's tensor specs (which the caller derives via
+        ``segment_for_item``, never a linear scan).
         """
         entries = []
         for route in plan.routes:
-            producer_ranks = rank_map.worker_ranks(plan.outer_dp_rank, route.producer_worker_id)
-            if len(producer_ranks) != 1:
-                raise MdpBridgeError(
-                    f"MDP: producer_worker_id={route.producer_worker_id} resolves to "
-                    f"{len(producer_ranks)} ranks; the encoder-CP physical expansion is "
-                    "not implemented in this version."
-                )
-            producer_rank = producer_ranks[0]
+            producer_rank = rank_map.worker_leader_rank(
+                plan.outer_dp_rank, route.producer_worker_id
+            )
             if phase is BridgePhase.EMBEDDING:
                 src, dst = producer_rank, route.endpoint_rank
             elif phase is BridgePhase.PIXEL:
@@ -150,16 +146,9 @@ class ModalityBridge:
                 if route.owner_worker_id is None:
                     owner_rank = route.endpoint_rank
                 else:
-                    owner_ranks = rank_map.worker_ranks(
+                    owner_rank = rank_map.worker_leader_rank(
                         plan.outer_dp_rank, route.owner_worker_id
                     )
-                    if len(owner_ranks) != 1:
-                        raise MdpBridgeError(
-                            f"MDP: owner_worker_id={route.owner_worker_id} resolves to "
-                            f"{len(owner_ranks)} ranks; the encoder-CP physical "
-                            "expansion is not implemented in this version."
-                        )
-                    owner_rank = owner_ranks[0]
                 src, dst = owner_rank, producer_rank
             else:  # GRADIENT flows owner endpoint -> producer
                 src, dst = route.endpoint_rank, producer_rank

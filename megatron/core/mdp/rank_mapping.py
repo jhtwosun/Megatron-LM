@@ -107,6 +107,10 @@ class MdpRankMap:
         encoder_cp = self._spec.encoder_cp
         return tuple(group[worker_id * encoder_cp : (worker_id + 1) * encoder_cp])
 
+    def worker_leader_rank(self, outer_dp_rank: int, worker_id: int) -> int:
+        """Canonical physical rank used for one logical worker's bridge edges."""
+        return self.worker_ranks(outer_dp_rank, worker_id)[0]
+
     def view(self, global_rank: int) -> MdpRankView:
         """The local view for one rank; stores only what that rank needs."""
         if global_rank not in self._rank_to_coord:

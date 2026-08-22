@@ -49,11 +49,11 @@ def _sentinel(outer_dp_rank, item_id):
     return float(100 * (outer_dp_rank + 1) + item_id)
 
 
-def _setup():
+def _setup(*, encoder_cp=1, pp=2):
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
     rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
+        MdpRankSpec(world_size=world, tp=1, pp=pp, cp=1, ep=1, encoder_cp=encoder_cp)
     )
     view = rank_map.view(rank)
     # costs 10, 9, 8 over two workers: item 0 -> worker 0 (endpoint-local),
@@ -68,6 +68,52 @@ def _setup():
     )
     plan = planner.build_plan(0, descriptors, [0])
     return rank_map, view, plan, descriptors
+
+
+def test_encoder_cp_ledger_routes_each_item_once_between_worker_leaders():
+    rank_map, _, plan, descriptors = _setup(encoder_cp=2, pp=4)
+    bridge = ModalityBridge(DirectBufferAllocator())
+    pixel_specs = _pixel_specs(plan, descriptors)
+    output_specs = {
+        BridgeBufferKey(d.global_item_id): BridgeTensorSpec(
+            valid_rows=d.output_rows,
+            capacity_rows=plan.capacity_policy.capacity_of(d.output_rows),
+            width=WIDTH,
+            dtype=torch.float32,
+            device=torch.device("cuda"),
+        )
+        for d in descriptors
+    }
+
+    for phase, specs in (
+        (BridgePhase.PIXEL, pixel_specs),
+        (BridgePhase.EMBEDDING, output_specs),
+        (BridgePhase.GRADIENT, output_specs),
+    ):
+        ledger = bridge.build_ledger(phase, plan, rank_map, specs)
+        assert len(ledger.entries) == len(plan.routes)
+        by_item = {entry.key.global_item_id: entry for entry in ledger.entries}
+        assert len(by_item) == len(ledger.entries)
+        for route in plan.routes:
+            entry = by_item[route.global_item_id]
+            producer = rank_map.worker_leader_rank(
+                plan.outer_dp_rank, route.producer_worker_id
+            )
+            owner = rank_map.worker_leader_rank(
+                plan.outer_dp_rank, route.owner_worker_id
+            )
+            if phase is BridgePhase.PIXEL:
+                assert (entry.src_global_rank, entry.dst_global_rank) == (owner, producer)
+            elif phase is BridgePhase.EMBEDDING:
+                assert (entry.src_global_rank, entry.dst_global_rank) == (
+                    producer,
+                    route.endpoint_rank,
+                )
+            else:
+                assert (entry.src_global_rank, entry.dst_global_rank) == (
+                    route.endpoint_rank,
+                    producer,
+                )
 
 
 def _make_descriptor(item_id, cost, lane):

@@ -103,7 +103,10 @@ def add_multimodal_args(parser):
         "--mdp-encoder-cp",
         type=int,
         default=1,
-        help="MDP encoder context-parallel width (must currently be 1).",
+        help=(
+            "MDP encoder context-parallel width; must be positive and divide "
+            "the PP x decoder-CP planning domain."
+        ),
     )
     group.add_argument(
         "--mdp-encoder-max-payload-rows",

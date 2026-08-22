@@ -17,6 +17,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.encoder import (
     assert_parameter_disjointness,
+    build_effective_encoder_config,
     build_encoder_domain,
     build_encoder_pg_collection,
     finalize_encoder_grads,
@@ -60,6 +61,45 @@ class _TinyAdapter:
 
     def build_encoder(self, model_config, *, pg_collection):
         return _TinyEncoder(model_config)
+
+
+def test_e2_effective_config_and_pg_collection_are_explicit_and_immutable():
+    world = torch.distributed.get_world_size()
+    assert world == 4
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=2)
+    )
+    groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
+    encoder_pgs = build_encoder_pg_collection(
+        rank_map, encoder_cp=2, process_groups=groups
+    )
+    source = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=1,
+        context_parallel_size=1,
+        calculate_per_token_loss=True,
+        use_cpu_initialization=True,
+    )
+    effective = build_effective_encoder_config(
+        source, MdpConfig(enable=True, encoder_cp=2)
+    )
+
+    assert effective is not source
+    assert source.context_parallel_size == 1
+    assert effective.context_parallel_size == 2
+    assert encoder_pgs.cp is groups.encoder_cp_group
+    assert encoder_pgs.dp is torch.distributed.group.WORLD
+
+
+def test_encoder_pg_collection_rejects_rank_map_argument_mismatch():
+    world = torch.distributed.get_world_size()
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=2)
+    )
+    groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
+    with pytest.raises(MdpConfigurationError, match="rank-map"):
+        build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
 
 
 def _build_domain():

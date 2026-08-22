@@ -97,13 +97,12 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
         return
 
     # --- MdpConfig field validation ---
-    if config.encoder_cp != 1:
+    if config.encoder_cp < 1:
         _reject(
             "encoder_cp",
             config.encoder_cp,
-            "encoder_cp == 1",
-            "Encoder context parallelism is a registered extension hook, not an "
-            "implemented capability.",
+            "encoder_cp >= 1",
+            "Encoder context parallelism must have a positive group size.",
             "1",
         )
     if config.encoder_max_payload_rows is not None and config.encoder_max_payload_rows <= 0:
@@ -211,6 +210,17 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "world_size % (TP * PP * CP) == 0",
             f"TP * PP * CP = {model_parallel} must evenly divide the world size to "
             "form outer data-parallel planning groups.",
+        )
+    inner_rank_domain = (
+        options.pipeline_parallel_size * options.context_parallel_size
+    )
+    if inner_rank_domain % config.encoder_cp != 0:
+        _reject(
+            "encoder_cp",
+            config.encoder_cp,
+            "encoder_cp divides PP * CP",
+            f"PP * CP = {inner_rank_domain} physical ranks must split into equal "
+            "logical encoder workers.",
         )
 
     # --- training semantics ---
