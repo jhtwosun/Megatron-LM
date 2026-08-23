@@ -29,6 +29,8 @@ class MdpIterationMetrics:
     encoder_backward_ms: float
     worker_loads: tuple
     empty_workers: int
+    endpoint_leaf_valid_rows: int
+    endpoint_leaf_capacity_rows: int
     bridge_stats: Mapping
     allocator_reuse: Mapping
 
@@ -46,7 +48,6 @@ def nvtx_phase(name: str):
 def worker_loads_from_plan(plan, num_workers: int) -> tuple:
     """Per-logical-worker payload rows for all ``num_workers`` workers."""
     loads = {
-        layout.producer_worker_id: layout.total_payload_rows
-        for layout in plan.encoder_layouts
+        layout.producer_worker_id: layout.total_payload_rows for layout in plan.encoder_layouts
     }
     return tuple(loads.get(worker_id, 0) for worker_id in range(num_workers))

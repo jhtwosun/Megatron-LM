@@ -25,12 +25,7 @@ SUPPORTED_CHECKPOINT_MODE = "torch_dist"
 # Keys that may be overridden on the vision TransformerConfig. Field semantics and
 # cross-field validation are delegated entirely to MCore's own __post_init__.
 VISION_CONFIG_OVERRIDE_ALLOWLIST: frozenset = frozenset(
-    {
-        "recompute_granularity",
-        "recompute_method",
-        "recompute_num_layers",
-        "recompute_modules",
-    }
+    {"recompute_granularity", "recompute_method", "recompute_num_layers", "recompute_modules"}
 )
 
 
@@ -40,6 +35,7 @@ class MdpConfig:
 
     enable: bool = False
     encoder_cp: int = 1
+    decoder_cp_routing: str = "full_leaf"
     encoder_max_payload_rows: Optional[int] = None
     vision_config_overrides: tuple = ()
     locality_slack_permille: int = 10
@@ -59,6 +55,7 @@ class MdpCompatibilityOptions:
     tensor_parallel_size: int
     pipeline_parallel_size: int
     context_parallel_size: int
+    sequence_parallel: bool
     expert_parallel_size: int
     rank_order: str
     virtual_pipeline_parallel_size: Optional[int]
@@ -106,6 +103,14 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "implemented capability.",
             "1",
         )
+    if config.decoder_cp_routing not in ("full_leaf", "cp_local"):
+        _reject(
+            "decoder_cp_routing",
+            config.decoder_cp_routing,
+            "decoder_cp_routing in {'full_leaf', 'cp_local'}",
+            "Only the full-leaf oracle and compact CP-local routing are supported.",
+            "full_leaf",
+        )
     if config.encoder_max_payload_rows is not None and config.encoder_max_payload_rows <= 0:
         _reject(
             "encoder_max_payload_rows",
@@ -140,16 +145,6 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "plan mismatch degrades from a diagnosable error into a P2P hang.",
             "1",
         )
-    if config.pixel_owner_shard and options.tensor_parallel_size != 1:
-        _reject(
-            "pixel_owner_shard",
-            config.pixel_owner_shard,
-            "TP == 1 when pixel_owner_shard is enabled",
-            "Owner-sharded pixel reading suppresses the collate pixel branch on "
-            "non-owner workers; its interaction with the TP pixel broadcast is "
-            "untested.",
-            "False",
-        )
     if config.overlap_window_capture and options.tensor_parallel_size != 1:
         _reject(
             "overlap_window_capture",
@@ -181,23 +176,6 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "MDP rank mapping is derived from the default RankGenerator order and "
             "has not been validated against other orders.",
             SUPPORTED_RANK_ORDER,
-        )
-    if options.tensor_parallel_size != 1:
-        _reject(
-            "tensor_parallel_size",
-            options.tensor_parallel_size,
-            "TP == 1",
-            "The current MDP support matrix requires TP=1.",
-            "1",
-        )
-    if options.context_parallel_size != 1:
-        _reject(
-            "context_parallel_size",
-            options.context_parallel_size,
-            "decoder CP == 1",
-            "Decoder context parallelism is a registered extension hook, not an "
-            "implemented capability.",
-            "1",
         )
     model_parallel = (
         options.tensor_parallel_size
@@ -289,8 +267,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "overlap_grad_reduce",
             options.overlap_grad_reduce,
             "overlap_grad_reduce == False",
-            "Encoder communication must not overlap the decoder schedule or the "
-            "optimizer step.",
+            "Encoder communication must not overlap the decoder schedule or the " "optimizer step.",
             "False",
         )
     if options.overlap_param_gather:
@@ -298,8 +275,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "overlap_param_gather",
             options.overlap_param_gather,
             "overlap_param_gather == False",
-            "Encoder communication must not overlap the decoder schedule or the "
-            "optimizer step.",
+            "Encoder communication must not overlap the decoder schedule or the " "optimizer step.",
             "False",
         )
     if options.delay_grad_reduce:

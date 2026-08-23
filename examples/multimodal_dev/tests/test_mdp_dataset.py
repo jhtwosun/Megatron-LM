@@ -15,6 +15,7 @@ Run with::
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,6 +24,8 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+import megatron.core.mdp.window as mdp_window
+from examples.multimodal_dev import forward_step
 from examples.multimodal_dev.data.mdp_mock import MdpThdMockDataset, item_sentinel
 from examples.multimodal_dev.forward_step import build_vision_sidecar, pack_or_pad_batch
 from tests.unit_tests.test_utilities import Utils
@@ -150,6 +153,76 @@ def test_text_only_batch_produces_empty_sidecar():
     assert packed["pixel_values"].shape[0] == 0
 
 
+@pytest.mark.parametrize("use_packed_sequence", [False, True])
+def test_tp_owner_broadcast_excludes_heavy_pixels_and_reattaches_locally(
+    monkeypatch, use_packed_sequence
+):
+    """The physical TP0 source owns pixels; TP peers receive metadata only."""
+    sample = dict(MdpThdMockDataset(num_samples=8)[0])
+    expected_pixels = sample["pixel_values"].clone()
+    expected_grid = sample["image_grid_thw"].clone()
+    broadcast_keys = []
+
+    monkeypatch.setattr(forward_step.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(forward_step.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(forward_step.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        forward_step, "get_args", lambda: SimpleNamespace(sequence_parallel=False, mdp_enable=False)
+    )
+    monkeypatch.setattr(mdp_window, "pixel_capture_owner_state", lambda: True, raising=False)
+
+    def _record_broadcast(data, device):
+        broadcast_keys.append(tuple(data))
+        return dict(data)
+
+    monkeypatch.setattr(forward_step, "broadcast_data_batch", _record_broadcast)
+    result = forward_step.pack_or_pad_batch(
+        [sample],
+        use_packed_sequence=use_packed_sequence,
+        seq_length=int(sample["input_ids"].numel()),
+        device="cpu",
+        with_vision_sidecar=use_packed_sequence,
+    )
+
+    assert len(broadcast_keys) == 1
+    assert "pixel_values" not in broadcast_keys[0]
+    assert "image_grid_thw" in broadcast_keys[0]
+    assert torch.equal(result["pixel_values"], expected_pixels)
+    assert torch.equal(result["image_grid_thw"], expected_grid)
+    if use_packed_sequence:
+        assert result["vision_item_meta"].shape[0] == expected_grid.shape[0]
+
+
+@pytest.mark.parametrize("use_packed_sequence", [False, True])
+def test_native_batch_outside_capture_still_broadcasts_pixels(monkeypatch, use_packed_sequence):
+    sample = dict(MdpThdMockDataset(num_samples=8)[0])
+    expected_pixels = sample["pixel_values"].clone()
+    broadcast_keys = []
+
+    monkeypatch.setattr(forward_step.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(forward_step.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(forward_step.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        forward_step, "get_args", lambda: SimpleNamespace(sequence_parallel=False, mdp_enable=False)
+    )
+    monkeypatch.setattr(mdp_window, "pixel_capture_owner_state", lambda: None, raising=False)
+
+    def _record_broadcast(data, device):
+        broadcast_keys.append(tuple(data))
+        return dict(data)
+
+    monkeypatch.setattr(forward_step, "broadcast_data_batch", _record_broadcast)
+    result = forward_step.pack_or_pad_batch(
+        [sample],
+        use_packed_sequence=use_packed_sequence,
+        seq_length=int(sample["input_ids"].numel()),
+        device="cpu",
+    )
+
+    assert "pixel_values" in broadcast_keys[0]
+    assert torch.equal(result["pixel_values"], expected_pixels)
+
+
 # ------------------------- negative guards -------------------------
 
 
@@ -158,9 +231,7 @@ def _sidecar(batch):
     cu = [0]
     for length in lengths:
         cu.append(cu[-1] + length)
-    return build_vision_sidecar(
-        batch, cu, image_token_id=IMAGE_TOKEN_ID, spatial_merge_size=MERGE
-    )
+    return build_vision_sidecar(batch, cu, image_token_id=IMAGE_TOKEN_ID, spatial_merge_size=MERGE)
 
 
 def test_guard_pixel_grid_all_or_nothing():

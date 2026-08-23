@@ -49,11 +49,14 @@ class CapturedMicrobatch:
     - ``model_payload`` is an opaque replay payload owned by the adapter. Core
       never interprets its contents; it must be an immutable mapping exclusively
       referenced by the window and must not be mutated after capture.
+    - ``decoder_input_shape`` is the explicit immutable ``(B, S)`` shape used by
+      decoder-CP planning; core never recovers it from ``model_payload``.
     - ``decoder_packed_seq_params.qkv_format`` must be ``"thd"``; it is used only
       for decoder replay and never passed to the vision encoder.
     """
 
     decoder_packed_seq_params: "PackedSeqParams"
+    decoder_input_shape: tuple
     vision_items: tuple
     flat_pixel_payload: Optional["Tensor"]
     model_payload: Mapping[str, Any]
@@ -107,9 +110,7 @@ class MdpModelAdapter(Protocol):
         """Build the vision encoder through the same factory as the non-MDP path."""
         ...
 
-    def encode(
-        self, encoder: "Module", payload: "Tensor", layout: "EncoderThdLayout"
-    ) -> "Tensor":
+    def encode(self, encoder: "Module", payload: "Tensor", layout: "EncoderThdLayout") -> "Tensor":
         """Run encoder forward on one already-rebased chunk sub-layout.
 
         The adapter reads the ordered ``grid_thw`` from ``layout.segments`` and

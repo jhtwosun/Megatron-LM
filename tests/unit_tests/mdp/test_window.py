@@ -2,6 +2,7 @@
 
 """Iteration-window tests with a stub adapter (CPU only)."""
 
+import dataclasses
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
@@ -34,11 +35,12 @@ def _microbatch(items, total_rows, sentinel_base=0.0):
     if items:
         pixels = torch.zeros(total_rows, 4)
         for index, item in enumerate(items):
-            pixels[
-                item.payload_row_start : item.payload_row_start + item.payload_rows
-            ] = sentinel_base + index + 1
+            pixels[item.payload_row_start : item.payload_row_start + item.payload_rows] = (
+                sentinel_base + index + 1
+            )
     return CapturedMicrobatch(
         decoder_packed_seq_params=SimpleNamespace(qkv_format="thd"),
+        decoder_input_shape=(1, 8),
         vision_items=tuple(items),
         flat_pixel_payload=pixels,
         model_payload=MappingProxyType({"input_ids": torch.zeros(1, 8)}),
@@ -157,6 +159,7 @@ def test_release_pixels_clears_the_sidecar_only():
             lambda: [
                 CapturedMicrobatch(
                     decoder_packed_seq_params=SimpleNamespace(qkv_format="thd"),
+                    decoder_input_shape=(1, 8),
                     vision_items=(_item(0, 0, (1, 4, 4), 0),),
                     flat_pixel_payload=None,
                     model_payload=MappingProxyType({}),
@@ -168,18 +171,26 @@ def test_release_pixels_clears_the_sidecar_only():
         (lambda: [_microbatch([_item(0, 0, (1, 3, 4), 0)], 12)], "divisible"),
         # duplicate (sample, ordinal)
         (
-            lambda: [
-                _microbatch([_item(0, 0, (1, 4, 4), 0), _item(0, 0, (1, 4, 4), 16)], 32)
-            ],
+            lambda: [_microbatch([_item(0, 0, (1, 4, 4), 0), _item(0, 0, (1, 4, 4), 16)], 32)],
             "without duplicates",
         ),
         # payload interval out of bounds
         (lambda: [_microbatch([_item(0, 0, (1, 4, 4), 8)], 16)], "inside"),
+        # decoder shape is explicit metadata, never inferred from model_payload
+        (
+            lambda: [
+                dataclasses.replace(
+                    _microbatch([_item(0, 0, (1, 4, 4), 0)], 16), decoder_input_shape=(0, 8)
+                )
+            ],
+            "decoder_input_shape",
+        ),
         # wrong qkv_format
         (
             lambda: [
                 CapturedMicrobatch(
                     decoder_packed_seq_params=SimpleNamespace(qkv_format="bshd"),
+                    decoder_input_shape=(1, 8),
                     vision_items=(),
                     flat_pixel_payload=None,
                     model_payload=MappingProxyType({}),

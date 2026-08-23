@@ -41,21 +41,60 @@ class MdpRankView:
     endpoint_rank: int
     planning_group_ranks: tuple
     worker_ids: tuple
+    data_loader_source_worker_ids: tuple = ()
+    decoder_endpoint_ranks: tuple = ()
+    tp_group_ranks: tuple = ()
+    is_decoder_endpoint: bool = False
 
 
 class MdpRankMap:
     """Outer-DP planning groups and logical-worker resolution, built once and shared.
 
     A planning group is one outer-DP group: all model-parallel ranks with one fixed
-    decoder ``dp_rank``. Inside a group, the ``CP x PP`` encoder ranks form
+    decoder ``dp_rank``. Inside a group, the ``TP x CP x PP`` encoder ranks form
     ``inner_dp / encoder_cp`` logical workers with stable ids ``0..num_workers-1``;
     ``worker_ranks()`` is the only resolution point from logical workers to
     physical ranks.
     """
 
-    def __init__(self, spec: MdpRankSpec, planning_groups: Sequence[tuple]):
+    def __init__(
+        self,
+        spec: MdpRankSpec,
+        planning_groups: Sequence[tuple],
+        tp_groups: Sequence[tuple],
+        pipeline_groups: Sequence[tuple],
+    ):
         self._spec = spec
         self._groups = tuple(planning_groups)
+        self._tp_group_by_rank = {}
+        for group in tp_groups:
+            group = tuple(group)
+            if len(group) != spec.tp:
+                raise MdpConfigurationError(
+                    f"MDP: TP group {group} violates: group size == tp={spec.tp}."
+                )
+            for rank in group:
+                if rank in self._tp_group_by_rank:
+                    raise MdpConfigurationError(
+                        f"MDP: rank {rank} appears in more than one TP group."
+                    )
+                self._tp_group_by_rank[rank] = group
+
+        pipeline_first_ranks = {tuple(group)[0] for group in pipeline_groups}
+        tp_primary_ranks = {group[0] for group in self._tp_group_by_rank.values()}
+        self._decoder_endpoints = tuple(
+            tuple(
+                rank for rank in group if rank in pipeline_first_ranks and rank in tp_primary_ranks
+            )
+            for group in self._groups
+        )
+        for outer_dp_rank, endpoints in enumerate(self._decoder_endpoints):
+            if len(endpoints) != spec.cp:
+                raise MdpConfigurationError(
+                    f"MDP: outer_dp_rank={outer_dp_rank} has decoder endpoints "
+                    f"{endpoints}; expected one PP0/TP0 rank for each of cp={spec.cp}."
+                )
+
         self._rank_to_coord = {}
         for outer_dp_rank, group in enumerate(self._groups):
             for index_in_group, rank in enumerate(group):
@@ -71,6 +110,11 @@ class MdpRankMap:
                 f"MDP: planning groups cover {covered} ranks but world_size is "
                 f"{spec.world_size}; every rank must belong to exactly one group."
             )
+        if len(self._tp_group_by_rank) != spec.world_size:
+            raise MdpConfigurationError(
+                f"MDP: TP groups cover {len(self._tp_group_by_rank)} ranks but "
+                f"world_size is {spec.world_size}."
+            )
 
     @property
     def spec(self) -> MdpRankSpec:
@@ -80,16 +124,57 @@ class MdpRankMap:
     @property
     def num_workers_per_group(self) -> int:
         """Logical encoder workers per planning group."""
-        inner_dp = self._spec.cp * self._spec.pp
+        inner_dp = self._spec.tp * self._spec.cp * self._spec.pp
         return inner_dp // self._spec.encoder_cp
 
     def planning_groups(self) -> Sequence[tuple]:
         """All outer-DP planning groups in ascending ``outer_dp_rank`` order."""
         return self._groups
 
+    def primary_endpoint_rank(self, outer_dp_rank: int) -> int:
+        """The PP0/CP0/TP0 capture and planning endpoint of one group."""
+        return self._decoder_endpoints[outer_dp_rank][0]
+
+    def decoder_endpoint_ranks(self, outer_dp_rank: int) -> tuple:
+        """Return PP0/TP0 endpoints in native decoder-CP order."""
+        return self._decoder_endpoints[outer_dp_rank]
+
+    def decoder_endpoint_rank(self, outer_dp_rank: int, cp_rank: int) -> int:
+        """Return the PP0/TP0 endpoint for one decoder-CP coordinate."""
+        endpoints = self.decoder_endpoint_ranks(outer_dp_rank)
+        if not 0 <= cp_rank < len(endpoints):
+            raise MdpConfigurationError(
+                f"MDP: cp_rank={cp_rank} violates: 0 <= cp_rank < {len(endpoints)}."
+            )
+        return endpoints[cp_rank]
+
     def endpoint_rank(self, outer_dp_rank: int) -> int:
-        """The PP0 endpoint rank of one planning group."""
-        return self._groups[outer_dp_rank][0]
+        """Compatibility alias for :meth:`primary_endpoint_rank`."""
+        return self.primary_endpoint_rank(outer_dp_rank)
+
+    def tp_group_ranks(self, global_rank: int) -> tuple:
+        """Return the native TP group containing ``global_rank``."""
+        try:
+            return self._tp_group_by_rank[global_rank]
+        except KeyError as error:
+            raise MdpConfigurationError(
+                f"MDP: global_rank={global_rank} violates: rank belongs to a TP group "
+                f"of world_size={self._spec.world_size}."
+            ) from error
+
+    def data_loader_source_worker_ids(self, outer_dp_rank: int) -> tuple:
+        """Logical workers containing a native TP source rank, in plan order.
+
+        These workers may advance the real DataLoader. Physical TP followers
+        consume the native TP broadcast instead. The derivation is generic;
+        owner-sharded runtime coverage in this branch is limited to encoder CP 1.
+        """
+        sources = []
+        for worker_id in range(self.num_workers_per_group):
+            worker_ranks = self.worker_ranks(outer_dp_rank, worker_id)
+            if any(rank == self.tp_group_ranks(rank)[0] for rank in worker_ranks):
+                sources.append(worker_id)
+        return tuple(sources)
 
     def worker_ranks(self, outer_dp_rank: int, worker_id: int) -> tuple:
         """Resolve one logical worker to its physical ranks.
@@ -116,7 +201,8 @@ class MdpRankMap:
             )
         outer_dp_rank, index_in_group = self._rank_to_coord[global_rank]
         group = self._groups[outer_dp_rank]
-        endpoint = group[0]
+        endpoints = self.decoder_endpoint_ranks(outer_dp_rank)
+        endpoint = endpoints[0]
         return MdpRankView(
             global_rank=global_rank,
             outer_dp_rank=outer_dp_rank,
@@ -125,6 +211,10 @@ class MdpRankMap:
             endpoint_rank=endpoint,
             planning_group_ranks=group,
             worker_ids=tuple(range(self.num_workers_per_group)),
+            data_loader_source_worker_ids=self.data_loader_source_worker_ids(outer_dp_rank),
+            decoder_endpoint_ranks=endpoints,
+            tp_group_ranks=self.tp_group_ranks(global_rank),
+            is_decoder_endpoint=global_rank in endpoints,
         )
 
 
@@ -151,28 +241,21 @@ def build_rank_map(spec: MdpRankSpec) -> MdpRankMap:
             f"MDP: rank_order={spec.rank_order!r} violates: rank_order == "
             f"'{SUPPORTED_RANK_ORDER}'. Other orders are not validated."
         )
-    if spec.tp != 1:
-        raise MdpConfigurationError(
-            f"MDP: tp={spec.tp} violates: TP == 1. The logical worker partition is "
-            "defined over the CP x PP ranks of each outer-DP group."
-        )
-    for name in ("world_size", "pp", "cp", "ep", "encoder_cp"):
+    for name in ("world_size", "tp", "pp", "cp", "ep", "encoder_cp"):
         value = getattr(spec, name)
         if value < 1:
-            raise MdpConfigurationError(
-                f"MDP: {name}={value} violates: {name} >= 1."
-            )
+            raise MdpConfigurationError(f"MDP: {name}={value} violates: {name} >= 1.")
     model_parallel = spec.tp * spec.pp * spec.cp
     if spec.world_size % model_parallel != 0:
         raise MdpConfigurationError(
             f"MDP: world_size={spec.world_size} violates: world_size % "
             f"(TP * PP * CP) == 0 with TP * PP * CP = {model_parallel}."
         )
-    inner_dp = spec.cp * spec.pp
+    inner_dp = spec.tp * spec.cp * spec.pp
     if inner_dp % spec.encoder_cp != 0:
         raise MdpConfigurationError(
             f"MDP: encoder_cp={spec.encoder_cp} violates: encoder_cp divides "
-            f"inner_dp = CP * PP = {inner_dp}."
+            f"physical encoder ranks per planning group = TP * CP * PP = {inner_dp}."
         )
 
     decoder_dp = spec.world_size // model_parallel
@@ -187,4 +270,6 @@ def build_rank_map(spec: MdpRankSpec) -> MdpRankMap:
             f"MDP: RankGenerator produced {len(planning_groups)} outer-DP groups; "
             f"expected decoder_dp={decoder_dp}."
         )
-    return MdpRankMap(spec, planning_groups)
+    tp_groups = [tuple(group) for group in generator.get_ranks("tp")]
+    pipeline_groups = [tuple(group) for group in generator.get_ranks("pp")]
+    return MdpRankMap(spec, planning_groups, tp_groups, pipeline_groups)

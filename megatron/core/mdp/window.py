@@ -33,11 +33,21 @@ def pixel_capture_suppressed() -> bool:
     Queried by the model collate path to skip pixel materialization + H2D for
     microbatches whose pixels another planning-group worker owns.
     """
+    return pixel_capture_owner_state() is False
+
+
+def pixel_capture_owner_state() -> Optional[bool]:
+    """Owner state for the active capture: owner, non-owner, or outside.
+
+    ``True`` means this physical rank's logical worker owns the current
+    microbatch, ``False`` means a different worker owns it, and ``None`` means
+    the caller is outside owner-sharded window capture.
+    """
     context = getattr(_PIXEL_OWNERSHIP, "value", None)
     if context is None:
-        return False
+        return None
     owner_worker_id, my_worker_id = context
-    return owner_worker_id != my_worker_id
+    return owner_worker_id == my_worker_id
 
 
 @dataclass(frozen=True)
@@ -63,14 +73,16 @@ class MdpMicrobatchVisionRecord:
 class MdpMicrobatchRecord:
     """One decoder microbatch's replay record.
 
-    ``model_payload`` is opaque to core; ``decoder_packed_seq_params`` stays an
-    explicit field because core must assert ``qkv_format == "thd"`` (dual-THD
-    isolation), and it is never passed to the vision encoder.
+    ``model_payload`` is opaque to core. ``decoder_input_shape`` and
+    ``decoder_packed_seq_params`` are explicit because decoder-CP planning must
+    not inspect that payload; packed decoder metadata is never passed to the
+    vision encoder.
     """
 
     microbatch_id: int
     text_only: bool
     vision_items: tuple
+    decoder_input_shape: tuple
     decoder_packed_seq_params: Any
     model_payload: Mapping[str, Any]
 
@@ -123,7 +135,8 @@ class MdpIterationWindow:
         lane_id: Optional[int],
         pixel_owner_shard: bool = False,
         my_worker_id: Optional[int] = None,
-        num_workers: Optional[int] = None,
+        num_logical_workers: Optional[int] = None,
+        data_loader_source_worker_ids: Optional[Sequence[int]] = None,
         endpoint_worker_id: int = 0,
     ) -> "MdpIterationWindow":
         """Consume one real iterator and build records, descriptors, and sidecar.
@@ -135,20 +148,49 @@ class MdpIterationWindow:
 
         The pixel sidecar is cut by the endpoint when ``pixel_owner_shard`` is
         off (today's behavior). With sharding on, every worker materializes and
-        cuts pixels only for the microbatches it owns
-        (``microbatch_id % num_workers == my_worker_id``); the ownership context
-        set around each ``adapter.get_batch`` call lets the model collate path
-        skip pixel materialization on non-owners.
+        cuts pixels only for the microbatches assigned round-robin over ordered
+        native-TP source workers. The ownership context set around each
+        ``adapter.get_batch`` call lets the model collate path skip pixel
+        materialization on non-owners. PyTorch DataLoader subprocess count is
+        unrelated to ``num_logical_workers``.
         """
         if isinstance(data_iterators, (list, tuple)):
             iterator = data_iterators[0] if data_iterators else None
         else:
             iterator = data_iterators
-        if pixel_owner_shard and (my_worker_id is None or not num_workers):
-            raise MdpConfigurationError(
-                "MDP: pixel_owner_shard requires my_worker_id and num_workers "
-                f"(got {my_worker_id}, {num_workers})."
+        source_worker_ids = None
+        if pixel_owner_shard:
+            valid_worker_count = (
+                isinstance(num_logical_workers, int)
+                and not isinstance(num_logical_workers, bool)
+                and num_logical_workers > 0
             )
+            valid_worker_id = (
+                isinstance(my_worker_id, int)
+                and not isinstance(my_worker_id, bool)
+                and valid_worker_count
+                and 0 <= my_worker_id < num_logical_workers
+            )
+            source_worker_ids = tuple(data_loader_source_worker_ids or ())
+            valid_sources = (
+                bool(source_worker_ids)
+                and all(
+                    isinstance(worker_id, int) and not isinstance(worker_id, bool)
+                    for worker_id in source_worker_ids
+                )
+                and source_worker_ids == tuple(sorted(set(source_worker_ids)))
+                and valid_worker_count
+                and all(0 <= worker_id < num_logical_workers for worker_id in source_worker_ids)
+            )
+            if not (valid_worker_count and valid_worker_id and valid_sources):
+                raise MdpConfigurationError(
+                    "MDP: pixel_owner_shard requires my_worker_id in "
+                    "[0, num_logical_workers) and nonempty, unique, ordered "
+                    "data_loader_source_worker_ids within that range "
+                    f"(got my_worker_id={my_worker_id}, "
+                    f"num_logical_workers={num_logical_workers}, "
+                    f"data_loader_source_worker_ids={source_worker_ids})."
+                )
 
         records = []
         descriptors = []
@@ -157,7 +199,7 @@ class MdpIterationWindow:
         merge = adapter.spatial_merge_size
         for microbatch_id in range(num_microbatches):
             if pixel_owner_shard:
-                owner_worker_id = microbatch_id % num_workers
+                owner_worker_id = source_worker_ids[microbatch_id % len(source_worker_ids)]
                 owns_pixels = owner_worker_id == my_worker_id
             else:
                 owner_worker_id = endpoint_worker_id
@@ -227,6 +269,7 @@ class MdpIterationWindow:
                     microbatch_id=microbatch_id,
                     text_only=not captured.vision_items,
                     vision_items=tuple(vision_records),
+                    decoder_input_shape=captured.decoder_input_shape,
                     decoder_packed_seq_params=captured.decoder_packed_seq_params,
                     model_payload=captured.model_payload,
                 )
@@ -237,8 +280,7 @@ class MdpIterationWindow:
         """``num_vpp_chunks`` independent cursors; a second call raises."""
         if self._replayed:
             raise MdpStateError(
-                "MDP: iteration window violates: replay iterators are created once per "
-                "capture."
+                "MDP: iteration window violates: replay iterators are created once per " "capture."
             )
         self._replayed = True
         return [_ReplayCursor(self._records) for _ in range(self._num_vpp_chunks)]
@@ -282,6 +324,16 @@ def _validate_captured(
     branch is suppressed), so both wiring failures are diagnosed here.
     """
     params = captured.decoder_packed_seq_params
+    shape = captured.decoder_input_shape
+    if (
+        not isinstance(shape, tuple)
+        or len(shape) != 2
+        or any(type(value) is not int or value < 1 for value in shape)
+    ):
+        raise MdpConfigurationError(
+            f"MDP: microbatch {microbatch_id} violates: decoder_input_shape is an "
+            f"explicit positive integer (B, S) tuple (got {shape!r})."
+        )
     if params is not None and getattr(params, "qkv_format", None) != "thd":
         raise MdpConfigurationError(
             f"MDP: microbatch {microbatch_id} violates: decoder_packed_seq_params."

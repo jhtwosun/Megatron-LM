@@ -176,7 +176,12 @@ class MultimodalModel(MegatronModule):
         self.language_model.set_input_tensor(input_tensor[0])
 
     def _scatter_vision_embeddings(
-        self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings: Tensor
+        self,
+        input_ids: Tensor,
+        text_embeddings: Tensor,
+        vision_embeddings: Tensor,
+        *,
+        defer_sequence_parallel_scatter: bool = False,
     ) -> Tensor:
         """Replace image-token positions with vision embeddings.
 
@@ -188,7 +193,9 @@ class MultimodalModel(MegatronModule):
             vision_embeddings: ``[num_visual_tokens, D]``.
 
         Returns:
-            Combined embeddings, same shape as *text_embeddings*.
+            Combined embeddings, same shape as *text_embeddings* unless the
+            sequence-parallel scatter is explicitly deferred for a subsequent
+            CP partition.
         """
         sp = (
             self.config.sequence_parallel
@@ -210,10 +217,76 @@ class MultimodalModel(MegatronModule):
                 "mis-fill the sequence"
             )
         mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
-        combined = combined.masked_scatter(
-            mask_expanded, vision_embeddings.to(combined.dtype)
-        )
+        combined = combined.masked_scatter(mask_expanded, vision_embeddings.to(combined.dtype))
         combined = combined.transpose(0, 1).contiguous()
+
+        if sp and not defer_sequence_parallel_scatter:
+            combined = tensor_parallel.scatter_to_sequence_parallel_region(combined)
+
+        return combined
+
+    def _scatter_local_vision_embeddings(
+        self,
+        input_ids: Tensor,
+        text_embeddings: Tensor,
+        vision_embeddings: Tensor,
+        local_positions: tuple,
+    ) -> Tensor:
+        """Scatter a compact vision leaf into flattened rank-local positions."""
+        if not isinstance(local_positions, tuple):
+            raise RuntimeError("compact vision local positions must be an immutable tuple")
+        if any(type(position) is not int for position in local_positions):
+            raise RuntimeError("compact vision local positions must be integers")
+        if vision_embeddings.dim() != 2:
+            raise RuntimeError(
+                "compact vision embeddings must be a two-dimensional [rows, hidden] tensor"
+            )
+        if len(local_positions) != vision_embeddings.shape[0]:
+            raise RuntimeError(
+                f"compact vision local positions {len(local_positions)} != vision embedding "
+                f"rows {vision_embeddings.shape[0]}"
+            )
+        if len(set(local_positions)) != len(local_positions):
+            raise RuntimeError("compact vision local positions must be unique")
+
+        sp = (
+            self.config.sequence_parallel
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
+        )
+        if sp:
+            text_embeddings = tensor_parallel.gather_from_sequence_parallel_region(
+                text_embeddings, tensor_parallel_output_grad=False
+            )
+
+        combined = text_embeddings.transpose(0, 1).contiguous()
+        flat_combined = combined.view(-1, combined.shape[-1])
+        if vision_embeddings.shape[1] != flat_combined.shape[1]:
+            raise RuntimeError(
+                f"compact vision embedding hidden size {vision_embeddings.shape[1]} != "
+                f"decoder hidden size {flat_combined.shape[1]}"
+            )
+        if any(position < 0 or position >= flat_combined.shape[0] for position in local_positions):
+            raise RuntimeError(
+                f"compact vision local position lies outside rank-local token rows "
+                f"[0, {flat_combined.shape[0]})"
+            )
+
+        position_index = torch.tensor(local_positions, dtype=torch.long, device=input_ids.device)
+        placeholder_positions = (input_ids.reshape(-1) == self.image_token_id).nonzero(
+            as_tuple=True
+        )[0]
+        if not torch.equal(position_index.sort().values, placeholder_positions):
+            raise RuntimeError(
+                "compact vision local positions must match rank-local image placeholder positions"
+            )
+
+        local_leaf = vision_embeddings.to(flat_combined.dtype)
+        flat_combined = flat_combined.index_copy(0, position_index, local_leaf)
+        if not local_positions:
+            # Keep a zero-row endpoint leaf connected to autograd even though
+            # index_copy has no source elements to consume.
+            flat_combined = flat_combined + local_leaf.sum() * 0.0
+        combined = flat_combined.view_as(combined).transpose(0, 1).contiguous()
 
         if sp:
             combined = tensor_parallel.scatter_to_sequence_parallel_region(combined)
@@ -242,6 +315,7 @@ class MultimodalModel(MegatronModule):
         position_ids,
         packed_seq_params,
         padding_mask=None,
+        decoder_input_is_sp_gathered=False,
     ):
         """Apply CP split to model-forward inputs.
 
@@ -256,10 +330,31 @@ class MultimodalModel(MegatronModule):
         cp_size = parallel_state.get_context_parallel_world_size()
         if cp_size <= 1:
             return (
-                decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids, padding_mask,
+                decoder_input,
+                input_ids,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                padding_mask,
             )
         cp_rank = parallel_state.get_context_parallel_rank()
+        decoder_input_uses_sp = (
+            decoder_input is not None
+            and self.config.sequence_parallel
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
+        )
+        if decoder_input_is_sp_gathered and not decoder_input_uses_sp:
+            raise RuntimeError(
+                "decoder input cannot be marked as SP-gathered when sequence parallelism is off"
+            )
+        if decoder_input_uses_sp and not decoder_input_is_sp_gathered:
+            # Full-leaf embedding/scatter produces a global-sequence SP shard.
+            # Reconstruct the global sequence before applying the native CP
+            # partition, then restore SP ownership within that CP-local shard.
+            decoder_input = tensor_parallel.gather_from_sequence_parallel_region(
+                decoder_input, tensor_parallel_output_grad=False
+            )
 
         if packed_seq_params is not None:
             total_tokens = (
@@ -294,9 +389,17 @@ class MultimodalModel(MegatronModule):
             attention_mask = _split(attention_mask, 1)
             padding_mask = _split(padding_mask, 1)
 
+        if decoder_input_uses_sp:
+            decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(decoder_input)
+
         return (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         )
 
     @staticmethod
@@ -356,6 +459,7 @@ class MultimodalModel(MegatronModule):
         decoder_input: Tensor = None,
         packed_seq_params=None,
         vision_embeddings: Tensor = None,
+        vision_embedding_local_positions: Optional[tuple] = None,
         **kwargs,
     ):
         """Forward pass.
@@ -376,6 +480,9 @@ class MultimodalModel(MegatronModule):
             image_grid_thw: ``[num_images, 3]`` grid dimensions.
             decoder_input: Pre-computed decoder input (skip embed).
             packed_seq_params: ``PackedSeqParams`` for THD attention.
+            vision_embedding_local_positions: Flattened rank-local positions
+                for a compact vision leaf. ``None`` preserves the full-leaf
+                path; an empty tuple selects a graph-connected zero-row leaf.
 
         Returns:
             Loss tensor (post_process=True) or hidden states.
@@ -387,6 +494,37 @@ class MultimodalModel(MegatronModule):
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
                 packed_seq_params=packed_seq_params,
+            )
+
+        compact_vision_scatter = vision_embedding_local_positions is not None
+        full_leaf_decoder_input_is_sp_gathered = False
+        if compact_vision_scatter:
+            if not self.pre_process:
+                raise RuntimeError("compact vision scatter is only valid on a pre-process stage")
+            if decoder_input is not None:
+                raise RuntimeError("compact vision scatter cannot use a pre-computed decoder input")
+            if vision_embeddings is None:
+                raise RuntimeError(
+                    "compact vision scatter requires a vision embedding tensor, including "
+                    "an empty [0, hidden] leaf for a zero-row endpoint"
+                )
+            (
+                decoder_input,
+                input_ids,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                padding_mask,
+            ) = self._cp_split_for_forward(
+                decoder_input=None,
+                input_ids=input_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
             )
 
         if self.pre_process:
@@ -409,9 +547,27 @@ class MultimodalModel(MegatronModule):
                 if vision_embeddings is not None:
                     torch.cuda.nvtx.range_push("native.scatter_vision_embeddings")
                     try:
-                        decoder_input = self._scatter_vision_embeddings(
-                            input_ids, text_embeddings, vision_embeddings
-                        )
+                        if compact_vision_scatter:
+                            decoder_input = self._scatter_local_vision_embeddings(
+                                input_ids,
+                                text_embeddings,
+                                vision_embeddings,
+                                vision_embedding_local_positions,
+                            )
+                        else:
+                            full_leaf_decoder_input_is_sp_gathered = (
+                                self.config.sequence_parallel
+                                and parallel_state.get_tensor_model_parallel_world_size() > 1
+                                and parallel_state.get_context_parallel_world_size() > 1
+                            )
+                            decoder_input = self._scatter_vision_embeddings(
+                                input_ids,
+                                text_embeddings,
+                                vision_embeddings,
+                                defer_sequence_parallel_scatter=(
+                                    full_leaf_decoder_input_is_sp_gathered
+                                ),
+                            )
                     finally:
                         torch.cuda.nvtx.range_pop()
                 else:
@@ -430,19 +586,26 @@ class MultimodalModel(MegatronModule):
             # so the CP-split helper leaves it as None.
             decoder_input = None
 
-        (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
-        ) = self._cp_split_for_forward(
-            decoder_input=decoder_input,
-            input_ids=input_ids,
-            labels=labels,
-            loss_mask=loss_mask,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-        )
+        if not compact_vision_scatter:
+            (
+                decoder_input,
+                input_ids,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                padding_mask,
+            ) = self._cp_split_for_forward(
+                decoder_input=decoder_input,
+                input_ids=input_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                decoder_input_is_sp_gathered=full_leaf_decoder_input_is_sp_gathered,
+            )
 
         with self._thd_mrope_no_cp_override(packed_seq_params):
             return self.language_model(

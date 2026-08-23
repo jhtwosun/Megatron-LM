@@ -48,19 +48,14 @@ class MdpPlanner:
         )
 
     def build_plan(
-        self,
-        iteration: int,
-        descriptors: Sequence,
-        microbatch_ids: Sequence[int],
+        self, iteration: int, descriptors: Sequence, microbatch_ids: Sequence[int]
     ) -> MdpBatchPlan:
         """Run deterministic LPT and assemble routes, layouts, and the digest."""
         view = self._rank_view
         self._validate_descriptors(descriptors, microbatch_ids)
 
         # LPT: (cost descending, item_id ascending); integer comparisons only.
-        ordered = sorted(
-            descriptors, key=lambda d: (-d.estimated_cost_units, d.global_item_id)
-        )
+        ordered = sorted(descriptors, key=lambda d: (-d.estimated_cost_units, d.global_item_id))
         loads = {worker_id: 0 for worker_id in view.worker_ids}
         assignment = {}  # global_item_id -> worker_id
         producer_items = {worker_id: [] for worker_id in view.worker_ids}
@@ -134,9 +129,7 @@ class MdpPlanner:
             items_by_microbatch[descriptor.microbatch_id].append(descriptor)
         layouts = []
         for mb_id in microbatch_ids:
-            items = sorted(
-                items_by_microbatch[mb_id], key=lambda d: (d.sample_id, d.image_ordinal)
-            )
+            items = sorted(items_by_microbatch[mb_id], key=lambda d: (d.sample_id, d.image_ordinal))
             segments = []
             leaf_offset = 0
             for descriptor in items:
@@ -157,17 +150,20 @@ class MdpPlanner:
                 )
             )
 
-        # Routes: one slice per item in v1. The endpoint is single-valued.
-        # owner_worker_id names the PIXEL source; without owner sharding the
-        # window sets it to the endpoint worker, keeping today's routes.
+        # Full-leaf decoder CP: one route per item and PP0/TP0 CP endpoint.
+        # Pixels still use only canonical slice 0; embedding and gradient
+        # phases use every slice.
+        decoder_endpoints = view.decoder_endpoint_ranks or (view.endpoint_rank,)
         routes = tuple(
             RouteSlice(
                 global_item_id=descriptor.global_item_id,
                 producer_worker_id=assignment[descriptor.global_item_id],
-                endpoint_rank=view.endpoint_rank,
+                endpoint_rank=endpoint_rank,
                 owner_worker_id=descriptor.owner_worker_id,
+                slice_id=slice_id,
             )
             for descriptor in sorted(descriptors, key=lambda d: d.global_item_id)
+            for slice_id, endpoint_rank in enumerate(decoder_endpoints)
         )
 
         digest_entries = [
@@ -175,7 +171,9 @@ class MdpPlanner:
                 descriptor.global_item_id,
                 assignment[descriptor.global_item_id],
                 order_in_producer[descriptor.global_item_id],
-                view.endpoint_rank,
+                endpoint_rank,
+                slice_id,
+                descriptor.owner_worker_id,
                 descriptor.payload_rows,
                 descriptor.output_rows,
                 descriptor.grid_thw[0],
@@ -183,10 +181,9 @@ class MdpPlanner:
                 descriptor.grid_thw[2],
             )
             for descriptor in sorted(descriptors, key=lambda d: d.global_item_id)
+            for slice_id, endpoint_rank in enumerate(decoder_endpoints)
         ]
-        digest = compute_plan_digest(
-            PLAN_SCHEMA_VERSION, self._capacity_policy, digest_entries
-        )
+        digest = compute_plan_digest(PLAN_SCHEMA_VERSION, self._capacity_policy, digest_entries)
 
         plan = MdpBatchPlan(
             schema_version=PLAN_SCHEMA_VERSION,
@@ -228,8 +225,7 @@ class MdpPlanner:
                 )
             if descriptor.payload_rows <= 0 or descriptor.output_rows <= 0:
                 raise MdpPlanError(
-                    f"MDP: item {item_id} violates: payload_rows and output_rows are "
-                    "positive."
+                    f"MDP: item {item_id} violates: payload_rows and output_rows are " "positive."
                 )
             if descriptor.microbatch_id not in known_microbatches:
                 raise MdpPlanError(
@@ -252,8 +248,8 @@ class MdpPlanner:
 
 def _validate_plan(plan: MdpBatchPlan, view: MdpRankView) -> None:
     """Full coverage / no-overlap validation in O(items + routes)."""
-    route_items = {route.global_item_id for route in plan.routes}
     layout_items = set()
+    producer_by_item = {}
     for layout in plan.encoder_layouts:
         if layout.producer_worker_id not in view.worker_ids:
             raise MdpPlanError(
@@ -262,12 +258,7 @@ def _validate_plan(plan: MdpBatchPlan, view: MdpRankView) -> None:
             )
         for segment in layout.segments:
             layout_items.add(segment.global_item_id)
-    if route_items != layout_items:
-        raise MdpPlanError(
-            "MDP: plan violates: routes and encoder layouts cover exactly the same items "
-            f"(routes-only={sorted(route_items - layout_items)}, "
-            f"layouts-only={sorted(layout_items - route_items)})."
-        )
+            producer_by_item[segment.global_item_id] = layout.producer_worker_id
     endpoint_items = set()
     for layout in plan.layouts:
         for segment in layout.segments:
@@ -277,16 +268,52 @@ def _validate_plan(plan: MdpBatchPlan, view: MdpRankView) -> None:
                     "layout entry per item."
                 )
             endpoint_items.add(segment.global_item_id)
-    if endpoint_items != route_items:
+    if endpoint_items != layout_items:
         raise MdpPlanError(
-            "MDP: plan violates: endpoint layouts cover exactly the routed items."
+            "MDP: plan violates: endpoint and encoder layouts cover exactly the same items."
         )
+
+    decoder_endpoints = view.decoder_endpoint_ranks or (view.endpoint_rank,)
+    route_keys = set()
     for route in plan.routes:
-        if route.endpoint_rank not in view.planning_group_ranks:
+        key = (route.global_item_id, route.slice_id)
+        if key in route_keys:
             raise MdpPlanError(
-                f"MDP: endpoint_rank={route.endpoint_rank} violates: routes never cross an "
-                "outer-DP group boundary."
+                f"MDP: route violates: unique (global_item_id, slice_id) keys "
+                f"(duplicate={key})."
             )
+        route_keys.add(key)
+        if not 0 <= route.slice_id < len(decoder_endpoints):
+            raise MdpPlanError(
+                f"MDP: slice_id={route.slice_id} for item {route.global_item_id} violates: "
+                f"0 <= slice_id < {len(decoder_endpoints)}."
+            )
+        expected_endpoint = decoder_endpoints[route.slice_id]
+        if route.endpoint_rank != expected_endpoint:
+            raise MdpPlanError(
+                f"MDP: endpoint_rank={route.endpoint_rank} for item "
+                f"{route.global_item_id} violates: endpoint_rank for "
+                f"slice_id={route.slice_id} is {expected_endpoint}."
+            )
+        expected_producer = producer_by_item.get(route.global_item_id)
+        if expected_producer is not None and route.producer_worker_id != expected_producer:
+            raise MdpPlanError(
+                f"MDP: producer_worker_id={route.producer_worker_id} for item "
+                f"{route.global_item_id} violates: every endpoint slice uses its "
+                f"encoder layout producer {expected_producer}."
+            )
+
+    expected_route_keys = {
+        (item_id, slice_id)
+        for item_id in layout_items
+        for slice_id in range(len(decoder_endpoints))
+    }
+    if route_keys != expected_route_keys:
+        raise MdpPlanError(
+            "MDP: plan violates: exactly one route per decoder endpoint for every "
+            f"encoder item (missing={sorted(expected_route_keys - route_keys)}, "
+            f"extra={sorted(route_keys - expected_route_keys)})."
+        )
 
 
 def assert_consistent_plan(
@@ -345,7 +372,8 @@ def _canonical_plan_payload(plan: MdpBatchPlan):
         plan.outer_dp_rank,
         plan.capacity_policy.alignment_rows,
         tuple(
-            (r.global_item_id, r.producer_worker_id, r.endpoint_rank) for r in plan.routes
+            (r.global_item_id, r.producer_worker_id, r.slice_id, r.endpoint_rank, r.owner_worker_id)
+            for r in plan.routes
         ),
         tuple(
             (

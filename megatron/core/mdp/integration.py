@@ -23,6 +23,7 @@ from typing import Callable, Optional
 
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.bridge import ModalityBridge
 from megatron.core.mdp.config import (
@@ -78,8 +79,7 @@ def mdp_config_from_args(args) -> MdpConfig:
         key, _, raw = entry.partition("=")
         if not _:
             raise MdpConfigurationError(
-                f"MDP: --mdp-vision-config-override entry {entry!r} violates: "
-                "KEY=VALUE format."
+                f"MDP: --mdp-vision-config-override entry {entry!r} violates: " "KEY=VALUE format."
             )
         value: object = raw
         if raw in ("None", "null"):
@@ -93,6 +93,7 @@ def mdp_config_from_args(args) -> MdpConfig:
     return MdpConfig(
         enable=mdp_enabled(args),
         encoder_cp=getattr(args, "mdp_encoder_cp", 1),
+        decoder_cp_routing=getattr(args, "mdp_decoder_cp_routing", "full_leaf"),
         encoder_max_payload_rows=getattr(args, "mdp_encoder_max_payload_rows", None),
         vision_config_overrides=tuple(overrides),
         locality_slack_permille=getattr(args, "mdp_locality_slack_permille", 10),
@@ -124,25 +125,20 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
     # validate_mdp_config's rejection can fire instead of building planning
     # groups that no longer match the decoder replicas.
     rank_order = (
-        "tp-cp-ep-pp-dp"
-        if getattr(args, "use_tp_pp_dp_mapping", False)
-        else SUPPORTED_RANK_ORDER
+        "tp-cp-ep-pp-dp" if getattr(args, "use_tp_pp_dp_mapping", False) else SUPPORTED_RANK_ORDER
     )
     return MdpCompatibilityOptions(
         world_size=args.world_size,
         tensor_parallel_size=args.tensor_model_parallel_size,
         pipeline_parallel_size=args.pipeline_model_parallel_size,
         context_parallel_size=args.context_parallel_size,
+        sequence_parallel=bool(getattr(args, "sequence_parallel", False)),
         expert_parallel_size=getattr(args, "expert_model_parallel_size", 1),
         rank_order=rank_order,
-        virtual_pipeline_parallel_size=getattr(
-            args, "virtual_pipeline_model_parallel_size", None
-        ),
+        virtual_pipeline_parallel_size=getattr(args, "virtual_pipeline_model_parallel_size", None),
         calculate_per_token_loss=getattr(args, "calculate_per_token_loss", False),
         use_distributed_optimizer=getattr(args, "use_distributed_optimizer", False),
-        distributed_optimizer_instances=getattr(
-            args, "num_distributed_optimizer_instances", 1
-        ),
+        distributed_optimizer_instances=getattr(args, "num_distributed_optimizer_instances", 1),
         fp16=bool(args.fp16),
         bf16=bool(args.bf16),
         fsdp_enabled=fsdp,
@@ -196,7 +192,9 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
     )
     rank_view = rank_map.view(torch.distributed.get_rank())
     process_groups = install_mdp_process_groups(
-        rank_map, group_registry=MdpGroupRegistry()
+        rank_map,
+        group_registry=MdpGroupRegistry(),
+        decoder_tp_group=parallel_state.get_tensor_model_parallel_group(),
     )
     encoder_pgs = build_encoder_pg_collection(
         rank_map, encoder_cp=mdp_config.encoder_cp, process_groups=process_groups

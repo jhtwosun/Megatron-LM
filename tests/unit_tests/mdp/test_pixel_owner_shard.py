@@ -19,19 +19,11 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 import torch
 
+import megatron.core.mdp.window as mdp_window
 from megatron.core.mdp.allocator import DirectBufferAllocator
-from megatron.core.mdp.bridge import (
-    BridgeBufferKey,
-    BridgePhase,
-    BridgeTensorSpec,
-    ModalityBridge,
-)
-from megatron.core.mdp.config import (
-    MdpCompatibilityOptions,
-    MdpConfig,
-    validate_mdp_config,
-)
-from megatron.core.mdp.errors import MdpConfigurationError
+from megatron.core.mdp.bridge import BridgeBufferKey, BridgePhase, BridgeTensorSpec, ModalityBridge
+from megatron.core.mdp.config import MdpCompatibilityOptions, MdpConfig, validate_mdp_config
+from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
 from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem, VisionDescriptor
@@ -94,6 +86,7 @@ class _ShardAwareAdapter:
             pixels = _pixels_for(items, total_rows)
         return CapturedMicrobatch(
             decoder_packed_seq_params=SimpleNamespace(qkv_format="thd"),
+            decoder_input_shape=(1, 8),
             vision_items=tuple(items),
             flat_pixel_payload=pixels,
             model_payload=MappingProxyType({"input_ids": torch.zeros(1, 8)}),
@@ -101,6 +94,177 @@ class _ShardAwareAdapter:
 
     def estimate_cost(self, item):
         return item.payload_rows
+
+
+class _MetadataOnlyDataset(torch.utils.data.Dataset):
+    """DataLoader workers return serializable metadata and never image tensors."""
+
+    def __init__(self, length):
+        self._length = length
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, index):
+        return {"sample_id": index}
+
+
+class _LateMaterializingAdapter:
+    payload_width = WIDTH
+    spatial_merge_size = MERGE
+
+    def __init__(self):
+        self.observed_sample_ids = []
+        self.materialized_sample_ids = []
+        self.owner_states = []
+
+    def get_batch(self, iterator):
+        try:
+            metadata = next(iterator)
+        except StopIteration:
+            return None
+        sample_id = int(metadata["sample_id"].reshape(-1)[0])
+        self.observed_sample_ids.append(sample_id)
+        self.owner_states.append(mdp_window.pixel_capture_owner_state())
+        item = _item(sample_id, 0, (1, 4, 4), 0)
+        pixels = None
+        if not pixel_capture_suppressed():
+            self.materialized_sample_ids.append(sample_id)
+            pixels = _pixels_for((item,), item.payload_rows)
+        return CapturedMicrobatch(
+            decoder_packed_seq_params=SimpleNamespace(qkv_format="thd"),
+            decoder_input_shape=(1, 8),
+            vision_items=(item,),
+            flat_pixel_payload=pixels,
+            model_payload=MappingProxyType({"input_ids": torch.zeros(1, 8)}),
+        )
+
+    def estimate_cost(self, item):
+        return item.payload_rows
+
+
+def _shutdown_dataloader(iterator):
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if shutdown is not None:
+        shutdown()
+
+
+def _capture_loader_window(loader_num_workers):
+    expected = list(range(8))
+    loader = torch.utils.data.DataLoader(
+        _MetadataOnlyDataset(len(expected)),
+        batch_size=1,
+        num_workers=loader_num_workers,
+        persistent_workers=loader_num_workers > 0,
+    )
+    iterator = iter(loader)
+    first_adapter = _LateMaterializingAdapter()
+    try:
+        first = MdpIterationWindow.capture(
+            iterator,
+            num_microbatches=len(expected),
+            adapter=first_adapter,
+            num_vpp_chunks=1,
+            lane_id=0,
+            pixel_owner_shard=True,
+            my_worker_id=0,
+            num_logical_workers=4,
+            data_loader_source_worker_ids=(0, 2),
+        )
+        with pytest.raises(MdpStateError, match="exhausted"):
+            MdpIterationWindow.capture(
+                iterator,
+                num_microbatches=1,
+                adapter=first_adapter,
+                num_vpp_chunks=1,
+                lane_id=0,
+                pixel_owner_shard=True,
+                my_worker_id=0,
+                num_logical_workers=4,
+                data_loader_source_worker_ids=(0, 2),
+            )
+
+        # A new iterator over the persistent worker pool must restart at sample
+        # zero without changing physical MDP ownership or the plan digest.
+        iterator = iter(loader)
+        resumed_adapter = _LateMaterializingAdapter()
+        resumed = MdpIterationWindow.capture(
+            iterator,
+            num_microbatches=len(expected),
+            adapter=resumed_adapter,
+            num_vpp_chunks=1,
+            lane_id=0,
+            pixel_owner_shard=True,
+            my_worker_id=0,
+            num_logical_workers=4,
+            data_loader_source_worker_ids=(0, 2),
+        )
+    finally:
+        _shutdown_dataloader(iterator)
+
+    planner = MdpPlanner(_view(), locality_slack_permille=10, capacity_policy=RowCapacityPolicy())
+    first_plan = planner.build_plan(0, first.descriptors(), expected)
+    resumed_plan = planner.build_plan(0, resumed.descriptors(), expected)
+    return (
+        first_adapter.observed_sample_ids,
+        first_adapter.materialized_sample_ids,
+        tuple((d.global_item_id, d.owner_worker_id) for d in first.descriptors()),
+        first_plan.digest,
+        resumed_adapter.observed_sample_ids,
+        resumed_adapter.materialized_sample_ids,
+        resumed_plan.digest,
+    )
+
+
+def test_persistent_dataloader_prefetch_preserves_order_ownership_and_digest():
+    worker0 = _capture_loader_window(0)
+    worker2 = _capture_loader_window(2)
+    assert worker0 == worker2
+    assert worker0[0] == list(range(8))
+    assert worker0[1] == [0, 2, 4, 6]
+    assert worker0[2] == tuple((item_id, (0, 2)[item_id % 2]) for item_id in range(8))
+    assert worker0[4] == list(range(8))
+    assert worker0[5] == [0, 2, 4, 6]
+    assert worker0[3] == worker0[6]
+
+
+@pytest.mark.parametrize(
+    "my_worker_id, expected_materialized, expected_owner_states",
+    [
+        (0, [0, 2], [True, False, True, False]),
+        (1, [], [False, False, False, False]),
+        (2, [1, 3], [False, True, False, True]),
+        (3, [], [False, False, False, False]),
+    ],
+)
+def test_only_tp0_source_workers_materialize_prefetched_metadata(
+    my_worker_id, expected_materialized, expected_owner_states
+):
+    loader = torch.utils.data.DataLoader(
+        _MetadataOnlyDataset(4), batch_size=1, num_workers=2, persistent_workers=True
+    )
+    iterator = iter(loader)
+    adapter = _LateMaterializingAdapter()
+    try:
+        window = MdpIterationWindow.capture(
+            iterator,
+            num_microbatches=4,
+            adapter=adapter,
+            num_vpp_chunks=1,
+            lane_id=0 if my_worker_id == 0 else None,
+            pixel_owner_shard=True,
+            my_worker_id=my_worker_id,
+            num_logical_workers=4,
+            data_loader_source_worker_ids=(0, 2),
+        )
+    finally:
+        _shutdown_dataloader(iterator)
+
+    assert adapter.observed_sample_ids == [0, 1, 2, 3]
+    assert adapter.materialized_sample_ids == expected_materialized
+    assert adapter.owner_states == expected_owner_states
+    assert len(window.records()) == 4
+    assert mdp_window.pixel_capture_owner_state() is None
 
 
 def _window_microbatches():
@@ -125,7 +289,8 @@ def test_capture_cuts_sidecar_for_owned_microbatches_only(my_worker_id):
         lane_id=0 if my_worker_id == 0 else None,
         pixel_owner_shard=True,
         my_worker_id=my_worker_id,
-        num_workers=4,
+        num_logical_workers=4,
+        data_loader_source_worker_ids=(0, 1, 2, 3),
     )
     # global_item_id assignment order: mb0 -> 0, 1; mb1 -> 2; mb3 -> 3; mb4 -> 4.
     owned_items = {0: {0, 1, 4}, 1: {2}, 2: set(), 3: {3}}[my_worker_id]
@@ -154,7 +319,8 @@ def test_capture_with_fewer_microbatches_than_workers():
         lane_id=None,
         pixel_owner_shard=True,
         my_worker_id=2,
-        num_workers=4,
+        num_logical_workers=4,
+        data_loader_source_worker_ids=(0, 1, 2, 3),
     )
     assert window.payload_sidecar() == {}
     assert len(window.records()) == 2
@@ -170,7 +336,24 @@ def test_capture_rejects_unsuppressed_pixels_on_non_owner():
             lane_id=None,
             pixel_owner_shard=True,
             my_worker_id=1,  # owner of mb0 is worker 0
-            num_workers=4,
+            num_logical_workers=4,
+            data_loader_source_worker_ids=(0, 1, 2, 3),
+        )
+
+
+@pytest.mark.parametrize("source_ids", [(), (0, 0), (2, 0), (0, 4)])
+def test_capture_rejects_invalid_dataloader_source_workers(source_ids):
+    with pytest.raises(MdpConfigurationError, match="data_loader_source_worker_ids"):
+        MdpIterationWindow.capture(
+            iter(()),
+            num_microbatches=0,
+            adapter=_ShardAwareAdapter(()),
+            num_vpp_chunks=1,
+            lane_id=0,
+            pixel_owner_shard=True,
+            my_worker_id=0,
+            num_logical_workers=4,
+            data_loader_source_worker_ids=source_ids,
         )
 
 
@@ -197,6 +380,7 @@ def _options(**overrides):
         tensor_parallel_size=1,
         pipeline_parallel_size=4,
         context_parallel_size=1,
+        sequence_parallel=False,
         expert_parallel_size=1,
         rank_order="tp-cp-ep-dp-pp",
         virtual_pipeline_parallel_size=None,
@@ -225,11 +409,9 @@ def test_pixel_shard_flags_validate():
     validate_mdp_config(
         MdpConfig(enable=True, pixel_owner_shard=True, pixel_locality=True), _options()
     )
-    with pytest.raises(MdpConfigurationError, match="pixel_owner_shard"):
-        validate_mdp_config(
-            MdpConfig(enable=True, pixel_owner_shard=True),
-            _options(tensor_parallel_size=2),
-        )
+    validate_mdp_config(
+        MdpConfig(enable=True, pixel_owner_shard=True), _options(tensor_parallel_size=2)
+    )
     with pytest.raises(MdpConfigurationError, match="pixel_locality"):
         validate_mdp_config(MdpConfig(enable=True, pixel_locality=True), _options())
 
@@ -271,20 +453,16 @@ def _assignment(plan):
     return {r.global_item_id: r.producer_worker_id for r in plan.routes}
 
 
-def test_shard_off_assignment_and_digest_identical_to_baseline():
+def test_owner_changes_digest_without_changing_assignment_or_layout():
     # Baseline: descriptors without explicit owners (default 0 = endpoint worker).
     baseline = [_descriptor(i, cost=10 + (i * 7) % 5, mb=i % 4) for i in range(9)]
-    sharded = [
-        _descriptor(i, cost=10 + (i * 7) % 5, mb=i % 4, owner=(i % 4)) for i in range(9)
-    ]
-    planner = MdpPlanner(
-        _view(), locality_slack_permille=10, capacity_policy=RowCapacityPolicy()
-    )
+    sharded = [_descriptor(i, cost=10 + (i * 7) % 5, mb=i % 4, owner=(i % 4)) for i in range(9)]
+    planner = MdpPlanner(_view(), locality_slack_permille=10, capacity_policy=RowCapacityPolicy())
     plan_a = planner.build_plan(0, baseline, [0, 1, 2, 3])
     plan_b = planner.build_plan(0, sharded, [0, 1, 2, 3])
     # Owner metadata must not perturb LPT when locality is off.
     assert _assignment(plan_a) == _assignment(plan_b)
-    assert plan_a.digest == plan_b.digest
+    assert plan_a.digest != plan_b.digest
     assert plan_a.encoder_layouts == plan_b.encoder_layouts
     assert plan_a.layouts == plan_b.layouts
 
@@ -295,10 +473,7 @@ def test_locality_prefers_owner_only_within_slack():
     # eligible and locality may follow the owner freely.
     equal = [_descriptor(i, cost=100, mb=i, owner=i % 4) for i in range(8)]
     local_planner = MdpPlanner(
-        view,
-        locality_slack_permille=10,
-        capacity_policy=RowCapacityPolicy(),
-        pixel_locality=True,
+        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy(), pixel_locality=True
     )
     plan = local_planner.build_plan(0, equal, list(range(8)))
     assignment = _assignment(plan)
@@ -310,14 +485,9 @@ def test_locality_prefers_owner_only_within_slack():
         _descriptor(i, cost=10, mb=i, owner=1) for i in range(1, 5)
     ]
     strict_local = MdpPlanner(
-        view,
-        locality_slack_permille=0,
-        capacity_policy=RowCapacityPolicy(),
-        pixel_locality=True,
+        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy(), pixel_locality=True
     )
-    strict_base = MdpPlanner(
-        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy()
-    )
+    strict_base = MdpPlanner(view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy())
     plan_local = strict_local.build_plan(0, skewed, list(range(5)))
     plan_base = strict_base.build_plan(0, skewed, list(range(5)))
     local_assignment = _assignment(plan_local)
@@ -356,9 +526,7 @@ GRIDS = ((1, 4, 4), (1, 8, 8), (2, 4, 4), (1, 4, 8), (1, 6, 6), (1, 8, 4), (2, 6
 def _dist_setup(num_items=8, pixel_locality=False):
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=4, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=4, cp=1, ep=1, encoder_cp=1))
     view = rank_map.view(rank)
     num_workers = len(view.worker_ids)
     descriptors = []
@@ -416,6 +584,19 @@ def _owner_local_tensors(view, rank_map, descriptors):
     return local
 
 
+def _a2a_dest_views(ledger, tensor_specs, global_rank):
+    """Allocate the exact caller-owned destinations required by A2A."""
+    destinations = {}
+    for entry in ledger.entries:
+        if entry.dst_global_rank != global_rank:
+            continue
+        spec = tensor_specs[entry.key]
+        rows = entry.element_count // max(1, spec.width)
+        shape = (rows,) if spec.width == 0 else (rows, spec.width)
+        destinations[entry.key] = torch.empty(shape, dtype=spec.dtype, device=spec.device)
+    return destinations
+
+
 @needs_dist
 def test_alltoall_sentinels_and_zero_split_participation():
     from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
@@ -442,6 +623,7 @@ def test_alltoall_sentinels_and_zero_split_participation():
     # proves little for a no-host-sync collective.
     for _ in range(50):
         local = _owner_local_tensors(view, rank_map, descriptors)
+        destinations = _a2a_dest_views(ledger, specs, rank)
         received = bridge.exchange_all_to_all(
             ledger,
             local,
@@ -451,6 +633,7 @@ def test_alltoall_sentinels_and_zero_split_participation():
             global_rank=rank,
             dtype=torch.bfloat16,
             device=torch.device("cuda"),
+            dest_views=destinations,
         )
         assert {k.global_item_id for k in received} == my_items
         for key, tensor in received.items():
@@ -478,18 +661,14 @@ def test_alltoall_sentinels_and_zero_split_participation():
         )
     ]
     planner = MdpPlanner(
-        view,
-        locality_slack_permille=10,
-        capacity_policy=RowCapacityPolicy(),
-        pixel_locality=True,
+        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy(), pixel_locality=True
     )
     single_plan = planner.build_plan(1, single, [0])
     assert _assignment(single_plan) == {0: 0}
     single_specs = _dist_pixel_specs(single_plan, single)
-    single_ledger = bridge.build_ledger(
-        BridgePhase.PIXEL, single_plan, rank_map, single_specs
-    )
+    single_ledger = bridge.build_ledger(BridgePhase.PIXEL, single_plan, rank_map, single_specs)
     local = _owner_local_tensors(view, rank_map, single)
+    destinations = _a2a_dest_views(single_ledger, single_specs, rank)
     received = bridge.exchange_all_to_all(
         single_ledger,
         local,
@@ -499,6 +678,7 @@ def test_alltoall_sentinels_and_zero_split_participation():
         global_rank=rank,
         dtype=torch.bfloat16,
         device=torch.device("cuda"),
+        dest_views=destinations,
     )
     if view.my_worker_id == 0 and rank == view.planning_group_ranks[0]:
         assert {k.global_item_id for k in received} == {0}
@@ -523,6 +703,7 @@ def test_alltoall_sentinels_and_zero_split_participation():
         global_rank=rank,
         dtype=torch.bfloat16,
         device=torch.device("cuda"),
+        dest_views={},
     )
     assert received == {}
     bridge.assert_idle()
@@ -532,13 +713,9 @@ def test_alltoall_sentinels_and_zero_split_participation():
 def test_shard_off_pixel_ledger_is_byte_identical_to_baseline():
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=4, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=4, cp=1, ep=1, encoder_cp=1))
     view = rank_map.view(rank)
-    planner = MdpPlanner(
-        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy()
-    )
+    planner = MdpPlanner(view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy())
     baseline = [
         _descriptor(i, cost=16 + i, mb=i, lane=view.outer_dp_rank) for i in range(4)
     ]  # owner=0 default = endpoint worker
