@@ -31,6 +31,17 @@ Registry entry fields
     Maps ``--dataset-provider`` names to callables (or dotted import paths
     resolved lazily) with signature
     ``(train_val_test_num_samples) -> (train_ds, val_ds, test_ds)``.
+
+``energon_task_encoder_factory``  *(required by the ``energon`` provider)*
+    Lazy callable with signature ``(*, args, energon_api) -> TaskEncoder``.
+
+``energon_image_materializer_factory``  *(required for Energon images)*
+    Lazy callable with signature ``(*, args) -> callable``. The returned
+    callable decodes and patchifies selected descriptors on their pixel owner.
+
+``energon_image_metadata_validator``  *(optional for Energon images)*
+    Lazy callable with signature ``(descriptors, image_grid_thw) -> object``.
+    Validates model-specific image metadata before materializer construction.
 """
 
 from examples.multimodal_dev.models.qwen35_vl.configuration import get_qwen35_vl_vision_config
@@ -48,6 +59,15 @@ MODEL_REGISTRY = {
         "vision_config_fn": get_qwen35_vl_vision_config,
         "post_language_config_fn": _qwen35_vl_post_language_config,
         "vision_flops_fn": _qwen35_vl_vision_flops,
+        "energon_task_encoder_factory": (
+            "examples.multimodal_dev.models.qwen35_vl.energon.build_task_encoder"
+        ),
+        "energon_image_materializer_factory": (
+            "examples.multimodal_dev.models.qwen35_vl.energon.build_image_materializer"
+        ),
+        "energon_image_metadata_validator": (
+            "examples.multimodal_dev.models.qwen35_vl.energon.validate_image_metadata"
+        ),
         "dataset_providers": {
             "mock": (
                 "examples.multimodal_dev.data.mock"
@@ -59,6 +79,10 @@ MODEL_REGISTRY = {
             ),
             "mdp_mock": (
                 "examples.multimodal_dev.data.mdp_mock"
+                ".train_valid_test_datasets_provider"
+            ),
+            "energon": (
+                "examples.multimodal_dev.data.energon.provider"
                 ".train_valid_test_datasets_provider"
             ),
         },
