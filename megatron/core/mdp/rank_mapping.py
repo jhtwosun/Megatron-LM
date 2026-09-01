@@ -41,6 +41,7 @@ class MdpRankView:
     endpoint_rank: int
     planning_group_ranks: tuple
     worker_ids: tuple
+    decoder_endpoint_id: Optional[int] = None
 
 
 class MdpRankMap:
@@ -88,8 +89,12 @@ class MdpRankMap:
         return self._groups
 
     def endpoint_rank(self, outer_dp_rank: int) -> int:
-        """The PP0 endpoint rank of one planning group."""
+        """The canonical PP0/CP0 endpoint rank of one planning group."""
         return self._groups[outer_dp_rank][0]
+
+    def decoder_endpoint_ranks(self, outer_dp_rank: int) -> tuple:
+        """The PP0 ranks, ordered by decoder context-parallel rank."""
+        return self._groups[outer_dp_rank][: self._spec.cp]
 
     def worker_ranks(self, outer_dp_rank: int, worker_id: int) -> tuple:
         """Resolve one logical worker to its physical ranks.
@@ -117,6 +122,7 @@ class MdpRankMap:
         outer_dp_rank, index_in_group = self._rank_to_coord[global_rank]
         group = self._groups[outer_dp_rank]
         endpoint = group[0]
+        decoder_endpoint_id = index_in_group if index_in_group < self._spec.cp else None
         return MdpRankView(
             global_rank=global_rank,
             outer_dp_rank=outer_dp_rank,
@@ -125,6 +131,7 @@ class MdpRankMap:
             endpoint_rank=endpoint,
             planning_group_ranks=group,
             worker_ids=tuple(range(self.num_workers_per_group)),
+            decoder_endpoint_id=decoder_endpoint_id,
         )
 
 

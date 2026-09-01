@@ -36,8 +36,11 @@ class BridgePhase(Enum):
 
 @dataclass(frozen=True)
 class BridgeBufferKey:
-    """Identifies one transported buffer. ``slice_id`` is always 0 in v1 and
-    distinguishes multiple slices of one item once decoder CP lands."""
+    """Identifies one transported buffer.
+
+    ``slice_id`` is zero for pixels and identifies the decoder CP endpoint for
+    embeddings and gradients.
+    """
 
     global_item_id: int
     slice_id: int = 0
@@ -136,9 +139,7 @@ class ModalityBridge:
                     "not implemented in this version."
                 )
             producer_rank = producer_ranks[0]
-            if phase is BridgePhase.EMBEDDING:
-                src, dst = producer_rank, route.endpoint_rank
-            elif phase is BridgePhase.PIXEL:
+            if phase is BridgePhase.PIXEL:
                 owner_ranks = rank_map.worker_ranks(
                     plan.outer_dp_rank, route.owner_worker_id
                 )
@@ -149,29 +150,44 @@ class ModalityBridge:
                         "expansion is not implemented in this version."
                     )
                 owner_rank = owner_ranks[0]
-                src, dst = owner_rank, producer_rank
-            else:  # GRADIENT flows owner endpoint -> producer
-                src, dst = route.endpoint_rank, producer_rank
-            key = BridgeBufferKey(global_item_id=route.global_item_id)
-            spec = tensor_specs.get(key)
-            if spec is None:
-                raise MdpBridgeError(
-                    f"MDP: key {key} violates: every routed item has a tensor spec."
+                transfers = (
+                    (
+                        owner_rank,
+                        producer_rank,
+                        BridgeBufferKey(global_item_id=route.global_item_id),
+                    ),
                 )
-            element_count = spec.valid_rows * max(1, spec.width)
-            if element_count == 0:
-                continue  # empty edges are omitted
-            entries.append(
-                BridgeLedgerEntry(
-                    phase=phase,
-                    src_global_rank=src,
-                    dst_global_rank=dst,
-                    dtype=spec.dtype,
-                    element_count=element_count,
-                    plan_offset=0,  # assigned below in canonical order
-                    key=key,
+            else:
+                transfers = []
+                for endpoint_id, endpoint_rank in enumerate(
+                    rank_map.decoder_endpoint_ranks(plan.outer_dp_rank)
+                ):
+                    if phase is BridgePhase.EMBEDDING:
+                        src, dst = producer_rank, endpoint_rank
+                    else:  # GRADIENT reverses each decoder endpoint edge.
+                        src, dst = endpoint_rank, producer_rank
+                    transfers.append((src, dst, BridgeBufferKey(route.global_item_id, endpoint_id)))
+
+            for src, dst, key in transfers:
+                spec = tensor_specs.get(key)
+                if spec is None:
+                    raise MdpBridgeError(
+                        f"MDP: key {key} violates: every routed item has a tensor spec."
+                    )
+                element_count = spec.valid_rows * max(1, spec.width)
+                if element_count == 0:
+                    continue  # empty edges are omitted
+                entries.append(
+                    BridgeLedgerEntry(
+                        phase=phase,
+                        src_global_rank=src,
+                        dst_global_rank=dst,
+                        dtype=spec.dtype,
+                        element_count=element_count,
+                        plan_offset=0,  # assigned below in canonical order
+                        key=key,
+                    )
                 )
-            )
 
         entries.sort(key=_entry_sort_key)
         # Assign each entry its element offset inside the coalesced (src, dst)

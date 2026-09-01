@@ -205,7 +205,8 @@ def test_pixel_embedding_gradient_share_one_transport():
     assert stats["pixel"].elapsed_ms >= 0.0
 
 
-def test_empty_member_performs_noop_exchange():
+@pytest.mark.parametrize("phase", tuple(BridgePhase))
+def test_empty_member_performs_noop_exchange(phase):
     rank_map, view, plan, descriptors = _setup()
     bridge = ModalityBridge(DirectBufferAllocator())
     groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
@@ -215,7 +216,7 @@ def test_empty_member_performs_noop_exchange():
         view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy()
     )
     empty_plan = empty_planner.build_plan(1, [], [0])
-    ledger = bridge.build_ledger(BridgePhase.PIXEL, empty_plan, rank_map, {})
+    ledger = bridge.build_ledger(phase, empty_plan, rank_map, {})
     assert ledger.entries == ()
     received = bridge.exchange_all_to_all(
         ledger,
@@ -229,3 +230,58 @@ def test_empty_member_performs_noop_exchange():
     )
     assert received == {}
     bridge.assert_idle()
+
+
+def test_decoder_cp2_duplicates_embeddings_but_not_pixels():
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=4, tp=1, pp=2, cp=2, ep=1, encoder_cp=1)
+    )
+    view = rank_map.view(0)
+    descriptor = _make_descriptor(0, 16, view.outer_dp_rank)
+    plan = MdpPlanner(
+        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy()
+    ).build_plan(0, (descriptor,), (0,))
+    bridge = ModalityBridge(DirectBufferAllocator())
+    device = torch.device("cuda")
+    pixel_specs = {
+        BridgeBufferKey(0): BridgeTensorSpec(
+            descriptor.payload_rows,
+            descriptor.payload_rows,
+            WIDTH,
+            torch.float32,
+            device,
+        )
+    }
+    io_specs = {
+        BridgeBufferKey(0, endpoint_id): BridgeTensorSpec(
+            descriptor.output_rows,
+            descriptor.output_rows,
+            WIDTH,
+            torch.float32,
+            device,
+        )
+        for endpoint_id in range(2)
+    }
+
+    pixel = bridge.build_ledger(BridgePhase.PIXEL, plan, rank_map, pixel_specs)
+    embedding = bridge.build_ledger(BridgePhase.EMBEDDING, plan, rank_map, io_specs)
+    gradient = bridge.build_ledger(BridgePhase.GRADIENT, plan, rank_map, io_specs)
+    producer_rank = rank_map.worker_ranks(
+        plan.outer_dp_rank, plan.routes[0].producer_worker_id
+    )[0]
+
+    assert tuple((entry.src_global_rank, entry.dst_global_rank) for entry in pixel.entries) == (
+        (view.endpoint_rank, producer_rank),
+    )
+    assert tuple(
+        (entry.src_global_rank, entry.dst_global_rank, entry.key) for entry in embedding.entries
+    ) == (
+        (producer_rank, 0, BridgeBufferKey(0, 0)),
+        (producer_rank, 1, BridgeBufferKey(0, 1)),
+    )
+    assert tuple(
+        (entry.src_global_rank, entry.dst_global_rank, entry.key) for entry in gradient.entries
+    ) == (
+        (0, producer_rank, BridgeBufferKey(0, 0)),
+        (1, producer_rank, BridgeBufferKey(0, 1)),
+    )

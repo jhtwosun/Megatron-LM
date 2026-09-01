@@ -53,6 +53,15 @@ def test_valid_configuration_passes():
     validate_mdp_config(MdpConfig(enable=True), _options())
 
 
+def test_decoder_cp2_configuration_passes():
+    validate_mdp_config(MdpConfig(enable=True), _options(context_parallel_size=2))
+
+
+def test_decoder_cp_must_be_positive():
+    with pytest.raises(MdpConfigurationError, match="context_parallel_size"):
+        validate_mdp_config(MdpConfig(enable=True), _options(context_parallel_size=0))
+
+
 def test_decoder_ep_overlap_configuration_passes_with_vpp():
     validate_mdp_config(
         MdpConfig(enable=True),
@@ -140,7 +149,6 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
     [
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),
         (dict(tensor_parallel_size=2), "tensor_parallel_size"),
-        (dict(context_parallel_size=2), "context_parallel_size"),
         (dict(world_size=6, pipeline_parallel_size=4), "world_size"),
         (dict(calculate_per_token_loss=False), "calculate_per_token_loss"),
         (dict(use_distributed_optimizer=False), "use_distributed_optimizer"),

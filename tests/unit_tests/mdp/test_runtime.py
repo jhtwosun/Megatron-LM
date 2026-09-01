@@ -133,11 +133,11 @@ class _StubAdapter:
         return torch.cat(pieces) if pieces else payload[:0]
 
 
-def _build_runtime():
+def _build_runtime(*, decoder_cp=1, allocator=None):
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
     rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
+        MdpRankSpec(world_size=world, tp=1, pp=2, cp=decoder_cp, ep=1, encoder_cp=1)
     )
     view = rank_map.view(rank)
     groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
@@ -165,7 +165,7 @@ def _build_runtime():
         encoder_pgs=encoder_pgs,
         wrap_mixed_precision=False,
     )
-    allocator = DirectBufferAllocator()
+    allocator = allocator or DirectBufferAllocator()
     config = MdpConfig(enable=True)
     runtime = MdpRuntime(
         config=config,
@@ -193,7 +193,7 @@ def _drive_decoder(runtime, view, replay_iters, *, backward):
     """Consume the replay iterator like the native schedule would."""
     records = [next(replay_iters[0]) for _ in range(2)]
     assert [r.model_payload["microbatch"] for r in records] == [0, 1]
-    if view.lane_id is not None:
+    if view.decoder_endpoint_id is not None:
         leaf = runtime.storage.get_leaf(0)
         assert leaf is not None
         assert runtime.storage.get_leaf(1) is None  # text-only
