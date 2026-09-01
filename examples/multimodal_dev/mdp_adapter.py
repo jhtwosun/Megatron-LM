@@ -24,16 +24,23 @@ from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisi
 from megatron.core.mdp.dynamic_cp import GlobalSampleId, GlobalVisionItemId
 from megatron.core.mdp.dynamic_cp_execution import (
     DECODER_EXECUTION_SCHEMA_VERSION,
+    DecoderGlobalManifest,
+    DecoderMicrobatchKey,
     DecoderPayloadHeaderV1,
     DecoderPayloadPacket,
     DecoderSourceWindow,
     DecoderTensorFieldSpec,
     DecoderVisionItemMetadata,
     finalize_decoder_source_window,
+    validate_decoder_global_manifest,
     validate_decoder_payload_packet,
     validate_decoder_source_window,
 )
-from megatron.core.mdp.dynamic_cp_plan import DecoderSampleMetadata, EncoderVisionItemMetadata
+from megatron.core.mdp.dynamic_cp_plan import (
+    DecoderCpAssignment,
+    DecoderSampleMetadata,
+    EncoderVisionItemMetadata,
+)
 from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError
 from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
 from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
@@ -433,6 +440,244 @@ class MultimodalDecoderPayloadCodec:
         validate_decoder_source_window(window)
         self._validate_packet_collection(window.packets)
         return window
+
+    def validate_packet(self, packet: DecoderPayloadPacket) -> None:
+        """Validate one destination packet against the fixed Qwen decoder schema."""
+        validate_decoder_payload_packet(packet)
+        tensor_names = tuple(spec.name for spec in packet.field_specs)
+        supported_none_fields = (*_DECODER_ROUTED_FIELD_ORDER[-1:], "attention_mask")
+        if any(name not in supported_none_fields for name in packet.none_fields):
+            raise MdpConfigurationError(
+                "MDP: decoder payload packet None fields use the supported optional schema."
+            )
+        canonical_none_fields = tuple(
+            name for name in supported_none_fields if name in packet.none_fields
+        )
+        if packet.none_fields != canonical_none_fields:
+            raise MdpConfigurationError(
+                "MDP: decoder payload packet optional None fields use canonical order."
+            )
+        expected_tensor_names = tuple(
+            name for name in _DECODER_ROUTED_FIELD_ORDER if name not in packet.none_fields
+        )
+        if tensor_names != expected_tensor_names:
+            raise MdpConfigurationError(
+                "MDP: decoder payload packet tensor fields use the fixed routed-field order."
+            )
+        for spec in packet.field_specs:
+            tensor = packet.tensor_fields[spec.name]
+            if spec.name in _DECODER_REQUIRED_TENSOR_FIELDS and (
+                tensor.ndim != 2 or tensor.shape[0] != 1
+            ):
+                raise MdpConfigurationError(
+                    f"MDP: decoder packet field {spec.name} has Qwen THD shape [1, T]."
+                )
+            if spec.name == "position_ids" and not (
+                (tensor.ndim == 2 and tensor.shape[0] == 1)
+                or (tensor.ndim == 3 and tuple(tensor.shape[:2]) == (3, 1))
+            ):
+                raise MdpConfigurationError(
+                    "MDP: decoder packet position_ids has Qwen THD shape [1, T] or [3, 1, T]."
+                )
+
+    @classmethod
+    def _validate_assignment(cls, assignment: Any) -> DecoderCpAssignment:
+        if not isinstance(assignment, DecoderCpAssignment):
+            raise MdpPlanError("MDP: decoder rebuild requires a DecoderCpAssignment.")
+        if not isinstance(assignment.sample_ids, tuple) or not assignment.sample_ids:
+            raise MdpPlanError("MDP: decoder assignment names an immutable non-empty sample tuple.")
+        if any(not isinstance(sample_id, GlobalSampleId) for sample_id in assignment.sample_ids):
+            raise MdpPlanError("MDP: decoder assignment sample IDs use GlobalSampleId.")
+        if len(set(assignment.sample_ids)) != len(assignment.sample_ids):
+            raise MdpPlanError("MDP: decoder assignment sample IDs are unique.")
+        if not isinstance(assignment.endpoint_ranks, tuple) or not assignment.endpoint_ranks:
+            raise MdpPlanError("MDP: decoder assignment has immutable non-empty endpoint ranks.")
+        try:
+            endpoint_ranks = tuple(
+                cls._require_nonnegative_integer(
+                    f"decoder assignment endpoint_ranks[{index}]", rank
+                )
+                for index, rank in enumerate(assignment.endpoint_ranks)
+            )
+        except MdpConfigurationError as error:
+            raise MdpPlanError(
+                "MDP: decoder assignment endpoint ranks are non-negative integers."
+            ) from error
+        if len(set(endpoint_ranks)) != len(endpoint_ranks):
+            raise MdpPlanError("MDP: decoder assignment endpoint ranks are unique.")
+        return assignment
+
+    def _select_rebuild_inputs(
+        self, global_manifest: DecoderGlobalManifest, assignment: DecoderCpAssignment, packets: Any
+    ) -> tuple[
+        tuple[DecoderSampleMetadata, ...],
+        tuple[DecoderVisionItemMetadata, ...],
+        tuple[DecoderPayloadPacket, ...],
+    ]:
+        validate_decoder_global_manifest(global_manifest)
+        assignment = self._validate_assignment(assignment)
+        if not isinstance(packets, tuple):
+            raise MdpConfigurationError(
+                "MDP: global decoder manifest rebuild requires an ordered packet tuple."
+            )
+        if any(not isinstance(packet, DecoderPayloadPacket) for packet in packets):
+            raise MdpConfigurationError("MDP: global decoder rebuild uses typed packet members.")
+        packet_ids = tuple(packet.sample_id for packet in packets)
+        if packet_ids != assignment.sample_ids:
+            raise MdpPlanError(
+                "MDP: decoder destination packets match the exact assignment sample order."
+            )
+        for packet in packets:
+            self.validate_packet(packet)
+        self._validate_packet_collection(packets)
+
+        sample_by_id = {sample.sample_id: sample for sample in global_manifest.samples}
+        payload_by_id = {payload.sample_id: payload for payload in global_manifest.payloads}
+        try:
+            selected_samples = tuple(sample_by_id[sample_id] for sample_id in assignment.sample_ids)
+            expected_payloads = tuple(
+                payload_by_id[sample_id] for sample_id in assignment.sample_ids
+            )
+        except KeyError as error:
+            raise MdpPlanError(
+                "MDP: decoder assignment names a sample in the global manifest."
+            ) from error
+        if tuple(packet.metadata() for packet in packets) != expected_payloads:
+            raise MdpPlanError(
+                "MDP: decoder packets exactly match global manifest payload metadata."
+            )
+        return selected_samples, global_manifest.items, packets
+
+    @staticmethod
+    def _cumulative_lengths(lengths: Sequence[int]) -> tuple[int, ...]:
+        values = [0]
+        for length in lengths:
+            values.append(values[-1] + length)
+        return tuple(values)
+
+    def rebuild_microbatch(
+        self,
+        global_manifest: DecoderGlobalManifest,
+        assignment: DecoderCpAssignment,
+        *,
+        packets: tuple[DecoderPayloadPacket, ...],
+        key: DecoderMicrobatchKey,
+        cp_group: Any,
+        cp_partition_mode: str,
+    ) -> MdpMicrobatchRecord:
+        """Rebuild one destination assignment in physical THD sample order."""
+        if not isinstance(key, DecoderMicrobatchKey):
+            raise MdpConfigurationError("MDP: decoder rebuild key is a DecoderMicrobatchKey.")
+        if cp_partition_mode not in ("zigzag", "contiguous"):
+            raise MdpConfigurationError(
+                "MDP: decoder rebuild CP partition mode is zigzag or contiguous."
+            )
+        selected_samples, catalog_items, selected_packets = self._select_rebuild_inputs(
+            global_manifest, assignment, packets
+        )
+        try:
+            group_size = getattr(cp_group, "size", None)
+        except Exception as error:
+            raise MdpConfigurationError("MDP: decoder rebuild CP group query failed.") from error
+        if not callable(group_size):
+            raise MdpConfigurationError("MDP: decoder rebuild CP group exposes a callable size.")
+        try:
+            actual_group_size = group_size()
+        except Exception as error:
+            raise MdpConfigurationError("MDP: decoder rebuild CP group query failed.") from error
+        if (
+            not isinstance(actual_group_size, int)
+            or isinstance(actual_group_size, bool)
+            or actual_group_size != assignment.local_cp_size
+        ):
+            raise MdpConfigurationError(
+                "MDP: decoder rebuild CP group size matches the assignment endpoints."
+            )
+
+        tensor_names = tuple(spec.name for spec in selected_packets[0].field_specs)
+        none_fields = selected_packets[0].none_fields
+        rebuilt_payload = {}
+        try:
+            for name in _DECODER_ROUTED_FIELD_ORDER:
+                if name in tensor_names:
+                    rebuilt_payload[name] = torch.cat(
+                        tuple(packet.tensor_fields[name] for packet in selected_packets), dim=-1
+                    )
+                elif name in none_fields:
+                    rebuilt_payload[name] = None
+        except Exception as error:
+            raise MdpConfigurationError(
+                "MDP: decoder destination packet tensors concatenate on physical T."
+            ) from error
+        if "attention_mask" in none_fields:
+            rebuilt_payload["attention_mask"] = None
+
+        item_by_id = {item.item_id: item for item in catalog_items}
+        vision_records = []
+        grids = []
+        padded_start = 0
+        for destination_sample, sample in enumerate(selected_samples):
+            for encoder_item in sample.vision_items:
+                try:
+                    item = item_by_id[encoder_item.item_id]
+                except KeyError as error:
+                    raise MdpPlanError(
+                        "MDP: decoder rebuild manifest contains every assigned vision item."
+                    ) from error
+                if item.sample_id != sample.sample_id:
+                    raise MdpPlanError(
+                        "MDP: decoder rebuild vision item remains attached to its source sample."
+                    )
+                vision_records.append(
+                    MdpMicrobatchVisionRecord(
+                        global_item_id=item.item_id,
+                        sample_id=destination_sample,
+                        image_ordinal=item.image_ordinal,
+                        grid_thw=item.grid_thw,
+                        output_rows=item.output_rows,
+                        decoder_positions=tuple(
+                            padded_start + offset for offset in item.decoder_offsets
+                        ),
+                    )
+                )
+                grids.append(item.grid_thw)
+            padded_start += sample.padded_seqlen
+
+        rebuilt_payload["image_grid_thw"] = (
+            torch.tensor(grids, dtype=torch.int64, device="cpu")
+            if grids
+            else torch.empty((0, 3), dtype=torch.int64, device="cpu")
+        )
+        valid_cu_values = self._cumulative_lengths(
+            tuple(sample.valid_seqlen for sample in selected_samples)
+        )
+        padded_cu_values = self._cumulative_lengths(
+            tuple(sample.padded_seqlen for sample in selected_samples)
+        )
+        metadata_device = selected_packets[0].tensor_fields[tensor_names[0]].device
+        valid_cu = torch.tensor(valid_cu_values, dtype=torch.int32, device=metadata_device)
+        padded_cu = torch.tensor(padded_cu_values, dtype=torch.int32, device=metadata_device)
+        max_padded_seqlen = max(sample.padded_seqlen for sample in selected_samples)
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=valid_cu,
+            cu_seqlens_kv=valid_cu.clone(),
+            cu_seqlens_q_padded=padded_cu,
+            cu_seqlens_kv_padded=padded_cu.clone(),
+            max_seqlen_q=max_padded_seqlen,
+            max_seqlen_kv=max_padded_seqlen,
+            local_cp_size=assignment.local_cp_size,
+            cp_group=cp_group,
+            total_tokens=padded_cu_values[-1],
+            cp_partition_mode=cp_partition_mode,
+        )
+        return MdpMicrobatchRecord(
+            microbatch_id=key.microbatch_index,
+            text_only=not vision_records,
+            vision_items=tuple(vision_records),
+            decoder_packed_seq_params=packed,
+            model_payload=MappingProxyType(rebuilt_payload),
+        )
 
 
 class Qwen35VLMdpAdapter:
