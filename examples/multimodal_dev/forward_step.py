@@ -10,14 +10,23 @@ from typing import Any, Dict, Iterator
 import torch
 import torch.nn.functional as F
 
+from examples.multimodal_dev.mdp_batch import (
+    apply_mdp_prepartition,
+    broadcast_data_batch_from_rank,
+    fetch_and_broadcast,
+)
 from megatron.core import mpu
+from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
+    get_context_parallel_rank,
     get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
 )
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
+from megatron.core.utils import get_thd_batch_on_this_cp_rank
 from megatron.training import get_args
 
 # -------------------------------------------------------------------
@@ -49,15 +58,16 @@ def _id_to_dtype(id_val):
 
 def _broadcast_tensor(tensor, src, group, device):
     """Broadcast a single tensor from *src* to all ranks in *group*."""
-    ndim = torch.tensor(
-        [len(tensor.shape) if tensor is not None else 0],
+    encoded_ndim = torch.tensor(
+        [tensor.dim() + 1 if tensor is not None else 0],
         dtype=torch.long,
         device=device,
     )
-    torch.distributed.broadcast(ndim, src, group=group)
+    torch.distributed.broadcast(encoded_ndim, src, group=group)
 
-    if ndim.item() == 0:
+    if encoded_ndim.item() == 0:
         return None
+    ndim = int(encoded_ndim.item()) - 1
 
     if tensor is not None:
         shape_tensor = torch.tensor(
@@ -70,7 +80,7 @@ def _broadcast_tensor(tensor, src, group, device):
         )
     else:
         shape_tensor = torch.zeros(
-            ndim.item(), dtype=torch.long, device=device,
+            ndim, dtype=torch.long, device=device,
         )
         dtype_id = torch.zeros(1, dtype=torch.long, device=device)
 
@@ -189,6 +199,77 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
+def _prepare_prepacked_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize an Energon-packed dict and restore ``PackedSeqParams``."""
+    cu_seqlens = batch.pop("cu_seqlens")
+    cu_seqlens_padded = batch.pop("cu_seqlens_padded")
+    max_seqlen = batch.pop("max_seqlen")
+    if cu_seqlens.dim() == 2:
+        if cu_seqlens.shape[0] != 1:
+            raise ValueError("packed Energon batches require micro-batch-size 1")
+        cu_seqlens = cu_seqlens[0]
+    if cu_seqlens_padded.dim() == 2:
+        if cu_seqlens_padded.shape[0] != 1:
+            raise ValueError("packed Energon batches require micro-batch-size 1")
+        cu_seqlens_padded = cu_seqlens_padded[0]
+    if cu_seqlens.dim() != 1 or cu_seqlens_padded.dim() != 1:
+        raise ValueError("packed sequence boundaries must be one-dimensional")
+
+    for key in ("input_ids", "labels", "loss_mask"):
+        tensor = batch.get(key)
+        if tensor is not None and tensor.dim() == 1:
+            batch[key] = tensor.unsqueeze(0)
+    position_ids = batch.get("position_ids")
+    if position_ids is not None and position_ids.dim() == 2:
+        batch["position_ids"] = position_ids.unsqueeze(1)
+
+    sequence_length = int(batch["input_ids"].shape[-1])
+    if int(cu_seqlens_padded[-1].item()) != sequence_length:
+        raise ValueError(
+            "packed sequence boundary does not match input length: "
+            f"boundary={int(cu_seqlens_padded[-1].item())}, "
+            f"input={sequence_length}"
+        )
+    max_seqlen_value = int(max_seqlen.reshape(-1)[0].item())
+    logical_cu_seqlens = cu_seqlens.to(dtype=torch.int32)
+    physical_cu_seqlens = cu_seqlens_padded.to(dtype=torch.int32)
+    batch["packed_seq_params"] = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical_cu_seqlens,
+        cu_seqlens_kv=logical_cu_seqlens,
+        cu_seqlens_q_padded=physical_cu_seqlens,
+        cu_seqlens_kv_padded=physical_cu_seqlens,
+        max_seqlen_q=max_seqlen_value,
+        max_seqlen_kv=max_seqlen_value,
+        total_tokens=sequence_length,
+    )
+    return batch
+
+
+def _mdp_prepartition_kwargs(batch):
+    """Collect loader-side LPT metadata for ``apply_mdp_prepartition``."""
+    return {
+        "prepartitioned_assignment": batch.get("_mdp_prepartitioned_assignment"),
+        "prepartitioned_row_counts": batch.get("_mdp_prepartitioned_row_counts"),
+        "prepartitioned_image_grid_thw": batch.get(
+            "_mdp_prepartitioned_image_grid_thw"
+        ),
+    }
+
+
+def _get_mdp_prepartitioned_batch(data_iterator):
+    """Fetch the b436 loader-prepartitioned THD batch for CP-local MDP."""
+    batch = fetch_and_broadcast(data_iterator)
+    if batch is None:
+        return None
+    if "input_ids" not in batch and batch.get("tokens") is not None:
+        batch["input_ids"] = batch["tokens"]
+    batch.pop("local_cp_size", None)
+
+    # Keep one THD normalization owner. PR #2's helper preserves logical q/kv
+    # boundaries while using physical padded boundaries for residual-stream
+    # shape; the MDP path must not reconstruct either view independently.
+    return _prepare_prepacked_batch(batch)
 
 
 def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=False, seq_length: int=None, device = "cuda") -> list[Dict[str, Any]]:
@@ -284,6 +365,58 @@ def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=Fal
         return padded_batch
 
 
+def _shard_qwen3_packed_batch_for_cp(batch, cp_size, cp_rank):
+    """Apply MCore's canonical data-side THD shard for plain Qwen3 GPT.
+
+    Vision tensors are not sequence-aligned and must not be passed to
+    ``get_thd_batch_on_this_cp_rank``.  Position IDs use the same THD
+    partition indices but may have an extra MRoPE channel dimension, so
+    they are indexed separately along their last dimension.
+    """
+    packed_seq_params = batch["packed_seq_params"]
+    cu_seqlens = packed_seq_params.cu_seqlens_q
+    cu_seqlens_padded = packed_seq_params.cu_seqlens_q_padded
+    max_seqlen = torch.tensor(
+        [packed_seq_params.max_seqlen_q],
+        dtype=torch.int32,
+        device=cu_seqlens.device,
+    )
+
+    sequence_batch = {"tokens": batch["input_ids"]}
+    for key in ("labels", "loss_mask", "attention_mask"):
+        if batch.get(key) is not None:
+            sequence_batch[key] = batch[key]
+
+    sequence_batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
+        sequence_batch,
+        cu_seqlens,
+        cu_seqlens_padded,
+        max_seqlen,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+    )
+
+    sharded_batch = dict(batch)
+    sharded_batch["input_ids"] = sequence_batch.pop("tokens")
+    sharded_batch.update(sequence_batch)
+    sharded_batch["packed_seq_params"] = packed_seq_params
+
+    position_ids = batch.get("position_ids")
+    if position_ids is not None:
+        indices = get_thd_partitioned_indices(
+            cu_seqlens_padded,
+            int(cu_seqlens_padded[-1].item()),
+            cp_size,
+            cp_rank,
+        ).long()
+        sharded_batch["position_ids"] = position_ids.index_select(-1, indices)
+
+    # ``forward_step`` uses this marker to avoid sharding the loss mask a
+    # second time after the plain GPT model returns its already-local output.
+    sharded_batch["_data_side_cp_sharded"] = True
+    return sharded_batch
+
+
 # -------------------------------------------------------------------
 # get_batch
 # -------------------------------------------------------------------
@@ -292,6 +425,15 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
+
+    if (
+        bool(getattr(args, "mdp_encoder_mode", True))
+        and (
+            get_context_parallel_world_size() > 1
+            or getattr(args, "mdp_inner_dp_scope", "cp") == "pp_cp"
+        )
+    ):
+        return _get_mdp_prepartitioned_batch(data_iterator)
 
     if get_tensor_model_parallel_rank() == 0:
         try:
@@ -315,8 +457,24 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     if has_data.item() == 0:
         return None
 
-    # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
-    batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
+    if get_tensor_model_parallel_rank() == 0:
+        prepacked = torch.tensor(
+            [int(isinstance(data, dict) and "cu_seqlens" in data)],
+            dtype=torch.uint8,
+            device=device,
+        )
+    else:
+        prepacked = torch.empty(1, dtype=torch.uint8, device=device)
+    torch.distributed.broadcast(prepacked, src, group=group)
+
+    if prepacked.item():
+        batch = _prepare_prepacked_batch(
+            broadcast_data_batch(data, device=device)
+        )
+    else:
+        batch = pack_or_pad_batch(
+            data, args.use_packed_sequence, args.seq_length, device=device
+        )
 
     # Fix shapes produced by default_collate.
     if "position_ids" in batch and batch["position_ids"] is not None:
@@ -337,6 +495,18 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
         g = batch["image_grid_thw"]
         if g.dim() == 3:
             batch["image_grid_thw"] = g.squeeze(1)
+
+    cp_size = get_context_parallel_world_size()
+    if (
+        getattr(args, "model_arch", None) == "qwen3"
+        and batch.get("packed_seq_params") is not None
+        and cp_size > 1
+    ):
+        batch = _shard_qwen3_packed_batch_for_cp(
+            batch,
+            cp_size=cp_size,
+            cp_rank=get_context_parallel_rank(),
+        )
 
     return batch
 
@@ -363,14 +533,214 @@ def loss_func(loss_mask, output_tensor):
 # Forward step
 # -------------------------------------------------------------------
 
-def forward_step(data_iterator, model):
-    """Forward step for multimodal_dev training."""
+def _wrapped_model_method(model, name):
+    while model is not None:
+        method = getattr(model, name, None)
+        if method is not None:
+            return method
+        model = getattr(model, "module", None)
+    return None
+
+
+def _wrapped_model_attr(model, name, default=None):
+    while model is not None:
+        if hasattr(model, name):
+            return getattr(model, name)
+        model = getattr(model, "module", None)
+    return default
+
+
+def _pack_sidecar_packed_seq_params(batch):
+    """Replace ``PackedSeqParams`` with tensors safe for PP broadcast."""
+    packed = dict(batch)
+    packed_seq_params = packed.pop("packed_seq_params", None)
+    if packed_seq_params is None:
+        return packed
+
+    cu_seqlens_q = packed_seq_params.cu_seqlens_q
+    device = cu_seqlens_q.device
+    total_tokens = getattr(packed_seq_params, "total_tokens", None)
+    if total_tokens is None:
+        physical_boundaries = packed_seq_params.cu_seqlens_q_padded
+        if physical_boundaries is None:
+            physical_boundaries = cu_seqlens_q
+        total_tokens = int(physical_boundaries[-1].item())
+    packed.update(
+        {
+            "_pp_cp_sidecar_cu_seqlens_q": cu_seqlens_q,
+            "_pp_cp_sidecar_cu_seqlens_kv": packed_seq_params.cu_seqlens_kv,
+            "_pp_cp_sidecar_cu_seqlens_q_padded": (
+                packed_seq_params.cu_seqlens_q_padded
+            ),
+            "_pp_cp_sidecar_cu_seqlens_kv_padded": (
+                packed_seq_params.cu_seqlens_kv_padded
+            ),
+            "_pp_cp_sidecar_max_seqlen_q": torch.tensor(
+                [int(packed_seq_params.max_seqlen_q)],
+                dtype=torch.int64,
+                device=device,
+            ),
+            "_pp_cp_sidecar_max_seqlen_kv": torch.tensor(
+                [int(packed_seq_params.max_seqlen_kv)],
+                dtype=torch.int64,
+                device=device,
+            ),
+            "_pp_cp_sidecar_total_tokens": torch.tensor(
+                [int(total_tokens)],
+                dtype=torch.int64,
+                device=device,
+            ),
+        }
+    )
+    return packed
+
+
+def _unpack_sidecar_packed_seq_params(batch):
+    """Restore ``PackedSeqParams`` after the PP metadata broadcast."""
+    unpacked = dict(batch)
+    cu_seqlens_q = unpacked.pop("_pp_cp_sidecar_cu_seqlens_q", None)
+    if cu_seqlens_q is None:
+        return unpacked
+    cu_seqlens_kv = unpacked.pop("_pp_cp_sidecar_cu_seqlens_kv", None)
+    cu_seqlens_q_padded = unpacked.pop(
+        "_pp_cp_sidecar_cu_seqlens_q_padded", None
+    )
+    cu_seqlens_kv_padded = unpacked.pop(
+        "_pp_cp_sidecar_cu_seqlens_kv_padded", None
+    )
+    max_seqlen_q = unpacked.pop("_pp_cp_sidecar_max_seqlen_q")
+    max_seqlen_kv = unpacked.pop("_pp_cp_sidecar_max_seqlen_kv")
+    total_tokens = unpacked.pop("_pp_cp_sidecar_total_tokens")
+    unpacked["packed_seq_params"] = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=(
+            cu_seqlens_q if cu_seqlens_kv is None else cu_seqlens_kv
+        ),
+        cu_seqlens_q_padded=(
+            cu_seqlens_q
+            if cu_seqlens_q_padded is None
+            else cu_seqlens_q_padded
+        ),
+        cu_seqlens_kv_padded=(
+            cu_seqlens_q
+            if cu_seqlens_kv_padded is None
+            else cu_seqlens_kv_padded
+        ),
+        max_seqlen_q=int(max_seqlen_q.reshape(-1)[0].item()),
+        max_seqlen_kv=int(max_seqlen_kv.reshape(-1)[0].item()),
+        total_tokens=int(total_tokens.reshape(-1)[0].item()),
+    )
+    return unpacked
+
+
+def _drop_sidecar_vision_payload(batch):
+    """Remove PP0-owned vision tensors while retaining language metadata."""
+    trimmed = dict(batch)
+    for key in (
+        "pixel_values",
+        "_balancedata_image_grid_thw_rows",
+        "_mdp_prepartitioned_image_grid_thw",
+        "_mdp_prepartitioned_assignment",
+        "_mdp_prepartitioned_row_counts",
+        "_mdp_prepartitioned_local_raw_counts",
+        "_mdp_image_descriptors",
+        "_mdp_image_descriptors_json",
+    ):
+        trimmed.pop(key, None)
+    return trimmed
+
+
+def _stage_forward_view_from_full_batch(batch, vp_stage=None, config=None):
+    """Return only the batch fields consumed by this pipeline stage."""
+    if mpu.is_pipeline_first_stage(
+        ignore_virtual=False, vp_stage=vp_stage
+    ) or mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
+        return batch
+    if config is not None and mtp_on_this_rank(
+        config, ignore_virtual=False, vp_stage=vp_stage
+    ):
+        return batch
+    return {
+        key: batch[key]
+        for key in ("position_ids", "attention_mask", "packed_seq_params")
+        if batch.get(key) is not None
+    }
+
+
+def _build_pp_batch_sidecar_cache(
+    *, data_iterator, model, vp_stage=None, forward_only=False
+):
+    """Broadcast one MDP-off packed batch from PP0 before pipeline P2P."""
+    config = _wrapped_model_attr(model, "config")
+    pp_group = mpu.get_pipeline_model_parallel_group()
+    pp_src = mpu.get_pipeline_model_parallel_first_rank()
+    is_pp_first = mpu.is_pipeline_first_stage(
+        ignore_virtual=False, vp_stage=vp_stage
+    )
+
+    if is_pp_first:
+        if data_iterator is None:
+            raise RuntimeError(
+                "MDP-off PP batch sidecar requires a data iterator on PP0"
+            )
+        batch = get_batch(data_iterator)
+        if batch is None:
+            raise RuntimeError(
+                "MDP-off PP batch sidecar received no batch on PP0"
+            )
+        broadcast_batch = _drop_sidecar_vision_payload(
+            _pack_sidecar_packed_seq_params(batch)
+        )
+    else:
+        batch = None
+        broadcast_batch = None
+
+    received_batch = broadcast_data_batch_from_rank(
+        broadcast_batch,
+        src=pp_src,
+        group=pp_group,
+        device="cuda",
+    )
+    if not is_pp_first:
+        batch = _unpack_sidecar_packed_seq_params(received_batch)
+
+    forward_batch = dict(
+        _stage_forward_view_from_full_batch(batch, vp_stage, config=config)
+    )
+    forward_batch["_mdp_pp_cp_sidecar_applied"] = True
+    return {
+        "batch": forward_batch,
+        "vision_embeddings": None,
+        "forward_only": bool(forward_only),
+    }
+
+
+def build_mdp_pp_cp_sidecar_cache(
+    *,
+    data_iterator,
+    model,
+    vp_stage=None,
+    forward_only=False,
+):
+    """Consume and encode one loader-prepartitioned PP x CP microbatch."""
+    if bool(_wrapped_model_attr(model, "_pp_cp_batch_sidecar", False)):
+        return _build_pp_batch_sidecar_cache(
+            data_iterator=data_iterator,
+            model=model,
+            vp_stage=vp_stage,
+            forward_only=forward_only,
+        )
+
     batch = get_batch(data_iterator)
-
     if batch is None:
-        return None, None
+        raise RuntimeError(
+            "PP x CP vision sidecar received no batch before pipeline forward"
+        )
 
-    pixel_values = batch.get("pixel_values", None)
+    pixel_values = batch.get("pixel_values")
+    global_image_grid_thw = batch.get("image_grid_thw")
+    image_grid_thw = global_image_grid_thw
     if (
         pixel_values is not None
         and pixel_values.is_floating_point()
@@ -378,20 +748,187 @@ def forward_step(data_iterator, model):
     ):
         pixel_values = pixel_values.bfloat16()
 
-    # We don't provide position_ids, now. Let model handle it itself.
-    output_tensor = model(
-        input_ids=batch["input_ids"],
+    pixel_values, image_grid_thw = apply_mdp_prepartition(
+        model=model,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        image_grid_thw_rows=batch.get("_balancedata_image_grid_thw_rows"),
+        prepartitioned_assignment=batch.get("_mdp_prepartitioned_assignment"),
+        prepartitioned_row_counts=batch.get("_mdp_prepartitioned_row_counts"),
+        prepartitioned_image_grid_thw=batch.get(
+            "_mdp_prepartitioned_image_grid_thw"
+        ),
+    )
+    compute_vision = _wrapped_model_method(
+        model, "mdp_pp_cp_sidecar_compute_vision"
+    )
+    if compute_vision is None:
+        raise RuntimeError(
+            "PP x CP vision sidecar requires mdp_pp_cp_sidecar_compute_vision"
+        )
+    context = torch.no_grad() if forward_only else torch.enable_grad()
+    with context:
+        vision_embeddings = compute_vision(
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            mdp_cp_local_plan=batch.get("_mdp_cp_local_plan"),
+        )
+
+    forward_batch = dict(batch)
+    forward_batch["pixel_values"] = None
+    # The owner-local grid is only a vision-encoder input. The language
+    # forward retains the global grid for MRoPE/position-id fallback.
+    forward_batch["image_grid_thw"] = global_image_grid_thw
+    forward_batch["_mdp_pp_cp_sidecar_applied"] = True
+    return {
+        "batch": forward_batch,
+        "vision_embeddings": vision_embeddings,
+        "forward_only": bool(forward_only),
+    }
+
+
+def build_mdp_pp_cp_sidecar_cache_window(
+    *,
+    data_iterator,
+    model,
+    vp_stage=None,
+    count: int,
+    max_sequence_length: int,
+    forward_only=False,
+):
+    """Consume an ordered loader-planned window and build fused vision caches."""
+    if bool(_wrapped_model_attr(model, "_pp_cp_batch_sidecar", False)):
+        return [
+            _build_pp_batch_sidecar_cache(
+                data_iterator=data_iterator,
+                model=model,
+                vp_stage=vp_stage,
+                forward_only=forward_only,
+            )
+            for _ in range(int(count))
+        ]
+
+    del vp_stage
+    from examples.multimodal_dev.fused_vision_window import (
+        build_fused_vision_caches,
+    )
+
+    batches = []
+    for _ in range(int(count)):
+        batch = get_batch(data_iterator)
+        if batch is None:
+            raise RuntimeError(
+                "MDP fused vision sidecar received no batch before pipeline forward"
+            )
+        if (
+            batch.get("_mdp_image_descriptors") is not None
+            or batch.get("_mdp_image_descriptors_json") is not None
+        ):
+            raise RuntimeError(
+                "MDP fused vision requires loader-side owner planning and "
+                "descriptor materialization before the schedule sidecar"
+            )
+        batches.append(batch)
+
+    args = get_args()
+    return build_fused_vision_caches(
+        model,
+        batches,
+        max_sequence_length=int(max_sequence_length),
+        backward_mode=str(
+            getattr(args, "mdp_fused_vision_backward", "recompute")
+        ),
+        forward_only=bool(forward_only),
+    )
+
+
+def _pop_mdp_pp_cp_sidecar_cache(model):
+    pop_cache = _wrapped_model_method(model, "mdp_pp_cp_sidecar_pop_cache")
+    if pop_cache is None:
+        return None
+    cache = pop_cache()
+    if cache is None:
+        return None
+    activate_cache = _wrapped_model_method(
+        model, "mdp_pp_cp_sidecar_activate_cache"
+    )
+    if activate_cache is None:
+        raise RuntimeError(
+            "PP x CP vision sidecar cache requires an activation callback"
+        )
+    activate_cache(cache)
+    return cache
+
+
+def forward_step(data_iterator, model, return_schedule_plan=False):
+    """Forward step for multimodal_dev training."""
+    args = get_args()
+    sidecar_cache = _pop_mdp_pp_cp_sidecar_cache(model)
+    batch = (
+        sidecar_cache["batch"]
+        if sidecar_cache is not None
+        else get_batch(data_iterator)
+    )
+
+    if batch is None:
+        return None, None
+
+    pixel_values = batch.get("pixel_values", None)
+    image_grid_thw = batch.get("image_grid_thw", None)
+    if (
+        pixel_values is not None
+        and pixel_values.is_floating_point()
+        and pixel_values.dtype == torch.float32
+    ):
+        pixel_values = pixel_values.bfloat16()
+
+    if (
+        bool(getattr(args, "mdp_encoder_mode", True))
+        and not bool(batch.get("_mdp_pp_cp_sidecar_applied", False))
+    ):
+        pixel_values, image_grid_thw = apply_mdp_prepartition(
+            model=model,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            image_grid_thw_rows=batch.get("_balancedata_image_grid_thw_rows"),
+            **_mdp_prepartition_kwargs(batch),
+        )
+
+    model_kwargs = dict(
+        input_ids=batch.get("input_ids"),
         position_ids=batch.get("position_ids"),
         attention_mask=batch.get("attention_mask", None),
         labels=batch.get("labels", None),
         loss_mask=batch.get("loss_mask", None),
         pixel_values=pixel_values,
-        image_grid_thw=batch.get("image_grid_thw", None),
+        image_grid_thw=image_grid_thw,
         packed_seq_params=batch.get("packed_seq_params", None),
+        mdp_cp_local_plan=batch.get("_mdp_cp_local_plan"),
     )
+    if return_schedule_plan:
+        args = get_args()
+        if not args.overlap_moe_expert_parallel_comm:
+            raise RuntimeError(
+                "overlap_moe_expert_parallel_comm must be enabled "
+                "to return the schedule plan"
+            )
+        if (
+            getattr(args, "model_arch", None) in {"qwen35_vl", "qwen3vl"}
+            and model_kwargs["packed_seq_params"] is not None
+            and get_context_parallel_world_size() > 1
+        ):
+            raise RuntimeError(
+                "Qwen VL packed THD with context parallelism does not "
+                "support overlap_moe_expert_parallel_comm: deferred MRoPE "
+                "execution cannot use the regular forward CP override"
+            )
+        output_tensor = model.build_schedule_plan(**model_kwargs)
+    else:
+        # We don't provide position_ids, now. Let model handle it itself.
+        output_tensor = model(**model_kwargs)
 
     loss_mask = batch.get("loss_mask", None)
-    if loss_mask is None:
+    if loss_mask is None and batch.get("input_ids") is not None:
         loss_mask = torch.ones_like(
             batch["input_ids"], dtype=torch.float,
         )
@@ -401,9 +938,11 @@ def forward_step(data_iterator, model):
     # THD: use the same TE-based per-sample partition index as the model.
     # BSHD: use the matching zigzag split.
     cp_size = get_context_parallel_world_size()
-    if cp_size > 1:
-        from megatron.core.parallel_state import get_context_parallel_rank
-
+    if (
+        cp_size > 1
+        and loss_mask is not None
+        and not batch.get("_data_side_cp_sharded", False)
+    ):
         from examples.multimodal_dev.models.base import (
             _cp_split_tensor,
             _thd_cp_partition_index,
