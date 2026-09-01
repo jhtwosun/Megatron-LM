@@ -10,10 +10,12 @@ The pure record round-trip tests also pass single-process.
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from megatron.core.mdp.encoder import build_encoder_pg_collection
 from megatron.core.mdp.errors import MdpBridgeError
 from megatron.core.mdp.groups import (
     MdpGroupRegistry,
@@ -48,6 +50,53 @@ def test_record_round_trip_is_lossless():
         _descriptor(1, mb=1, sample=3, ordinal=2, cost=123, grid=(1, 4, 4)),
     )
     assert records_to_descriptors(descriptors_to_records(descriptors)) == descriptors
+
+
+def test_group_creation_order_and_encoder_cp_leader_are_canonical(monkeypatch):
+    calls = []
+
+    def _new_group(*, ranks):
+        group = object()
+        calls.append((tuple(ranks), group))
+        return group
+
+    world_group = object()
+    fake_dist = SimpleNamespace(
+        group=SimpleNamespace(WORLD=world_group),
+        get_rank=lambda: 0,
+        new_group=_new_group,
+    )
+    monkeypatch.setattr("megatron.core.mdp.groups.dist", fake_dist)
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=4, tp=1, pp=2, cp=2, ep=1, encoder_cp=2)
+    )
+    registry = MdpGroupRegistry()
+
+    groups = install_mdp_process_groups(rank_map, group_registry=registry)
+
+    assert registry.created_keys() == (
+        ("singleton", 0),
+        ("singleton", 1),
+        ("singleton", 2),
+        ("singleton", 3),
+        ("planning", 0),
+        ("encoder_cp", 0, 0),
+        ("encoder_cp", 0, 1),
+        ("world_alias",),
+    )
+    assert [ranks for ranks, _ in calls] == [
+        (0,),
+        (1,),
+        (2,),
+        (3,),
+        (0, 1, 2, 3),
+        (0, 1),
+        (2, 3),
+    ]
+    assert groups.encoder_cp_group_ranks == (0, 1)
+    assert groups.encoder_cp_leader_rank == 0
+    assert groups.singleton_group is calls[0][1]
+    registry.assert_no_leak()
 
 
 _DISTRIBUTED = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -87,6 +136,88 @@ def test_install_process_groups_and_registry_dedup():
     assert registry.created_keys() == first_keys
     assert groups_again.planning_group is groups.planning_group
     registry.assert_no_leak()
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) != 4,
+    reason="needs world4 for ECP1/ECP2/ECP4",
+)
+@pytest.mark.parametrize("encoder_cp", (1, 2, 4))
+def test_encoder_cp_groups_and_pg_collection(encoder_cp):
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=4, tp=1, pp=2, cp=2, ep=1, encoder_cp=encoder_cp)
+    )
+    registry = MdpGroupRegistry()
+    groups = install_mdp_process_groups(rank_map, group_registry=registry)
+    view = rank_map.view(torch.distributed.get_rank())
+    expected_ranks = rank_map.worker_ranks(view.outer_dp_rank, view.my_worker_id)
+    encoder_pgs = build_encoder_pg_collection(
+        rank_map, encoder_cp=encoder_cp, process_groups=groups
+    )
+
+    assert groups.encoder_cp_group_ranks == expected_ranks
+    assert groups.encoder_cp_leader_rank == expected_ranks[0]
+    assert (
+        tuple(torch.distributed.get_process_group_ranks(groups.encoder_cp_group))
+        == expected_ranks
+    )
+    assert encoder_pgs.cp is groups.encoder_cp_group
+    assert encoder_pgs.dp is torch.distributed.group.WORLD
+    assert encoder_pgs.dp_cp is torch.distributed.group.WORLD
+    assert encoder_pgs.intra_dp_cp is torch.distributed.group.WORLD
+    assert encoder_pgs.intra_dist_opt is torch.distributed.group.WORLD
+    assert encoder_pgs.tp is groups.singleton_group
+    assert encoder_pgs.pp is groups.singleton_group
+    assert encoder_pgs.ep is groups.singleton_group
+    assert encoder_pgs.expt_dp is groups.singleton_group
+    if encoder_cp == 1:
+        assert groups.encoder_cp_group is groups.singleton_group
+    registry.assert_no_leak()
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) != 4,
+    reason="needs world4 for native TP2 with independent ECP/DCP",
+)
+@pytest.mark.parametrize(("decoder_cp", "encoder_cp"), ((1, 2), (1, 4), (2, 2), (2, 4)))
+def test_tp2_uses_native_tp_group_with_independent_encoder_cp(decoder_cp, encoder_cp):
+    rank = torch.distributed.get_rank()
+    local_tp_group = None
+    for tp_ranks in ((0, 1), (2, 3)):
+        group = torch.distributed.new_group(ranks=list(tp_ranks))
+        if rank in tp_ranks:
+            local_tp_group = group
+    assert local_tp_group is not None
+
+    pp = 2 if decoder_cp == 1 else 1
+    rank_map = build_rank_map(
+        MdpRankSpec(
+            world_size=4,
+            tp=2,
+            pp=pp,
+            cp=decoder_cp,
+            ep=1,
+            encoder_cp=encoder_cp,
+        )
+    )
+    groups = install_mdp_process_groups(
+        rank_map,
+        group_registry=MdpGroupRegistry(),
+        decoder_pg_collection=SimpleNamespace(tp=local_tp_group),
+    )
+    view = rank_map.view(rank)
+    encoder_pgs = build_encoder_pg_collection(
+        rank_map, encoder_cp=encoder_cp, process_groups=groups
+    )
+
+    assert groups.decoder_tp_group is local_tp_group
+    assert tuple(torch.distributed.get_process_group_ranks(groups.decoder_tp_group)) == (
+        rank_map.tp_group_ranks(rank)
+    )
+    assert tuple(torch.distributed.get_process_group_ranks(encoder_pgs.cp)) == (
+        rank_map.worker_ranks(view.outer_dp_rank, view.my_worker_id)
+    )
+    assert encoder_pgs.tp.size() == 1
 
 
 @pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")

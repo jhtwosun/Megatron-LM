@@ -9,7 +9,12 @@ import torch
 
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
-from megatron.core.mdp.window import MdpIterationWindow
+from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
+from megatron.core.mdp.window import (
+    MdpIterationWindow,
+    pixel_capture_owner_state,
+    pixel_capture_suppressed,
+)
 
 MERGE = 2
 
@@ -60,6 +65,27 @@ class _StubAdapter:
 
     def estimate_cost(self, item):
         return item.payload_rows
+
+
+class _OwnershipAdapter(_StubAdapter):
+    """Mirror collate: retain metadata but materialize pixels only for the owner."""
+
+    def __init__(self, microbatches):
+        super().__init__(microbatches)
+        self.capture_states = []
+
+    def get_batch(self, iterator):
+        captured = super().get_batch(iterator)
+        suppressed = pixel_capture_suppressed()
+        self.capture_states.append((suppressed, pixel_capture_owner_state()))
+        if not suppressed:
+            return captured
+        return CapturedMicrobatch(
+            decoder_packed_seq_params=captured.decoder_packed_seq_params,
+            vision_items=captured.vision_items,
+            flat_pixel_payload=None,
+            model_payload=captured.model_payload,
+        )
 
 
 def _default_microbatches():
@@ -113,6 +139,84 @@ def test_non_endpoint_member_holds_records_and_owned_pixels():
     assert window.descriptors() == ()
     assert set(window.payload_sidecar()) == {0, 1, 2}
     assert len(window.records()) == 2
+
+
+@pytest.mark.parametrize(
+    ("global_rank", "is_worker_leader", "expected_state", "expected_sidecar"),
+    (
+        (0, True, (False, True), {0, 1, 2}),
+        (1, False, (True, False), set()),
+        (2, True, (True, False), set()),
+    ),
+    ids=("owner-leader", "owner-follower", "non-owner-leader"),
+)
+def test_encoder_cp_pixel_capture_is_worker_leader_only(
+    global_rank, is_worker_leader, expected_state, expected_sidecar
+):
+    """TP2/ECP2: only the selected logical worker's leader decodes pixels."""
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=4, tp=2, pp=2, cp=1, ep=1, encoder_cp=2)
+    )
+    view = rank_map.view(global_rank)
+    adapter = _OwnershipAdapter(_default_microbatches()[:1])
+
+    window = MdpIterationWindow.capture(
+        iter(range(10)),
+        num_microbatches=1,
+        adapter=adapter,
+        num_vpp_chunks=1,
+        lane_id=view.lane_id,
+        my_worker_id=view.my_worker_id,
+        num_workers=len(view.worker_ids),
+        data_loader_source_worker_ids=rank_map.data_loader_source_worker_ids(0),
+        is_worker_leader=is_worker_leader,
+    )
+
+    assert adapter.capture_states == [expected_state]
+    assert set(window.payload_sidecar()) == expected_sidecar
+
+
+def test_tp2_ecp3_misalignment_never_selects_a_tp1_worker_leader():
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=6, tp=2, pp=3, cp=1, ep=1, encoder_cp=3)
+    )
+    source_worker_ids = rank_map.data_loader_source_worker_ids(0)
+    assert source_worker_ids == (0,)
+
+    observations = []
+    for global_rank in (0, 2, 3, 4):
+        view = rank_map.view(global_rank)
+        is_worker_leader = global_rank == rank_map.worker_leader_rank(
+            view.outer_dp_rank, view.my_worker_id
+        )
+        adapter = _OwnershipAdapter(_default_microbatches()[:1])
+        window = MdpIterationWindow.capture(
+            iter(range(10)),
+            num_microbatches=1,
+            adapter=adapter,
+            num_vpp_chunks=1,
+            lane_id=view.lane_id,
+            my_worker_id=view.my_worker_id,
+            num_workers=len(view.worker_ids),
+            data_loader_source_worker_ids=source_worker_ids,
+            is_worker_leader=is_worker_leader,
+        )
+        observations.append(
+            (
+                global_rank,
+                view.my_worker_id,
+                is_worker_leader,
+                adapter.capture_states[0],
+                set(window.payload_sidecar()),
+            )
+        )
+
+    assert observations == [
+        (0, 0, True, (False, True), {0, 1, 2}),
+        (2, 0, False, (True, False), set()),
+        (3, 1, True, (True, False), set()),
+        (4, 1, False, (True, False), set()),
+    ]
 
 
 def test_vpp_replay_contract():

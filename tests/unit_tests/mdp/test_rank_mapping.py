@@ -142,6 +142,30 @@ def test_worker_ranks_is_the_single_resolution_point():
         rank_map.worker_ranks(0, 2)
 
 
+@pytest.mark.parametrize("encoder_cp", (1, 2, 4))
+def test_worker_leader_is_the_first_physical_rank(encoder_cp):
+    rank_map = build_rank_map(
+        _spec(world_size=8, pp=2, cp=2, encoder_cp=encoder_cp)
+    )
+    for outer_dp_rank in range(len(rank_map.planning_groups())):
+        for worker_id in range(rank_map.num_workers_per_group):
+            assert rank_map.worker_leader_rank(outer_dp_rank, worker_id) == (
+                rank_map.worker_ranks(outer_dp_rank, worker_id)[0]
+            )
+
+
+def test_tp2_ecp3_data_source_requires_the_worker_leader_to_be_tp0():
+    rank_map = build_rank_map(
+        _spec(world_size=6, tp=2, pp=3, cp=1, encoder_cp=3)
+    )
+
+    assert rank_map.worker_ranks(0, 0) == (0, 1, 2)
+    assert rank_map.worker_ranks(0, 1) == (3, 4, 5)
+    assert rank_map.tp_group_ranks(3) == (2, 3)
+    assert rank_map.tp_group_ranks(4) == (4, 5)
+    assert rank_map.data_loader_source_worker_ids(0) == (0,)
+
+
 def test_extension_hook_encoder_cp2():
     # encoder_cp=2 over CP=2, PP=2: 4 workers' ranks collapse to 2 logical
     # workers of 2 ranks each; assignment-visible worker ids are unchanged
@@ -165,6 +189,46 @@ def test_extension_hook_encoder_cp2():
             assert view.worker_ids == (0, 1)
             assert rank in rank_map.worker_ranks(outer_dp_rank, view.my_worker_id)
     assert seen == set(range(16))
+
+
+@pytest.mark.parametrize(
+    ("tp", "pp", "decoder_cp", "encoder_cp"),
+    [
+        (1, 1, 1, 1),
+        (1, 2, 1, 2),
+        (1, 1, 2, 2),
+        (1, 2, 2, 4),
+        (2, 1, 1, 2),
+        (2, 1, 2, 4),
+        (2, 2, 1, 4),
+        (2, 3, 1, 3),
+        (2, 3, 1, 6),
+    ],
+)
+def test_independent_encoder_decoder_cp_topology_matrix(tp, pp, decoder_cp, encoder_cp):
+    world_size = tp * pp * decoder_cp
+    rank_map = build_rank_map(
+        _spec(
+            world_size=world_size,
+            tp=tp,
+            pp=pp,
+            cp=decoder_cp,
+            encoder_cp=encoder_cp,
+        )
+    )
+
+    assert rank_map.spec.cp == decoder_cp
+    assert rank_map.spec.encoder_cp == encoder_cp
+    for outer_dp_rank, planning_group in enumerate(rank_map.planning_groups()):
+        workers = tuple(
+            rank_map.worker_ranks(outer_dp_rank, worker_id)
+            for worker_id in range(rank_map.num_workers_per_group)
+        )
+        assert all(len(worker) == encoder_cp for worker in workers)
+        assert tuple(rank for worker in workers for rank in worker) == planning_group
+        assert tuple(worker[0] for worker in workers) == tuple(
+            planning_group[index] for index in range(0, len(planning_group), encoder_cp)
+        )
 
 
 def test_local_view_has_no_global_lists():

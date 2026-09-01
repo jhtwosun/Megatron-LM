@@ -44,10 +44,17 @@ def _nvtx(name: str):
 
 from examples.multimodal_dev.models.qwen35_vl.vision_pos_cache import GridCache
 from examples.multimodal_dev.observability import backward_range_begin, backward_range_end
+from megatron.core.fusions.fused_mrope import mrope_freqs_to_rotary_emb
+from megatron.core.mdp.encoder_cp import (
+    build_encoder_cp_plan,
+    partition_encoder_cp_inputs,
+    restore_encoder_cp_output,
+)
 from megatron.core.models.common.vision_module.vision_module import (
     VisionModule,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -219,6 +226,8 @@ class Qwen35VLPatchMerger(MegatronModule):
         hidden_size: Per-token hidden size from the ViT.
         out_hidden_size: Output dimension (language model hidden_size).
         spatial_merge_size: Merge factor per spatial dimension.
+        tp_group: Optional explicit tensor-parallel group. MDP passes its
+            encoder singleton; the native path keeps the default group.
     """
 
     def __init__(
@@ -227,6 +236,7 @@ class Qwen35VLPatchMerger(MegatronModule):
         hidden_size: int = 1152,
         out_hidden_size: int = 3584,
         spatial_merge_size: int = 2,
+        tp_group=None,
     ):
         super().__init__(config=config)
         self.spatial_merge_size = spatial_merge_size
@@ -242,6 +252,7 @@ class Qwen35VLPatchMerger(MegatronModule):
             init_method=config.init_method,
             bias=True,
             gather_output=False,
+            tp_group=tp_group,
         )
         self.linear_fc2 = build_module(
             RowParallelLinear,
@@ -252,6 +263,7 @@ class Qwen35VLPatchMerger(MegatronModule):
             bias=True,
             input_is_parallel=True,
             skip_bias_add=False,
+            tp_group=tp_group,
         )
 
     def forward(self, hidden_states: Tensor) -> Tensor:
@@ -293,6 +305,8 @@ class Qwen35VLVisionEncoder(VisionModule):
     Args:
         config: Vision ``TransformerConfig``.
         transformer_layer_spec: ``ModuleSpec`` for ViT layers.
+        encoder_context_parallel: Whether to partition the packed vision rows.
+        pg_collection: Explicit encoder groups; MDP passes this even at ECP1.
         in_channels: Image channels (3 for RGB).
         patch_size: Spatial patch size.
         temporal_patch_size: Temporal patch size.
@@ -305,6 +319,8 @@ class Qwen35VLVisionEncoder(VisionModule):
         self,
         config: TransformerConfig,
         transformer_layer_spec: ModuleSpec = None,
+        encoder_context_parallel: bool = False,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         in_channels: int = 3,
         patch_size: int = 16,
         temporal_patch_size: int = 2,
@@ -313,6 +329,29 @@ class Qwen35VLVisionEncoder(VisionModule):
         max_num_positions: int = 2304,
     ):
         super().__init__(config=config)
+
+        if encoder_context_parallel:
+            encoder_cp_group = (
+                None if pg_collection is None else getattr(pg_collection, "cp", None)
+            )
+            if encoder_cp_group is None:
+                raise ValueError(
+                    "Qwen3.5-VL encoder context parallelism requires pg_collection.cp"
+                )
+            configured_cp_size = int(config.context_parallel_size)
+            if (
+                configured_cp_size <= 1
+                or int(encoder_cp_group.size()) != configured_cp_size
+            ):
+                raise ValueError(
+                    "Qwen3.5-VL encoder pg_collection.cp must match a "
+                    "config.context_parallel_size greater than one"
+                )
+            self._encoder_cp_size = configured_cp_size
+            self._encoder_cp_group = encoder_cp_group
+        else:
+            self._encoder_cp_size = 1
+            self._encoder_cp_group = None
 
         self.hidden_size = config.hidden_size
         self.spatial_merge_size = spatial_merge_size
@@ -340,10 +379,18 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         # --- Transformer blocks ---
         if transformer_layer_spec is None:
-            from examples.multimodal_dev.models.qwen35_vl.specs import (
-                get_qwen35_vl_vision_spec,
-            )
-            transformer_layer_spec = get_qwen35_vl_vision_spec()
+            if self._encoder_cp_size > 1:
+                from examples.multimodal_dev.models.qwen35_vl.specs import (
+                    get_qwen35_vl_encoder_cp_vision_spec,
+                )
+
+                transformer_layer_spec = get_qwen35_vl_encoder_cp_vision_spec()
+            else:
+                from examples.multimodal_dev.models.qwen35_vl.specs import (
+                    get_qwen35_vl_vision_spec,
+                )
+
+                transformer_layer_spec = get_qwen35_vl_vision_spec()
 
         self.decoder = TransformerBlock(
             config=config,
@@ -351,6 +398,7 @@ class Qwen35VLVisionEncoder(VisionModule):
             pre_process=True,
             post_process=True,
             post_layer_norm=False,
+            pg_collection=pg_collection,
         )
 
         # --- Patch merger ---
@@ -359,6 +407,9 @@ class Qwen35VLVisionEncoder(VisionModule):
             hidden_size=config.hidden_size,
             out_hidden_size=out_hidden_size,
             spatial_merge_size=spatial_merge_size,
+            tp_group=(
+                None if pg_collection is None else getattr(pg_collection, "tp", None)
+            ),
         )
 
         # Grid-keyed cache of position indices/weights, merge permutations,
@@ -700,6 +751,42 @@ class Qwen35VLVisionEncoder(VisionModule):
         # 4. Transformer blocks with PackedSeqParams
         with _nvtx("build_packed_seq_params"):
             packed_seq_params = self._build_packed_seq_params(grid_thw)
+        encoder_cp_plan = None
+        if self._encoder_cp_size > 1:
+            original_cu_q = packed_seq_params.cu_seqlens_q
+            original_cu_kv = packed_seq_params.cu_seqlens_kv
+            if original_cu_q.device != hidden_states.device:
+                raise ValueError(
+                    "encoder cu_seqlens_q and hidden states must share a device"
+                )
+            if original_cu_kv.device != hidden_states.device:
+                raise ValueError(
+                    "encoder cu_seqlens_kv and hidden states must share a device"
+                )
+            if rot_freqs.device != hidden_states.device:
+                raise ValueError("encoder RoPE and hidden states must share a device")
+            if getattr(self.config, "mrope_section", None) is not None:
+                rot_freqs = mrope_freqs_to_rotary_emb(
+                    rot_freqs,
+                    self.config.mrope_section,
+                    interleaved_mrope=self.config.mrope_interleaved,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                )
+            encoder_cp_plan = build_encoder_cp_plan(
+                original_cu_q, self._encoder_cp_group
+            )
+            hidden_states, rot_freqs = partition_encoder_cp_inputs(
+                hidden_states, rot_freqs, encoder_cp_plan
+            )
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=encoder_cp_plan.cu_seqlens,
+                cu_seqlens_kv=encoder_cp_plan.cu_seqlens,
+                cu_seqlens_q_padded=encoder_cp_plan.cu_seqlens_padded,
+                cu_seqlens_kv_padded=encoder_cp_plan.cu_seqlens_padded,
+                max_seqlen_q=encoder_cp_plan.max_seqlen,
+                max_seqlen_kv=encoder_cp_plan.max_seqlen,
+            )
         with _nvtx("transformer_blocks"):
             hidden_states = hidden_states.unsqueeze(1)
             hidden_states = self.decoder(
@@ -709,6 +796,10 @@ class Qwen35VLVisionEncoder(VisionModule):
                 packed_seq_params=packed_seq_params,
             )
             hidden_states = hidden_states.squeeze(1)
+        if encoder_cp_plan is not None:
+            hidden_states = restore_encoder_cp_output(
+                hidden_states, encoder_cp_plan, self._encoder_cp_group
+            )
 
         # 5. Patch merger
         with _nvtx("patch_merger"):

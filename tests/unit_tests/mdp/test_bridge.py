@@ -285,3 +285,55 @@ def test_decoder_cp2_duplicates_embeddings_but_not_pixels():
         (0, producer_rank, BridgeBufferKey(0, 0)),
         (1, producer_rank, BridgeBufferKey(0, 1)),
     )
+
+
+def test_encoder_cp_keeps_public_bridge_edges_leader_only():
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=4, tp=1, pp=2, cp=2, ep=1, encoder_cp=2)
+    )
+    view = rank_map.view(0)
+    descriptor = _make_descriptor(0, 16, view.outer_dp_rank)
+    plan = MdpPlanner(
+        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy()
+    ).build_plan(0, (descriptor,), (0,))
+    route = plan.routes[0]
+    producer_leader = rank_map.worker_ranks(
+        plan.outer_dp_rank, route.producer_worker_id
+    )[0]
+    owner_leader = rank_map.worker_ranks(plan.outer_dp_rank, route.owner_worker_id)[0]
+    endpoints = rank_map.decoder_endpoint_ranks(plan.outer_dp_rank)
+    bridge = ModalityBridge(DirectBufferAllocator())
+    device = torch.device("cuda")
+    pixel_specs = {
+        BridgeBufferKey(0): BridgeTensorSpec(
+            descriptor.payload_rows,
+            descriptor.payload_rows,
+            WIDTH,
+            torch.float32,
+            device,
+        )
+    }
+    io_specs = {
+        BridgeBufferKey(0, endpoint_id): BridgeTensorSpec(
+            descriptor.output_rows,
+            descriptor.output_rows,
+            WIDTH,
+            torch.float32,
+            device,
+        )
+        for endpoint_id in range(len(endpoints))
+    }
+
+    pixel = bridge.build_ledger(BridgePhase.PIXEL, plan, rank_map, pixel_specs)
+    embedding = bridge.build_ledger(BridgePhase.EMBEDDING, plan, rank_map, io_specs)
+    gradient = bridge.build_ledger(BridgePhase.GRADIENT, plan, rank_map, io_specs)
+
+    assert tuple((entry.src_global_rank, entry.dst_global_rank) for entry in pixel.entries) == (
+        (owner_leader, producer_leader),
+    )
+    assert tuple(
+        (entry.src_global_rank, entry.dst_global_rank) for entry in embedding.entries
+    ) == tuple((producer_leader, endpoint) for endpoint in endpoints)
+    assert tuple(
+        (entry.src_global_rank, entry.dst_global_rank) for entry in gradient.entries
+    ) == tuple((endpoint, producer_leader) for endpoint in endpoints)

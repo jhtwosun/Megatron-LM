@@ -15,7 +15,10 @@ from typing import Iterator, Optional
 import torch
 
 from examples.multimodal_dev.models.qwen35_vl.configuration import VISION_KWARGS
-from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
+from examples.multimodal_dev.models.qwen35_vl.specs import (
+    get_qwen35_vl_encoder_cp_vision_spec,
+    get_qwen35_vl_vision_spec,
+)
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
 from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
 
@@ -119,11 +122,17 @@ class Qwen35VLMdpAdapter:
 
     def build_encoder(self, model_config, *, pg_collection) -> torch.nn.Module:
         """Same factory as the non-MDP path (models/qwen35_vl/model.py)."""
-        del pg_collection  # the encoder has no model parallelism in v1
         kwargs = self._vision_kwargs
+        encoder_cp = model_config.context_parallel_size > 1
         return Qwen35VLVisionEncoder(
             config=model_config,
-            transformer_layer_spec=get_qwen35_vl_vision_spec(),
+            transformer_layer_spec=(
+                get_qwen35_vl_encoder_cp_vision_spec()
+                if encoder_cp
+                else get_qwen35_vl_vision_spec()
+            ),
+            encoder_context_parallel=encoder_cp,
+            pg_collection=pg_collection,
             in_channels=kwargs["in_channels"],
             patch_size=kwargs["patch_size"],
             temporal_patch_size=kwargs["temporal_patch_size"],

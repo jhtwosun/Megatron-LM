@@ -27,6 +27,10 @@ class MdpProcessGroups:
     """The process groups one rank participates in."""
 
     planning_group: dist.ProcessGroup
+    encoder_cp_group: dist.ProcessGroup
+    encoder_cp_group_ranks: tuple
+    encoder_cp_leader_rank: int
+    singleton_group: dist.ProcessGroup
     encoder_reduction_group: dist.ProcessGroup
     world_group: dist.ProcessGroup
     decoder_tp_group: Optional[dist.ProcessGroup] = None
@@ -70,7 +74,7 @@ class MdpGroupRegistry:
     def assert_no_leak(self) -> None:
         """Every created key must be a planning group or a registered alias."""
         for key in self._groups:
-            if key[0] not in ("planning", "world_alias"):
+            if key[0] not in ("planning", "encoder_cp", "singleton", "world_alias"):
                 raise MdpConfigurationError(
                     f"MDP: group registry violates: no unexpected groups (found {key})."
                 )
@@ -84,15 +88,11 @@ def install_mdp_process_groups(
 ) -> MdpProcessGroups:
     """Install MDP process groups; every rank creates groups in the same order.
 
-    One planning group per outer-DP group, in ascending ``outer_dp_rank`` order.
-    With ``encoder_cp=1`` the encoder reduction group aliases WORLD; no duplicate
-    same-sized group is created.
+    Every WORLD rank creates all singleton groups, then all planning groups,
+    then all logical-worker encoder-CP groups in the same canonical order.
+    Encoder-CP size one aliases the corresponding singleton. Encoder gradient
+    reduction and optimizer sharding continue to alias WORLD.
     """
-    if rank_map.spec.encoder_cp != 1:
-        raise MdpConfigurationError(
-            f"MDP: encoder_cp={rank_map.spec.encoder_cp} violates: encoder_cp == 1. "
-            "Encoder-CP group construction requires revalidating DDP/ZeRO semantics."
-        )
     world = dist.group.WORLD
     my_rank = dist.get_rank()
     decoder_tp_group = (
@@ -111,21 +111,59 @@ def install_mdp_process_groups(
                 f"MDP: native decoder TP group ranks {actual_tp_ranks} violate: "
                 f"RankGenerator TP ranks {expected_tp_ranks}."
             )
+
+    singleton_groups = {}
+    my_singleton_group = None
+    for rank in range(rank_map.spec.world_size):
+        group = group_registry.get_or_create(("singleton", rank), (rank,))
+        singleton_groups[rank] = group
+        if my_rank == rank:
+            my_singleton_group = group
+
     my_planning_group = None
     for outer_dp_rank, ranks in enumerate(rank_map.planning_groups()):
         group = group_registry.get_or_create(("planning", outer_dp_rank), ranks)
         if my_rank in ranks:
             my_planning_group = group
+
+    my_encoder_cp_group = None
+    my_encoder_cp_group_ranks = None
+    my_encoder_cp_leader_rank = None
+    for outer_dp_rank, _ in enumerate(rank_map.planning_groups()):
+        for worker_id in range(rank_map.num_workers_per_group):
+            ranks = rank_map.worker_ranks(outer_dp_rank, worker_id)
+            leader_rank = rank_map.worker_leader_rank(outer_dp_rank, worker_id)
+            key = ("encoder_cp", outer_dp_rank, worker_id)
+            if rank_map.spec.encoder_cp == 1:
+                group = singleton_groups[leader_rank]
+                group_registry.register_alias(key, ranks, group)
+            else:
+                group = group_registry.get_or_create(key, ranks)
+            if my_rank in ranks:
+                my_encoder_cp_group = group
+                my_encoder_cp_group_ranks = ranks
+                my_encoder_cp_leader_rank = leader_rank
+
     group_registry.register_alias(
         ("world_alias",), tuple(range(rank_map.spec.world_size)), world
     )
-    if my_planning_group is None:
+    if (
+        my_singleton_group is None
+        or my_planning_group is None
+        or my_encoder_cp_group is None
+        or my_encoder_cp_group_ranks is None
+        or my_encoder_cp_leader_rank is None
+    ):
         raise MdpConfigurationError(
-            f"MDP: rank {my_rank} violates: every rank belongs to exactly one planning "
-            "group."
+            f"MDP: rank {my_rank} violates: every rank belongs to one singleton, "
+            "planning, and encoder-CP group."
         )
     return MdpProcessGroups(
         planning_group=my_planning_group,
+        encoder_cp_group=my_encoder_cp_group,
+        encoder_cp_group_ranks=my_encoder_cp_group_ranks,
+        encoder_cp_leader_rank=my_encoder_cp_leader_rank,
+        singleton_group=my_singleton_group,
         encoder_reduction_group=world,
         world_group=world,
         decoder_tp_group=decoder_tp_group,

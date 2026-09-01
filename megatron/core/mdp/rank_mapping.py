@@ -143,11 +143,11 @@ class MdpRankMap:
             ) from error
 
     def data_loader_source_worker_ids(self, outer_dp_rank: int) -> tuple:
-        """Logical workers containing a native TP0 DataLoader source rank."""
+        """Logical workers whose public leader is a native TP0 DataLoader source."""
         sources = []
         for worker_id in range(self.num_workers_per_group):
-            worker_ranks = self.worker_ranks(outer_dp_rank, worker_id)
-            if any(rank == self.tp_group_ranks(rank)[0] for rank in worker_ranks):
+            leader = self.worker_leader_rank(outer_dp_rank, worker_id)
+            if leader == self.tp_group_ranks(leader)[0]:
                 sources.append(worker_id)
         return tuple(sources)
 
@@ -166,6 +166,10 @@ class MdpRankMap:
         group = self._groups[outer_dp_rank]
         encoder_cp = self._spec.encoder_cp
         return tuple(group[worker_id * encoder_cp : (worker_id + 1) * encoder_cp])
+
+    def worker_leader_rank(self, outer_dp_rank: int, worker_id: int) -> int:
+        """Canonical physical rank for public transport to one logical worker."""
+        return self.worker_ranks(outer_dp_rank, worker_id)[0]
 
     def view(self, global_rank: int) -> MdpRankView:
         """The local view for one rank; stores only what that rank needs."""
