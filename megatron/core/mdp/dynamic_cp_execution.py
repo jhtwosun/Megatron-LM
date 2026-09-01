@@ -5,22 +5,32 @@
 The module keeps global sample and vision-item identities beside the existing
 static descriptors. Decoder tensor payload stays in source-local packets;
 global manifests contain only immutable metadata required for planning and
-routing. This module validates metadata and local packet carriers but performs
-no transport.
+routing. This module validates metadata, local packet carriers, and rank-local
+native-group bindings but performs no transport.
 """
 
 import hashlib
 import struct
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, ClassVar
 
 import torch
 from torch import Tensor
 
-from megatron.core.mdp.dynamic_cp import GlobalSampleId, GlobalVisionItemId
-from megatron.core.mdp.dynamic_cp_plan import DecoderSampleMetadata, EncoderVisionItemMetadata
+from megatron.core.mdp.dynamic_cp import (
+    GlobalSampleId,
+    GlobalVisionItemId,
+    lookup_decoder_dynamic_cp_group,
+)
+from megatron.core.mdp.dynamic_cp_plan import (
+    DecoderCpAssignment,
+    DecoderDynamicPlan,
+    DecoderSampleMetadata,
+    EncoderVisionItemMetadata,
+    validate_decoder_dynamic_plan,
+)
 from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError
 
 DECODER_EXECUTION_SCHEMA_VERSION = 1
@@ -55,6 +65,21 @@ def _require_sequence(name: str, value: Any) -> Sequence:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         raise MdpConfigurationError(f"MDP: {name}={value!r} violates: an ordered sequence.")
     return value
+
+
+def _require_ordered_ranks(name: str, value: Any, *, immutable: bool) -> tuple[int, ...]:
+    if immutable:
+        if not isinstance(value, tuple):
+            raise MdpConfigurationError(f"MDP: {name} is an immutable tuple.")
+        ordered = value
+    else:
+        ordered = _require_sequence(name, value)
+    if not ordered:
+        raise MdpConfigurationError(f"MDP: {name} is non-empty.")
+    ranks = tuple(_require_integer(f"{name}[{index}]", rank) for index, rank in enumerate(ordered))
+    if len(set(ranks)) != len(ranks):
+        raise MdpConfigurationError(f"MDP: {name} contains unique ranks.")
+    return ranks
 
 
 def _require_digest(name: str, value: Any) -> bytes:
@@ -168,6 +193,97 @@ class DecoderMicrobatchKey:
 
     def __post_init__(self) -> None:
         _require_integer("microbatch_index", self.microbatch_index)
+
+
+@dataclass(frozen=True)
+class LocalDecoderAssignment:
+    """One logical decoder assignment bound to an opaque native subgroup."""
+
+    key: DecoderMicrobatchKey
+    assignment: DecoderCpAssignment
+    cp_group: Any = field(compare=False, repr=False)
+
+
+def bind_local_decoder_assignment(
+    plan: DecoderDynamicPlan,
+    *,
+    key: DecoderMicrobatchKey,
+    global_rank: int,
+    maximum_group_ranks: tuple[int, ...],
+    group_getter: Any,
+    group_ranks_getter: Any,
+) -> LocalDecoderAssignment:
+    """Bind this rank's plan assignment to its exact native Dynamic-CP group."""
+    validate_decoder_dynamic_plan(plan)
+    if type(key) is not DecoderMicrobatchKey:
+        raise MdpConfigurationError("MDP: local decoder binding key is a DecoderMicrobatchKey.")
+    microbatch_index = _require_integer("local decoder microbatch index", key.microbatch_index)
+    if microbatch_index >= len(plan.microbatches):
+        raise MdpConfigurationError(
+            f"MDP: decoder microbatch index {microbatch_index} lies outside the dynamic plan."
+        )
+    rank = _require_integer("local decoder global_rank", global_rank)
+    maximum_ranks = _require_ordered_ranks(
+        "maximum Dynamic-CP rank order", maximum_group_ranks, immutable=True
+    )
+    if maximum_ranks != plan.decoder_ranks:
+        raise MdpConfigurationError(
+            "MDP: maximum Dynamic-CP rank order matches the exact ordered decoder plan ranks."
+        )
+
+    microbatch = plan.microbatches[microbatch_index]
+    assignments = tuple(
+        assignment for assignment in microbatch.assignments if rank in assignment.endpoint_ranks
+    )
+    if len(assignments) != 1:
+        raise MdpConfigurationError(
+            f"MDP: global rank {rank} has one local assignment in decoder microbatch "
+            f"{microbatch_index}."
+        )
+    assignment = assignments[0]
+    if not callable(group_getter) or not callable(group_ranks_getter):
+        raise MdpConfigurationError("MDP: native Dynamic-CP group getters are callable.")
+
+    try:
+        cp_group = lookup_decoder_dynamic_cp_group(
+            assignment.local_cp_size,
+            minimum_size=plan.minimum_cp_size,
+            maximum_size=len(plan.decoder_ranks),
+            group_getter=group_getter,
+        )
+    except MdpConfigurationError:
+        raise
+    except Exception as error:
+        raise MdpConfigurationError("MDP: native Dynamic-CP group query failed.") from error
+
+    try:
+        actual_size = cp_group.size()
+        native_ranks = group_ranks_getter(cp_group)
+        native_local_rank = cp_group.rank()
+    except Exception as error:
+        raise MdpConfigurationError("MDP: native Dynamic-CP group query failed.") from error
+    if (
+        not _is_integer(actual_size)
+        or actual_size < 0
+        or actual_size > _INT64_MAX
+        or actual_size != assignment.local_cp_size
+    ):
+        raise MdpConfigurationError(
+            "MDP: native Dynamic-CP group size matches the logical assignment."
+        )
+    actual_ranks = _require_ordered_ranks(
+        "native Dynamic-CP ordered ranks", native_ranks, immutable=False
+    )
+    if actual_ranks != assignment.endpoint_ranks:
+        raise MdpConfigurationError(
+            "MDP: native Dynamic-CP group uses the exact ordered endpoint tuple."
+        )
+    local_rank = _require_integer("native Dynamic-CP local rank", native_local_rank)
+    if local_rank != actual_ranks.index(rank):
+        raise MdpConfigurationError(
+            "MDP: native Dynamic-CP local rank matches the ordered endpoint tuple."
+        )
+    return LocalDecoderAssignment(key=key, assignment=assignment, cp_group=cp_group)
 
 
 @dataclass(frozen=True)
