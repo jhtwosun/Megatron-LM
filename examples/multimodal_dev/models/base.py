@@ -380,6 +380,17 @@ class MultimodalModel(MegatronModule):
                 attention_mask, position_ids, padding_mask,
             )
         cp_rank = parallel_state.get_context_parallel_rank()
+        decoder_input_uses_sp = (
+            decoder_input is not None
+            and self.config.sequence_parallel
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
+        )
+        if decoder_input_uses_sp:
+            # Reconstruct the global sequence before applying the native CP
+            # partition, then restore SP ownership within the CP-local shard.
+            decoder_input = tensor_parallel.gather_from_sequence_parallel_region(
+                decoder_input, tensor_parallel_output_grad=False
+            )
 
         if packed_seq_params is not None:
             total_tokens = (
@@ -413,6 +424,9 @@ class MultimodalModel(MegatronModule):
             loss_mask = _split(loss_mask, 1)
             attention_mask = _split(attention_mask, 1)
             padding_mask = _split(padding_mask, 1)
+
+        if decoder_input_uses_sp:
+            decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(decoder_input)
 
         return (
             decoder_input, input_ids, labels, loss_mask,

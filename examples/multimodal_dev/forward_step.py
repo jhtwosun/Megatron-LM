@@ -142,6 +142,11 @@ def broadcast_data_batch(data, device="cuda"):
     return result
 
 
+def _move_owner_pixels_to_device(pixel_values, device):
+    """Move the one owner-local pixel payload after TP metadata broadcast."""
+    return pixel_values.to(device, non_blocking=pixel_values.is_pinned())
+
+
 # -------------------------------------------------------------------
 # THD (packed sequence) helpers
 # -------------------------------------------------------------------
@@ -402,6 +407,10 @@ def pack_or_pad_batch(
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
     is_src = mpu.get_tensor_model_parallel_rank() == 0
+    from megatron.core.mdp.window import pixel_capture_owner_state
+
+    pixel_owner_state = pixel_capture_owner_state()
+    suppress_pixels = pixel_owner_state is False
 
     # SP is an explicit runtime option; TP>1 does not imply SP is enabled.
     # get_args() itself raises in test contexts where megatron globals are
@@ -435,10 +444,6 @@ def pack_or_pad_batch(
         # materialization + H2D wholesale. All text tensors and vision item
         # metadata (grid_thw, sidecar) are still built from input_ids/grids,
         # so every offset stays valid. False outside a sharded MDP capture.
-        from megatron.core.mdp.window import pixel_capture_suppressed
-
-        suppress_pixels = pixel_capture_suppressed()
-
         # MDP capture fast path (TP=1): build each packed field directly in
         # one pinned buffer (no per-sample F.pad + concat churn) and move it
         # with a non-blocking copy. Pageable H2D copies each carry an implicit
@@ -620,7 +625,17 @@ def pack_or_pad_batch(
                 if key in packed_batch:
                     sidecar_cpu[key] = packed_batch.pop(key)
 
+        owner_pixel_values = None
+        if tp_size > 1 and pixel_owner_state is not None and is_src:
+            if "pixel_values" in packed_batch:
+                pixel_values = packed_batch.pop("pixel_values")
+                if pixel_values.numel():
+                    owner_pixel_values = pixel_values
         packed_batch = broadcast_data_batch(packed_batch, device=device)
+        if owner_pixel_values is not None:
+            packed_batch["pixel_values"] = _move_owner_pixels_to_device(
+                owner_pixel_values, device
+            )
         packed_batch.update(sidecar_cpu)
 
         cu_seqlens_t = packed_batch.pop("cu_seqlens")
@@ -692,10 +707,22 @@ def pack_or_pad_batch(
         if has_padding:
             positions = torch.arange(target_seqlens).unsqueeze(0)
             padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
-        padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
+        if not suppress_pixels:
+            padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
 
-    return broadcast_data_batch(padded_batch, device=device)
+    owner_pixel_values = None
+    if tp_size > 1 and pixel_owner_state is not None and is_src:
+        if "pixel_values" in padded_batch:
+            pixel_values = padded_batch.pop("pixel_values")
+            if pixel_values.numel():
+                owner_pixel_values = pixel_values
+    padded_batch = broadcast_data_batch(padded_batch, device=device)
+    if owner_pixel_values is not None:
+        padded_batch["pixel_values"] = _move_owner_pixels_to_device(
+            owner_pixel_values, device
+        )
+    return padded_batch
 
 
 # -------------------------------------------------------------------

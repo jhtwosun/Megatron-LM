@@ -9,7 +9,7 @@ cursors, so the replay iterators never consume additional sampler input.
 
 import threading
 from dataclasses import dataclass
-from typing import Any, Iterator, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Iterator, Mapping, Optional, Sequence, Union
 
 from torch import Tensor
 
@@ -38,6 +38,15 @@ def pixel_capture_suppressed() -> bool:
         return False
     owner_worker_id, my_worker_id = context
     return owner_worker_id != my_worker_id
+
+
+def pixel_capture_owner_state() -> Optional[bool]:
+    """Whether this rank owns the active capture's pixels, or ``None`` outside capture."""
+    context = getattr(_PIXEL_OWNERSHIP, "value", None)
+    if context is None:
+        return None
+    owner_worker_id, my_worker_id = context
+    return owner_worker_id == my_worker_id
 
 
 @dataclass(frozen=True)
@@ -123,6 +132,10 @@ class MdpIterationWindow:
         lane_id: Optional[int],
         my_worker_id: int,
         num_workers: int,
+        data_loader_source_worker_ids: Optional[Sequence[int]] = None,
+        capture_error_consensus: Optional[
+            Callable[[Optional[BaseException]], bool]
+        ] = None,
     ) -> "MdpIterationWindow":
         """Consume one real iterator and build records, descriptors, and sidecar.
 
@@ -131,10 +144,10 @@ class MdpIterationWindow:
         image_ordinal)`` capture order, so they are stable and unique within the
         planning group (one endpoint per group generates them).
 
-        Every worker materializes and cuts pixels only for the microbatches it owns
-        (``microbatch_id % num_workers == my_worker_id``); the ownership context
-        set around each ``adapter.get_batch`` call lets the model collate path
-        skip pixel materialization on non-owners.
+        Every worker materializes and cuts pixels only for the microbatches it owns.
+        Ownership round-robins over logical workers that contain native TP0
+        DataLoader sources; the ownership context around ``adapter.get_batch`` lets
+        the collate path keep pixels local while broadcasting decoder metadata.
         """
         if isinstance(data_iterators, (list, tuple)):
             iterator = data_iterators[0] if data_iterators else None
@@ -145,6 +158,20 @@ class MdpIterationWindow:
                 "MDP: owner-sharded capture requires 0 <= my_worker_id < num_workers "
                 f"(got {my_worker_id}, {num_workers})."
             )
+        source_worker_ids = (
+            tuple(range(num_workers))
+            if data_loader_source_worker_ids is None
+            else tuple(data_loader_source_worker_ids)
+        )
+        if (
+            not source_worker_ids
+            or tuple(sorted(set(source_worker_ids))) != source_worker_ids
+            or any(worker_id < 0 or worker_id >= num_workers for worker_id in source_worker_ids)
+        ):
+            raise MdpConfigurationError(
+                "MDP: DataLoader source worker ids must be a non-empty ordered unique "
+                f"subset of [0, {num_workers}) (got {source_worker_ids})."
+            )
 
         records = []
         descriptors = []
@@ -152,76 +179,98 @@ class MdpIterationWindow:
         next_item_id = 0
         merge = adapter.spatial_merge_size
         for microbatch_id in range(num_microbatches):
-            owner_worker_id = microbatch_id % num_workers
+            owner_worker_id = source_worker_ids[microbatch_id % len(source_worker_ids)]
             owns_pixels = owner_worker_id == my_worker_id
+            captured = None
+            capture_error = None
+            pending_record = None
+            pending_descriptors = []
+            pending_sidecar = {}
+            pending_next_item_id = next_item_id
             try:
                 _PIXEL_OWNERSHIP.value = (owner_worker_id, my_worker_id)
                 with nvtx_phase("p1_get_batch"):
                     captured = adapter.get_batch(iterator)
-            finally:
-                _PIXEL_OWNERSHIP.value = None
-            if captured is None:
-                raise MdpStateError(
-                    f"MDP: data iterator violates: {num_microbatches} microbatches per "
-                    f"iteration (exhausted at microbatch {microbatch_id})."
-                )
-            _validate_captured(
-                captured,
-                microbatch_id,
-                merge,
-                expect_pixels=owns_pixels,
-            )
-            vision_records = []
-            for item in captured.vision_items:
-                t, h, w = item.grid_thw
-                output_rows = t * (h // merge) * (w // merge)
-                item_id = next_item_id
-                next_item_id += 1
-                vision_records.append(
-                    MdpMicrobatchVisionRecord(
-                        global_item_id=item_id,
-                        sample_id=item.sample_id,
-                        image_ordinal=item.image_ordinal,
-                        grid_thw=item.grid_thw,
-                        output_rows=output_rows,
-                        decoder_positions=item.decoder_positions,
+                if captured is None:
+                    raise MdpStateError(
+                        f"MDP: data iterator violates: {num_microbatches} microbatches per "
+                        f"iteration (exhausted at microbatch {microbatch_id})."
                     )
+                _validate_captured(
+                    captured,
+                    microbatch_id,
+                    merge,
+                    expect_pixels=owns_pixels,
                 )
-                if lane_id is not None:
-                    if len(item.decoder_positions) != output_rows:
-                        raise MdpConfigurationError(
-                            f"MDP: item (mb={microbatch_id}, sample={item.sample_id}, "
-                            f"ordinal={item.image_ordinal}) violates: "
-                            f"len(decoder_positions) == output_rows "
-                            f"({len(item.decoder_positions)} != {output_rows})."
-                        )
-                    descriptors.append(
-                        VisionDescriptor(
+                vision_records = []
+                for item in captured.vision_items:
+                    t, h, w = item.grid_thw
+                    output_rows = t * (h // merge) * (w // merge)
+                    item_id = pending_next_item_id
+                    pending_next_item_id += 1
+                    vision_records.append(
+                        MdpMicrobatchVisionRecord(
                             global_item_id=item_id,
                             sample_id=item.sample_id,
                             image_ordinal=item.image_ordinal,
-                            owner_dp_lane=lane_id,
-                            microbatch_id=microbatch_id,
-                            estimated_cost_units=adapter.estimate_cost(item),
-                            payload_rows=item.payload_rows,
-                            output_rows=output_rows,
                             grid_thw=item.grid_thw,
-                            owner_worker_id=owner_worker_id,
+                            output_rows=output_rows,
+                            decoder_positions=item.decoder_positions,
                         )
                     )
-                if owns_pixels:
-                    sidecar[item_id] = captured.flat_pixel_payload[
-                        item.payload_row_start : item.payload_row_start + item.payload_rows
-                    ]
-            records.append(
-                MdpMicrobatchRecord(
+                    if lane_id is not None:
+                        if len(item.decoder_positions) != output_rows:
+                            raise MdpConfigurationError(
+                                f"MDP: item (mb={microbatch_id}, sample={item.sample_id}, "
+                                f"ordinal={item.image_ordinal}) violates: "
+                                f"len(decoder_positions) == output_rows "
+                                f"({len(item.decoder_positions)} != {output_rows})."
+                            )
+                        pending_descriptors.append(
+                            VisionDescriptor(
+                                global_item_id=item_id,
+                                sample_id=item.sample_id,
+                                image_ordinal=item.image_ordinal,
+                                owner_dp_lane=lane_id,
+                                microbatch_id=microbatch_id,
+                                estimated_cost_units=adapter.estimate_cost(item),
+                                payload_rows=item.payload_rows,
+                                output_rows=output_rows,
+                                grid_thw=item.grid_thw,
+                                owner_worker_id=owner_worker_id,
+                            )
+                        )
+                    if owns_pixels:
+                        pending_sidecar[item_id] = captured.flat_pixel_payload[
+                            item.payload_row_start : item.payload_row_start + item.payload_rows
+                        ]
+                pending_record = MdpMicrobatchRecord(
                     microbatch_id=microbatch_id,
                     text_only=not captured.vision_items,
                     vision_items=tuple(vision_records),
                     decoder_packed_seq_params=captured.decoder_packed_seq_params,
                     model_payload=captured.model_payload,
                 )
+            except BaseException as error:
+                capture_error = error
+            finally:
+                _PIXEL_OWNERSHIP.value = None
+            capture_failed = (
+                capture_error_consensus(capture_error)
+                if capture_error_consensus is not None
+                else capture_error is not None
             )
+            if capture_failed:
+                if capture_error is not None:
+                    raise capture_error
+                raise MdpStateError(
+                    f"MDP: microbatch {microbatch_id} capture failed on another "
+                    "planning rank; planning and bridge communication were not started."
+                )
+            records.append(pending_record)
+            descriptors.extend(pending_descriptors)
+            sidecar.update(pending_sidecar)
+            next_item_id = pending_next_item_id
         return cls(records, descriptors, sidecar, num_vpp_chunks)
 
     def replay_iterators(self) -> list:
