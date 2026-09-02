@@ -164,6 +164,211 @@ def test_dynamic_execution_config_consensus_rejects_mismatch_before_runtime():
         )
 
 
+def test_pre_authority_producer_separates_contributor_noncontributor_and_error_states():
+    runtime = _runtime()
+    owner = object()
+    contributor = runtime._PreAuthorityDynamicProducer(
+        rank_view="rank-view",
+        local_manifest="manifest",
+        source_window="window",
+        static_plan="plan",
+        item_outputs=MappingProxyType({0: object()}),
+        owner=owner,
+        local_prepare_error=None,
+        forward_only=False,
+    )
+    noncontributor = runtime._PreAuthorityDynamicProducer(
+        rank_view="rank-view",
+        local_manifest=None,
+        source_window=None,
+        static_plan=None,
+        item_outputs=MappingProxyType({}),
+        owner=owner,
+        local_prepare_error=None,
+        forward_only=False,
+    )
+    failed = runtime._PreAuthorityDynamicProducer(
+        rank_view="rank-view",
+        local_manifest=None,
+        source_window=None,
+        static_plan=None,
+        item_outputs=MappingProxyType({}),
+        owner=None,
+        local_prepare_error=RuntimeError("local prepare failed"),
+        forward_only=False,
+    )
+
+    assert contributor.owner is owner
+    assert not noncontributor.item_outputs
+    assert isinstance(failed.local_prepare_error, RuntimeError)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"item_outputs": {}},
+        {"local_manifest": "manifest", "source_window": None, "static_plan": None},
+        {"owner": None},
+        {"forward_only": True},
+        {
+            "local_prepare_error": RuntimeError("failed"),
+            "local_manifest": "manifest",
+            "source_window": "window",
+            "static_plan": "plan",
+        },
+    ),
+    ids=(
+        "mutable-outputs",
+        "partial-contributor",
+        "missing-owner",
+        "forward-only",
+        "failed-with-state",
+    ),
+)
+def test_pre_authority_producer_rejects_ambiguous_local_ownership(kwargs):
+    values = {
+        "rank_view": "rank-view",
+        "local_manifest": None,
+        "source_window": None,
+        "static_plan": None,
+        "item_outputs": MappingProxyType({}),
+        "owner": object(),
+        "local_prepare_error": None,
+        "forward_only": False,
+    }
+    values.update(kwargs)
+
+    with pytest.raises(MdpConfigurationError):
+        _runtime()._PreAuthorityDynamicProducer(**values)
+
+
+def test_dynamic_producer_carrier_requires_mapping_views_and_callbacks():
+    runtime = _runtime()
+    authority = _dynamic_authority(runtime)
+    owner = object()
+    views = MappingProxyType({})
+    pre_authority = runtime._PreAuthorityDynamicProducer(
+        rank_view="rank-view",
+        local_manifest="manifest",
+        source_window="window",
+        static_plan="plan",
+        item_outputs=views,
+        owner=owner,
+        local_prepare_error=None,
+        forward_only=False,
+    )
+    carrier = runtime._DynamicProducerCarrier(
+        authority=authority,
+        pre_authority=pre_authority,
+        owner=owner,
+        rank_view="rank-view",
+        local_manifest="manifest",
+        source_window="window",
+        static_plan="plan",
+        item_outputs=views,
+        payload_destination_views=views,
+        embedding_destination_views=views,
+        gradient_destination_views=views,
+        summed_gradient_destination_views=views,
+        backward=lambda gradients: gradients,
+        cleanup=lambda: None,
+    )
+    assert carrier.item_outputs is views
+
+    with pytest.raises(MdpConfigurationError):
+        runtime._DynamicProducerCarrier(
+            authority=authority,
+            pre_authority=pre_authority,
+            owner=owner,
+            rank_view="rank-view",
+            local_manifest="manifest",
+            source_window="window",
+            static_plan="plan",
+            item_outputs=(),
+            payload_destination_views=views,
+            embedding_destination_views=views,
+            gradient_destination_views=views,
+            summed_gradient_destination_views=views,
+            backward=lambda gradients: gradients,
+            cleanup=lambda: None,
+        )
+    with pytest.raises(MdpConfigurationError, match="preserves its pre-authority identity"):
+        replace(carrier, rank_view=object())
+    noncontributor = runtime._PreAuthorityDynamicProducer(
+        rank_view="rank-view",
+        local_manifest=None,
+        source_window=None,
+        static_plan=None,
+        item_outputs=MappingProxyType({}),
+        owner=owner,
+        local_prepare_error=None,
+        forward_only=False,
+    )
+    with pytest.raises(MdpConfigurationError, match="preserves its pre-authority identity"):
+        replace(carrier, pre_authority=noncontributor)
+    with pytest.raises(MdpConfigurationError, match="callbacks are callable"):
+        runtime._DynamicProducerCarrier(
+            authority=authority,
+            pre_authority=pre_authority,
+            owner=owner,
+            rank_view="rank-view",
+            local_manifest="manifest",
+            source_window="window",
+            static_plan="plan",
+            item_outputs=views,
+            payload_destination_views=views,
+            embedding_destination_views=views,
+            gradient_destination_views=views,
+            summed_gradient_destination_views=views,
+            backward=None,
+            cleanup=lambda: None,
+        )
+    with pytest.raises(MdpConfigurationError, match="owner matches"):
+        runtime._DynamicProducerCarrier(
+            authority=authority,
+            pre_authority=pre_authority,
+            owner=object(),
+            rank_view="rank-view",
+            local_manifest="manifest",
+            source_window="window",
+            static_plan="plan",
+            item_outputs=views,
+            payload_destination_views=views,
+            embedding_destination_views=views,
+            gradient_destination_views=views,
+            summed_gradient_destination_views=views,
+            backward=lambda gradients: gradients,
+            cleanup=lambda: None,
+        )
+
+
+def test_dynamic_iteration_authority_requires_mapping_fields():
+    runtime = _runtime()
+    authority = _dynamic_authority(runtime)
+    assert authority.plan.digest == _state().plan.digest
+
+    mutable_source_ranks = dict(authority.source_rank_by_lane)
+    snapshotted = replace(authority, source_rank_by_lane=mutable_source_ranks)
+    mutable_source_ranks[99] = 99
+    assert 99 not in snapshotted.source_rank_by_lane
+    assert isinstance(snapshotted.source_rank_by_lane, type(MappingProxyType({})))
+    with pytest.raises(MdpConfigurationError, match="is a mapping"):
+        replace(authority, source_rank_by_lane=())
+    with pytest.raises(MdpConfigurationError, match="exact typed carrier"):
+        replace(authority, global_manifest="manifest")
+
+
+def test_dynamic_iteration_authority_rejects_mixed_valid_iteration_components():
+    runtime = _runtime()
+    authority = _dynamic_authority(runtime)
+    other = _state(solver=_SingleWaveCp2Solver(), capacity=8)
+
+    with pytest.raises(MdpBridgeError, match="routes match plan and manifest authority"):
+        replace(authority, payload_ledger=other.payload_ledger)
+    with pytest.raises(MdpBridgeError, match="match plan authority"):
+        replace(authority, embedding_ledger=other.embedding, gradient_ledger=other.gradient)
+
+
 def _packet(order, *, device):
     base = torch.arange(order * 10, order * 10 + 4, device=device).reshape(1, 4)
     tensors = MappingProxyType(
@@ -306,6 +511,25 @@ def _state(*, device="cpu", images_per_sample=1, text_only=False, solver=None, c
         bridge_authority=bridge_authority,
         embedding=embedding,
         gradient=gradient,
+    )
+
+
+def _dynamic_authority(runtime):
+    state = _state()
+    return runtime._DynamicIterationAuthority(
+        global_manifest=state.manifest,
+        plan=state.plan,
+        source_rank_by_lane=MappingProxyType(dict(state.payload_authority["source_rank_by_lane"])),
+        producer_rank_by_item=MappingProxyType(
+            dict(state.bridge_authority["producer_rank_by_item"])
+        ),
+        output_rows_by_item=MappingProxyType(dict(state.bridge_authority["output_rows_by_item"])),
+        payload_ledger=state.payload_ledger,
+        embedding_ledger=state.embedding,
+        gradient_ledger=state.gradient,
+        participant_ranks=_PARTICIPANTS,
+        bridge_width=_WIDTH,
+        bridge_dtype=torch.float32,
     )
 
 
