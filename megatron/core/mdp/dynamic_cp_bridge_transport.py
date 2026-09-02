@@ -1,19 +1,21 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Caller-buffer preparation for Dynamic-CP embedding and gradient bridges.
+"""Caller-buffer preparation and execution for Dynamic-CP tensor bridges.
 
-This module validates and packs one bridge phase.  It does not allocate buffers,
-perform collective communication, create process groups, or own retry policy.
+This module validates, packs, and synchronously exchanges one embedding or
+gradient phase. It does not allocate buffers, create process groups, or own
+cross-rank consensus, retry, or recovery policy.
 """
 
 import hashlib
 import struct
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
 from megatron.core.mdp.bridge import BridgePhase
@@ -356,6 +358,96 @@ def validate_prepared_dynamic_bridge_exchange(prepared: Any) -> PreparedDynamicB
 def route_authority_digest(prepared: Any) -> bytes:
     """Return the validated common route digest; tensor contents are not sealed."""
     return validate_prepared_dynamic_bridge_exchange(prepared).route_authority_digest
+
+
+def _validate_group_binding(
+    prepared: PreparedDynamicBridgeExchange, *, group: Any, group_ranks_getter: Callable[[Any], Any]
+) -> None:
+    try:
+        actual_ranks = tuple(group_ranks_getter(group))
+    except Exception as error:
+        raise MdpConfigurationError(
+            "MDP: dynamic bridge native group rank query succeeded."
+        ) from error
+    if actual_ranks != prepared.participant_ranks or any(
+        type(rank) is not int for rank in actual_ranks
+    ):
+        raise MdpConfigurationError(
+            "MDP: dynamic bridge native group uses the exact participant rank order."
+        )
+    try:
+        size_query = getattr(group, "size")
+        local_rank_query = getattr(group, "rank")
+        if not callable(size_query) or not callable(local_rank_query):
+            raise TypeError("native group size and rank queries are callable")
+        group_size = size_query()
+        local_rank = local_rank_query()
+    except Exception as error:
+        raise MdpConfigurationError(
+            "MDP: dynamic bridge native group geometry query succeeded."
+        ) from error
+    if type(group_size) is not int or group_size != len(prepared.participant_ranks):
+        raise MdpConfigurationError(
+            "MDP: dynamic bridge native group size matches participant count."
+        )
+    expected_local_rank = prepared.participant_ranks.index(prepared.global_rank)
+    if type(local_rank) is not int or local_rank != expected_local_rank:
+        raise MdpConfigurationError(
+            "MDP: dynamic bridge native group local rank matches the global rank."
+        )
+
+
+def execute_dynamic_bridge_exchange(
+    prepared: PreparedDynamicBridgeExchange,
+    *,
+    group: Any,
+    group_ranks_getter: Callable[[Any], Any] = dist.get_process_group_ranks,
+    all_to_all_single: Callable[..., Any] = dist.all_to_all_single,
+) -> Mapping[DynamicBridgeKey, Tensor]:
+    """Execute one sealed synchronous embedding or gradient all-to-all.
+
+    The prepared participant order must exactly match the native order returned
+    by ``group_ranks_getter``. Every participant calls the collective once,
+    including ranks with all-zero splits. This function provides no failure
+    consensus, retry, or recovery.
+
+    Args:
+        prepared: Sealed caller-owned buffers and immutable receive views.
+        group: Native process group whose ordered ranks match the carrier.
+        group_ranks_getter: Injectable native ordered-rank query.
+        all_to_all_single: Injectable synchronous collective implementation.
+
+    Returns:
+        The exact immutable receive-view mapping stored in ``prepared``.
+    """
+    carrier = validate_prepared_dynamic_bridge_exchange(prepared)
+    if not callable(group_ranks_getter):
+        raise MdpConfigurationError("MDP: dynamic bridge group_ranks_getter is callable.")
+    if not callable(all_to_all_single):
+        raise MdpConfigurationError("MDP: dynamic bridge all_to_all_single is callable.")
+    _validate_group_binding(carrier, group=group, group_ranks_getter=group_ranks_getter)
+    return _execute_validated_dynamic_bridge_exchange(
+        carrier, group=group, all_to_all_single=all_to_all_single
+    )
+
+
+def _execute_validated_dynamic_bridge_exchange(
+    carrier: PreparedDynamicBridgeExchange, *, group: Any, all_to_all_single: Callable[..., Any]
+) -> Mapping[DynamicBridgeKey, Tensor]:
+    try:
+        all_to_all_single(
+            carrier.receive_buffer,
+            carrier.send_buffer,
+            output_split_sizes=list(carrier.output_split_sizes),
+            input_split_sizes=list(carrier.input_split_sizes),
+            group=group,
+            async_op=False,
+        )
+    except Exception as error:
+        raise MdpBridgeError(
+            "MDP: synchronous dynamic bridge all-to-all completed successfully."
+        ) from error
+    return carrier.received_tensors
 
 
 def prepare_dynamic_bridge_exchange(
