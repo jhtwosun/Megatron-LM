@@ -1,15 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Private gates 0--2 composition and gate-3 preparation for Dynamic-CP.
+"""Private gates 0--2 composition and gate-3 gradient transport for Dynamic-CP.
 
 The caller owns buffers, encoder outputs, process groups, and resource
 retirement. A trusted rank-local adapter constructs the structural VPP1
 records and leaf views. This module serializes the existing all-dtype decoder
 payload gate, the existing embedding bridge gate, one decoder-ready status
-gate, and one noncollective reverse-gradient preparation. It does not enter a
-decoder schedule, execute a gradient collective, create replay cursors,
-execute backward, retry, or recover from a failure inside an entered
-collective.
+gate, and one reverse-gradient preparation/transport gate. It does not enter
+a decoder schedule, create replay cursors, execute backward, retire gradient
+state, retry, or recover from a failure inside an entered collective.
 """
 
 import hashlib
@@ -877,6 +876,74 @@ def _prepare_decoder_gradient_exchange(
         embedding_width=embedding_width,
         embedding_dtype=embedding_dtype,
         cp_partition_mode=cp_partition_mode,
+    )
+
+
+def _run_decoder_gradient_gate(
+    prepared: Any,
+    *,
+    global_manifest: DecoderGlobalManifest,
+    plan: DecoderDynamicPlan,
+    embedding_ledger: DynamicBridgeLedger,
+    gradient_ledger: DynamicBridgeLedger,
+    producer_rank_by_item: Mapping[GlobalVisionItemId, int],
+    output_rows_by_item: Mapping[GlobalVisionItemId, int],
+    embedding_width: int,
+    embedding_dtype: torch.dtype,
+    cp_partition_mode: str,
+    global_rank: int,
+    group_ranks: tuple[int, ...],
+    all_gather_status: Any,
+    timeout_seconds: float,
+    group: Any,
+    group_ranks_getter: Callable[[Any], Any] = dist.get_process_group_ranks,
+    all_to_all_single: Callable[..., Any] = dist.all_to_all_single,
+) -> Mapping[DynamicBridgeKey, Tensor]:
+    """Run gate 3 for one sealed decoder-gradient preparation.
+
+    Invalid local carriers intentionally enter the status gate with a neutral
+    predecessor. The local preparation callback then records the validation
+    error, so all ranks converge before the helper can issue gradient A2A.
+    """
+    predecessor_authority_digest = bytes(16)
+    if (
+        type(prepared) is PreparedDecoderGradientExchange
+        and type(prepared._authority) is _PreparedDecoderGradientAuthority
+    ):
+        predecessor_authority_digest = prepared._authority.ready_authority_digest
+
+    def local_prepare() -> PreparedDynamicBridgeExchange:
+        carrier = validate_prepared_decoder_gradient_exchange(
+            prepared,
+            global_manifest=global_manifest,
+            plan=plan,
+            global_rank=global_rank,
+            participant_ranks=group_ranks,
+            embedding_width=embedding_width,
+            embedding_dtype=embedding_dtype,
+            cp_partition_mode=cp_partition_mode,
+        )
+        return carrier.exchange
+
+    return _run_dynamic_bridge_gate(
+        phase=BridgePhase.GRADIENT,
+        ledger=gradient_ledger,
+        reverse_ledger=embedding_ledger,
+        plan=plan,
+        global_manifest=global_manifest,
+        producer_rank_by_item=producer_rank_by_item,
+        output_rows_by_item=output_rows_by_item,
+        width=embedding_width,
+        dtype=embedding_dtype,
+        global_rank=global_rank,
+        group_ranks=group_ranks,
+        all_gather_status=all_gather_status,
+        local_prepare=local_prepare,
+        timeout_seconds=timeout_seconds,
+        group=group,
+        predecessor_authority_digest=predecessor_authority_digest,
+        group_ranks_getter=group_ranks_getter,
+        all_to_all_single=all_to_all_single,
     )
 
 
