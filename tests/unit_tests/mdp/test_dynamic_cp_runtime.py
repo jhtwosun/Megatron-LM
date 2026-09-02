@@ -55,6 +55,115 @@ def _gradient_lifecycle(nonce=b"\x01" * 16):
     return _runtime()._begin_decoder_gradient_receipt_lifecycle(nonce)
 
 
+def _dynamic_execution_config(**changes):
+    runtime = _runtime()
+    values = {
+        "schema_version": runtime.DYNAMIC_RUNTIME_SCHEMA_VERSION,
+        "forward_only": False,
+        "partition_mode": "contiguous",
+        "embedding_width": _WIDTH,
+        "embedding_dtype_id": 2,
+        "participant_ranks": _PARTICIPANTS,
+        "tensor_parallel_size": 1,
+        "expert_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "configured_context_parallel_size": 1,
+        "encoder_context_parallel_size": 1,
+        "virtual_pipeline_parallel_size": 1,
+        "expert_group_ranks": None,
+        "sequence_parallel": False,
+        "dynamic_encoder_context_parallel": False,
+        "overlap_window_capture": False,
+    }
+    values.update(changes)
+    return runtime._DynamicExecutionConfig(**values)
+
+
+def test_dynamic_execution_config_locks_supported_topologies_and_fixed_wire():
+    config = _dynamic_execution_config()
+    assert len(config.to_wire_tuple()) == 20
+    assert len(config.digest) == 16
+    assert config == _dynamic_execution_config()
+    with pytest.raises(MdpConfigurationError, match="training-only"):
+        _dynamic_execution_config(forward_only=True)
+
+    joint = _dynamic_execution_config(
+        configured_context_parallel_size=4,
+        encoder_context_parallel_size=4,
+        expert_parallel_size=4,
+        expert_group_ranks=_PARTICIPANTS,
+        dynamic_encoder_context_parallel=True,
+    )
+    assert joint.participant_ranks == _PARTICIPANTS
+    with pytest.raises(MdpConfigurationError, match="sequence parallel and overlap off"):
+        _dynamic_execution_config(sequence_parallel=True)
+    with pytest.raises(MdpConfigurationError, match="expert group exactly matches"):
+        _dynamic_execution_config(
+            configured_context_parallel_size=4,
+            encoder_context_parallel_size=4,
+            expert_parallel_size=4,
+            expert_group_ranks=(4, 5, 6, 7),
+            dynamic_encoder_context_parallel=True,
+        )
+
+
+def test_dynamic_execution_config_consensus_rejects_mismatch_before_runtime():
+    config = _dynamic_execution_config()
+    events = []
+
+    def matching_gather(wire, **kwargs):
+        events.append((wire, kwargs))
+        return _consensus_rows(wire, _PARTICIPANTS)
+
+    _runtime()._consensus_dynamic_execution_config(
+        config=config,
+        group_ranks=_PARTICIPANTS,
+        global_rank=1,
+        all_gather_status=matching_gather,
+        timeout_seconds=0.001,
+    )
+    assert len(events) == 1
+    assert events[0][1] == {"timeout_seconds": 0.001}
+
+    def mismatched_gather(wire, **kwargs):
+        return _consensus_rows(wire, _PARTICIPANTS, digests={2: b"\x11" * 16})
+
+    with pytest.raises(MdpPlanError, match="plan digest mismatch at rank 2"):
+        _runtime()._consensus_dynamic_execution_config(
+            config=config,
+            group_ranks=_PARTICIPANTS,
+            global_rank=1,
+            all_gather_status=mismatched_gather,
+            timeout_seconds=0.001,
+        )
+
+    group_events = []
+
+    def local_error_gather(wire, **kwargs):
+        group_events.append((wire, kwargs))
+        return _consensus_rows(wire, (1, 2, 3, 4))
+
+    with pytest.raises(MdpPlanError, match="error code 1"):
+        _runtime()._consensus_dynamic_execution_config(
+            config=config,
+            group_ranks=(1, 2, 3, 4),
+            global_rank=1,
+            all_gather_status=local_error_gather,
+            timeout_seconds=0.001,
+        )
+    assert len(group_events) == 1
+
+    object.__setattr__(config, "embedding_width", _WIDTH + 1)
+    with pytest.raises(MdpPlanError, match="error code 1"):
+        _runtime()._consensus_dynamic_execution_config(
+            config=config,
+            group_ranks=_PARTICIPANTS,
+            global_rank=1,
+            all_gather_status=matching_gather,
+            timeout_seconds=0.001,
+        )
+
+
 def _packet(order, *, device):
     base = torch.arange(order * 10, order * 10 + 4, device=device).reshape(1, 4)
     tensors = MappingProxyType(
