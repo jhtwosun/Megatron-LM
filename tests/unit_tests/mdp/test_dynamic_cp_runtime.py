@@ -173,6 +173,7 @@ def test_pre_authority_producer_separates_contributor_noncontributor_and_error_s
         source_window="window",
         static_plan="plan",
         item_outputs=MappingProxyType({0: object()}),
+        sample_location_by_id=MappingProxyType({"sample": (0, 0)}),
         owner=owner,
         local_prepare_error=None,
         forward_only=False,
@@ -183,6 +184,7 @@ def test_pre_authority_producer_separates_contributor_noncontributor_and_error_s
         source_window=None,
         static_plan=None,
         item_outputs=MappingProxyType({}),
+        sample_location_by_id=MappingProxyType({}),
         owner=owner,
         local_prepare_error=None,
         forward_only=False,
@@ -193,6 +195,7 @@ def test_pre_authority_producer_separates_contributor_noncontributor_and_error_s
         source_window=None,
         static_plan=None,
         item_outputs=MappingProxyType({}),
+        sample_location_by_id=MappingProxyType({}),
         owner=None,
         local_prepare_error=RuntimeError("local prepare failed"),
         forward_only=False,
@@ -203,10 +206,33 @@ def test_pre_authority_producer_separates_contributor_noncontributor_and_error_s
     assert isinstance(failed.local_prepare_error, RuntimeError)
 
 
+def test_pre_authority_producer_carries_immutable_sample_locations():
+    runtime = _runtime()
+    backing = {"sample": (0, 0)}
+    locations = MappingProxyType(backing)
+
+    producer = runtime._PreAuthorityDynamicProducer(
+        rank_view="rank-view",
+        local_manifest="manifest",
+        source_window="window",
+        static_plan="plan",
+        item_outputs=MappingProxyType({}),
+        sample_location_by_id=locations,
+        owner=object(),
+        local_prepare_error=None,
+        forward_only=False,
+    )
+
+    backing["sample"] = (9, 9)
+    assert producer.sample_location_by_id == {"sample": (0, 0)}
+    assert producer.sample_location_by_id is not locations
+
+
 @pytest.mark.parametrize(
     "kwargs",
     (
         {"item_outputs": {}},
+        {"sample_location_by_id": {}},
         {"local_manifest": "manifest", "source_window": None, "static_plan": None},
         {"owner": None},
         {"forward_only": True},
@@ -219,6 +245,7 @@ def test_pre_authority_producer_separates_contributor_noncontributor_and_error_s
     ),
     ids=(
         "mutable-outputs",
+        "mutable-sample-locations",
         "partial-contributor",
         "missing-owner",
         "forward-only",
@@ -232,6 +259,7 @@ def test_pre_authority_producer_rejects_ambiguous_local_ownership(kwargs):
         "source_window": None,
         "static_plan": None,
         "item_outputs": MappingProxyType({}),
+        "sample_location_by_id": MappingProxyType({}),
         "owner": object(),
         "local_prepare_error": None,
         "forward_only": False,
@@ -253,6 +281,7 @@ def test_dynamic_producer_carrier_requires_mapping_views_and_callbacks():
         source_window="window",
         static_plan="plan",
         item_outputs=views,
+        sample_location_by_id=MappingProxyType({"sample": (0, 0)}),
         owner=owner,
         local_prepare_error=None,
         forward_only=False,
@@ -300,6 +329,7 @@ def test_dynamic_producer_carrier_requires_mapping_views_and_callbacks():
         source_window=None,
         static_plan=None,
         item_outputs=MappingProxyType({}),
+        sample_location_by_id=MappingProxyType({}),
         owner=owner,
         local_prepare_error=None,
         forward_only=False,
