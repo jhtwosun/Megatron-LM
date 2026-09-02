@@ -51,6 +51,10 @@ def _runtime():
     return importlib.import_module("megatron.core.mdp.dynamic_cp_runtime")
 
 
+def _gradient_lifecycle(nonce=b"\x01" * 16):
+    return _runtime()._begin_decoder_gradient_receipt_lifecycle(nonce)
+
+
 def _packet(order, *, device):
     base = torch.arange(order * 10, order * 10 + 4, device=device).reshape(1, 4)
     tensors = MappingProxyType(
@@ -321,6 +325,7 @@ def _prepare_gradient(state, ready, rank, *, buffers=None, **overrides):
 def _run_gradient_gate(state, prepared, rank, *, events, phase=False, **overrides):
     runtime = _runtime()
     group = overrides.pop("group", _FakeGroup(_PARTICIPANTS, rank))
+    iteration_nonce = overrides.pop("iteration_nonce", b"\x01" * 16) if phase else None
 
     def gather(wire, **kwargs):
         status = execution._PrecollectiveStatus.from_wire_tuple(wire)
@@ -351,6 +356,8 @@ def _run_gradient_gate(state, prepared, rank, *, events, phase=False, **override
         all_to_all_single=all_to_all_single,
     )
     values.update(overrides)
+    if phase:
+        values["iteration_nonce"] = iteration_nonce
     runner = runtime._run_decoder_gradient_phase if phase else runtime._run_decoder_gradient_gate
     return runner(prepared, **values)
 
@@ -935,7 +942,11 @@ def test_decoder_gradient_gate_discriminator_is_available():
     runtime = _runtime()
     assert callable(runtime._run_decoder_gradient_gate)
     assert callable(runtime._run_decoder_gradient_phase)
+    assert callable(runtime._begin_decoder_gradient_receipt_lifecycle)
+    assert callable(runtime._consume_decoder_gradient_receipt)
+    assert callable(runtime._retire_decoder_gradient_receipt_lifecycle)
     assert runtime.DecoderGradientReceipt.__module__ == runtime.__name__
+    assert runtime.DecoderGradientReceiptLifecycle.__module__ == runtime.__name__
 
 
 def test_decoder_gradient_gate_runs_one_status_gate_before_reverse_exchange():
@@ -975,6 +986,7 @@ def test_decoder_gradient_receipt_aggregates_exact_endpoint_gradients():
         tensor.fill_(index)
     destinations = _gradient_destinations(state, 1, fill_value=-7)
     assembled = _runtime()._assemble_decoder_gradient_receipt(
+        _gradient_lifecycle(),
         receipt,
         global_manifest=state.manifest,
         plan=state.plan,
@@ -1004,6 +1016,93 @@ def test_decoder_gradient_receipt_aggregates_exact_endpoint_gradients():
     assert all(leaf.grad is not None for leaf in ready.embedding_leaves.values())
 
 
+def test_decoder_gradient_receipt_lifecycle_consumes_once_then_retires():
+    state = _state(images_per_sample=2, solver=_SingleWaveCp2Solver(), capacity=8)
+    ready = _run(state, 1)
+    _set_leaf_grads(ready)
+    prepared = _prepare_gradient(state, ready, 1)
+    nonce = b"\x02" * 16
+    receipt = _run_gradient_gate(state, prepared, 1, events=[], phase=True, iteration_nonce=nonce)
+    for index, tensor in enumerate(receipt.received_tensors.values(), start=1):
+        tensor.fill_(index)
+    destinations = _gradient_destinations(state, 1, fill_value=-7)
+    aggregation_kwargs = dict(
+        global_manifest=state.manifest,
+        plan=state.plan,
+        embedding_ledger=state.embedding,
+        gradient_ledger=state.gradient,
+        producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+        output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+        global_rank=1,
+        participant_ranks=_PARTICIPANTS,
+        embedding_width=_WIDTH,
+        embedding_dtype=torch.float32,
+        cp_partition_mode="contiguous",
+        destination_tensors=destinations,
+    )
+    runtime = _runtime()
+    lifecycle = runtime._begin_decoder_gradient_receipt_lifecycle(nonce)
+    assembled = runtime._consume_decoder_gradient_receipt(lifecycle, receipt, **aggregation_kwargs)
+    assert tuple(assembled) == tuple(destinations)
+    assert lifecycle._state == "consumed"
+    destination_snapshots = {item_id: tensor.clone() for item_id, tensor in destinations.items()}
+    with pytest.raises(MdpStateError, match="requires a new state"):
+        runtime._consume_decoder_gradient_receipt(lifecycle, receipt, **aggregation_kwargs)
+    with pytest.raises(MdpStateError, match="consumed exactly once"):
+        runtime._consume_decoder_gradient_receipt(
+            runtime._begin_decoder_gradient_receipt_lifecycle(nonce), receipt, **aggregation_kwargs
+        )
+    with pytest.raises(MdpStateError, match="consumed exactly once"):
+        runtime._assemble_decoder_gradient_receipt(
+            runtime._begin_decoder_gradient_receipt_lifecycle(nonce), receipt, **aggregation_kwargs
+        )
+    for item_id, destination in destinations.items():
+        torch.testing.assert_close(destination, destination_snapshots[item_id])
+    runtime._retire_decoder_gradient_receipt_lifecycle(lifecycle)
+    assert lifecycle._state == "retired"
+    with pytest.raises(MdpStateError, match="requires a consumed state"):
+        runtime._retire_decoder_gradient_receipt_lifecycle(lifecycle)
+
+
+def test_decoder_gradient_receipt_lifecycle_rejects_stale_or_unsealed_state_before_mutation():
+    state = _state()
+    ready = _run(state, 1)
+    _set_leaf_grads(ready)
+    prepared = _prepare_gradient(state, ready, 1)
+    receipt = _run_gradient_gate(
+        state, prepared, 1, events=[], phase=True, iteration_nonce=b"\x03" * 16
+    )
+    destinations = _gradient_destinations(state, 1, fill_value=-7)
+    aggregation_kwargs = dict(
+        global_manifest=state.manifest,
+        plan=state.plan,
+        embedding_ledger=state.embedding,
+        gradient_ledger=state.gradient,
+        producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+        output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+        global_rank=1,
+        participant_ranks=_PARTICIPANTS,
+        embedding_width=_WIDTH,
+        embedding_dtype=torch.float32,
+        cp_partition_mode="contiguous",
+        destination_tensors=destinations,
+    )
+    runtime = _runtime()
+    with pytest.raises(MdpStateError, match="active lifecycle nonce"):
+        runtime._consume_decoder_gradient_receipt(
+            runtime._begin_decoder_gradient_receipt_lifecycle(b"\x04" * 16),
+            receipt,
+            **aggregation_kwargs,
+        )
+    unsealed = runtime.DecoderGradientReceiptLifecycle(iteration_nonce=b"\x03" * 16)
+    with pytest.raises(MdpBridgeError, match="private authority seal"):
+        runtime._consume_decoder_gradient_receipt(unsealed, receipt, **aggregation_kwargs)
+    assert all(
+        torch.equal(destination, torch.full_like(destination, -7))
+        for destination in destinations.values()
+    )
+
+
 def test_decoder_gradient_receipt_rejects_forgery_without_mutating_destinations():
     state = _state()
     ready = _run(state, 1)
@@ -1015,6 +1114,7 @@ def test_decoder_gradient_receipt_rejects_forgery_without_mutating_destinations(
     destinations = _gradient_destinations(state, 1, fill_value=-7)
     with pytest.raises(MdpBridgeError, match="private authority seal"):
         _runtime()._assemble_decoder_gradient_receipt(
+            _gradient_lifecycle(),
             forged,
             global_manifest=state.manifest,
             plan=state.plan,
@@ -1046,6 +1146,7 @@ def test_decoder_gradient_receipt_rejects_decoder_gradient_alias_before_mutation
     source_before = source.clone()
     with pytest.raises(MdpBridgeError, match="do not alias"):
         _runtime()._assemble_decoder_gradient_receipt(
+            _gradient_lifecycle(),
             receipt,
             global_manifest=state.manifest,
             plan=state.plan,
@@ -1074,6 +1175,7 @@ def test_decoder_gradient_receipt_rejects_transport_buffer_alias_before_mutation
     destination_before = destination.clone()
     with pytest.raises(MdpBridgeError, match="do not alias"):
         _runtime()._assemble_decoder_gradient_receipt(
+            _gradient_lifecycle(),
             receipt,
             global_manifest=state.manifest,
             plan=state.plan,
@@ -1107,6 +1209,7 @@ def test_decoder_gradient_receipt_rejects_decoder_leaf_alias_before_mutation():
     destination_before = destination.clone()
     with pytest.raises(MdpBridgeError, match="do not alias"):
         _runtime()._assemble_decoder_gradient_receipt(
+            _gradient_lifecycle(),
             receipt,
             global_manifest=state.manifest,
             plan=state.plan,
@@ -1480,7 +1583,15 @@ def _run_world4(state, rank, groups, *, fail_local=False, events=None):
 
 
 def _run_world4_gradient_gate(
-    state, ready, rank, groups, *, fail_local=False, events=None, phase=False
+    state,
+    ready,
+    rank,
+    groups,
+    *,
+    fail_local=False,
+    events=None,
+    phase=False,
+    iteration_nonce=b"\x01" * 16,
 ):
     runtime = _runtime()
     participant, _ = groups
@@ -1505,8 +1616,7 @@ def _run_world4_gradient_gate(
         return torch.distributed.all_to_all_single(*args, **kwargs)
 
     runner = runtime._run_decoder_gradient_phase if phase else runtime._run_decoder_gradient_gate
-    return runner(
-        prepared,
+    values = dict(
         global_manifest=state.manifest,
         plan=state.plan,
         embedding_ledger=state.embedding,
@@ -1524,6 +1634,9 @@ def _run_world4_gradient_gate(
         group_ranks_getter=torch.distributed.get_process_group_ranks,
         all_to_all_single=tracked_all_to_all_single,
     )
+    if phase:
+        values["iteration_nonce"] = iteration_nonce
+    return runner(prepared, **values)
 
 
 def _world4_oracles(state):
@@ -1674,7 +1787,10 @@ def test_world4_nccl_decoder_gradient_receipt_aggregates_cp2_endpoints(decoder_r
         state, ready, rank, decoder_ready_groups, events=events, phase=True
     )
     destinations = _gradient_destinations(state, rank, fill_value=-7)
-    assembled = _runtime()._assemble_decoder_gradient_receipt(
+    runtime = _runtime()
+    lifecycle = runtime._begin_decoder_gradient_receipt_lifecycle(b"\x01" * 16)
+    assembled = runtime._consume_decoder_gradient_receipt(
+        lifecycle,
         receipt,
         global_manifest=state.manifest,
         plan=state.plan,
@@ -1699,3 +1815,4 @@ def test_world4_nccl_decoder_gradient_receipt_aggregates_cp2_endpoints(decoder_r
             if entry.dst_global_rank == rank and entry.key.item_id == item_id:
                 expected.add_(receipt.received_tensors[entry.key])
         torch.testing.assert_close(destination, expected)
+    runtime._retire_decoder_gradient_receipt_lifecycle(lifecycle)

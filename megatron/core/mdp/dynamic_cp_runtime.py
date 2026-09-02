@@ -6,10 +6,11 @@ The caller owns buffers, encoder outputs, process groups, and resource
 retirement. A trusted rank-local adapter constructs the structural VPP1
 records and leaf views. This module serializes the existing all-dtype decoder
 payload gate, the existing embedding bridge gate, one decoder-ready status
-gate, one reverse-gradient preparation/transport gate, and local caller-owned
-producer aggregation. It does not enter a decoder schedule, create replay
-cursors, execute backward, retire gradient state, retry, or recover from a
-failure inside an entered collective.
+gate, one reverse-gradient preparation/transport gate, local caller-owned
+producer aggregation, and a local one-shot receipt lifecycle. It does not
+enter a decoder schedule, create replay cursors, execute backward, clear
+caller-owned gradient buffers, retry, or recover from a failure inside an
+entered collective.
 """
 
 import hashlib
@@ -150,6 +151,8 @@ class PreparedDecoderGradientExchange:
 class _DecoderGradientReceiptAuthority:
     receipt_identity: int
     prepared_identity: int
+    iteration_nonce: bytes
+    consumed_lifecycle_identity: int | None
     received_mapping_identity: int
     received_descriptors: tuple[
         tuple[DynamicBridgeKey, int, tuple[int, ...], torch.dtype, torch.device, int, int], ...
@@ -161,8 +164,30 @@ class DecoderGradientReceipt:
     """One sealed gate-3 result, ready for caller-owned producer aggregation."""
 
     prepared: PreparedDecoderGradientExchange = field(compare=False, repr=False)
+    iteration_nonce: bytes
     received_tensors: Mapping[DynamicBridgeKey, Tensor] = field(compare=False, repr=False)
+    _consumed_lifecycle_identity: int | None = field(default=None, init=False, repr=False)
     _authority: _DecoderGradientReceiptAuthority | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
+
+
+@dataclass(frozen=True)
+class _DecoderGradientReceiptLifecycleAuthority:
+    lifecycle_identity: int
+    iteration_nonce: bytes
+    state: str
+    receipt_identity: int | None
+
+
+@dataclass(frozen=True)
+class DecoderGradientReceiptLifecycle:
+    """Caller-owned one-shot state for one decoder-gradient receipt."""
+
+    iteration_nonce: bytes
+    _receipt_identity: int | None = field(default=None, init=False, repr=False)
+    _state: str = field(default="new", init=False, repr=False)
+    _authority: _DecoderGradientReceiptLifecycleAuthority | None = field(
         default=None, init=False, compare=False, repr=False
     )
 
@@ -186,6 +211,60 @@ def _require_digest(name: str, value: Any) -> bytes:
     if type(value) is not bytes or len(value) != 16:
         raise MdpPlanError(f"MDP: {name} is an exact 16-byte digest.")
     return value
+
+
+def _require_iteration_nonce(value: Any) -> bytes:
+    nonce = _require_digest("decoder gradient iteration nonce", value)
+    if nonce == bytes(16):
+        raise MdpConfigurationError("MDP: decoder gradient iteration nonce is non-zero.")
+    return nonce
+
+
+def _capture_decoder_gradient_receipt_lifecycle_authority(
+    lifecycle: DecoderGradientReceiptLifecycle,
+) -> _DecoderGradientReceiptLifecycleAuthority:
+    nonce = _require_iteration_nonce(lifecycle.iteration_nonce)
+    if lifecycle._state == "new":
+        if lifecycle._receipt_identity is not None:
+            raise MdpStateError("MDP: new decoder gradient lifecycle has no receipt.")
+    elif lifecycle._state == "consumed":
+        if not isinstance(lifecycle._receipt_identity, int):
+            raise MdpStateError("MDP: consumed decoder gradient lifecycle owns one receipt.")
+    elif lifecycle._state == "retired":
+        if lifecycle._receipt_identity is not None:
+            raise MdpStateError("MDP: retired decoder gradient lifecycle has no receipt.")
+    else:
+        raise MdpStateError("MDP: decoder gradient lifecycle has a valid state.")
+    return _DecoderGradientReceiptLifecycleAuthority(
+        lifecycle_identity=id(lifecycle),
+        iteration_nonce=nonce,
+        state=lifecycle._state,
+        receipt_identity=lifecycle._receipt_identity,
+    )
+
+
+def _validate_decoder_gradient_receipt_lifecycle(
+    lifecycle: Any, *, expected_state: str
+) -> DecoderGradientReceiptLifecycle:
+    if type(lifecycle) is not DecoderGradientReceiptLifecycle:
+        raise MdpConfigurationError("MDP: decoder gradient lifecycle has its exact owner type.")
+    if type(lifecycle._authority) is not _DecoderGradientReceiptLifecycleAuthority:
+        raise MdpBridgeError("MDP: decoder gradient lifecycle has a private authority seal.")
+    if _capture_decoder_gradient_receipt_lifecycle_authority(lifecycle) != lifecycle._authority:
+        raise MdpBridgeError("MDP: decoder gradient lifecycle matches its private authority seal.")
+    if lifecycle._state != expected_state:
+        raise MdpStateError(f"MDP: decoder gradient lifecycle requires a {expected_state} state.")
+    return lifecycle
+
+
+def _seal_decoder_gradient_receipt_lifecycle(
+    lifecycle: DecoderGradientReceiptLifecycle, *, state: str, receipt_identity: int | None
+) -> None:
+    object.__setattr__(lifecycle, "_state", state)
+    object.__setattr__(lifecycle, "_receipt_identity", receipt_identity)
+    object.__setattr__(
+        lifecycle, "_authority", _capture_decoder_gradient_receipt_lifecycle_authority(lifecycle)
+    )
 
 
 def _digest_integers(hasher: Any, *values: int) -> None:
@@ -825,9 +904,21 @@ def validate_prepared_decoder_gradient_exchange(
 def _capture_decoder_gradient_receipt_authority(
     receipt: DecoderGradientReceipt,
 ) -> _DecoderGradientReceiptAuthority:
+    consumed_lifecycle_identity = receipt._consumed_lifecycle_identity
+    if not (
+        consumed_lifecycle_identity is None
+        or (
+            isinstance(consumed_lifecycle_identity, int)
+            and not isinstance(consumed_lifecycle_identity, bool)
+            and consumed_lifecycle_identity >= 0
+        )
+    ):
+        raise MdpStateError("MDP: decoder gradient receipt has a valid consumption owner.")
     return _DecoderGradientReceiptAuthority(
         receipt_identity=id(receipt),
         prepared_identity=id(receipt.prepared),
+        iteration_nonce=_require_iteration_nonce(receipt.iteration_nonce),
+        consumed_lifecycle_identity=consumed_lifecycle_identity,
         received_mapping_identity=id(receipt.received_tensors),
         received_descriptors=_gradient_source_descriptors(receipt.received_tensors),
     )
@@ -847,12 +938,14 @@ def _validate_decoder_gradient_receipt(
     embedding_width: int,
     embedding_dtype: torch.dtype,
     cp_partition_mode: str,
+    iteration_nonce: bytes,
 ) -> DecoderGradientReceipt:
     """Validate one sealed gate-3 result before local producer aggregation."""
     if type(receipt) is not DecoderGradientReceipt:
         raise MdpConfigurationError("MDP: decoder gradient receipt has its exact carrier type.")
     if type(receipt._authority) is not _DecoderGradientReceiptAuthority:
         raise MdpBridgeError("MDP: decoder gradient receipt has a private authority seal.")
+    expected_nonce = _require_iteration_nonce(iteration_nonce)
     prepared = validate_prepared_decoder_gradient_exchange(
         receipt.prepared,
         global_manifest=global_manifest,
@@ -867,6 +960,10 @@ def _validate_decoder_gradient_receipt(
         raise MdpBridgeError("MDP: decoder gradient receipt retains the exact gate-3 mapping.")
     if _capture_decoder_gradient_receipt_authority(receipt) != receipt._authority:
         raise MdpBridgeError("MDP: decoder gradient receipt matches its private authority seal.")
+    if receipt.iteration_nonce != expected_nonce:
+        raise MdpStateError("MDP: decoder gradient receipt belongs to the active iteration nonce.")
+    if receipt._consumed_lifecycle_identity is not None:
+        raise MdpStateError("MDP: decoder gradient receipt is consumed exactly once.")
     route_authority_digest = build_dynamic_bridge_route_authority_digest(
         gradient_ledger,
         embedding_ledger,
@@ -891,17 +988,32 @@ def _validate_decoder_gradient_receipt(
 
 
 def _make_decoder_gradient_receipt(
-    prepared: PreparedDecoderGradientExchange, received_tensors: Mapping[DynamicBridgeKey, Tensor]
+    prepared: PreparedDecoderGradientExchange,
+    received_tensors: Mapping[DynamicBridgeKey, Tensor],
+    *,
+    iteration_nonce: bytes,
 ) -> DecoderGradientReceipt:
     """Seal the exact immutable mapping returned by a successful gate-3 exchange."""
     if received_tensors is not prepared.exchange.received_tensors:
         raise MdpBridgeError("MDP: decoder gradient receipt receives the exact gate-3 mapping.")
-    receipt = DecoderGradientReceipt(prepared=prepared, received_tensors=received_tensors)
+    receipt = DecoderGradientReceipt(
+        prepared=prepared,
+        iteration_nonce=_require_iteration_nonce(iteration_nonce),
+        received_tensors=received_tensors,
+    )
     object.__setattr__(receipt, "_authority", _capture_decoder_gradient_receipt_authority(receipt))
     return receipt
 
 
+def _seal_decoder_gradient_receipt_consumption(
+    receipt: DecoderGradientReceipt, lifecycle: DecoderGradientReceiptLifecycle
+) -> None:
+    object.__setattr__(receipt, "_consumed_lifecycle_identity", id(lifecycle))
+    object.__setattr__(receipt, "_authority", _capture_decoder_gradient_receipt_authority(receipt))
+
+
 def _assemble_decoder_gradient_receipt(
+    lifecycle: DecoderGradientReceiptLifecycle,
     receipt: DecoderGradientReceipt,
     *,
     global_manifest: DecoderGlobalManifest,
@@ -922,6 +1034,7 @@ def _assemble_decoder_gradient_receipt(
     This is local, non-destructive receipt consumption only.  It neither runs
     encoder backward nor retires the receipt, decoder leaves, or caller buffers.
     """
+    lifecycle = _validate_decoder_gradient_receipt_lifecycle(lifecycle, expected_state="new")
     receipt = _validate_decoder_gradient_receipt(
         receipt,
         global_manifest=global_manifest,
@@ -935,6 +1048,7 @@ def _assemble_decoder_gradient_receipt(
         embedding_width=embedding_width,
         embedding_dtype=embedding_dtype,
         cp_partition_mode=cp_partition_mode,
+        iteration_nonce=lifecycle.iteration_nonce,
     )
     if not isinstance(destination_tensors, Mapping):
         raise MdpConfigurationError("MDP: decoder gradient destinations are an item mapping.")
@@ -1000,7 +1114,39 @@ def _assemble_decoder_gradient_receipt(
     for entry in gradient_ledger.entries:
         if entry.dst_global_rank == global_rank:
             destinations[entry.key.item_id].add_(receipt.received_tensors[entry.key])
+    _seal_decoder_gradient_receipt_consumption(receipt, lifecycle)
+    _seal_decoder_gradient_receipt_lifecycle(
+        lifecycle, state="consumed", receipt_identity=id(receipt)
+    )
     return MappingProxyType({item_id: destinations[item_id] for item_id in local_items})
+
+
+def _begin_decoder_gradient_receipt_lifecycle(
+    iteration_nonce: bytes,
+) -> DecoderGradientReceiptLifecycle:
+    """Create one local, one-shot owner for a caller-selected backward wave."""
+    lifecycle = DecoderGradientReceiptLifecycle(
+        iteration_nonce=_require_iteration_nonce(iteration_nonce)
+    )
+    _seal_decoder_gradient_receipt_lifecycle(lifecycle, state="new", receipt_identity=None)
+    return lifecycle
+
+
+def _consume_decoder_gradient_receipt(
+    lifecycle: Any, receipt: DecoderGradientReceipt, **kwargs: Any
+) -> Mapping[GlobalVisionItemId, Tensor]:
+    """Aggregate one current receipt once, then make the lifecycle consumed."""
+    lifecycle = _validate_decoder_gradient_receipt_lifecycle(lifecycle, expected_state="new")
+    nonce = lifecycle.iteration_nonce
+    if type(receipt) is not DecoderGradientReceipt or receipt.iteration_nonce != nonce:
+        raise MdpStateError("MDP: decoder gradient receipt belongs to the active lifecycle nonce.")
+    return _assemble_decoder_gradient_receipt(lifecycle, receipt, **kwargs)
+
+
+def _retire_decoder_gradient_receipt_lifecycle(lifecycle: Any) -> None:
+    """Close a consumed local lifecycle without clearing caller-owned buffers."""
+    lifecycle = _validate_decoder_gradient_receipt_lifecycle(lifecycle, expected_state="consumed")
+    _seal_decoder_gradient_receipt_lifecycle(lifecycle, state="retired", receipt_identity=None)
 
 
 def _prepare_decoder_gradient_exchange(
@@ -1151,11 +1297,13 @@ def _run_decoder_gradient_gate(
 
 
 def _run_decoder_gradient_phase(
-    prepared: PreparedDecoderGradientExchange, **kwargs: Any
+    prepared: PreparedDecoderGradientExchange, *, iteration_nonce: bytes, **kwargs: Any
 ) -> DecoderGradientReceipt:
     """Run gate 3 and seal its exact received mapping for local aggregation."""
     received_tensors = _run_decoder_gradient_gate(prepared, **kwargs)
-    return _make_decoder_gradient_receipt(prepared, received_tensors)
+    return _make_decoder_gradient_receipt(
+        prepared, received_tensors, iteration_nonce=iteration_nonce
+    )
 
 
 def _build_decoder_ready_iteration(
