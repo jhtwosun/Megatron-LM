@@ -26,6 +26,10 @@ Registry entry fields
     ``(args, language_config, vision_config) -> None``
     Sets vision FLOPs metadata on ``args`` for training throughput logging.
 
+``mdp_adapter_factory``  *(required when MDP is enabled)*
+    Callable or lazily resolved dotted path with signature
+    ``(args, language_config) -> MdpModelAdapter``.
+
 ``dataset_providers``  *(optional)*
     ``Dict[str, str | callable]``
     Maps ``--dataset-provider`` names to callables (or dotted import paths
@@ -48,6 +52,7 @@ MODEL_REGISTRY = {
         "vision_config_fn": get_qwen35_vl_vision_config,
         "post_language_config_fn": _qwen35_vl_post_language_config,
         "vision_flops_fn": _qwen35_vl_vision_flops,
+        "mdp_adapter_factory": "examples.multimodal_dev.mdp_adapter.build_mdp_adapter",
         "dataset_providers": {
             "mock": (
                 "examples.multimodal_dev.data.mock"
