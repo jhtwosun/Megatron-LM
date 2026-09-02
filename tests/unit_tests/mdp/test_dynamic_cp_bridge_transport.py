@@ -38,6 +38,8 @@ from megatron.core.mdp.errors import (
 
 _DECODER_RANKS = (30, 10, 40, 20)
 _PARTICIPANTS = (80, 30, 70, 20, 10, 40, 99)
+_GRADIENT_PREDECESSOR_DIGEST = bytes.fromhex("00112233445566778899aabbccddeeff")
+_STALE_GRADIENT_PREDECESSOR_DIGEST = bytes.fromhex("ffeeddccbbaa99887766554433221100")
 
 
 def _packet(lane, order, valid, padded):
@@ -239,6 +241,21 @@ def _expected_digest(state, phase):
         _selected(state, phase),
         state.gradient if phase is BridgePhase.EMBEDDING else state.embedding,
         **state.authority,
+    )
+
+
+def _expected_gate_digest(state, phase, predecessor_authority_digest=None):
+    route_digest = _expected_digest(state, phase)
+    if phase is BridgePhase.EMBEDDING:
+        return route_digest
+    return getattr(transport, "_dynamic_bridge_gate_authority_digest")(
+        phase,
+        route_digest,
+        (
+            _GRADIENT_PREDECESSOR_DIGEST
+            if predecessor_authority_digest is None
+            else predecessor_authority_digest
+        ),
     )
 
 
@@ -647,6 +664,9 @@ def _run_gate(state, default_phase, rank, local_prepare, **overrides):
         group=_FakeGroup(ranks, rank),
         group_ranks_getter=lambda _group: list(ranks),
         all_to_all_single=lambda *_args, **_kwargs: None,
+        predecessor_authority_digest=(
+            _GRADIENT_PREDECESSOR_DIGEST if default_phase is BridgePhase.GRADIENT else None
+        ),
     )
     values.update(overrides)
     return getattr(transport, "_run_dynamic_bridge_gate")(**values)
@@ -677,7 +697,7 @@ def test_gate_runs_prepare_status_then_collective_for_self_and_idle(phase, rank,
         status = execution._PrecollectiveStatus.from_wire_tuple(wire)
         assert status.global_rank == rank
         assert status.global_manifest_digest == state.manifest.digest
-        assert status.plan_digest == _expected_digest(state, phase)
+        assert status.plan_digest == _expected_gate_digest(state, phase)
         assert status.error_code == 0
         assert status.gate_id == expected_gate
         assert kwargs == {"timeout_seconds": 1.0}
@@ -695,6 +715,120 @@ def test_gate_runs_prepare_status_then_collective_for_self_and_idle(phase, rank,
     assert events == ["prepare", "status", "all-to-all"]
     assert len(prepared_values) == 1
     assert received is prepared_values[0].received_tensors
+    assert prepared_values[0].route_authority_digest == _expected_digest(state, phase)
+
+
+def test_gradient_gate_authority_digest_binds_every_context_axis(monkeypatch):
+    state = _state()
+    helper = getattr(transport, "_dynamic_bridge_gate_authority_digest")
+    route_digest = _expected_digest(state, BridgePhase.GRADIENT)
+    baseline = helper(BridgePhase.GRADIENT, route_digest, _GRADIENT_PREDECESSOR_DIGEST)
+    changed_route = helper(
+        BridgePhase.GRADIENT, bytes(reversed(route_digest)), _GRADIENT_PREDECESSOR_DIGEST
+    )
+    changed_predecessor = helper(
+        BridgePhase.GRADIENT, route_digest, _STALE_GRADIENT_PREDECESSOR_DIGEST
+    )
+    changed_phase = helper(BridgePhase.EMBEDDING, route_digest, _GRADIENT_PREDECESSOR_DIGEST)
+
+    schema_version = transport._GATE_AUTHORITY_SCHEMA_VERSION
+    monkeypatch.setattr(transport, "_GATE_AUTHORITY_SCHEMA_VERSION", schema_version + 1)
+    changed_schema = helper(BridgePhase.GRADIENT, route_digest, _GRADIENT_PREDECESSOR_DIGEST)
+    monkeypatch.setattr(transport, "_GATE_AUTHORITY_SCHEMA_VERSION", schema_version)
+    monkeypatch.setattr(
+        transport, "_GATE_AUTHORITY_DOMAIN", transport._GATE_AUTHORITY_DOMAIN + b".changed"
+    )
+    changed_domain = helper(BridgePhase.GRADIENT, route_digest, _GRADIENT_PREDECESSOR_DIGEST)
+
+    assert type(baseline) is bytes and len(baseline) == 16
+    changed = (changed_route, changed_predecessor, changed_phase, changed_schema, changed_domain)
+    assert len({baseline, *changed}) == 6
+
+
+@pytest.mark.parametrize(
+    "phase,route_digest,predecessor_digest",
+    [
+        (object(), b"r" * 16, b"p" * 16),
+        (BridgePhase.GRADIENT, bytearray(16), b"p" * 16),
+        (BridgePhase.GRADIENT, b"r" * 15, b"p" * 16),
+        (BridgePhase.GRADIENT, b"r" * 17, b"p" * 16),
+        (BridgePhase.GRADIENT, b"r" * 16, bytearray(16)),
+        (BridgePhase.GRADIENT, b"r" * 16, b"p" * 15),
+        (BridgePhase.GRADIENT, b"r" * 16, b"p" * 17),
+    ],
+)
+def test_gradient_gate_authority_digest_rejects_malformed_inputs(
+    phase, route_digest, predecessor_digest
+):
+    with pytest.raises(MdpBridgeError):
+        getattr(transport, "_dynamic_bridge_gate_authority_digest")(
+            phase, route_digest, predecessor_digest
+        )
+
+
+@pytest.mark.parametrize(
+    "phase,predecessor_digest,expected_gate",
+    [
+        (BridgePhase.GRADIENT, None, 3),
+        (BridgePhase.GRADIENT, object(), 3),
+        (BridgePhase.GRADIENT, b"p" * 15, 3),
+        (BridgePhase.GRADIENT, b"p" * 17, 3),
+        (BridgePhase.EMBEDDING, b"p" * 16, 1),
+    ],
+)
+def test_gate_converges_invalid_predecessor_context_before_collective(
+    phase, predecessor_digest, expected_gate
+):
+    state = _state()
+    events = []
+    statuses = []
+
+    def gather(wire, **_kwargs):
+        events.append("status")
+        statuses.append(execution._PrecollectiveStatus.from_wire_tuple(wire))
+        return _consensus_rows(wire, _PARTICIPANTS)
+
+    with pytest.raises(MdpPlanError) as caught:
+        _run_gate(
+            state,
+            phase,
+            30,
+            lambda: events.append("prepare"),
+            predecessor_authority_digest=predecessor_digest,
+            all_gather_status=gather,
+            all_to_all_single=lambda *_args, **_kwargs: events.append("all-to-all"),
+        )
+
+    assert events == ["status"]
+    assert len(statuses) == 1
+    assert statuses[0].error_code == 1
+    assert statuses[0].gate_id == expected_gate
+    assert isinstance(caught.value.__cause__, MdpBridgeError)
+
+
+def test_gradient_gate_rejects_remote_stale_predecessor_before_collective():
+    state = _state()
+    events = []
+    stale_digest = _expected_gate_digest(
+        state, BridgePhase.GRADIENT, _STALE_GRADIENT_PREDECESSOR_DIGEST
+    )
+
+    def gather(wire, **_kwargs):
+        events.append("status")
+        status = execution._PrecollectiveStatus.from_wire_tuple(wire)
+        assert status.plan_digest == _expected_gate_digest(state, BridgePhase.GRADIENT)
+        return _consensus_rows(wire, _PARTICIPANTS, route_digests={99: stale_digest})
+
+    with pytest.raises(MdpPlanError, match="digest"):
+        _run_gate(
+            state,
+            BridgePhase.GRADIENT,
+            30,
+            lambda: (events.append("prepare") or _prepare(state, BridgePhase.GRADIENT, 30)[0]),
+            all_gather_status=gather,
+            all_to_all_single=lambda *_args, **_kwargs: events.append("all-to-all"),
+        )
+    assert events == ["prepare", "status"]
 
 
 @pytest.mark.parametrize(
@@ -1338,6 +1472,58 @@ def test_world4_nccl_gate_converges_rank2_failure_then_reuses_group(failure, bri
         BridgePhase.EMBEDDING,
         rank,
         lambda: _prepare(state, BridgePhase.EMBEDDING, rank)[0],
+        group=bridge_group,
+        group_ranks_getter=torch.distributed.get_process_group_ranks,
+        all_gather_status=gather,
+        all_to_all_single=tracked_all_to_all_single,
+        timeout_seconds=30.0,
+    )
+    retry_completion = torch.ones((), dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(retry_completion, group=bridge_group)
+    assert retry_completion.item() == 4
+    assert calls == 1
+    assert received is not None
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+def test_world4_nccl_gradient_gate_converges_stale_predecessor_then_reuses_group(bridge_group):
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = _world4_state(torch.float32, device)
+    calls = 0
+
+    def tracked_all_to_all_single(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return torch.distributed.all_to_all_single(*args, **kwargs)
+
+    gather = payload_transport.make_precollective_status_gather(
+        group=bridge_group, group_ranks=_WORLD4_PARTICIPANTS, global_rank=rank, device=device
+    )
+    predecessor = _STALE_GRADIENT_PREDECESSOR_DIGEST if rank == 2 else _GRADIENT_PREDECESSOR_DIGEST
+    with pytest.raises(MdpPlanError, match="digest"):
+        _run_gate(
+            state,
+            BridgePhase.GRADIENT,
+            rank,
+            lambda: _prepare(state, BridgePhase.GRADIENT, rank)[0],
+            predecessor_authority_digest=predecessor,
+            group=bridge_group,
+            group_ranks_getter=torch.distributed.get_process_group_ranks,
+            all_gather_status=gather,
+            all_to_all_single=tracked_all_to_all_single,
+            timeout_seconds=30.0,
+        )
+    completion = torch.ones((), dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(completion, group=bridge_group)
+    assert completion.item() == 4
+    assert calls == 0
+
+    received = _run_gate(
+        state,
+        BridgePhase.GRADIENT,
+        rank,
+        lambda: _prepare(state, BridgePhase.GRADIENT, rank)[0],
         group=bridge_group,
         group_ranks_getter=torch.distributed.get_process_group_ranks,
         all_gather_status=gather,

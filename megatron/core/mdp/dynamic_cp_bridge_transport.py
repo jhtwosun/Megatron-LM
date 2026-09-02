@@ -44,6 +44,8 @@ _INT64_MAX = 2**63 - 1
 _MAPPING_PROXY_TYPE = type(MappingProxyType({}))
 _AUTHORITY_DOMAIN = b"megatron.mdp.dynamic-cp.dynamic-bridge-transport"
 _AUTHORITY_SCHEMA_VERSION = 1
+_GATE_AUTHORITY_DOMAIN = b"megatron.mdp.dynamic-cp.dynamic-bridge-gate"
+_GATE_AUTHORITY_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -217,6 +219,27 @@ def build_dynamic_bridge_route_authority_digest(
         dtype=dtype,
         participant_ranks=participant_ranks,
     )
+
+
+def _dynamic_bridge_gate_authority_digest(
+    phase: BridgePhase, route_authority_digest: bytes, predecessor_authority_digest: bytes
+) -> bytes:
+    """Bind one bridge route to the exact predecessor phase authority."""
+    if not isinstance(phase, BridgePhase):
+        raise MdpBridgeError("MDP: dynamic bridge gate authority phase is typed.")
+    if type(route_authority_digest) is not bytes or len(route_authority_digest) != 16:
+        raise MdpBridgeError("MDP: dynamic bridge gate route authority digest is exactly 16 bytes.")
+    if type(predecessor_authority_digest) is not bytes or len(predecessor_authority_digest) != 16:
+        raise MdpBridgeError(
+            "MDP: dynamic bridge gate predecessor authority digest is exactly 16 bytes."
+        )
+    hasher = hashlib.blake2b(digest_size=16)
+    _digest_integers(hasher, len(_GATE_AUTHORITY_DOMAIN), _GATE_AUTHORITY_SCHEMA_VERSION)
+    hasher.update(_GATE_AUTHORITY_DOMAIN)
+    _digest_text(hasher, phase.value)
+    _digest_bytes(hasher, route_authority_digest)
+    _digest_bytes(hasher, predecessor_authority_digest)
+    return hasher.digest()
 
 
 def _storage_pointer(tensor: Tensor) -> int:
@@ -512,6 +535,7 @@ def _run_dynamic_bridge_gate(
     local_prepare: Any,
     timeout_seconds: float,
     group: Any,
+    predecessor_authority_digest: bytes | None = None,
     group_ranks_getter: Callable[[Any], Any] = dist.get_process_group_ranks,
     all_to_all_single: Callable[..., Any] = dist.all_to_all_single,
 ) -> Mapping[DynamicBridgeKey, Tensor]:
@@ -519,9 +543,11 @@ def _run_dynamic_bridge_gate(
 
     Only rank-symmetric rendezvous context may reject before the status gather.
     All metadata, route, preparation, carrier, callback, and native-group
-    failures become one local error status. ``local_prepare`` must remain
-    rank-local and noncollective. The injected gather must not mutate its status
-    input or sealed carrier buffers. This helper owns no retry or recovery.
+    failures become one local error status. A gradient gate additionally binds
+    an exact predecessor authority; an embedding gate accepts no predecessor.
+    ``local_prepare`` must remain rank-local and noncollective. The injected
+    gather must not mutate its status input or sealed carrier buffers. This
+    helper owns no retry or recovery.
     """
     gate_id = 3 if phase is BridgePhase.GRADIENT else 1
     rank, ranks, gather, timeout = _validate_bridge_gate_context(
@@ -532,6 +558,7 @@ def _run_dynamic_bridge_gate(
     )
     manifest_digest = _snapshot_bridge_gate_digest(global_manifest)
     route_digest = bytes(16)
+    gate_digest = bytes(16)
     carrier = None
     local_error = None
     try:
@@ -556,6 +583,14 @@ def _run_dynamic_bridge_gate(
             dtype=dtype,
             participant_ranks=ranks,
         )
+        if phase is BridgePhase.EMBEDDING:
+            gate_digest = route_digest
+            if predecessor_authority_digest is not None:
+                raise MdpBridgeError("MDP: embedding bridge gate predecessor authority is None.")
+        else:
+            gate_digest = _dynamic_bridge_gate_authority_digest(
+                phase, route_digest, predecessor_authority_digest
+            )
         if not callable(local_prepare):
             raise MdpConfigurationError("MDP: dynamic bridge gate local_prepare is callable.")
         if not callable(group_ranks_getter):
@@ -588,7 +623,8 @@ def _run_dynamic_bridge_gate(
     status = _PrecollectiveStatus(
         global_rank=rank,
         global_manifest_digest=manifest_digest,
-        plan_digest=route_digest,
+        # Gate 3 carries route-plus-predecessor authority in this fixed wire slot.
+        plan_digest=gate_digest,
         error_code=int(local_error is not None),
         gate_id=gate_id,
     )
