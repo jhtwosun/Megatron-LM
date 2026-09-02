@@ -9,6 +9,8 @@ group order, which may differ from the decoder endpoint order in the plan.
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import timedelta
+from math import isfinite
 from types import MappingProxyType
 from typing import Any
 
@@ -24,8 +26,9 @@ from megatron.core.mdp.dynamic_cp_routing import (
     decoder_payload_split_sizes,
     validate_decoder_payload_route_ledger,
 )
-from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError
+from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError, MdpPlanError
 
+_INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 _MAPPING_PROXY_TYPE = type(MappingProxyType({}))
 
@@ -459,3 +462,196 @@ def prepare_decoder_payload_exchange(
     )
     object.__setattr__(prepared, "_authority", _capture_prepared_authority(prepared))
     return prepared
+
+
+def _validate_status_wire(value: Any) -> tuple[int, ...]:
+    if not isinstance(value, tuple) or len(value) != 7:
+        raise MdpPlanError("MDP: precollective status has an exact seven-word tuple wire.")
+    if any(
+        not isinstance(component, int)
+        or isinstance(component, bool)
+        or component < _INT64_MIN
+        or component > _INT64_MAX
+        for component in value
+    ):
+        raise MdpPlanError("MDP: every precollective status word is a signed-int64 integer.")
+    return value
+
+
+def _validate_status_timeout(value: Any) -> timedelta:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MdpConfigurationError(
+            "MDP: precollective status timeout is a positive finite number."
+        )
+    try:
+        seconds = float(value)
+    except (OverflowError, ValueError) as error:
+        raise MdpConfigurationError(
+            "MDP: precollective status timeout is a positive finite number."
+        ) from error
+    if not isfinite(seconds) or seconds <= 0:
+        raise MdpConfigurationError(
+            "MDP: precollective status timeout is a positive finite number."
+        )
+    if seconds < 0.001:
+        raise MdpConfigurationError(
+            "MDP: precollective status timeout is at least one millisecond."
+        )
+    try:
+        timeout = timedelta(seconds=seconds)
+    except (OverflowError, ValueError) as error:
+        raise MdpConfigurationError(
+            "MDP: precollective status timeout fits a bounded wait duration."
+        ) from error
+    if timeout < timedelta(milliseconds=1):
+        raise MdpConfigurationError(
+            "MDP: precollective status timeout is at least one millisecond."
+        )
+    return timeout
+
+
+def _validate_status_group_context(
+    *,
+    group: Any,
+    group_ranks: Any,
+    global_rank: Any,
+    device: Any,
+    group_ranks_getter: Any,
+    all_gather_into_tensor: Any,
+) -> tuple[int, ...]:
+    if not isinstance(group_ranks, tuple):
+        raise MdpConfigurationError("MDP: precollective status group ranks use an immutable tuple.")
+    if not group_ranks:
+        raise MdpConfigurationError("MDP: precollective status group ranks form a non-empty tuple.")
+    if any(
+        not isinstance(rank, int) or isinstance(rank, bool) or rank < 0 or rank > _INT64_MAX
+        for rank in group_ranks
+    ):
+        raise MdpConfigurationError(
+            "MDP: precollective status group ranks are signed-int64 integers."
+        )
+    if len(set(group_ranks)) != len(group_ranks):
+        raise MdpConfigurationError("MDP: precollective status group ranks are unique.")
+    if (
+        not isinstance(global_rank, int)
+        or isinstance(global_rank, bool)
+        or global_rank not in group_ranks
+    ):
+        raise MdpConfigurationError(
+            "MDP: precollective status global rank is an exact group participant."
+        )
+    if not isinstance(device, torch.device):
+        raise MdpConfigurationError("MDP: precollective status device is a torch.device.")
+    if not callable(group_ranks_getter):
+        raise MdpConfigurationError("MDP: precollective status group_ranks_getter is callable.")
+    if not callable(all_gather_into_tensor):
+        raise MdpConfigurationError("MDP: precollective status all_gather_into_tensor is callable.")
+    try:
+        actual_ranks = tuple(group_ranks_getter(group))
+    except Exception as error:
+        raise MdpConfigurationError(
+            "MDP: precollective status native group rank query succeeded."
+        ) from error
+    if actual_ranks != group_ranks or any(
+        not isinstance(rank, int) or isinstance(rank, bool) for rank in actual_ranks
+    ):
+        raise MdpConfigurationError(
+            "MDP: precollective status native group uses the exact rank order."
+        )
+    try:
+        size_query = getattr(group, "size")
+        rank_query = getattr(group, "rank")
+        if not callable(size_query) or not callable(rank_query):
+            raise TypeError("native group size and rank queries are callable")
+        group_size = size_query()
+        local_rank = rank_query()
+    except Exception as error:
+        raise MdpConfigurationError(
+            "MDP: precollective status native group geometry query succeeded."
+        ) from error
+    if (
+        not isinstance(group_size, int)
+        or isinstance(group_size, bool)
+        or group_size != len(group_ranks)
+    ):
+        raise MdpConfigurationError(
+            "MDP: precollective status native group size matches participant count."
+        )
+    if (
+        not isinstance(local_rank, int)
+        or isinstance(local_rank, bool)
+        or local_rank != group_ranks.index(global_rank)
+    ):
+        raise MdpConfigurationError(
+            "MDP: precollective status native group local rank matches the global rank."
+        )
+    return group_ranks
+
+
+def make_precollective_status_gather(
+    *,
+    group: Any,
+    group_ranks: tuple[int, ...],
+    global_rank: int,
+    device: torch.device,
+    group_ranks_getter: Callable[[Any], Any] = dist.get_process_group_ranks,
+    all_gather_into_tensor: Callable[..., Any] = dist.all_gather_into_tensor,
+) -> Callable[..., tuple[tuple[int, ...], ...]]:
+    """Bind a fixed-width bounded status gather to one exact native group.
+
+    All participants must call the returned closure in the same phase order.
+    Wire and timeout validation is rank-local before NCCL, so this helper cannot
+    recover from asymmetric misuse; caller-side ordering and consensus remain
+    runtime responsibilities.
+    """
+    ranks = _validate_status_group_context(
+        group=group,
+        group_ranks=group_ranks,
+        global_rank=global_rank,
+        device=device,
+        group_ranks_getter=group_ranks_getter,
+        all_gather_into_tensor=all_gather_into_tensor,
+    )
+
+    def gather(value: tuple[int, ...], *, timeout_seconds: float) -> tuple[tuple[int, ...], ...]:
+        wire = _validate_status_wire(value)
+        timeout = _validate_status_timeout(timeout_seconds)
+        _validate_status_group_context(
+            group=group,
+            group_ranks=ranks,
+            global_rank=global_rank,
+            device=device,
+            group_ranks_getter=group_ranks_getter,
+            all_gather_into_tensor=all_gather_into_tensor,
+        )
+        source = torch.tensor(wire, dtype=torch.int64, device=device)
+        destination = torch.empty(len(ranks) * len(wire), dtype=torch.int64, device=device)
+        try:
+            work = all_gather_into_tensor(destination, source, group=group, async_op=True)
+        except Exception as error:
+            raise MdpBridgeError("MDP: precollective status gather failed.") from error
+        try:
+            wait = getattr(work, "wait")
+        except Exception as error:
+            raise MdpBridgeError(
+                "MDP: precollective status work exposes a callable wait."
+            ) from error
+        if not callable(wait):
+            raise MdpBridgeError("MDP: precollective status work exposes a callable wait.")
+        try:
+            completed = wait(timeout=timeout)
+        except Exception as error:
+            raise MdpBridgeError("MDP: precollective status wait failed.") from error
+        if completed is False:
+            raise MdpBridgeError("MDP: precollective status gather timed out.")
+        if completed is not True:
+            raise MdpBridgeError("MDP: precollective status wait returns a boolean completion.")
+        try:
+            rows = destination.view(len(ranks), len(wire)).tolist()
+            return tuple(tuple(int(component) for component in row) for row in rows)
+        except Exception as error:
+            raise MdpBridgeError(
+                "MDP: precollective status result materialization failed."
+            ) from error
+
+    return gather
