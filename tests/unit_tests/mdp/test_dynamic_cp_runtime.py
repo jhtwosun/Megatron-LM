@@ -945,6 +945,7 @@ def test_decoder_gradient_gate_discriminator_is_available():
     assert callable(runtime._begin_decoder_gradient_receipt_lifecycle)
     assert callable(runtime._consume_decoder_gradient_receipt)
     assert callable(runtime._retire_decoder_gradient_receipt_lifecycle)
+    assert callable(runtime._complete_decoder_gradient_phase)
     assert runtime.DecoderGradientReceipt.__module__ == runtime.__name__
     assert runtime.DecoderGradientReceiptLifecycle.__module__ == runtime.__name__
 
@@ -1101,6 +1102,56 @@ def test_decoder_gradient_receipt_lifecycle_rejects_stale_or_unsealed_state_befo
         torch.equal(destination, torch.full_like(destination, -7))
         for destination in destinations.values()
     )
+
+
+def test_decoder_gradient_completion_composes_one_ready_to_retired_wave():
+    state = _state()
+    ready = _run(state, 1)
+    _set_leaf_grads(ready)
+    send_buffer, receive_buffer = _gradient_buffers(state, 1)
+    destinations = _gradient_destinations(state, 1, fill_value=-7)
+    events = []
+
+    def gather(wire, **kwargs):
+        status = execution._PrecollectiveStatus.from_wire_tuple(wire)
+        events.append(f"status-{status.gate_id}")
+        assert kwargs == {"timeout_seconds": 0.001}
+        return _consensus_rows(wire, _PARTICIPANTS)
+
+    def all_to_all_single(*args, **kwargs):
+        input_tensor = kwargs["input"] if "input" in kwargs else args[1]
+        output_tensor = kwargs["output"] if "output" in kwargs else args[0]
+        events.append(f"a2a-{input_tensor.dtype}")
+        output_tensor.zero_()
+
+    assembled = _runtime()._complete_decoder_gradient_phase(
+        ready,
+        iteration_nonce=b"\x05" * 16,
+        global_manifest=state.manifest,
+        plan=state.plan,
+        embedding_ledger=state.embedding,
+        gradient_ledger=state.gradient,
+        producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+        output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+        embedding_width=_WIDTH,
+        embedding_dtype=torch.float32,
+        cp_partition_mode="contiguous",
+        global_rank=1,
+        participant_ranks=_PARTICIPANTS,
+        group_ranks=_PARTICIPANTS,
+        send_buffer=send_buffer,
+        receive_buffer=receive_buffer,
+        destination_tensors=destinations,
+        all_gather_status=gather,
+        timeout_seconds=0.001,
+        group=_FakeGroup(_PARTICIPANTS, 1),
+        group_ranks_getter=lambda selected: list(selected.ranks),
+        all_to_all_single=all_to_all_single,
+    )
+    assert events == ["status-3", "a2a-torch.float32"]
+    assert tuple(assembled) == tuple(destinations)
+    assert all(torch.count_nonzero(destination) == 0 for destination in assembled.values())
+    assert all(leaf.grad is not None for leaf in ready.embedding_leaves.values())
 
 
 def test_decoder_gradient_receipt_rejects_forgery_without_mutating_destinations():
@@ -1582,25 +1633,8 @@ def _run_world4(state, rank, groups, *, fail_local=False, events=None):
     )
 
 
-def _run_world4_gradient_gate(
-    state,
-    ready,
-    rank,
-    groups,
-    *,
-    fail_local=False,
-    events=None,
-    phase=False,
-    iteration_nonce=b"\x01" * 16,
-):
-    runtime = _runtime()
+def _world4_gradient_phase_kwargs(state, rank, groups, *, events):
     participant, _ = groups
-    events = [] if events is None else events
-    prepared = _prepare_gradient(state, ready, rank)
-    if fail_local and rank == 2:
-        forged = replace(prepared)
-        object.__setattr__(forged, "_authority", prepared._authority)
-        prepared = forged
     gather = payload_transport.make_precollective_status_gather(
         group=participant, group_ranks=_PARTICIPANTS, global_rank=rank, device=state.device
     )
@@ -1615,8 +1649,7 @@ def _run_world4_gradient_gate(
         events.append(f"a2a-{input_tensor.dtype}")
         return torch.distributed.all_to_all_single(*args, **kwargs)
 
-    runner = runtime._run_decoder_gradient_phase if phase else runtime._run_decoder_gradient_gate
-    values = dict(
+    return dict(
         global_manifest=state.manifest,
         plan=state.plan,
         embedding_ledger=state.embedding,
@@ -1634,6 +1667,28 @@ def _run_world4_gradient_gate(
         group_ranks_getter=torch.distributed.get_process_group_ranks,
         all_to_all_single=tracked_all_to_all_single,
     )
+
+
+def _run_world4_gradient_gate(
+    state,
+    ready,
+    rank,
+    groups,
+    *,
+    fail_local=False,
+    events=None,
+    phase=False,
+    iteration_nonce=b"\x01" * 16,
+):
+    runtime = _runtime()
+    events = [] if events is None else events
+    prepared = _prepare_gradient(state, ready, rank)
+    if fail_local and rank == 2:
+        forged = replace(prepared)
+        object.__setattr__(forged, "_authority", prepared._authority)
+        prepared = forged
+    values = _world4_gradient_phase_kwargs(state, rank, groups, events=events)
+    runner = runtime._run_decoder_gradient_phase if phase else runtime._run_decoder_gradient_gate
     if phase:
         values["iteration_nonce"] = iteration_nonce
     return runner(prepared, **values)
@@ -1816,3 +1871,141 @@ def test_world4_nccl_decoder_gradient_receipt_aggregates_cp2_endpoints(decoder_r
                 expected.add_(receipt.received_tensors[entry.key])
         torch.testing.assert_close(destination, expected)
     runtime._retire_decoder_gradient_receipt_lifecycle(lifecycle)
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+def test_world4_nccl_decoder_gradient_completion_composes_cp2_wave(decoder_ready_groups):
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = _state(device=device, solver=_SingleWaveCp2Solver(), capacity=8)
+    ready = _run_world4(state, rank, decoder_ready_groups)
+    _set_leaf_grads(ready)
+
+    oracle_events = []
+    oracle = _run_world4_gradient_gate(
+        state,
+        ready,
+        rank,
+        decoder_ready_groups,
+        events=oracle_events,
+        phase=True,
+        iteration_nonce=b"\x06" * 16,
+    )
+    assert oracle_events == ["status-3", "a2a-torch.float32"]
+
+    send_buffer, receive_buffer = _gradient_buffers(state, rank)
+    destinations = _gradient_destinations(state, rank, fill_value=-7)
+    events = []
+    assembled = _runtime()._complete_decoder_gradient_phase(
+        ready,
+        iteration_nonce=b"\x06" * 16,
+        participant_ranks=_PARTICIPANTS,
+        send_buffer=send_buffer,
+        receive_buffer=receive_buffer,
+        destination_tensors=destinations,
+        **_world4_gradient_phase_kwargs(state, rank, decoder_ready_groups, events=events),
+    )
+    completion = torch.ones((), dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(completion, group=decoder_ready_groups[0])
+    assert completion.item() == 4
+    assert events == ["status-3", "a2a-torch.float32"]
+    assert tuple(assembled) == tuple(destinations)
+    for item_id, destination in assembled.items():
+        expected = torch.zeros_like(destination)
+        for entry in state.gradient.entries:
+            if entry.dst_global_rank == rank and entry.key.item_id == item_id:
+                expected.add_(oracle.received_tensors[entry.key])
+        torch.testing.assert_close(destination, expected)
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+def test_world4_nccl_decoder_gradient_completion_rejects_nonce_mismatch_before_a2a(
+    decoder_ready_groups,
+):
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = _state(device=device, solver=_SingleWaveCp2Solver(), capacity=8)
+    ready = _run_world4(state, rank, decoder_ready_groups)
+    _set_leaf_grads(ready)
+    send_buffer, receive_buffer = _gradient_buffers(state, rank)
+    destinations = _gradient_destinations(state, rank, fill_value=-7)
+    events = []
+
+    with pytest.raises(MdpPlanError, match="plan digest mismatch"):
+        _runtime()._complete_decoder_gradient_phase(
+            ready,
+            iteration_nonce=b"\x07" * 16 if rank == 2 else b"\x06" * 16,
+            participant_ranks=_PARTICIPANTS,
+            send_buffer=send_buffer,
+            receive_buffer=receive_buffer,
+            destination_tensors=destinations,
+            **_world4_gradient_phase_kwargs(state, rank, decoder_ready_groups, events=events),
+        )
+    assert events == ["status-3"]
+    assert all(
+        torch.equal(destination, torch.full_like(destination, -7))
+        for destination in destinations.values()
+    )
+
+    retry_events = []
+    retry_send, retry_receive = _gradient_buffers(state, rank)
+    retry_destinations = _gradient_destinations(state, rank, fill_value=-7)
+    _runtime()._complete_decoder_gradient_phase(
+        ready,
+        iteration_nonce=b"\x06" * 16,
+        participant_ranks=_PARTICIPANTS,
+        send_buffer=retry_send,
+        receive_buffer=retry_receive,
+        destination_tensors=retry_destinations,
+        **_world4_gradient_phase_kwargs(state, rank, decoder_ready_groups, events=retry_events),
+    )
+    assert retry_events == ["status-3", "a2a-torch.float32"]
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+def test_world4_nccl_decoder_gradient_completion_converges_prepare_failure_before_a2a(
+    decoder_ready_groups,
+):
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = _state(device=device, solver=_SingleWaveCp2Solver(), capacity=8)
+    ready = _run_world4(state, rank, decoder_ready_groups)
+    _set_leaf_grads(ready)
+    valid_ready = ready
+    if rank == 2:
+        forged = replace(ready)
+        object.__setattr__(forged, "_authority", ready._authority)
+        ready = forged
+    send_buffer, receive_buffer = _gradient_buffers(state, rank)
+    destinations = _gradient_destinations(state, rank, fill_value=-7)
+    events = []
+
+    with pytest.raises(MdpPlanError, match="error code 1"):
+        _runtime()._complete_decoder_gradient_phase(
+            ready,
+            iteration_nonce=b"\x06" * 16,
+            participant_ranks=_PARTICIPANTS,
+            send_buffer=send_buffer,
+            receive_buffer=receive_buffer,
+            destination_tensors=destinations,
+            **_world4_gradient_phase_kwargs(state, rank, decoder_ready_groups, events=events),
+        )
+    assert events == ["status-3"]
+    assert all(
+        torch.equal(destination, torch.full_like(destination, -7))
+        for destination in destinations.values()
+    )
+
+    retry_events = []
+    retry_send, retry_receive = _gradient_buffers(state, rank)
+    retry_destinations = _gradient_destinations(state, rank, fill_value=-7)
+    _runtime()._complete_decoder_gradient_phase(
+        valid_ready,
+        iteration_nonce=b"\x06" * 16,
+        participant_ranks=_PARTICIPANTS,
+        send_buffer=retry_send,
+        receive_buffer=retry_receive,
+        destination_tensors=retry_destinations,
+        **_world4_gradient_phase_kwargs(state, rank, decoder_ready_groups, events=retry_events),
+    )
+    assert retry_events == ["status-3", "a2a-torch.float32"]
