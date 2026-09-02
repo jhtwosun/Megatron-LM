@@ -44,6 +44,7 @@ from megatron.core.mdp.dynamic_cp_execution import (
     LocalDecoderAssignment,
     _PrecollectiveStatus,
     _run_precollective_consensus,
+    _validate_local_singleton_producer_proof,
     bind_local_decoder_assignment,
     validate_decoder_global_manifest,
 )
@@ -647,6 +648,7 @@ class _DynamicProducerCarrier:
     local_manifest: Any
     source_window: Any
     static_plan: Any
+    native_item_outputs: Mapping
     item_outputs: Mapping
     payload_destination_views: Mapping
     embedding_destination_views: Mapping
@@ -668,12 +670,17 @@ class _DynamicProducerCarrier:
             raise MdpConfigurationError(
                 "MDP: dynamic producer owner matches its pre-authority identity."
             )
-        for name in ("rank_view", "local_manifest", "source_window", "static_plan", "item_outputs"):
+        for name in ("rank_view", "local_manifest", "source_window", "static_plan"):
             if getattr(self, name) is not getattr(self.pre_authority, name):
                 raise MdpConfigurationError(
                     f"MDP: dynamic producer {name} preserves its pre-authority identity."
                 )
+        if self.native_item_outputs is not self.pre_authority.item_outputs:
+            raise MdpConfigurationError(
+                "MDP: dynamic producer native outputs preserve pre-authority identity."
+            )
         for name in (
+            "native_item_outputs",
             "item_outputs",
             "payload_destination_views",
             "embedding_destination_views",
@@ -688,6 +695,122 @@ class _DynamicProducerCarrier:
             raise MdpConfigurationError(
                 "MDP: dynamic producer backward and cleanup callbacks are callable."
             )
+
+
+def _bind_pre_authority_dynamic_producer(
+    *,
+    producer: _PreAuthorityDynamicProducer,
+    authority: _DynamicIterationAuthority,
+    payload_destination_views: Mapping,
+    embedding_destination_views: Mapping,
+    gradient_destination_views: Mapping,
+    summed_gradient_destination_views: Mapping,
+) -> _DynamicProducerCarrier:
+    """Bind one runtime-owned P0--P2 producer to exact global D3 authority."""
+    if type(producer) is not _PreAuthorityDynamicProducer:
+        raise MdpConfigurationError("MDP: producer binding requires its pre-authority carrier.")
+    if producer.local_prepare_error is not None or producer.owner is None:
+        raise MdpStateError("MDP: failed pre-authority producer cannot bind D3 authority.")
+    if type(authority) is not _DynamicIterationAuthority:
+        raise MdpConfigurationError("MDP: producer binding requires typed D3 authority.")
+
+    owner = producer.owner
+    runtime = getattr(owner, "_runtime", None)
+    validate_identity = getattr(runtime, "_validate_pre_authority_dynamic_producer", None)
+    consume_identity = getattr(runtime, "_consume_pre_authority_dynamic_producer", None)
+    if not callable(validate_identity) or not callable(consume_identity):
+        raise MdpStateError("MDP: producer binding requires runtime-owned producer identity.")
+    if not callable(getattr(owner, "prepare_dynamic_completion", None)) or not callable(
+        getattr(owner, "abort", None)
+    ):
+        raise MdpStateError("MDP: producer binding requires completion and cleanup ownership.")
+    validate_identity(owner, producer)
+    _validate_local_singleton_producer_proof(
+        rank_view=producer.rank_view,
+        source_rank_by_lane=authority.source_rank_by_lane,
+        local_manifest=producer.local_manifest,
+        source_window=producer.source_window,
+        static_plan=producer.static_plan,
+        sample_location_by_id=producer.sample_location_by_id,
+    )
+
+    global_rank = _require_integer(
+        "producer binding global rank", getattr(producer.rank_view, "global_rank", None)
+    )
+    lane = getattr(producer.rank_view, "lane_id", None)
+    if lane is not None:
+        lane = _require_integer("producer binding source lane", lane)
+        if authority.source_rank_by_lane.get(lane) != global_rank:
+            raise MdpPlanError("MDP: producer lane authority names the exact local source rank.")
+    if any(type(item_id) is not int for item_id in producer.item_outputs):
+        raise MdpConfigurationError("MDP: producer native item IDs are exact integers.")
+    if lane is None and producer.item_outputs:
+        raise MdpPlanError("MDP: noncontributor producer has no local encoder outputs.")
+    global_outputs = MappingProxyType(
+        {}
+        if lane is None
+        else {
+            GlobalVisionItemId(lane, item_id): output
+            for item_id, output in producer.item_outputs.items()
+        }
+    )
+
+    local_authority = {
+        item_id
+        for item_id, producer_rank in authority.producer_rank_by_item.items()
+        if producer_rank == global_rank
+    }
+    if local_authority != set(global_outputs):
+        raise MdpPlanError("MDP: local encoder outputs exactly cover global item authority.")
+    for item_id, output in global_outputs.items():
+        rows = authority.output_rows_by_item[item_id]
+        if (
+            not isinstance(output, Tensor)
+            or output.ndim != 2
+            or tuple(output.shape) != (rows, authority.bridge_width)
+            or output.dtype != authority.bridge_dtype
+        ):
+            raise MdpPlanError("MDP: local encoder output matches authoritative rows and schema.")
+
+    def prepare_completion(global_gradients: Mapping[GlobalVisionItemId, Tensor]):
+        if not isinstance(global_gradients, Mapping) or set(global_gradients) != set(global_outputs):
+            raise MdpStateError("MDP: producer gradients exactly cover its global item outputs.")
+        native_gradients = {}
+        for item_id, output in global_outputs.items():
+            gradient = global_gradients[item_id]
+            if (
+                not isinstance(gradient, Tensor)
+                or gradient.shape != output.shape
+                or gradient.dtype != output.dtype
+                or gradient.device != output.device
+            ):
+                raise MdpStateError("MDP: producer gradient matches its local encoder output.")
+            native_gradients[item_id.local_item_id] = gradient
+        return owner.prepare_dynamic_completion(MappingProxyType(native_gradients))
+
+    def cleanup() -> None:
+        if getattr(owner, "_runtime", None) is not None:
+            owner.abort()
+
+    bound = _DynamicProducerCarrier(
+        authority=authority,
+        pre_authority=producer,
+        owner=owner,
+        rank_view=producer.rank_view,
+        local_manifest=producer.local_manifest,
+        source_window=producer.source_window,
+        static_plan=producer.static_plan,
+        native_item_outputs=producer.item_outputs,
+        item_outputs=global_outputs,
+        payload_destination_views=payload_destination_views,
+        embedding_destination_views=embedding_destination_views,
+        gradient_destination_views=gradient_destination_views,
+        summed_gradient_destination_views=summed_gradient_destination_views,
+        backward=prepare_completion,
+        cleanup=cleanup,
+    )
+    consume_identity(owner, producer)
+    return bound
 
 
 def _require_digest(name: str, value: Any) -> bytes:
