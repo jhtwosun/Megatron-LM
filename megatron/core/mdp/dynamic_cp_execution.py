@@ -35,6 +35,18 @@ from megatron.core.mdp.dynamic_cp_plan import (
     validate_decoder_dynamic_plan,
 )
 from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError, MdpPlanError
+from megatron.core.mdp.plan import (
+    PLAN_SCHEMA_VERSION,
+    EncoderThdLayout,
+    EncoderThdSegment,
+    LayoutSegment,
+    MdpBatchPlan,
+    MicrobatchLayout,
+    RouteSlice,
+    RowCapacityPolicy,
+    compute_plan_digest,
+)
+from megatron.core.mdp.rank_mapping import MdpRankView
 
 DECODER_EXECUTION_SCHEMA_VERSION = 1
 DYNAMIC_PRECOLLECTIVE_GATES = (
@@ -63,6 +75,14 @@ def _require_integer(name: str, value: Any, *, positive: bool = False) -> int:
         qualifier = "a positive signed-int64 integer" if positive else "a signed-int64 integer >= 0"
         raise MdpConfigurationError(f"MDP: {name}={value!r} violates: {name} is {qualifier}.")
     return value
+
+
+def _checked_add(name: str, left: int, right: int) -> int:
+    left = _require_integer(name, left)
+    right = _require_integer(name, right)
+    if right > _INT64_MAX - left:
+        raise MdpConfigurationError(f"MDP: {name} fits signed int64.")
+    return left + right
 
 
 def _require_signed_integer(name: str, value: Any) -> int:
@@ -969,6 +989,339 @@ def validate_decoder_global_manifest(manifest: DecoderGlobalManifest) -> None:
     )
     if _require_digest("global decoder manifest digest", manifest.digest) != expected_digest:
         raise MdpPlanError("MDP: global decoder manifest digest matches its canonical metadata.")
+
+
+def _validate_singleton_static_plan(
+    plan: Any,
+    *,
+    local_manifest: DecoderSourceManifest,
+    rank_view: MdpRankView,
+    sample_location_by_id: Mapping[GlobalSampleId, tuple[int, int]],
+) -> None:
+    """Join one singleton static encoder plan to exact source metadata."""
+    if not isinstance(plan, MdpBatchPlan):
+        raise MdpPlanError("MDP: singleton producer proof requires an MdpBatchPlan.")
+    schema_version = _require_integer("singleton static plan schema version", plan.schema_version)
+    if schema_version != PLAN_SCHEMA_VERSION:
+        raise MdpPlanError("MDP: singleton static plan uses the current schema version.")
+    _require_integer("singleton static plan iteration", plan.iteration)
+    outer_dp_rank = _require_integer("singleton static plan outer-DP rank", plan.outer_dp_rank)
+    if outer_dp_rank != local_manifest.source_dp_lane:
+        raise MdpPlanError("MDP: singleton static plan belongs to the source DP lane.")
+    if not isinstance(plan.capacity_policy, RowCapacityPolicy):
+        raise MdpPlanError("MDP: singleton static plan has a row-capacity policy.")
+    _require_integer(
+        "singleton static alignment rows", plan.capacity_policy.alignment_rows, positive=True
+    )
+    _require_digest("singleton static plan digest", plan.digest)
+    if not isinstance(sample_location_by_id, Mapping):
+        raise MdpConfigurationError("MDP: singleton sample locations are a mapping.")
+    expected_sample_ids = {sample.sample_id for sample in local_manifest.samples}
+    if set(sample_location_by_id) != expected_sample_ids:
+        raise MdpPlanError(
+            "MDP: singleton sample locations exactly cover the source sample catalog."
+        )
+    sample_locations = {}
+    for sample_id, location in sample_location_by_id.items():
+        if not isinstance(location, tuple) or len(location) != 2:
+            raise MdpConfigurationError(
+                "MDP: singleton sample location is an immutable microbatch/sample pair."
+            )
+        sample_locations[sample_id] = (
+            _require_integer("singleton sample microbatch", location[0]),
+            _require_integer("singleton sample local index", location[1]),
+        )
+    if len(set(sample_locations.values())) != len(sample_locations):
+        raise MdpPlanError("MDP: singleton sample locations are unique within the source window.")
+    sample_indices_by_microbatch = {}
+    for microbatch_id, sample_id in sample_locations.values():
+        sample_indices_by_microbatch.setdefault(microbatch_id, []).append(sample_id)
+    for sample_ids in sample_indices_by_microbatch.values():
+        if tuple(sorted(sample_ids)) != tuple(range(len(sample_ids))):
+            raise MdpPlanError(
+                "MDP: singleton microbatch-local sample IDs are dense and zero-based."
+            )
+    expected_items = {item.item_id.local_item_id: item for item in local_manifest.items}
+    if not isinstance(plan.routes, tuple) or not all(
+        isinstance(route, RouteSlice) for route in plan.routes
+    ):
+        raise MdpPlanError("MDP: singleton static plan has typed immutable routes.")
+    if not isinstance(plan.encoder_layouts, tuple) or not all(
+        isinstance(layout, EncoderThdLayout) for layout in plan.encoder_layouts
+    ):
+        raise MdpPlanError("MDP: singleton static plan has typed encoder layouts.")
+    if len(plan.encoder_layouts) > 1:
+        raise MdpPlanError("MDP: singleton static plan has only worker-0 encoder layout.")
+    for index, layout in enumerate(plan.encoder_layouts):
+        producer_worker_id = _require_integer(
+            f"singleton encoder layout[{index}] producer worker", layout.producer_worker_id
+        )
+        if producer_worker_id != 0:
+            raise MdpPlanError("MDP: singleton static plan has only worker-0 encoder layout.")
+
+    routes = {}
+    for route in plan.routes:
+        item_id = _require_integer("singleton static route item", route.global_item_id)
+        producer_worker_id = _require_integer(
+            "singleton static route producer worker", route.producer_worker_id
+        )
+        owner_worker_id = _require_integer(
+            "singleton static route owner worker", route.owner_worker_id
+        )
+        endpoint_rank = _require_integer(
+            "singleton static route endpoint rank", route.endpoint_rank
+        )
+        if item_id in routes:
+            raise MdpPlanError("MDP: singleton static routes cover each item once.")
+        if (
+            producer_worker_id != 0
+            or owner_worker_id != 0
+            or endpoint_rank != rank_view.global_rank
+        ):
+            raise MdpPlanError("MDP: singleton static route resolves to worker 0 and its leader.")
+        routes[item_id] = route
+
+    encoder_segments = {}
+    order_by_item = {}
+    payload_offset = 0
+    output_offset = 0
+    if plan.encoder_layouts:
+        segments = plan.encoder_layouts[0].segments
+        if not isinstance(segments, tuple) or not all(
+            isinstance(segment, EncoderThdSegment) for segment in segments
+        ):
+            raise MdpPlanError("MDP: singleton encoder layout has typed immutable segments.")
+        for order, segment in enumerate(segments):
+            item_id = _require_integer("singleton encoder segment item", segment.global_item_id)
+            microbatch_id = _require_integer(
+                "singleton encoder segment microbatch", segment.microbatch_id
+            )
+            sample_id = _require_integer("singleton encoder segment sample", segment.sample_id)
+            _require_integer("singleton encoder segment image ordinal", segment.image_ordinal)
+            payload_row_start = _require_integer(
+                "singleton encoder payload row start", segment.payload_row_start
+            )
+            payload_rows = _require_integer(
+                "singleton encoder payload rows", segment.payload_rows, positive=True
+            )
+            output_row_start = _require_integer(
+                "singleton encoder output row start", segment.output_row_start
+            )
+            output_rows = _require_integer(
+                "singleton encoder output rows", segment.output_rows, positive=True
+            )
+            if item_id in encoder_segments:
+                raise MdpPlanError("MDP: singleton encoder segments cover each item once.")
+            if item_id not in expected_items:
+                raise MdpPlanError("MDP: singleton encoder segment names a source item.")
+            expected_location = sample_locations[expected_items[item_id].sample_id]
+            if (microbatch_id, sample_id) != expected_location:
+                raise MdpPlanError(
+                    "MDP: singleton encoder segment matches its source microbatch/sample."
+                )
+            if payload_row_start != payload_offset or output_row_start != output_offset:
+                raise MdpPlanError("MDP: singleton encoder segment offsets are contiguous.")
+            grid = tuple(_require_sequence("singleton encoder grid", segment.grid_thw))
+            if len(grid) != 3:
+                raise MdpPlanError("MDP: singleton encoder grid has THW geometry.")
+            grid = tuple(
+                _require_integer(f"singleton encoder grid[{index}]", value, positive=True)
+                for index, value in enumerate(grid)
+            )
+            if payload_rows != grid[0] * grid[1] * grid[2]:
+                raise MdpPlanError("MDP: singleton encoder payload rows match THW geometry.")
+            payload_offset = _checked_add(
+                "singleton encoder payload extent", payload_offset, payload_rows
+            )
+            output_offset = _checked_add(
+                "singleton encoder output extent", output_offset, output_rows
+            )
+            encoder_segments[item_id] = segment
+            order_by_item[item_id] = order
+
+    if set(routes) != set(expected_items) or set(encoder_segments) != set(expected_items):
+        raise MdpPlanError(
+            "MDP: singleton static routes and encoder segments exactly cover local item IDs."
+        )
+    for item_id, item in expected_items.items():
+        segment = encoder_segments[item_id]
+        if (
+            segment.image_ordinal != item.image_ordinal
+            or segment.grid_thw != item.grid_thw
+            or segment.output_rows != item.output_rows
+        ):
+            raise MdpPlanError(
+                "MDP: singleton static segment matches source image, grid, and rows."
+            )
+
+    if not isinstance(plan.layouts, tuple) or not all(
+        isinstance(layout, MicrobatchLayout) for layout in plan.layouts
+    ):
+        raise MdpPlanError("MDP: singleton static plan has typed endpoint layouts.")
+    endpoint_items = set()
+    layouts_by_microbatch = {}
+    for layout in plan.layouts:
+        microbatch_id = _require_integer("singleton endpoint microbatch", layout.microbatch_id)
+        if microbatch_id in layouts_by_microbatch:
+            raise MdpPlanError("MDP: singleton endpoint layouts have unique microbatch IDs.")
+        layouts_by_microbatch[microbatch_id] = layout
+        total_output_rows = _require_integer(
+            "singleton endpoint total output rows", layout.total_output_rows
+        )
+        if not isinstance(layout.text_only, bool):
+            raise MdpConfigurationError("MDP: singleton endpoint text_only is a boolean.")
+        if not isinstance(layout.segments, tuple) or not all(
+            isinstance(segment, LayoutSegment) for segment in layout.segments
+        ):
+            raise MdpPlanError("MDP: singleton endpoint layout has typed immutable segments.")
+        offset = 0
+        local_items = set()
+        segment_keys = []
+        for segment in layout.segments:
+            item_id = _require_integer("singleton endpoint segment item", segment.global_item_id)
+            leaf_row_start = _require_integer(
+                "singleton endpoint segment row start", segment.leaf_row_start
+            )
+            output_rows = _require_integer(
+                "singleton endpoint segment output rows", segment.output_rows, positive=True
+            )
+            if item_id in endpoint_items or leaf_row_start != offset:
+                raise MdpPlanError("MDP: singleton endpoint segments are unique and contiguous.")
+            if item_id not in expected_items or output_rows != expected_items[item_id].output_rows:
+                raise MdpPlanError("MDP: singleton endpoint segment matches source output rows.")
+            item = expected_items[item_id]
+            sample_microbatch_id, local_sample_id = sample_locations[item.sample_id]
+            if sample_microbatch_id != microbatch_id:
+                raise MdpPlanError(
+                    "MDP: singleton endpoint segment belongs to its source microbatch."
+                )
+            segment_keys.append((local_sample_id, item.image_ordinal))
+            endpoint_items.add(item_id)
+            local_items.add(item_id)
+            offset = _checked_add("singleton endpoint output extent", offset, output_rows)
+        expected_local_items = {
+            item_id
+            for item_id, item in expected_items.items()
+            if sample_locations[item.sample_id][0] == microbatch_id
+        }
+        if local_items != expected_local_items:
+            raise MdpPlanError(
+                "MDP: singleton endpoint layout exactly covers its microbatch items."
+            )
+        if tuple(segment_keys) != tuple(sorted(segment_keys)):
+            raise MdpPlanError("MDP: singleton endpoint segments use canonical sample/image order.")
+        if total_output_rows != offset or layout.text_only != (not layout.segments):
+            raise MdpPlanError("MDP: singleton endpoint layout totals and text flag agree.")
+    expected_microbatch_ids = {location[0] for location in sample_locations.values()}
+    if set(layouts_by_microbatch) != expected_microbatch_ids:
+        raise MdpPlanError(
+            "MDP: singleton endpoint layouts exactly cover source microbatches, including text-only."
+        )
+    if tuple(layouts_by_microbatch) != tuple(sorted(expected_microbatch_ids)):
+        raise MdpPlanError("MDP: singleton endpoint layouts use canonical microbatch order.")
+    if endpoint_items != set(expected_items):
+        raise MdpPlanError("MDP: singleton endpoint layouts exactly cover local item IDs.")
+
+    digest_entries = tuple(
+        (
+            item_id,
+            0,
+            order_by_item[item_id],
+            rank_view.global_rank,
+            encoder_segments[item_id].payload_rows,
+            encoder_segments[item_id].output_rows,
+            *encoder_segments[item_id].grid_thw,
+        )
+        for item_id in sorted(expected_items)
+    )
+    if plan.digest != compute_plan_digest(
+        PLAN_SCHEMA_VERSION, plan.capacity_policy, digest_entries
+    ):
+        raise MdpPlanError("MDP: singleton static plan digest matches exact source geometry.")
+
+
+def _validate_local_singleton_producer_proof(
+    *,
+    rank_view: Any,
+    source_rank_by_lane: Mapping[int, int],
+    local_manifest: DecoderSourceManifest | None,
+    source_window: DecoderSourceWindow | None,
+    static_plan: MdpBatchPlan | None,
+    sample_location_by_id: Mapping[GlobalSampleId, tuple[int, int]],
+) -> None:
+    """Validate one local singleton source proof without deriving global authority."""
+    if not isinstance(rank_view, MdpRankView):
+        raise MdpConfigurationError("MDP: singleton producer proof requires an MdpRankView.")
+    rank = _require_integer("singleton producer global rank", rank_view.global_rank)
+    planning_ranks = _require_ordered_ranks(
+        "singleton producer planning group", rank_view.planning_group_ranks, immutable=True
+    )
+    if planning_ranks != (rank,):
+        raise MdpConfigurationError(
+            "MDP: singleton producer planning group is exactly the local global rank."
+        )
+    endpoint_rank = _require_integer("singleton producer endpoint rank", rank_view.endpoint_rank)
+    if not isinstance(rank_view.worker_ids, tuple):
+        raise MdpConfigurationError("MDP: singleton producer worker IDs are immutable.")
+    worker_ids = tuple(
+        _require_integer(f"singleton producer worker_ids[{index}]", worker_id)
+        for index, worker_id in enumerate(rank_view.worker_ids)
+    )
+    if endpoint_rank != rank or worker_ids != (0,):
+        raise MdpConfigurationError(
+            "MDP: singleton producer endpoint is the local leader and worker IDs are (0,)."
+        )
+    if _require_integer("singleton producer local worker ID", rank_view.my_worker_id) != 0:
+        raise MdpConfigurationError("MDP: singleton producer uses local worker ID 0.")
+    outer_dp_rank = _require_integer("singleton producer outer-DP rank", rank_view.outer_dp_rank)
+    lane_id = (
+        None
+        if rank_view.lane_id is None
+        else _require_integer("singleton producer lane ID", rank_view.lane_id)
+    )
+    if not isinstance(source_rank_by_lane, Mapping):
+        raise MdpConfigurationError("MDP: singleton source authority is a lane-to-rank mapping.")
+    if not isinstance(sample_location_by_id, Mapping):
+        raise MdpConfigurationError("MDP: singleton sample locations are a mapping.")
+    authority = {
+        _require_integer("singleton source DP lane", lane): _require_integer(
+            "singleton source global rank", source_rank
+        )
+        for lane, source_rank in source_rank_by_lane.items()
+    }
+    if len(authority) != len(source_rank_by_lane) or len(set(authority.values())) != len(authority):
+        raise MdpConfigurationError("MDP: singleton source lanes map to unique source ranks.")
+    local_lanes = tuple(lane for lane, source_rank in authority.items() if source_rank == rank)
+    if not local_lanes:
+        if (
+            sample_location_by_id
+            or lane_id is not None
+            or any(value is not None for value in (local_manifest, source_window, static_plan))
+        ):
+            raise MdpPlanError(
+                "MDP: noncontributor has no lane, source metadata, window, or static plan."
+            )
+        return None
+    if len(local_lanes) != 1:
+        raise MdpConfigurationError("MDP: one source lane contributes from each singleton rank.")
+    source_lane = local_lanes[0]
+    if lane_id != source_lane or outer_dp_rank != source_lane:
+        raise MdpConfigurationError(
+            "MDP: singleton contributor lane and outer-DP rank match source authority."
+        )
+    validate_decoder_source_manifest(local_manifest)
+    validate_decoder_source_window(source_window)
+    if local_manifest != source_window.metadata_manifest():
+        raise MdpPlanError(
+            "MDP: singleton contributor manifest and source window metadata match exactly."
+        )
+    _validate_singleton_static_plan(
+        static_plan,
+        local_manifest=local_manifest,
+        rank_view=rank_view,
+        sample_location_by_id=sample_location_by_id,
+    )
+    return None
 
 
 def build_decoder_global_manifest(

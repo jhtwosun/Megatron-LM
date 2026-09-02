@@ -30,6 +30,10 @@ from megatron.core.mdp.dynamic_cp_execution import (
 )
 from megatron.core.mdp.dynamic_cp_plan import DecoderSampleMetadata, EncoderVisionItemMetadata
 from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError
+from megatron.core.mdp.plan import RowCapacityPolicy
+from megatron.core.mdp.planner import MdpPlanner
+from megatron.core.mdp.protocols import VisionDescriptor
+from megatron.core.mdp.rank_mapping import MdpRankView
 
 _DEFAULT_RECORDS = ((4, 6, ((0,),)), (5, 7, ((1,), (2, 3))))
 
@@ -166,6 +170,279 @@ def _assert_tensor_free(value):
     elif isinstance(value, (tuple, list)):
         for item in value:
             _assert_tensor_free(item)
+
+
+def _singleton_rank_view(**changes):
+    values = {
+        "global_rank": 70,
+        "outer_dp_rank": 7,
+        "lane_id": 7,
+        "my_worker_id": 0,
+        "endpoint_rank": 70,
+        "planning_group_ranks": (70,),
+        "worker_ids": (0,),
+    }
+    values.update(changes)
+    return MdpRankView(**values)
+
+
+def _singleton_plan(manifest, *, rank_view=None, sample_locations=None):
+    if sample_locations is None:
+        sample_locations = _singleton_sample_locations(manifest)
+    descriptors = tuple(
+        VisionDescriptor(
+            global_item_id=item.item_id.local_item_id,
+            sample_id=sample_locations[item.sample_id][1],
+            image_ordinal=item.image_ordinal,
+            owner_dp_lane=7,
+            microbatch_id=sample_locations[item.sample_id][0],
+            estimated_cost_units=item.grid_thw[0] * item.grid_thw[1] * item.grid_thw[2],
+            payload_rows=item.grid_thw[0] * item.grid_thw[1] * item.grid_thw[2],
+            output_rows=item.output_rows,
+            grid_thw=item.grid_thw,
+            owner_worker_id=0,
+        )
+        for item in manifest.items
+    )
+    return MdpPlanner(
+        _singleton_rank_view() if rank_view is None else rank_view,
+        locality_slack_permille=0,
+        capacity_policy=RowCapacityPolicy(),
+    ).build_plan(
+        0, descriptors, tuple(sorted({location[0] for location in sample_locations.values()}))
+    )
+
+
+def _singleton_sample_locations(manifest):
+    return {
+        sample.sample_id: (sample.sample_id.local_sample_order, 0) for sample in manifest.samples
+    }
+
+
+def _validate_singleton_proof(**kwargs):
+    from megatron.core.mdp import dynamic_cp_execution
+
+    validator = getattr(dynamic_cp_execution, "_validate_local_singleton_producer_proof", None)
+    assert callable(validator), "production must provide the singleton producer proof validator"
+    return validator(**kwargs)
+
+
+def test_singleton_producer_proof_accepts_exact_contributor_and_empty_noncontributor():
+    window = _source_window(7)
+    manifest = window.metadata_manifest()
+    assert (
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(),
+            source_rank_by_lane={7: 70},
+            local_manifest=manifest,
+            source_window=window,
+            static_plan=_singleton_plan(manifest),
+            sample_location_by_id=_singleton_sample_locations(manifest),
+        )
+        is None
+    )
+    assert (
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(
+                global_rank=80,
+                outer_dp_rank=8,
+                lane_id=None,
+                endpoint_rank=80,
+                planning_group_ranks=(80,),
+            ),
+            source_rank_by_lane={7: 70},
+            local_manifest=None,
+            source_window=None,
+            static_plan=None,
+            sample_location_by_id={},
+        )
+        is None
+    )
+
+
+def test_singleton_producer_proof_accepts_packed_microbatch_sample_locations():
+    window = _source_window(7, records=((4, 6, ((0,),)), (5, 7, ((1,),))))
+    manifest = window.metadata_manifest()
+    locations = {manifest.samples[0].sample_id: (0, 0), manifest.samples[1].sample_id: (0, 1)}
+
+    assert (
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(),
+            source_rank_by_lane={7: 70},
+            local_manifest=manifest,
+            source_window=window,
+            static_plan=_singleton_plan(manifest, sample_locations=locations),
+            sample_location_by_id=locations,
+        )
+        is None
+    )
+
+
+def test_singleton_producer_proof_rejects_duplicate_sample_locations():
+    window = _source_window(7, records=((4, 6, ()), (5, 7, ())))
+    manifest = window.metadata_manifest()
+    locations = {sample.sample_id: (0, 0) for sample in manifest.samples}
+
+    with pytest.raises(MdpPlanError):
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(),
+            source_rank_by_lane={7: 70},
+            local_manifest=manifest,
+            source_window=window,
+            static_plan=_singleton_plan(manifest),
+            sample_location_by_id=locations,
+        )
+
+
+def test_singleton_producer_proof_rejects_sparse_microbatch_sample_locations():
+    window = _source_window(7, records=((4, 6, ()), (5, 7, ())))
+    manifest = window.metadata_manifest()
+    locations = {manifest.samples[0].sample_id: (0, 0), manifest.samples[1].sample_id: (0, 2)}
+
+    with pytest.raises(MdpPlanError):
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(),
+            source_rank_by_lane={7: 70},
+            local_manifest=manifest,
+            source_window=window,
+            static_plan=_singleton_plan(manifest),
+            sample_location_by_id=locations,
+        )
+
+
+def test_singleton_producer_proof_rejects_reordered_packed_endpoint_segments():
+    window = _source_window(7, records=((4, 6, ((0,),)), (5, 7, ((1,),))))
+    manifest = window.metadata_manifest()
+    locations = {manifest.samples[0].sample_id: (0, 0), manifest.samples[1].sample_id: (0, 1)}
+    plan = _singleton_plan(manifest, sample_locations=locations)
+    layout = plan.layouts[0]
+    first, second = layout.segments
+    reordered = replace(
+        layout,
+        segments=(
+            replace(second, leaf_row_start=0),
+            replace(first, leaf_row_start=second.output_rows),
+        ),
+    )
+
+    with pytest.raises(MdpPlanError):
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(),
+            source_rank_by_lane={7: 70},
+            local_manifest=manifest,
+            source_window=window,
+            static_plan=replace(plan, layouts=(reordered,)),
+            sample_location_by_id=locations,
+        )
+
+
+@pytest.mark.parametrize("residue", ("manifest", "window", "plan"))
+def test_singleton_noncontributor_rejects_stale_source_residue(residue):
+    window = _source_window(7)
+    manifest = window.metadata_manifest()
+    state = {"local_manifest": None, "source_window": None, "static_plan": None}
+    state[
+        {"manifest": "local_manifest", "window": "source_window", "plan": "static_plan"}[residue]
+    ] = {"manifest": manifest, "window": window, "plan": _singleton_plan(manifest)}[residue]
+
+    with pytest.raises((MdpConfigurationError, MdpPlanError)):
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(
+                global_rank=80,
+                outer_dp_rank=8,
+                lane_id=None,
+                endpoint_rank=80,
+                planning_group_ranks=(80,),
+            ),
+            source_rank_by_lane={7: 70},
+            sample_location_by_id={},
+            **state,
+        )
+
+
+def test_singleton_contributor_rejects_mismatched_manifest_window_and_plan_digest():
+    window = _source_window(7)
+    manifest = window.metadata_manifest()
+    other_window = _source_window(7, records=((4, 6, ()),))
+    with pytest.raises((MdpConfigurationError, MdpPlanError)):
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(),
+            source_rank_by_lane={7: 70},
+            local_manifest=manifest,
+            source_window=other_window,
+            static_plan=_singleton_plan(manifest),
+            sample_location_by_id=_singleton_sample_locations(manifest),
+        )
+
+    plan = _singleton_plan(manifest)
+    object.__setattr__(plan, "digest", b"x" * 16)
+    with pytest.raises((MdpConfigurationError, MdpPlanError)):
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(),
+            source_rank_by_lane={7: 70},
+            local_manifest=manifest,
+            source_window=window,
+            static_plan=plan,
+            sample_location_by_id=_singleton_sample_locations(manifest),
+        )
+
+
+@pytest.mark.parametrize("field", ("microbatch_id", "sample_id"))
+def test_singleton_proof_rejects_encoder_segment_location_mutation(field):
+    window = _source_window(7)
+    manifest = window.metadata_manifest()
+    plan = _singleton_plan(manifest)
+    encoder_layout = plan.encoder_layouts[0]
+    segment = encoder_layout.segments[0]
+    mutated_segment = replace(segment, **{field: getattr(segment, field) + 1})
+    mutated_layout = replace(
+        encoder_layout, segments=(mutated_segment, *encoder_layout.segments[1:])
+    )
+    plan = replace(plan, encoder_layouts=(mutated_layout,))
+
+    with pytest.raises((MdpConfigurationError, MdpPlanError)):
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(),
+            source_rank_by_lane={7: 70},
+            local_manifest=manifest,
+            source_window=window,
+            static_plan=plan,
+            sample_location_by_id=_singleton_sample_locations(manifest),
+        )
+
+
+def test_singleton_proof_rejects_layout_relocation_and_missing_text_only_layout():
+    records = ((4, 6, ((0,),)), (5, 7, ()))
+    window = _source_window(7, records=records)
+    manifest = window.metadata_manifest()
+    plan = _singleton_plan(manifest)
+    locations = _singleton_sample_locations(manifest)
+
+    relocated = replace(
+        plan, layouts=(replace(plan.layouts[0], microbatch_id=9), *plan.layouts[1:])
+    )
+    with pytest.raises((MdpConfigurationError, MdpPlanError)):
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(),
+            source_rank_by_lane={7: 70},
+            local_manifest=manifest,
+            source_window=window,
+            static_plan=relocated,
+            sample_location_by_id=locations,
+        )
+
+    without_text_only = replace(
+        plan, layouts=tuple(layout for layout in plan.layouts if not layout.text_only)
+    )
+    with pytest.raises((MdpConfigurationError, MdpPlanError)):
+        _validate_singleton_proof(
+            rank_view=_singleton_rank_view(),
+            source_rank_by_lane={7: 70},
+            local_manifest=manifest,
+            source_window=window,
+            static_plan=without_text_only,
+            sample_location_by_id=locations,
+        )
 
 
 def _mutate_digest_field(window, carrier):
