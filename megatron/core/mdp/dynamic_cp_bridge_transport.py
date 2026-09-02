@@ -3,8 +3,8 @@
 """Caller-buffer preparation and execution for Dynamic-CP tensor bridges.
 
 This module validates, packs, and synchronously exchanges one embedding or
-gradient phase. It does not allocate buffers, create process groups, or own
-cross-rank consensus, retry, or recovery policy.
+gradient phase, including its precollective gate consensus. It does not allocate
+buffers, create process groups, own runtime ordering, retry, or recovery policy.
 """
 
 import hashlib
@@ -26,9 +26,19 @@ from megatron.core.mdp.dynamic_cp_bridge import (
     dynamic_bridge_split_sizes,
     validate_dynamic_bridge_ledger_pair,
 )
-from megatron.core.mdp.dynamic_cp_execution import DecoderGlobalManifest
+from megatron.core.mdp.dynamic_cp_execution import (
+    DecoderGlobalManifest,
+    _PrecollectiveStatus,
+    _run_precollective_consensus,
+    _validate_precollective_timeout,
+)
 from megatron.core.mdp.dynamic_cp_plan import DecoderDynamicPlan
-from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError
+from megatron.core.mdp.errors import (
+    MdpBridgeError,
+    MdpConfigurationError,
+    MdpPlanError,
+    MdpStateError,
+)
 
 _INT64_MAX = 2**63 - 1
 _MAPPING_PROXY_TYPE = type(MappingProxyType({}))
@@ -448,6 +458,155 @@ def _execute_validated_dynamic_bridge_exchange(
             "MDP: synchronous dynamic bridge all-to-all completed successfully."
         ) from error
     return carrier.received_tensors
+
+
+def _validate_bridge_gate_context(
+    *, global_rank: Any, group_ranks: Any, all_gather_status: Any, timeout_seconds: Any
+) -> tuple[int, tuple[int, ...], Callable[..., Any], float]:
+    """Validate rank-symmetric rendezvous inputs before local preparation.
+
+    Because this check precedes consensus, asymmetric invalid rank, group,
+    gather, or timeout inputs cannot be converged by this helper.
+    """
+    rank = _require_integer("dynamic bridge gate global rank", global_rank)
+    if not isinstance(group_ranks, tuple) or not group_ranks:
+        raise MdpConfigurationError(
+            "MDP: dynamic bridge gate group ranks form a non-empty immutable tuple."
+        )
+    for participant in group_ranks:
+        _require_integer("dynamic bridge gate participant rank", participant)
+    if len(set(group_ranks)) != len(group_ranks):
+        raise MdpConfigurationError("MDP: dynamic bridge gate group ranks are unique.")
+    if rank not in group_ranks:
+        raise MdpConfigurationError("MDP: dynamic bridge gate global rank belongs to its group.")
+    if not callable(all_gather_status):
+        raise MdpConfigurationError("MDP: dynamic bridge gate status gather is callable.")
+    timeout = _validate_precollective_timeout(timeout_seconds)
+    return rank, group_ranks, all_gather_status, timeout
+
+
+def _snapshot_bridge_gate_digest(value: Any) -> bytes:
+    try:
+        digest = value.digest
+    except Exception:
+        return bytes(16)
+    if type(digest) is not bytes or len(digest) != 16:
+        return bytes(16)
+    return digest
+
+
+def _run_dynamic_bridge_gate(
+    *,
+    phase: BridgePhase,
+    ledger: DynamicBridgeLedger,
+    reverse_ledger: DynamicBridgeLedger,
+    plan: DecoderDynamicPlan,
+    global_manifest: DecoderGlobalManifest,
+    producer_rank_by_item: Mapping[GlobalVisionItemId, int],
+    output_rows_by_item: Mapping[GlobalVisionItemId, int],
+    width: int,
+    dtype: torch.dtype,
+    global_rank: int,
+    group_ranks: tuple[int, ...],
+    all_gather_status: Any,
+    local_prepare: Any,
+    timeout_seconds: float,
+    group: Any,
+    group_ranks_getter: Callable[[Any], Any] = dist.get_process_group_ranks,
+    all_to_all_single: Callable[..., Any] = dist.all_to_all_single,
+) -> Mapping[DynamicBridgeKey, Tensor]:
+    """Gate one embedding or gradient exchange with deterministic consensus.
+
+    Only rank-symmetric rendezvous context may reject before the status gather.
+    All metadata, route, preparation, carrier, callback, and native-group
+    failures become one local error status. ``local_prepare`` must remain
+    rank-local and noncollective. The injected gather must not mutate its status
+    input or sealed carrier buffers. This helper owns no retry or recovery.
+    """
+    gate_id = 3 if phase is BridgePhase.GRADIENT else 1
+    rank, ranks, gather, timeout = _validate_bridge_gate_context(
+        global_rank=global_rank,
+        group_ranks=group_ranks,
+        all_gather_status=all_gather_status,
+        timeout_seconds=timeout_seconds,
+    )
+    manifest_digest = _snapshot_bridge_gate_digest(global_manifest)
+    route_digest = bytes(16)
+    carrier = None
+    local_error = None
+    try:
+        if phase not in (BridgePhase.EMBEDDING, BridgePhase.GRADIENT):
+            raise MdpPlanError("MDP: dynamic bridge gate phase is embedding or gradient.")
+        if type(ledger) is not DynamicBridgeLedger or ledger.phase is not phase:
+            raise MdpPlanError("MDP: dynamic bridge gate ledger matches its exact phase.")
+        if type(global_manifest) is not DecoderGlobalManifest:
+            raise MdpPlanError("MDP: dynamic bridge gate has an exact global manifest.")
+        if type(plan) is not DecoderDynamicPlan:
+            raise MdpPlanError("MDP: dynamic bridge gate has an exact decoder plan.")
+        if not isinstance(dtype, torch.dtype):
+            raise MdpConfigurationError("MDP: dynamic bridge gate dtype is a torch dtype.")
+        route_digest = build_dynamic_bridge_route_authority_digest(
+            ledger,
+            reverse_ledger,
+            plan=plan,
+            global_manifest=global_manifest,
+            producer_rank_by_item=producer_rank_by_item,
+            output_rows_by_item=output_rows_by_item,
+            width=width,
+            dtype=dtype,
+            participant_ranks=ranks,
+        )
+        if not callable(local_prepare):
+            raise MdpConfigurationError("MDP: dynamic bridge gate local_prepare is callable.")
+        if not callable(group_ranks_getter):
+            raise MdpConfigurationError("MDP: dynamic bridge gate group_ranks_getter is callable.")
+        if not callable(all_to_all_single):
+            raise MdpConfigurationError("MDP: dynamic bridge gate all_to_all_single is callable.")
+        carrier = validate_prepared_dynamic_bridge_exchange(local_prepare())
+        if carrier.phase is not phase:
+            raise MdpBridgeError("MDP: prepared dynamic bridge phase matches the gate phase.")
+        if carrier.dtype != dtype:
+            raise MdpBridgeError(
+                "MDP: prepared dynamic bridge dtype matches the gate route authority."
+            )
+        if carrier.route_authority_digest != route_digest:
+            raise MdpBridgeError(
+                "MDP: prepared dynamic bridge matches the gate route authority digest."
+            )
+        if carrier.global_rank != rank:
+            raise MdpBridgeError(
+                "MDP: prepared dynamic bridge global rank matches the gate context."
+            )
+        if carrier.participant_ranks != ranks:
+            raise MdpBridgeError(
+                "MDP: prepared dynamic bridge participants match the gate context."
+            )
+        _validate_group_binding(carrier, group=group, group_ranks_getter=group_ranks_getter)
+    except Exception as error:
+        local_error = error
+
+    status = _PrecollectiveStatus(
+        global_rank=rank,
+        global_manifest_digest=manifest_digest,
+        plan_digest=route_digest,
+        error_code=int(local_error is not None),
+        gate_id=gate_id,
+    )
+    try:
+        _run_precollective_consensus(
+            status, group_ranks=ranks, all_gather_status=gather, timeout_seconds=timeout
+        )
+    except (MdpBridgeError, MdpPlanError) as error:
+        if local_error is not None and error.__cause__ is None:
+            raise error from local_error
+        raise
+    if local_error is not None:
+        raise MdpStateError(
+            "MDP: dynamic bridge gate consensus succeeded despite a local error."
+        ) from local_error
+    return _execute_validated_dynamic_bridge_exchange(
+        carrier, group=group, all_to_all_single=all_to_all_single
+    )
 
 
 def prepare_dynamic_bridge_exchange(

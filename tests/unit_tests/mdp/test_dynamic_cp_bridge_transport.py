@@ -3,7 +3,7 @@
 """Focused caller-buffer contracts for Dynamic-CP bridge transport."""
 
 import os
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
@@ -11,6 +11,8 @@ import torch
 
 import megatron.core.mdp.dynamic_cp_bridge as bridge
 import megatron.core.mdp.dynamic_cp_bridge_transport as transport
+import megatron.core.mdp.dynamic_cp_execution as execution
+import megatron.core.mdp.dynamic_cp_transport as payload_transport
 from megatron.core.mdp.bridge import BridgePhase
 from megatron.core.mdp.dynamic_cp import GlobalSampleId, GlobalVisionItemId
 from megatron.core.mdp.dynamic_cp_execution import (
@@ -27,7 +29,12 @@ from megatron.core.mdp.dynamic_cp_plan import (
     EncoderVisionItemMetadata,
     build_decoder_dynamic_plan,
 )
-from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError
+from megatron.core.mdp.errors import (
+    MdpBridgeError,
+    MdpConfigurationError,
+    MdpPlanError,
+    MdpStateError,
+)
 
 _DECODER_RANKS = (30, 10, 40, 20)
 _PARTICIPANTS = (80, 30, 70, 20, 10, 40, 99)
@@ -597,6 +604,354 @@ def _execute(prepared, *, group=None, group_ranks_getter=None, all_to_all_single
     )
 
 
+def _consensus_rows(
+    wire, ranks, *, errors=None, gates=None, manifest_digests=None, route_digests=None
+):
+    errors = {} if errors is None else errors
+    gates = {} if gates is None else gates
+    manifest_digests = {} if manifest_digests is None else manifest_digests
+    route_digests = {} if route_digests is None else route_digests
+    local = execution._PrecollectiveStatus.from_wire_tuple(wire)
+    return tuple(
+        replace(
+            local,
+            global_rank=rank,
+            global_manifest_digest=manifest_digests.get(rank, local.global_manifest_digest),
+            plan_digest=route_digests.get(rank, local.plan_digest),
+            error_code=errors.get(rank, local.error_code),
+            gate_id=gates.get(rank, local.gate_id),
+        ).to_wire_tuple()
+        for rank in ranks
+    )
+
+
+def _run_gate(state, default_phase, rank, local_prepare, **overrides):
+    ranks = state.authority["participant_ranks"]
+    values = dict(
+        phase=default_phase,
+        ledger=_selected(state, default_phase),
+        reverse_ledger=(
+            state.gradient if default_phase is BridgePhase.EMBEDDING else state.embedding
+        ),
+        plan=state.plan,
+        global_manifest=state.manifest,
+        producer_rank_by_item=state.authority["producer_rank_by_item"],
+        output_rows_by_item=state.authority["output_rows_by_item"],
+        width=state.authority["width"],
+        dtype=state.authority["dtype"],
+        global_rank=rank,
+        group_ranks=ranks,
+        all_gather_status=lambda wire, **_kwargs: _consensus_rows(wire, ranks),
+        local_prepare=local_prepare,
+        timeout_seconds=1.0,
+        group=_FakeGroup(ranks, rank),
+        group_ranks_getter=lambda _group: list(ranks),
+        all_to_all_single=lambda *_args, **_kwargs: None,
+    )
+    values.update(overrides)
+    return getattr(transport, "_run_dynamic_bridge_gate")(**values)
+
+
+@pytest.mark.parametrize(
+    "phase,rank,expected_gate",
+    [
+        (BridgePhase.EMBEDDING, 30, 1),
+        (BridgePhase.GRADIENT, 30, 3),
+        (BridgePhase.EMBEDDING, 99, 1),
+        (BridgePhase.GRADIENT, 99, 3),
+    ],
+)
+def test_gate_runs_prepare_status_then_collective_for_self_and_idle(phase, rank, expected_gate):
+    state = _state()
+    events = []
+    prepared_values = []
+
+    def local_prepare():
+        events.append("prepare")
+        prepared, _ = _prepare(state, phase, rank)
+        prepared_values.append(prepared)
+        return prepared
+
+    def gather(wire, **kwargs):
+        events.append("status")
+        status = execution._PrecollectiveStatus.from_wire_tuple(wire)
+        assert status.global_rank == rank
+        assert status.global_manifest_digest == state.manifest.digest
+        assert status.plan_digest == _expected_digest(state, phase)
+        assert status.error_code == 0
+        assert status.gate_id == expected_gate
+        assert kwargs == {"timeout_seconds": 1.0}
+        return _consensus_rows(wire, state.authority["participant_ranks"])
+
+    received = _run_gate(
+        state,
+        phase,
+        rank,
+        local_prepare,
+        all_gather_status=gather,
+        all_to_all_single=lambda *_args, **_kwargs: events.append("all-to-all"),
+    )
+
+    assert events == ["prepare", "status", "all-to-all"]
+    assert len(prepared_values) == 1
+    assert received is prepared_values[0].received_tensors
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "phase",
+        "manifest",
+        "plan",
+        "ledger-phase",
+        "reverse-ledger",
+        "carrier-phase",
+        "carrier-dtype",
+        "carrier-digest",
+        "carrier-rank",
+        "carrier-participants",
+        "group",
+        "foreign-carrier",
+    ],
+)
+def test_gate_converges_every_local_preflight_failure_before_collective(failure):
+    state = _state()
+    phase = BridgePhase.EMBEDDING
+    rank = 30
+    events = []
+    overrides = {}
+
+    def local_prepare():
+        events.append("prepare")
+        prepared, _ = _prepare(state, phase, rank)
+        return prepared
+
+    if failure == "phase":
+        overrides["phase"] = object()
+    elif failure == "manifest":
+        overrides["global_manifest"] = object()
+    elif failure == "plan":
+        overrides["plan"] = object()
+    elif failure == "ledger-phase":
+        overrides.update(ledger=state.gradient, reverse_ledger=state.embedding)
+    elif failure == "reverse-ledger":
+        overrides["reverse_ledger"] = state.embedding
+    elif failure == "carrier-phase":
+        local_prepare = lambda: _prepare(state, BridgePhase.GRADIENT, rank)[0]
+    elif failure == "carrier-dtype":
+        other = _state(dtype=torch.bfloat16)
+        local_prepare = lambda: _prepare(other, phase, rank)[0]
+    elif failure == "carrier-digest":
+
+        def tampered_prepare():
+            prepared, _ = _prepare(state, phase, rank)
+            object.__setattr__(prepared, "route_authority_digest", b"x" * 16)
+            return prepared
+
+        local_prepare = tampered_prepare
+
+    elif failure == "carrier-rank":
+        local_prepare = lambda: _prepare(state, phase, 80)[0]
+    elif failure == "carrier-participants":
+        other = _state(participants=tuple(reversed(_PARTICIPANTS)))
+        local_prepare = lambda: _prepare(other, phase, rank)[0]
+    elif failure == "group":
+        overrides.update(
+            group=_FakeGroup(tuple(reversed(_PARTICIPANTS)), rank),
+            group_ranks_getter=lambda group: list(group.participant_ranks),
+        )
+    else:
+        other = _state(
+            producers={
+                GlobalVisionItemId(3, 0): 70,
+                GlobalVisionItemId(3, 1): 70,
+                GlobalVisionItemId(7, 0): 80,
+            }
+        )
+        local_prepare = lambda: _prepare(other, phase, rank)[0]
+
+    observed = []
+
+    def gather(wire, **kwargs):
+        status = execution._PrecollectiveStatus.from_wire_tuple(wire)
+        observed.append((status, kwargs))
+        return _consensus_rows(wire, state.authority["participant_ranks"])
+
+    with pytest.raises(MdpPlanError, match="error code 1"):
+        _run_gate(
+            state,
+            phase,
+            rank,
+            local_prepare,
+            all_gather_status=gather,
+            all_to_all_single=lambda *_args, **_kwargs: events.append("all-to-all"),
+            **overrides,
+        )
+    assert len(observed) == 1
+    assert observed[0][0].error_code == 1
+    assert observed[0][0].gate_id == 1
+    assert observed[0][1] == {"timeout_seconds": 1.0}
+    if failure == "manifest":
+        assert observed[0][0].global_manifest_digest == bytes(16)
+    if failure in {"phase", "manifest", "plan", "ledger-phase", "reverse-ledger"}:
+        assert observed[0][0].plan_digest == bytes(16)
+    assert "all-to-all" not in events
+
+
+@pytest.mark.parametrize("mismatch", ["manifest", "digest", "gate", "error"])
+def test_gate_rejects_remote_status_mismatch_or_error_without_collective(mismatch):
+    state = _state()
+    ranks = state.authority["participant_ranks"]
+    events = []
+
+    def gather(wire, **_kwargs):
+        events.append("status")
+        changes = {}
+        if mismatch == "manifest":
+            changes["manifest_digests"] = {99: bytes(16)}
+        elif mismatch == "digest":
+            changes["route_digests"] = {99: bytes(16)}
+        elif mismatch == "gate":
+            changes["gates"] = {99: 3}
+        else:
+            changes["errors"] = {99: 4}
+        return _consensus_rows(wire, ranks, **changes)
+
+    with pytest.raises(MdpPlanError):
+        _run_gate(
+            state,
+            BridgePhase.EMBEDDING,
+            30,
+            lambda: (events.append("prepare") or _prepare(state, BridgePhase.EMBEDDING, 30)[0]),
+            all_gather_status=gather,
+            all_to_all_single=lambda *_args, **_kwargs: events.append("all-to-all"),
+        )
+    assert events == ["prepare", "status"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"global_rank": True},
+        {"group_ranks": []},
+        {"group_ranks": ()},
+        {"group_ranks": (80, 30, 30)},
+        {"group_ranks": (80, 99)},
+        {"all_gather_status": object()},
+        {"timeout_seconds": 0.000999},
+    ],
+)
+def test_gate_rejects_only_invalid_rendezvous_context_before_gather(overrides):
+    state = _state()
+    events = []
+    values = dict(
+        local_prepare=lambda: events.append("prepare"),
+        all_gather_status=lambda *_args, **_kwargs: events.append("status"),
+        all_to_all_single=lambda *_args, **_kwargs: events.append("all-to-all"),
+    )
+    values.update(overrides)
+
+    with pytest.raises(MdpConfigurationError):
+        _run_gate(state, BridgePhase.EMBEDDING, 30, **values)
+    assert events == []
+
+
+@pytest.mark.parametrize("callback", ["prepare", "group-getter", "all-to-all"])
+def test_gate_converges_noncallable_local_callbacks(callback):
+    state = _state()
+    events = []
+    values = dict(
+        local_prepare=lambda: events.append("prepare"),
+        group_ranks_getter=lambda _group: list(_PARTICIPANTS),
+        all_to_all_single=lambda *_args, **_kwargs: events.append("all-to-all"),
+    )
+    if callback == "prepare":
+        values["local_prepare"] = object()
+    elif callback == "group-getter":
+        values["group_ranks_getter"] = object()
+    else:
+        values["all_to_all_single"] = object()
+    statuses = []
+
+    def gather(wire, **_kwargs):
+        statuses.append(execution._PrecollectiveStatus.from_wire_tuple(wire))
+        return _consensus_rows(wire, _PARTICIPANTS)
+
+    with pytest.raises(MdpPlanError, match="error code 1"):
+        _run_gate(state, BridgePhase.EMBEDDING, 30, all_gather_status=gather, **values)
+    assert len(statuses) == 1 and statuses[0].error_code == 1
+    assert "all-to-all" not in events
+
+
+def test_gate_preserves_consensus_failure_cause_over_local_error():
+    state = _state()
+    local_error = RuntimeError("prepare")
+    gather_error = RuntimeError("gather")
+
+    def local_prepare():
+        raise local_error
+
+    def gather(*_args, **_kwargs):
+        raise gather_error
+
+    with pytest.raises(MdpBridgeError) as caught:
+        _run_gate(state, BridgePhase.EMBEDDING, 30, local_prepare, all_gather_status=gather)
+    assert caught.value.__cause__ is gather_error
+
+
+def test_gate_chains_local_error_when_consensus_error_has_no_cause():
+    state = _state()
+    local_error = RuntimeError("prepare")
+
+    def local_prepare():
+        raise local_error
+
+    with pytest.raises(MdpPlanError) as caught:
+        _run_gate(state, BridgePhase.EMBEDDING, 30, local_prepare)
+    assert caught.value.__cause__ is local_error
+
+
+@pytest.mark.parametrize("stage", ["manifest", "prepare", "group", "gather", "all-to-all"])
+def test_gate_does_not_catch_base_exception(stage):
+    state = _state()
+
+    def fail(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    manifest = state.manifest
+    local_prepare = lambda: _prepare(state, BridgePhase.EMBEDDING, 30)[0]
+    overrides = {}
+    if stage == "manifest":
+
+        class ExplodingManifest:
+            @property
+            def digest(self):
+                return fail()
+
+        manifest = ExplodingManifest()
+    elif stage == "prepare":
+        local_prepare = fail
+    elif stage == "group":
+        overrides["group_ranks_getter"] = fail
+    elif stage == "gather":
+        overrides["all_gather_status"] = fail
+    else:
+        overrides["all_to_all_single"] = fail
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_gate(
+            state, BridgePhase.EMBEDDING, 30, local_prepare, global_manifest=manifest, **overrides
+        )
+
+
+def test_gate_impossible_success_with_local_error_uses_state_guard(monkeypatch):
+    state = _state()
+    monkeypatch.setattr(transport, "_run_precollective_consensus", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(MdpStateError, match="despite a local error"):
+        _run_gate(state, BridgePhase.EMBEDDING, 30, object())
+
+
 @pytest.mark.parametrize("phase", [BridgePhase.EMBEDDING, BridgePhase.GRADIENT])
 def test_execute_calls_exact_collective_once_and_returns_live_views(phase):
     prepared, _ = _prepare(_state(), phase, 30)
@@ -889,3 +1244,108 @@ def test_world4_nccl_execute_preserves_self_remote_and_idle_ranks(phase, dtype, 
     assert set(received) == {entry.key for entry in destination_entries}
     for entry in destination_entries:
         torch.testing.assert_close(received[entry.key], oracle[entry.key], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+@pytest.mark.parametrize("phase", [BridgePhase.EMBEDDING, BridgePhase.GRADIENT])
+def test_world4_nccl_gate_composes_status_and_bridge_exchange(phase, bridge_group):
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = _world4_state(torch.float32, device)
+    prepared_values = []
+    calls = 0
+
+    def local_prepare():
+        prepared, _ = _prepare(state, phase, rank)
+        prepared_values.append(prepared)
+        return prepared
+
+    def tracked_all_to_all_single(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return torch.distributed.all_to_all_single(*args, **kwargs)
+
+    received = _run_gate(
+        state,
+        phase,
+        rank,
+        local_prepare,
+        group=bridge_group,
+        group_ranks_getter=torch.distributed.get_process_group_ranks,
+        all_gather_status=payload_transport.make_precollective_status_gather(
+            group=bridge_group, group_ranks=_WORLD4_PARTICIPANTS, global_rank=rank, device=device
+        ),
+        all_to_all_single=tracked_all_to_all_single,
+        timeout_seconds=30.0,
+    )
+    completion = torch.ones((), dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(completion, group=bridge_group)
+
+    assert completion.item() == 4
+    assert len(prepared_values) == calls == 1
+    assert received is prepared_values[0].received_tensors
+    oracle = {}
+    for source_rank in _WORLD4_PARTICIPANTS:
+        oracle.update(_local_tensors(state, phase, source_rank))
+    for key, tensor in received.items():
+        torch.testing.assert_close(tensor, oracle[key], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+@pytest.mark.parametrize("failure", ["prepare", "phase"])
+def test_world4_nccl_gate_converges_rank2_failure_then_reuses_group(failure, bridge_group):
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = _world4_state(torch.float32, device)
+    local_phase = (
+        BridgePhase.GRADIENT if failure == "phase" and rank == 2 else BridgePhase.EMBEDDING
+    )
+    calls = 0
+
+    def local_prepare():
+        if failure == "prepare" and rank == 2:
+            raise RuntimeError("rank-2 bridge prepare")
+        return _prepare(state, local_phase, rank)[0]
+
+    def tracked_all_to_all_single(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return torch.distributed.all_to_all_single(*args, **kwargs)
+
+    gather = payload_transport.make_precollective_status_gather(
+        group=bridge_group, group_ranks=_WORLD4_PARTICIPANTS, global_rank=rank, device=device
+    )
+    with pytest.raises(MdpPlanError):
+        _run_gate(
+            state,
+            local_phase,
+            rank,
+            local_prepare,
+            group=bridge_group,
+            group_ranks_getter=torch.distributed.get_process_group_ranks,
+            all_gather_status=gather,
+            all_to_all_single=tracked_all_to_all_single,
+            timeout_seconds=30.0,
+        )
+    completion = torch.ones((), dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(completion, group=bridge_group)
+
+    assert completion.item() == 4
+    assert calls == 0
+
+    received = _run_gate(
+        state,
+        BridgePhase.EMBEDDING,
+        rank,
+        lambda: _prepare(state, BridgePhase.EMBEDDING, rank)[0],
+        group=bridge_group,
+        group_ranks_getter=torch.distributed.get_process_group_ranks,
+        all_gather_status=gather,
+        all_to_all_single=tracked_all_to_all_single,
+        timeout_seconds=30.0,
+    )
+    retry_completion = torch.ones((), dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(retry_completion, group=bridge_group)
+    assert retry_completion.item() == 4
+    assert calls == 1
+    assert received is not None
