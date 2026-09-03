@@ -8,6 +8,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 import megatron.core.mdp.dynamic_cp_d3_coordinator as coordinator_module
+from megatron.core.mdp.bridge import BridgePhase
 from megatron.core.mdp.dynamic_cp_d3_coordinator import _D3Coordinator, _D3CoordinatorBindings
 from megatron.core.mdp.dynamic_cp_runtime import DecoderReadyIteration, _PreAuthorityDynamicProducer
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
@@ -21,6 +22,17 @@ class _BoundProducer:
     def __init__(self, producer):
         self.pre_authority = producer
         self.owner = producer.owner
+
+
+class _PayloadPrepared:
+    def __init__(self):
+        self.received_tensors = object()
+
+
+class _EmbeddingPrepared:
+    def __init__(self, phase=BridgePhase.EMBEDDING):
+        self.phase = phase
+        self.received_tensors = object()
 
 
 class _RegistryRuntime:
@@ -50,6 +62,12 @@ class _Owner:
 def _typed_coordinator_carriers(monkeypatch):
     monkeypatch.setattr(coordinator_module, "_DynamicIterationAuthority", _Authority)
     monkeypatch.setattr(coordinator_module, "_DynamicProducerCarrier", _BoundProducer)
+    monkeypatch.setattr(
+        coordinator_module, "PreparedDecoderPayloadBundle", _PayloadPrepared, raising=False
+    )
+    monkeypatch.setattr(
+        coordinator_module, "PreparedDynamicBridgeExchange", _EmbeddingPrepared, raising=False
+    )
 
 
 def _producer():
@@ -87,7 +105,7 @@ def _ready():
     )
 
 
-def _bindings(events, *, failing_operation=None):
+def _bindings(events, *, failing_operation=None, schedule_calls=None):
     authority = _Authority()
     ready = _ready()
 
@@ -114,17 +132,63 @@ def _bindings(events, *, failing_operation=None):
         producer.owner._runtime._consume_pre_authority_dynamic_producer(producer.owner, producer)
         return _BoundProducer(producer)
 
+    def prepare_payload(*_args):
+        events.append("payload-prepare")
+        if failing_operation == "payload-prepare":
+            raise RuntimeError("payload-prepare")
+        if failing_operation == "payload-prepared-malformed":
+            return object()
+        return _PayloadPrepared()
+
+    def execute_payload(prepared):
+        events.append("payload-execute")
+        if failing_operation == "payload-execute":
+            raise RuntimeError("payload-execute")
+        if failing_operation == "payload-result-malformed":
+            return object()
+        return prepared.received_tensors
+
+    def prepare_embedding(*_args):
+        events.append("embedding-prepare")
+        if failing_operation == "embedding-prepare":
+            raise RuntimeError("embedding-prepare")
+        if failing_operation == "embedding-prepared-wrong-type":
+            return object()
+        if failing_operation == "embedding-prepared-malformed":
+            return _EmbeddingPrepared(BridgePhase.GRADIENT)
+        return _EmbeddingPrepared()
+
+    def execute_embedding(prepared):
+        events.append("embedding-execute")
+        if failing_operation == "embedding-execute":
+            raise RuntimeError("embedding-execute")
+        if failing_operation == "embedding-result-malformed":
+            return object()
+        return prepared.received_tensors
+
+    def prepare_schedule(
+        authority_arg, bound, payload, payload_result, embedding, embedding_result
+    ):
+        events.append("schedule-prepare")
+        if schedule_calls is not None:
+            schedule_calls.append(
+                (authority_arg, bound, payload, payload_result, embedding, embedding_result)
+            )
+        if failing_operation == "schedule-prepare":
+            raise RuntimeError("schedule-prepare")
+        return ready
+
     return _D3CoordinatorBindings(
         execution_config_consensus=operation("config"),
         gather_metadata=operation("metadata", "metadata"),
         build_authority=operation("authority", authority),
         authority_status_gate=authority_gate,
         bind_producer=bind,
-        prepare_payload=operation("payload-prepare", "payload-prepared"),
-        execute_payload=operation("payload-execute", "payload-result"),
-        prepare_embedding=operation("embedding-prepare", "embedding-prepared"),
-        execute_embedding=operation("embedding-execute", "embedding-result"),
-        prepare_schedule=operation("schedule-prepare", ready),
+        prepare_payload=prepare_payload,
+        execute_payload=execute_payload,
+        prepare_embedding=prepare_embedding,
+        execute_embedding=execute_embedding,
+        prepare_schedule=prepare_schedule,
         prepare_gradient=operation("gradient-prepare", "gradient-prepared"),
         execute_gradient=operation("gradient-execute", "gradients"),
         prepare_encoder_completion=operation("completion-prepare", "completion"),
@@ -190,19 +254,40 @@ def test_d3_coordinator_runs_one_ordered_lifecycle_and_rejects_stale_handoffs():
     ]
 
 
+def test_d3_coordinator_passes_exact_completed_transport_objects_to_schedule_once():
+    events = []
+    schedule_calls = []
+    coordinator = _D3Coordinator(bindings=_bindings(events, schedule_calls=schedule_calls))
+
+    _begin(coordinator)
+
+    assert len(schedule_calls) == 1
+    authority, bound, payload, payload_result, embedding, embedding_result = schedule_calls[0]
+    assert type(authority) is _Authority
+    assert type(bound) is _BoundProducer
+    assert type(payload) is _PayloadPrepared
+    assert payload_result is payload.received_tensors
+    assert type(embedding) is _EmbeddingPrepared
+    assert embedding.phase is BridgePhase.EMBEDDING
+    assert embedding_result is embedding.received_tensors
+
+
 @pytest.mark.parametrize(
-    ("failing_operation", "gate_id", "needs_decoder_completion", "status_event"),
+    ("failing_operation", "gate_id", "needs_decoder_completion", "status_event", "cause_type"),
     (
-        ("authority", None, False, "authority-gate:True"),
-        ("bind", 0, False, "gate-0:True"),
-        ("payload-prepare", 0, False, "gate-0:True"),
-        ("schedule-prepare", 2, False, "gate-2:True"),
-        ("gradient-prepare", 3, True, "gate-3:True"),
-        ("cleanup", 6, True, "gate-6:True"),
+        ("authority", None, False, "authority-gate:True", RuntimeError),
+        ("bind", 0, False, "gate-0:True", RuntimeError),
+        ("payload-prepare", 0, False, "gate-0:True", RuntimeError),
+        ("payload-prepared-malformed", 0, False, "gate-0:True", MdpConfigurationError),
+        ("embedding-prepared-wrong-type", 1, False, "gate-1:True", MdpConfigurationError),
+        ("embedding-prepared-malformed", 1, False, "gate-1:True", MdpConfigurationError),
+        ("schedule-prepare", 2, False, "gate-2:True", RuntimeError),
+        ("gradient-prepare", 3, True, "gate-3:True", RuntimeError),
+        ("cleanup", 6, True, "gate-6:True", RuntimeError),
     ),
 )
 def test_d3_coordinator_converges_local_precollective_failures_then_cleans_up(
-    failing_operation, gate_id, needs_decoder_completion, status_event
+    failing_operation, gate_id, needs_decoder_completion, status_event, cause_type
 ):
     events = []
     coordinator = _D3Coordinator(bindings=_bindings(events, failing_operation=failing_operation))
@@ -213,7 +298,7 @@ def test_d3_coordinator_converges_local_precollective_failures_then_cleans_up(
         if needs_decoder_completion:
             coordinator.mark_decoder_complete(ready)
             coordinator.end_iteration()
-    assert isinstance(error.value.__cause__, RuntimeError)
+    assert isinstance(error.value.__cause__, cause_type)
     assert status_event in events
     assert events.count("cleanup") == 1
     assert coordinator.is_idle
@@ -300,6 +385,40 @@ def test_d3_coordinator_never_advances_after_an_entered_collective_fails():
         "cleanup",
     ]
     assert coordinator.is_idle
+
+
+@pytest.mark.parametrize(
+    "failing_operation", ("payload-result-malformed", "embedding-result-malformed")
+)
+def test_d3_coordinator_rejects_entered_collective_result_without_later_gate(failing_operation):
+    events = []
+    coordinator = _D3Coordinator(bindings=_bindings(events, failing_operation=failing_operation))
+
+    with pytest.raises(MdpStateError, match="exact received mapping"):
+        _begin(coordinator)
+
+    assert events.count("cleanup") == 1
+    if failing_operation == "payload-result-malformed":
+        assert "gate-1:False" not in events and "schedule-prepare" not in events
+    else:
+        assert "schedule-prepare" not in events and "gate-2:False" not in events
+    assert coordinator.is_idle
+
+
+def test_d3_coordinator_retry_never_retains_prior_transport_objects():
+    events = []
+    schedule_calls = []
+    coordinator = _D3Coordinator(bindings=_bindings(events, schedule_calls=schedule_calls))
+    first = _begin(coordinator)
+
+    with pytest.raises(RuntimeError, match="first"):
+        coordinator.abort_scheduled_iteration(first, RuntimeError("first"))
+    second = _begin(coordinator)
+
+    assert second is first
+    assert len(schedule_calls) == 2
+    for previous, current in zip(schedule_calls[0][2:], schedule_calls[1][2:]):
+        assert current is not previous
 
 
 def test_d3_scheduled_abort_preserves_exact_primary_and_retries_from_idle():
