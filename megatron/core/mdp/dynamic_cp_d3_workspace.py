@@ -9,7 +9,8 @@ from typing import Any
 import torch
 
 from megatron.core.mdp.allocator import MdpBufferAllocator
-from megatron.core.mdp.dynamic_cp_bridge import DynamicBridgeKey
+from megatron.core.mdp.dynamic_cp_bridge import DynamicBridgeKey, dynamic_bridge_split_sizes
+from megatron.core.mdp.dynamic_cp_routing import decoder_payload_split_sizes
 from megatron.core.mdp.dynamic_cp_runtime import _DynamicIterationAuthority
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.storage import MdpEmbeddingStorage
@@ -57,6 +58,12 @@ class _DynamicIterationWorkspace:
             raise MdpConfigurationError("MDP: D3 workspace uses MdpEmbeddingStorage.")
         if storage._allocator is not allocator:
             raise MdpConfigurationError("MDP: D3 workspace storage uses its allocator.")
+        if any(
+            spec.device_type != "cuda"
+            for payload in validated_authority.global_manifest.payloads
+            for spec in payload.field_specs
+        ):
+            raise MdpConfigurationError("MDP: D3 workspace uses CUDA decoder payload tensors.")
         self.authority = original_authority
         self._validated_authority = validated_authority
         self.rank = rank
@@ -70,11 +77,37 @@ class _DynamicIterationWorkspace:
         self._view_backings: list[dict] = []
         self._embedding_leaves_activated = False
         self._released = False
+        self.payload_transport_buffers = MappingProxyType({})
+        self.payload_views = MappingProxyType({})
+        self.embedding_transport_buffers = None
+        self.embedding_receive_views = MappingProxyType({})
+        self.embedding_views = MappingProxyType({})
+        self.gradient_transport_buffers = None
+        self.gradient_views = MappingProxyType({})
+        self.summed_gradient_views = MappingProxyType({})
         try:
+            self.payload_transport_buffers = self._payload_buffers()
             self.payload_views = self._payload_views()
+            (self.embedding_transport_buffers, embedding_output_splits) = self._bridge_buffers(
+                validated_authority.embedding_ledger,
+                validated_authority.gradient_ledger,
+                "embedding",
+            )
+            self.embedding_receive_views = self._bridge_receive_views(
+                validated_authority.embedding_ledger,
+                self.embedding_transport_buffers[1],
+                embedding_output_splits,
+            )
             self.embedding_views = self._embedding_views()
-            self.gradient_views = self._ledger_views(
-                validated_authority.gradient_ledger, "dynamic_cp_gradient_edges"
+            (self.gradient_transport_buffers, gradient_output_splits) = self._bridge_buffers(
+                validated_authority.gradient_ledger,
+                validated_authority.embedding_ledger,
+                "gradient",
+            )
+            self.gradient_views = self._bridge_receive_views(
+                validated_authority.gradient_ledger,
+                self.gradient_transport_buffers[1],
+                gradient_output_splits,
             )
             self.summed_gradient_views = self._summed_gradient_views()
         except BaseException as error:
@@ -89,9 +122,39 @@ class _DynamicIterationWorkspace:
             raise MdpConfigurationError("MDP: D3 workspace is not used after release.")
 
     def _acquire(self, *, rows: int, width: int, dtype: torch.dtype, tag: str) -> torch.Tensor:
-        base = self.allocator.acquire(
-            rows=rows, width=width, dtype=dtype, device=self.device, tag=tag
-        )
+        base = None
+        release_base = True
+        try:
+            base = self.allocator.acquire(
+                rows=rows, width=width, dtype=dtype, device=self.device, tag=tag
+            )
+            expected_shape = (rows,) if width == 0 else (rows, width)
+            if (
+                not isinstance(base, torch.Tensor)
+                or tuple(base.shape) != expected_shape
+                or base.dtype != dtype
+                or base.device != self.device
+                or not base.is_contiguous()
+                or base.requires_grad
+                or base.grad_fn is not None
+            ):
+                raise MdpConfigurationError(
+                    "MDP: D3 workspace allocator returns a detached contiguous requested buffer."
+                )
+            if base.numel() and any(
+                other.numel()
+                and base.untyped_storage().data_ptr() == other.untyped_storage().data_ptr()
+                for other in self._bases
+            ):
+                release_base = False
+                raise MdpConfigurationError("MDP: D3 workspace allocator returns disjoint buffers.")
+        except BaseException as error:
+            if release_base and isinstance(base, torch.Tensor):
+                try:
+                    self.allocator.release(base)
+                except BaseException as cleanup_error:
+                    error.add_note(f"suppressed D3 workspace cleanup error: {cleanup_error!r}")
+            raise
         self._bases.append(base)
         return base
 
@@ -99,33 +162,120 @@ class _DynamicIterationWorkspace:
         self._view_backings.append(views)
         return MappingProxyType(views)
 
+    @staticmethod
+    def _split_bases(splits: tuple[int, ...]) -> tuple[int, ...]:
+        starts, cursor = [], 0
+        for split in splits:
+            starts.append(cursor)
+            cursor += split
+        return tuple(starts)
+
+    def _payload_buffers(self) -> Mapping:
+        authority = self._validated_authority
+        dtypes = tuple(dict.fromkeys(entry.dtype for entry in authority.payload_ledger.entries))
+        buffers = {}
+        for dtype in dtypes:
+            input_splits, output_splits = decoder_payload_split_sizes(
+                authority.payload_ledger,
+                plan=authority.plan,
+                global_manifest=authority.global_manifest,
+                source_rank_by_lane=authority.source_rank_by_lane,
+                participant_ranks=authority.participant_ranks,
+                dtype=dtype,
+                global_rank=self.rank,
+            )
+            buffers[dtype] = (
+                self._acquire(
+                    rows=sum(input_splits), width=0, dtype=dtype, tag="dynamic_cp_payload_send"
+                ),
+                self._acquire(
+                    rows=sum(output_splits), width=0, dtype=dtype, tag="dynamic_cp_payload_receive"
+                ),
+            )
+        return self._freeze(buffers)
+
     def _payload_views(self) -> Mapping:
         specs = {
             (payload.sample_id, spec.name): spec
             for payload in self._validated_authority.global_manifest.payloads
             for spec in payload.field_specs
         }
-        entries = tuple(
-            entry
-            for entry in self._validated_authority.payload_ledger.entries
-            if entry.dst_global_rank == self.rank
+        authority = self._validated_authority
+        participants = {rank: index for index, rank in enumerate(authority.participant_ranks)}
+        views = {}
+        receive_bases = {}
+        for dtype in self.payload_transport_buffers:
+            _, output_splits = decoder_payload_split_sizes(
+                authority.payload_ledger,
+                plan=authority.plan,
+                global_manifest=authority.global_manifest,
+                source_rank_by_lane=authority.source_rank_by_lane,
+                participant_ranks=authority.participant_ranks,
+                dtype=dtype,
+                global_rank=self.rank,
+            )
+            receive_bases[dtype] = self._split_bases(output_splits)
+        for entry in authority.payload_ledger.entries:
+            if entry.dst_global_rank != self.rank:
+                continue
+            receive = self.payload_transport_buffers[entry.dtype][1]
+            start = (
+                receive_bases[entry.dtype][participants[entry.src_global_rank]] + entry.plan_offset
+            )
+            views[entry.key] = receive[start : start + entry.element_count].view(
+                specs[(entry.key.sample_id, entry.key.field_name)].shape
+            )
+        return self._freeze(views)
+
+    def _bridge_buffers(self, ledger: Any, reverse_ledger: Any, name: str) -> tuple:
+        authority = self._validated_authority
+        input_splits, output_splits = dynamic_bridge_split_sizes(
+            ledger,
+            reverse_ledger=reverse_ledger,
+            plan=authority.plan,
+            global_manifest=authority.global_manifest,
+            producer_rank_by_item=authority.producer_rank_by_item,
+            output_rows_by_item=authority.output_rows_by_item,
+            width=authority.bridge_width,
+            dtype=authority.bridge_dtype,
+            participant_ranks=authority.participant_ranks,
+            global_rank=self.rank,
+        )
+        return (
+            (
+                self._acquire(
+                    rows=sum(input_splits),
+                    width=0,
+                    dtype=authority.bridge_dtype,
+                    tag=f"dynamic_cp_{name}_send",
+                ),
+                self._acquire(
+                    rows=sum(output_splits),
+                    width=0,
+                    dtype=authority.bridge_dtype,
+                    tag=f"dynamic_cp_{name}_receive",
+                ),
+            ),
+            output_splits,
+        )
+
+    def _bridge_receive_views(
+        self, ledger: Any, receive: torch.Tensor, output_splits: tuple
+    ) -> Mapping:
+        authority = self._validated_authority
+        participants = {rank: index for index, rank in enumerate(authority.participant_ranks)}
+        receive_bases = self._split_bases(output_splits)
+        entries = sorted(
+            (entry for entry in ledger.entries if entry.dst_global_rank == self.rank),
+            key=lambda entry: (participants[entry.src_global_rank], entry.plan_offset),
         )
         views = {}
-        for dtype in dict.fromkeys(entry.dtype for entry in entries):
-            typed = tuple(entry for entry in entries if entry.dtype == dtype)
-            base = self._acquire(
-                rows=sum(entry.element_count for entry in typed),
-                width=0,
-                dtype=dtype,
-                tag="dynamic_cp_payload_destination",
+        for entry in entries:
+            start = receive_bases[participants[entry.src_global_rank]] + entry.plan_offset
+            rows = authority.output_rows_by_item[entry.key.item_id]
+            views[entry.key] = receive[start : start + entry.element_count].view(
+                rows, authority.bridge_width
             )
-            cursor = 0
-            for entry in typed:
-                end = cursor + entry.element_count
-                views[entry.key] = base[cursor:end].view(
-                    specs[(entry.key.sample_id, entry.key.field_name)].shape
-                )
-                cursor = end
         return self._freeze(views)
 
     def _local_item_ids(self, microbatch_index: int) -> tuple:
@@ -161,24 +311,6 @@ class _DynamicIterationWorkspace:
                 rows = self._validated_authority.output_rows_by_item[item_id]
                 views[DynamicBridgeKey(item_id, self.rank)] = base[cursor : cursor + rows]
                 cursor += rows
-        return self._freeze(views)
-
-    def _ledger_views(self, ledger: Any, tag: str) -> Mapping:
-        entries = tuple(entry for entry in ledger.entries if entry.dst_global_rank == self.rank)
-        if not entries:
-            return self._freeze({})
-        base = self._acquire(
-            rows=sum(entry.element_count for entry in entries),
-            width=0,
-            dtype=self._validated_authority.bridge_dtype,
-            tag=tag,
-        )
-        views, cursor = {}, 0
-        for entry in entries:
-            end = cursor + entry.element_count
-            rows = self._validated_authority.output_rows_by_item[entry.key.item_id]
-            views[entry.key] = base[cursor:end].view(rows, self._validated_authority.bridge_width)
-            cursor = end
         return self._freeze(views)
 
     def _summed_gradient_views(self) -> Mapping:
@@ -277,5 +409,7 @@ class _DynamicIterationWorkspace:
         self._embedding_bases.clear()
         self._storage_owned_base_ids.clear()
         self._view_backings.clear()
+        self.embedding_transport_buffers = None
+        self.gradient_transport_buffers = None
         if errors:
             self._raise_cleanup_errors(errors)
