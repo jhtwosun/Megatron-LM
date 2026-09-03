@@ -16,7 +16,7 @@ from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.window import MdpMicrobatchRecord
 
 
-def _require_callable(name: str, value: Any) -> Callable[[], Any]:
+def _require_callable(name: str, value: Any) -> Callable[..., Any]:
     if not callable(value):
         raise MdpConfigurationError(f"MDP: D3 private facade {name} must be callable.")
     return value
@@ -77,9 +77,9 @@ class _D3PrivateFacade:
     def __init__(
         self,
         *,
-        config_factory: Callable[[], Any],
-        producer_factory: Callable[[], Any],
-        coordinator_factory: Callable[[], Any],
+        config_factory: Callable[..., Any],
+        producer_factory: Callable[..., Any],
+        coordinator_factory: Callable[..., Any],
     ) -> None:
         self._config_factory = _require_callable("config_factory", config_factory)
         self._producer_factory = _require_callable("producer_factory", producer_factory)
@@ -91,8 +91,14 @@ class _D3PrivateFacade:
         """Return whether this facade currently owns no D3 handoff."""
         return self._active is None
 
-    def begin_iteration(self, *, forward_only: bool = False) -> DecoderReadyIteration:
+    def begin_iteration(
+        self, raw_iterator: Any, *, num_microbatches: int, forward_only: bool
+    ) -> DecoderReadyIteration:
         """Start one training-only D3 transaction and expose its exact handoff."""
+        if type(num_microbatches) is not int or num_microbatches <= 0:
+            raise MdpConfigurationError(
+                "MDP: D3 private facade num_microbatches must be a positive exact integer."
+            )
         if type(forward_only) is not bool:
             raise MdpConfigurationError(
                 "MDP: D3 private facade forward_only must be an exact bool."
@@ -102,12 +108,16 @@ class _D3PrivateFacade:
         if self._active is not None:
             raise MdpStateError("MDP: D3 private facade begins only while idle.")
 
-        config = self._config_factory()
+        config = self._config_factory(
+            raw_iterator, num_microbatches=num_microbatches, forward_only=forward_only
+        )
         if type(config) is not _DynamicExecutionConfig:
             raise MdpConfigurationError(
                 "MDP: D3 private facade config_factory returns typed dynamic config."
             )
-        coordinator = self._coordinator_factory()
+        coordinator = self._coordinator_factory(
+            raw_iterator, num_microbatches=num_microbatches, forward_only=forward_only
+        )
         if type(coordinator) is not _D3Coordinator:
             raise MdpConfigurationError(
                 "MDP: D3 private facade coordinator_factory returns typed D3 coordinator."
@@ -116,7 +126,9 @@ class _D3PrivateFacade:
             raise MdpStateError(
                 "MDP: D3 private facade coordinator_factory returns an idle coordinator."
             )
-        producer = self._producer_factory()
+        producer = self._producer_factory(
+            raw_iterator, num_microbatches=num_microbatches, forward_only=forward_only
+        )
         if type(producer) is not _PreAuthorityDynamicProducer:
             raise MdpConfigurationError(
                 "MDP: D3 private facade producer_factory returns typed pre-authority producer."
