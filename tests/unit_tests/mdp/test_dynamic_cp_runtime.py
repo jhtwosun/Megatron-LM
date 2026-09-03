@@ -2,6 +2,7 @@
 
 """Composition contracts for the private Dynamic-CP decoder-ready phase."""
 
+import gc
 import importlib
 import os
 from dataclasses import FrozenInstanceError, replace
@@ -37,6 +38,7 @@ from megatron.core.mdp.errors import (
     MdpPlanError,
     MdpStateError,
 )
+from megatron.core.mdp.runtime import MdpRuntime
 from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
 
 _PARTICIPANTS = (0, 1, 2, 3)
@@ -49,6 +51,167 @@ _FIELDS = ("input_ids", "loss_mask", "padding_mask")
 def _runtime():
     """Keep the new module lazy so the exact parent collects focused RED."""
     return importlib.import_module("megatron.core.mdp.dynamic_cp_runtime")
+
+
+def _bare_mdp_runtime():
+    """Construct only the private registry state; no CUDA/runtime setup is needed."""
+    runtime = object.__new__(MdpRuntime)
+    runtime._pre_authority_dynamic_producer = None
+    runtime._retired_pre_authority_dynamic_producers = {}
+    return runtime
+
+
+class _RegistryProducer:
+    def __init__(self, owner):
+        self.owner = owner
+
+
+class _NonWeakrefableRegistryProducer:
+    __slots__ = ("owner", "_mdp_pre_authority_runtime")
+
+    def __init__(self, owner):
+        self.owner = owner
+        self._mdp_pre_authority_runtime = None
+
+
+class _RegistryOwner:
+    def __init__(self, runtime):
+        self._runtime = runtime
+
+
+def test_runtime_owner_registry_requires_exact_registered_producer_once():
+    runtime = _bare_mdp_runtime()
+    owner = _RegistryOwner(runtime)
+    producer = _RegistryProducer(owner)
+
+    runtime._register_pre_authority_dynamic_producer(owner, producer)
+    runtime._validate_pre_authority_dynamic_producer(owner, producer)
+
+    with pytest.raises(MdpStateError, match="belongs to its exact runtime owner"):
+        runtime._validate_pre_authority_dynamic_producer(owner, _RegistryProducer(owner))
+    with pytest.raises(MdpStateError, match="exact producer owner"):
+        runtime._validate_pre_authority_dynamic_producer(_RegistryOwner(runtime), producer)
+    with pytest.raises(MdpStateError, match="already owns one producer"):
+        runtime._register_pre_authority_dynamic_producer(owner, _RegistryProducer(owner))
+
+    runtime._consume_pre_authority_dynamic_producer(owner, producer)
+    with pytest.raises(MdpStateError, match="exact registered producer"):
+        runtime._validate_pre_authority_dynamic_producer(owner, producer)
+    with pytest.raises(MdpStateError, match="retired producer"):
+        runtime._register_pre_authority_dynamic_producer(owner, producer)
+
+    retired_identity = id(producer)
+    del producer
+    gc.collect()
+    assert retired_identity not in runtime._retired_pre_authority_dynamic_producers
+
+    with pytest.raises(MdpStateError, match="supports runtime-owned one-shot identity"):
+        runtime._register_pre_authority_dynamic_producer(
+            owner, _NonWeakrefableRegistryProducer(owner)
+        )
+    assert runtime._pre_authority_dynamic_producer is None
+
+    active = _RegistryProducer(owner)
+    runtime._register_pre_authority_dynamic_producer(owner, active)
+    with pytest.raises(MdpStateError, match="exact producer owner"):
+        runtime._abort_pre_authority_dynamic_producer()
+    with pytest.raises(MdpStateError, match="exact producer owner"):
+        runtime._abort_pre_authority_dynamic_producer(_RegistryOwner(runtime))
+    runtime._validate_pre_authority_dynamic_producer(owner, active)
+    runtime._abort_pre_authority_dynamic_producer(owner)
+    with pytest.raises(MdpStateError, match="retired producer"):
+        runtime._register_pre_authority_dynamic_producer(owner, active)
+
+
+def test_runtime_owner_registry_rejects_cross_runtime_redirect_without_mutation():
+    runtime_a = _bare_mdp_runtime()
+    runtime_b = _bare_mdp_runtime()
+    owner = _RegistryOwner(runtime_a)
+    producer = _RegistryProducer(owner)
+    runtime_a._register_pre_authority_dynamic_producer(owner, producer)
+
+    owner._runtime = runtime_b
+    with pytest.raises(MdpStateError, match="exact runtime owner"):
+        runtime_a._validate_pre_authority_dynamic_producer(owner, producer)
+    with pytest.raises(MdpStateError, match="belongs to its exact runtime owner"):
+        runtime_b._register_pre_authority_dynamic_producer(owner, producer)
+    assert runtime_b._pre_authority_dynamic_producer is None
+
+    owner._runtime = runtime_a
+    runtime_a._validate_pre_authority_dynamic_producer(owner, producer)
+
+
+def test_runtime_capture_registers_sealed_pre_authority_producer_and_aborts_retry():
+    runtime = _bare_mdp_runtime()
+    owner = _RegistryOwner(runtime)
+    item_outputs = {0: object()}
+    locations = {GlobalSampleId(3, 0): (0, 0)}
+
+    contributor = runtime._capture_pre_authority_dynamic_producer(
+        owner=owner,
+        rank_view=object(),
+        local_manifest=object(),
+        source_window=object(),
+        static_plan=object(),
+        item_outputs=item_outputs,
+        sample_location_by_id=locations,
+        local_prepare_error=None,
+        forward_only=False,
+    )
+    assert contributor.item_outputs == item_outputs
+    assert contributor.item_outputs is not item_outputs
+    assert contributor.sample_location_by_id == locations
+    assert contributor.sample_location_by_id is not locations
+    runtime._validate_pre_authority_dynamic_producer(owner, contributor)
+
+    runtime._abort_pre_authority_dynamic_producer(owner)
+    with pytest.raises(MdpStateError, match="exact registered producer"):
+        runtime._validate_pre_authority_dynamic_producer(owner, contributor)
+
+    empty = runtime._capture_pre_authority_dynamic_producer(
+        owner=owner,
+        rank_view=object(),
+        local_manifest=None,
+        source_window=None,
+        static_plan=None,
+        item_outputs={},
+        sample_location_by_id={},
+        local_prepare_error=None,
+        forward_only=False,
+    )
+    assert empty.owner is owner
+    assert dict(empty.item_outputs) == dict(empty.sample_location_by_id) == {}
+    runtime._abort_pre_authority_dynamic_producer(owner)
+
+    failed = runtime._capture_pre_authority_dynamic_producer(
+        owner=owner,
+        rank_view=object(),
+        local_manifest=object(),
+        source_window=object(),
+        static_plan=object(),
+        item_outputs={0: object()},
+        sample_location_by_id={GlobalSampleId(3, 0): (0, 0)},
+        local_prepare_error=RuntimeError("local preparation failed"),
+        forward_only=False,
+    )
+    assert failed.owner is None
+    assert failed.local_prepare_error is not None
+    assert dict(failed.item_outputs) == dict(failed.sample_location_by_id) == {}
+    with pytest.raises(MdpStateError, match="exact producer owner"):
+        runtime._validate_pre_authority_dynamic_producer(owner, failed)
+
+    retry = runtime._capture_pre_authority_dynamic_producer(
+        owner=owner,
+        rank_view=object(),
+        local_manifest=None,
+        source_window=None,
+        static_plan=None,
+        item_outputs={},
+        sample_location_by_id={},
+        local_prepare_error=None,
+        forward_only=False,
+    )
+    runtime._validate_pre_authority_dynamic_producer(owner, retry)
 
 
 def _gradient_lifecycle(nonce=b"\x01" * 16):
