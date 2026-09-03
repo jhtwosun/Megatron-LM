@@ -11,6 +11,7 @@ import torch
 
 from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.dynamic_cp_bridge_transport import prepare_dynamic_bridge_exchange
+from megatron.core.mdp.dynamic_cp_execution import DecoderMicrobatchKey
 from megatron.core.mdp.dynamic_cp_transport import prepare_decoder_payload_bundle
 from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError, MdpStateError
 from megatron.core.mdp.storage import MdpEmbeddingStorage
@@ -144,6 +145,18 @@ def test_zero_copy_payload_and_microbatch_leaf_placement_preserve_exact_inputs()
         )
         assert result.payload_destination_views is workspace.payload_views
         assert result.embedding_destination_views is workspace.embedding_views
+        assert type(result.embedding_leaves) is type(MappingProxyType({}))
+        expected_leaf_keys = tuple(
+            DecoderMicrobatchKey(microbatch.microbatch_index)
+            for microbatch in workspace.authority.plan.microbatches
+            if microbatch.microbatch_index in workspace._embedding_bases
+        )
+        assert tuple(result.embedding_leaves) == expected_leaf_keys
+        for key in expected_leaf_keys:
+            leaf = workspace.storage.get_leaf(key.microbatch_index)
+            assert result.embedding_leaves[key] is leaf
+            assert leaf is workspace._embedding_bases[key.microbatch_index]
+            assert leaf.requires_grad and leaf.is_leaf
         for key, source in payload.received_tensors.items():
             destination = result.payload_destination_views[key]
             assert source.untyped_storage().data_ptr() == destination.untyped_storage().data_ptr()
@@ -327,6 +340,7 @@ def test_typed_result_rejects_replaced_bound_capability_mapping():
                 embedding_destination_views=foreign,
                 gradient_destination_views=foreign,
                 summed_gradient_destination_views=foreign,
+                embedding_leaves=MappingProxyType({}),
             )
     finally:
         workspace.release()
@@ -350,10 +364,98 @@ def test_typed_result_rejects_valid_d2_carriers_from_a_foreign_workspace():
                 embedding_destination_views=producer.embedding_destination_views,
                 gradient_destination_views=producer.gradient_destination_views,
                 summed_gradient_destination_views=producer.summed_gradient_destination_views,
+                embedding_leaves=MappingProxyType({}),
             )
     finally:
         workspace.release()
         foreign_workspace.release()
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra", "foreign", "nonleaf"))
+def test_typed_result_rejects_nonexact_activated_leaf_mapping(mutation):
+    workspace = _workspace()
+    producer = _producer(workspace)
+    payload, embedding = _prepared(workspace)
+    placed = _api()._place_d3_local_decoder_inputs(
+        workspace=workspace, producer=producer, payload_bundle=payload, embedding_exchange=embedding
+    )
+    leaves = dict(placed.embedding_leaves)
+    if mutation == "missing":
+        leaves.pop(next(iter(leaves)))
+    elif mutation == "extra":
+        leaves[DecoderMicrobatchKey(99)] = next(iter(leaves.values()))
+    elif mutation == "foreign":
+        key = next(iter(leaves))
+        leaves[key] = leaves[key].detach().clone().requires_grad_(True)
+    else:
+        next(iter(leaves.values())).requires_grad_(False)
+
+    try:
+        with pytest.raises((MdpBridgeError, MdpConfigurationError), match="leaves"):
+            _api()._D3LocalPlacement(
+                workspace=workspace,
+                producer=producer,
+                payload_bundle=payload,
+                embedding_exchange=embedding,
+                payload_destination_views=producer.payload_destination_views,
+                embedding_destination_views=producer.embedding_destination_views,
+                gradient_destination_views=producer.gradient_destination_views,
+                summed_gradient_destination_views=producer.summed_gradient_destination_views,
+                embedding_leaves=MappingProxyType(leaves),
+            )
+    finally:
+        workspace.release()
+
+
+def test_typed_result_requires_factory_minted_seal_for_exact_active_inputs():
+    workspace = _workspace()
+    producer = _producer(workspace)
+    payload, embedding = _prepared(workspace)
+    placed = _api()._place_d3_local_decoder_inputs(
+        workspace=workspace, producer=producer, payload_bundle=payload, embedding_exchange=embedding
+    )
+
+    try:
+        with pytest.raises(MdpStateError, match="factory"):
+            _api()._D3LocalPlacement(
+                workspace=workspace,
+                producer=producer,
+                payload_bundle=payload,
+                embedding_exchange=embedding,
+                payload_destination_views=placed.payload_destination_views,
+                embedding_destination_views=placed.embedding_destination_views,
+                gradient_destination_views=placed.gradient_destination_views,
+                summed_gradient_destination_views=placed.summed_gradient_destination_views,
+                embedding_leaves=placed.embedding_leaves,
+            )
+    finally:
+        workspace.release()
+
+
+def test_typed_result_rejects_replayed_factory_seal_for_exact_active_inputs():
+    workspace = _workspace()
+    producer = _producer(workspace)
+    payload, embedding = _prepared(workspace)
+    placed = _api()._place_d3_local_decoder_inputs(
+        workspace=workspace, producer=producer, payload_bundle=payload, embedding_exchange=embedding
+    )
+
+    try:
+        with pytest.raises(MdpStateError, match="factory"):
+            _api()._D3LocalPlacement(
+                workspace=workspace,
+                producer=producer,
+                payload_bundle=payload,
+                embedding_exchange=embedding,
+                payload_destination_views=placed.payload_destination_views,
+                embedding_destination_views=placed.embedding_destination_views,
+                gradient_destination_views=placed.gradient_destination_views,
+                summed_gradient_destination_views=placed.summed_gradient_destination_views,
+                embedding_leaves=placed.embedding_leaves,
+                _factory_seal=placed._factory_seal,
+            )
+    finally:
+        workspace.release()
 
 
 def test_typed_result_rejects_fresh_or_released_workspace():
@@ -372,6 +474,7 @@ def test_typed_result_rejects_fresh_or_released_workspace():
                 embedding_destination_views=producer.embedding_destination_views,
                 gradient_destination_views=producer.gradient_destination_views,
                 summed_gradient_destination_views=producer.summed_gradient_destination_views,
+                embedding_leaves=MappingProxyType({}),
             )
     finally:
         workspace.release()
@@ -386,6 +489,7 @@ def test_typed_result_rejects_fresh_or_released_workspace():
             embedding_destination_views=producer.embedding_destination_views,
             gradient_destination_views=producer.gradient_destination_views,
             summed_gradient_destination_views=producer.summed_gradient_destination_views,
+            embedding_leaves=MappingProxyType({}),
         )
 
 
