@@ -55,6 +55,7 @@ class _D3ActiveIteration:
     ready: DecoderReadyIteration | None = None
     decoder_complete: bool = False
     cleaned: bool = False
+    scheduled_abort_started: bool = False
 
 
 def _runtime_for_registered_producer(producer: _PreAuthorityDynamicProducer) -> Any:
@@ -246,6 +247,45 @@ class _D3Coordinator:
         if state.decoder_complete:
             raise MdpStateError("MDP: D3 coordinator records decoder completion exactly once.")
         state.decoder_complete = True
+
+    def abort_scheduled_iteration(
+        self, ready: DecoderReadyIteration, primary_error: BaseException
+    ) -> None:
+        """Retire one failed native-schedule handoff without entering later D3 phases."""
+        if not isinstance(primary_error, BaseException):
+            raise MdpConfigurationError(
+                "MDP: D3 scheduled abort requires a BaseException primary error."
+            )
+        state = self._active
+        if (
+            state is None
+            or state.ready is not ready
+            or state.decoder_complete
+            or state.scheduled_abort_started
+        ):
+            raise MdpStateError(
+                "MDP: D3 scheduled abort requires its exact active decoder-ready handoff."
+            )
+        state.scheduled_abort_started = True
+
+        try:
+            self._bindings.status_gate(3, primary_error, state.authority)
+        except BaseException as error:
+            self._add_secondary_note(primary_error, "scheduled abort gate", error)
+        cleanup_error = self._cleanup(state)
+        self._active = None
+        if cleanup_error is not None:
+            self._add_secondary_note(primary_error, "scheduled abort cleanup", cleanup_error)
+        raise primary_error
+
+    @staticmethod
+    def _add_secondary_note(
+        primary_error: BaseException, description: str, secondary_error: BaseException
+    ) -> None:
+        try:
+            primary_error.add_note(f"suppressed D3 {description} error: {secondary_error!r}")
+        except BaseException:
+            pass
 
     def end_iteration(self) -> None:
         """Run gates 3--6 and retire the private producer exactly once."""
