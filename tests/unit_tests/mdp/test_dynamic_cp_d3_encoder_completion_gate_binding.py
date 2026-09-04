@@ -9,6 +9,7 @@ import os
 import weakref
 from dataclasses import dataclass
 from importlib import import_module
+from types import MappingProxyType
 
 import pytest
 import torch
@@ -68,8 +69,25 @@ class _Receipt:
 
 
 @dataclass(frozen=True)
+class _PreAuthority:
+    owner: object
+
+
+class _NativeOwner:
+    producer: object
+
+
+@dataclass(frozen=True)
 class _Producer:
     marker: object
+    owner: object
+    pre_authority: _PreAuthority
+
+
+@dataclass(frozen=True)
+class _NativeCompletion:
+    owner: object
+    payload: object = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +178,15 @@ def gate_api(monkeypatch):
         return prepared
 
     monkeypatch.setattr(api, "_validate_prepared_d3_encoder_completion", validate)
+
+    def validate_native(completion, *, owner):
+        if type(completion) is not _NativeCompletion or completion.owner is not owner:
+            raise MdpStateError("exact native completion owner")
+        return completion
+
+    monkeypatch.setattr(
+        api, "_validate_prepared_native_encoder_completion", validate_native, raising=False
+    )
     monkeypatch.setattr(
         api,
         "build_dynamic_bridge_route_authority_digest",
@@ -188,8 +215,11 @@ def _parts(*, ranks=(7,), rank=7, nonce=b"n" * 16, ready_digest=b"q" * 16, mode=
     owner = _Owner(workspace)
     ready = _Ready(ready_digest)
     receipt = _Receipt(_ReceiptPrepared(ready), nonce)
-    producer = _Producer(object())
-    native = object()
+    native_owner = _NativeOwner()
+    pre_authority = _PreAuthority(native_owner)
+    native_owner.producer = pre_authority
+    producer = _Producer(object(), native_owner, pre_authority)
+    native = _NativeCompletion(native_owner)
     prepared = _Prepared(authority, producer, workspace, receipt, native, mode)
     return authority, workspace, owner, ready, receipt, prepared, native
 
@@ -302,6 +332,116 @@ def test_valid_digest_arms_and_exact_claim_only_unwraps(gate_api, mode):
     assert events == [("status", status)]
 
 
+def test_concrete_native_validation_precedes_status_and_claim_executes_nothing(
+    gate_api, monkeypatch
+):
+    api = gate_api
+    parts = _parts()
+    native, native_owner = parts[6], parts[5].producer.owner
+    calls = []
+    validate_native = api._validate_prepared_native_encoder_completion
+
+    def tracked(completion, *, owner):
+        calls.append((completion, owner))
+        return validate_native(completion, owner=owner)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("gate 4 must not execute encoder completion")
+
+    monkeypatch.setattr(api, "_validate_prepared_native_encoder_completion", tracked)
+    monkeypatch.setattr(torch.autograd, "backward", forbidden)
+    monkeypatch.setattr(
+        import_module("megatron.core.mdp.activation").EncoderForwardHandle, "backward", forbidden
+    )
+    monkeypatch.setattr(
+        import_module("megatron.core.mdp.encoder"), "finalize_encoder_grads", forbidden
+    )
+    binding = _binding(api, parts[2])
+
+    binding.status_gate(_context(parts), None)
+    assert calls == [(native, native_owner)]
+    assert binding.claim_for_backward(parts[5]) is native
+    assert calls == [(native, native_owner), (native, native_owner)]
+
+
+@pytest.mark.parametrize("fault", ("validation", "wrong-result"))
+def test_invalid_concrete_native_submits_zero_status_and_does_not_arm(gate_api, monkeypatch, fault):
+    api = gate_api
+    parts = _parts()
+    concrete_calls = []
+    if fault == "validation":
+        validate_native = api._validate_prepared_native_encoder_completion
+        object.__setattr__(parts[6], "owner", object())
+
+        def tracked(completion, *, owner):
+            concrete_calls.append((completion, owner))
+            return validate_native(completion, owner=owner)
+
+        monkeypatch.setattr(api, "_validate_prepared_native_encoder_completion", tracked)
+    else:
+        monkeypatch.setattr(
+            api,
+            "_validate_prepared_native_encoder_completion",
+            lambda completion, *, owner: _NativeCompletion(owner),
+        )
+    events = []
+    binding = _binding(api, parts[2], events=events)
+
+    with pytest.raises(MdpPlanError):
+        binding.status_gate(_context(parts), None)
+
+    assert events[0][1].plan_digest == bytes(16)
+    assert events[0][1].error_code == 1
+    assert binding.is_idle and not binding.is_armed
+    if fault == "validation":
+        assert concrete_calls == [(parts[6], parts[5].producer.owner)]
+
+
+@pytest.mark.parametrize("mismatch", ("owner", "pre-authority"))
+def test_pre_status_owner_chain_mismatch_submits_zero_and_does_not_arm(gate_api, mismatch):
+    api = gate_api
+    parts = _parts()
+    if mismatch == "owner":
+        object.__setattr__(parts[5].producer, "owner", object())
+    else:
+        object.__setattr__(
+            parts[5].producer, "pre_authority", _PreAuthority(parts[5].producer.owner)
+        )
+    events = []
+    binding = _binding(api, parts[2], events=events)
+
+    with pytest.raises(MdpPlanError):
+        binding.status_gate(_context(parts), None)
+
+    assert events[0][1].plan_digest == bytes(16)
+    assert events[0][1].error_code == 1
+    assert binding.is_idle and not binding.is_armed
+
+
+@pytest.mark.parametrize("substitution", ("native", "owner", "pre-authority"))
+def test_post_status_native_owner_or_pre_authority_substitution_is_task_fatal(
+    gate_api, substitution
+):
+    api = gate_api
+    parts = _parts()
+    binding = _binding(api, parts[2])
+    binding.status_gate(_context(parts), None)
+    if substitution == "native":
+        object.__setattr__(
+            parts[5], "native_completion", _NativeCompletion(parts[5].producer.owner)
+        )
+    elif substitution == "owner":
+        object.__setattr__(parts[5].producer, "owner", object())
+    else:
+        object.__setattr__(
+            parts[5].producer, "pre_authority", _PreAuthority(parts[5].producer.owner)
+        )
+
+    with pytest.raises(MdpTaskFatalError, match="exact armed native"):
+        binding.claim_for_backward(parts[5])
+    assert binding.is_poisoned
+
+
 def test_digest_uses_only_common_authority_ready_route_and_nonce(gate_api):
     api = gate_api
 
@@ -391,7 +531,7 @@ def test_local_validation_faults_submit_zero_before_any_claim(gate_api, fault):
     elif fault == "carrier":
         value = _Prepared(
             authority,
-            _Producer("invalid"),
+            _Producer("invalid", prepared.producer.owner, prepared.producer.pre_authority),
             workspace,
             receipt,
             prepared.native_completion,
@@ -509,7 +649,11 @@ def test_armed_reentry_substitution_post_status_mutation_and_double_claim(gate_a
     parts = _parts()
     binding = _binding(api, parts[2])
     binding.status_gate(_context(parts), None)
-    object.__setattr__(parts[5], "producer", _Producer("invalid"))
+    object.__setattr__(
+        parts[5],
+        "producer",
+        _Producer("invalid", parts[5].producer.owner, parts[5].producer.pre_authority),
+    )
     with pytest.raises(MdpTaskFatalError, match="post-status"):
         binding.claim_for_backward(parts[5])
     assert binding.is_poisoned
@@ -543,6 +687,105 @@ def test_post_status_workspace_geometry_mutation_is_task_fatal(gate_api, fault):
     assert binding.is_poisoned
 
 
+def _bind_real_native_completion(template_producer, authority):
+    from tests.unit_tests.mdp.test_dynamic_cp_d3_producer_owner import _runtime
+
+    producer_owner_api = import_module("megatron.core.mdp.dynamic_cp_d3_producer_owner")
+    dynamic_api = import_module("megatron.core.mdp.dynamic_cp_runtime")
+    native_runtime, native_outputs = _runtime(contributor=False)
+    native_runtime.rank_view = template_producer.rank_view
+    native_owner = None
+    try:
+        native_owner = producer_owner_api._capture_d3_producer_owner(
+            runtime=native_runtime,
+            rank_view=template_producer.rank_view,
+            local_manifest=None,
+            source_window=None,
+            static_plan=None,
+            item_outputs=native_outputs,
+            sample_location_by_id=MappingProxyType({}),
+            forward_only=False,
+        )
+        bound = dynamic_api._bind_pre_authority_dynamic_producer(
+            producer=native_owner.producer,
+            authority=authority,
+            payload_destination_views=template_producer.payload_destination_views,
+            embedding_destination_views=template_producer.embedding_destination_views,
+            gradient_destination_views=template_producer.gradient_destination_views,
+            summed_gradient_destination_views=template_producer.summed_gradient_destination_views,
+        )
+    except BaseException:
+        if native_owner is not None and native_owner._runtime is not None:
+            native_owner.abort()
+        raise
+    return bound, native_owner
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA workspace")
+def test_real_pr71_completion_passes_real_preparation_and_gate4_without_execution(monkeypatch):
+    api = _api()
+    preparation_api = import_module(
+        "megatron.core.mdp.dynamic_cp_d3_encoder_completion_preparation"
+    )
+    producer_owner_api = import_module("megatron.core.mdp.dynamic_cp_d3_producer_owner")
+    from tests.unit_tests.mdp.test_dynamic_cp_d3_encoder_completion_preparation import (
+        _real_receipt_inputs,
+    )
+
+    authority, owner, workspace, producer, receipt = _real_receipt_inputs()
+    native_owner = None
+    bound_producer = None
+    try:
+        bound_producer, native_owner = _bind_real_native_completion(producer, authority)
+        prepared = preparation_api._make_d3_encoder_completion_preparation_binding(
+            workspace_owner=owner, cp_partition_mode="contiguous"
+        )(authority, bound_producer, receipt)
+        native_completion = prepared.native_completion
+        assert type(native_completion) is producer_owner_api._PreparedNativeEncoderCompletion
+
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("gate 4 must not execute native encoder completion")
+
+        monkeypatch.setattr(torch.autograd, "backward", forbidden)
+        monkeypatch.setattr(
+            import_module("megatron.core.mdp.activation").EncoderForwardHandle,
+            "backward",
+            forbidden,
+        )
+        monkeypatch.setattr(
+            import_module("megatron.core.mdp.encoder"), "finalize_encoder_grads", forbidden
+        )
+        ranks = authority.participant_ranks
+        binding = api._make_d3_encoder_completion_gate_binding(
+            workspace_owner=owner,
+            cp_partition_mode="contiguous",
+            group=_Group(ranks, workspace.rank),
+            group_ranks=ranks,
+            global_rank=workspace.rank,
+            device=workspace.device,
+            timeout_seconds=1.0,
+            fallback_status_gate=lambda *_args: None,
+            all_gather_status=lambda wire, **_kwargs: tuple(
+                tuple((rank, *wire[1:])) for rank in ranks
+            ),
+            group_ranks_getter=lambda group: group.ranks,
+        )
+        context = _Context(4, authority, prepared, receipt.prepared.ready)
+        monkeypatch.setattr(api, "_D3GateStatusContext", _Context)
+
+        binding.status_gate(context, None)
+        assert binding.claim_for_backward(prepared) is native_completion
+        assert native_completion.handle is None
+    finally:
+        try:
+            if bound_producer is not None and native_owner._runtime is not None:
+                bound_producer.cleanup()
+            elif native_owner is not None and native_owner._runtime is not None:
+                native_owner.abort()
+        finally:
+            producer.cleanup()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA workspace")
 def test_post_status_resealed_real_route_cannot_change_accepted_digest(monkeypatch):
     api = _api()
@@ -556,10 +799,13 @@ def test_post_status_resealed_real_route_cannot_change_accepted_digest(monkeypat
     )
 
     authority, owner, workspace, producer, receipt = _real_receipt_inputs()
+    native_owner = None
+    bound_producer = None
     try:
+        bound_producer, native_owner = _bind_real_native_completion(producer, authority)
         prepared = preparation_api._make_d3_encoder_completion_preparation_binding(
             workspace_owner=owner, cp_partition_mode="contiguous"
-        )(authority, producer, receipt)
+        )(authority, bound_producer, receipt)
         ranks = authority.participant_ranks
 
         def gather(wire, *, timeout_seconds):
@@ -608,7 +854,13 @@ def test_post_status_resealed_real_route_cannot_change_accepted_digest(monkeypat
         assert "accepted gate authority" in str(caught.value.__cause__)
         assert binding.is_poisoned
     finally:
-        producer.cleanup()
+        try:
+            if bound_producer is not None and native_owner._runtime is not None:
+                bound_producer.cleanup()
+            elif native_owner is not None and native_owner._runtime is not None:
+                native_owner.abort()
+        finally:
+            producer.cleanup()
 
 
 @pytest.mark.parametrize("shared", ("authority", "ready", "receipt"))
@@ -644,8 +896,11 @@ def test_partial_replay_after_coordinated_reject_is_pre_gather_task_fatal(gate_a
             if shared == "receipt"
             else _Receipt(_ReceiptPrepared(ready), fresh[4].iteration_nonce)
         )
-    producer = _Producer(object())
-    replay = _Prepared(authority, producer, workspace, receipt, object())
+    native_owner = _NativeOwner()
+    pre_authority = _PreAuthority(native_owner)
+    native_owner.producer = pre_authority
+    producer = _Producer(object(), native_owner, pre_authority)
+    replay = _Prepared(authority, producer, workspace, receipt, _NativeCompletion(native_owner))
     retired[2].workspace = workspace
     context = _Context(4, authority, replay, ready)
 
@@ -658,12 +913,14 @@ def test_weak_retirement_does_not_retain_completion_or_native_tensor(gate_api):
     api = gate_api
     parts = list(_parts())
     native = torch.empty(1)
-    object.__setattr__(parts[5], "native_completion", native)
+    object.__setattr__(
+        parts[5], "native_completion", _NativeCompletion(parts[5].producer.owner, native)
+    )
     native_ref = weakref.ref(native)
     authority_ref = weakref.ref(parts[0])
     binding = _binding(api, parts[2])
     binding.status_gate(_context(parts), None)
-    assert binding.claim_for_backward(parts[5]) is native
+    assert binding.claim_for_backward(parts[5]) is parts[5].native_completion
 
     fresh = _parts(nonce=b"f" * 16)
     parts[2].workspace = fresh[1]
@@ -700,7 +957,11 @@ def test_world4_common_valid_digest_and_one_rank_failure_converges(
     device = torch.device("cuda", torch.cuda.current_device())
     parts = list(_parts(ranks=_WORLD4_RANKS, rank=rank, nonce=b"w" * 16))
     parts[1].device = device
-    object.__setattr__(parts[5], "native_completion", torch.tensor([rank], device=device))
+    object.__setattr__(
+        parts[5],
+        "native_completion",
+        _NativeCompletion(parts[5].producer.owner, torch.tensor([rank], device=device)),
+    )
     owner = parts[2]
     events = []
     from megatron.core.mdp.dynamic_cp_transport import make_precollective_status_gather

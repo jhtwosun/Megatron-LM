@@ -21,6 +21,9 @@ from megatron.core.mdp.dynamic_cp_d3_encoder_completion_preparation import (
     _validate_prepared_d3_encoder_completion,
 )
 from megatron.core.mdp.dynamic_cp_d3_gradient_gate_binding import _validate_native_group_context
+from megatron.core.mdp.dynamic_cp_d3_producer_owner import (
+    _validate_prepared_native_encoder_completion,
+)
 from megatron.core.mdp.dynamic_cp_d3_workspace_binding import _D3WorkspaceBindingOwner
 from megatron.core.mdp.dynamic_cp_execution import (
     _PrecollectiveStatus,
@@ -56,6 +59,9 @@ class _ArmedEncoderCompletion:
     prepared: _PreparedD3EncoderCompletion
     workspace: Any
     receipt: DecoderGradientReceipt
+    pre_authority: Any
+    native_completion: Any
+    native_owner: Any
     gate_digest: bytes
 
 
@@ -267,6 +273,23 @@ class _D3EncoderCompletionGateBinding:
                 producer=prepared.producer,
                 cp_partition_mode=self._cp_partition_mode,
             )
+            pre_authority = prepared.producer.pre_authority
+            native_owner = prepared.producer.owner
+            if (
+                native_owner is not pre_authority.owner
+                or native_owner.producer is not pre_authority
+            ):
+                raise MdpStateError(
+                    "MDP: D3 encoder completion gate retains exact pre-authority ownership."
+                )
+            native_candidate = prepared.native_completion
+            native_completion = _validate_prepared_native_encoder_completion(
+                native_candidate, owner=native_owner
+            )
+            if native_completion is not native_candidate:
+                raise MdpStateError(
+                    "MDP: D3 encoder completion gate validates the exact native completion."
+                )
             route_digest = self._route_digest(authority)
             if prepared.receipt.prepared.exchange.route_authority_digest != route_digest:
                 raise MdpBridgeError(
@@ -284,6 +307,9 @@ class _D3EncoderCompletionGateBinding:
                 prepared=prepared,
                 workspace=workspace,
                 receipt=prepared.receipt,
+                pre_authority=pre_authority,
+                native_completion=native_completion,
+                native_owner=native_owner,
                 gate_digest=gate_digest,
             )
         except BaseException as caught:
@@ -404,6 +430,14 @@ class _D3EncoderCompletionGateBinding:
                 raise MdpTaskFatalError(
                     "MDP: D3 encoder backward claim requires the exact armed preparation."
                 )
+            if (
+                prepared.native_completion is not armed.native_completion
+                or prepared.producer.owner is not armed.native_owner
+                or prepared.producer.pre_authority is not armed.pre_authority
+            ):
+                raise MdpTaskFatalError(
+                    "MDP: D3 encoder backward claim requires the exact armed native completion."
+                )
             workspace = self._workspace_owner.require_workspace(armed.authority)
             if (
                 workspace is not armed.workspace
@@ -447,11 +481,29 @@ class _D3EncoderCompletionGateBinding:
                 producer=prepared.producer,
                 cp_partition_mode=self._cp_partition_mode,
             )
+            if (
+                carrier.producer.pre_authority is not armed.pre_authority
+                or carrier.producer.owner is not armed.native_owner
+                or armed.pre_authority.owner is not armed.native_owner
+                or armed.native_owner.producer is not armed.pre_authority
+            ):
+                raise MdpBridgeError(
+                    "MDP: D3 encoder backward claim retains exact pre-authority ownership."
+                )
             if carrier.receipt is not armed.receipt:
                 raise MdpBridgeError(
                     "MDP: D3 encoder backward claim retains its exact gradient receipt."
                 )
-            native_completion = carrier.native_completion
+            native_completion = _validate_prepared_native_encoder_completion(
+                carrier.native_completion, owner=armed.native_owner
+            )
+            if (
+                native_completion is not armed.native_completion
+                or carrier.producer.owner is not armed.native_owner
+            ):
+                raise MdpBridgeError(
+                    "MDP: D3 encoder backward claim retains its exact native completion owner."
+                )
             retirement = tuple(
                 weakref.ref(value) for value in (armed.authority, armed.ready, armed.receipt)
             )
