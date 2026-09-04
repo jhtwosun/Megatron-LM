@@ -62,6 +62,13 @@ def _expected_assignments(
         )
     if len(assignments) != len(expected):
         raise MdpPlanError("MDP: D3 decoder-ready assignments exactly cover local microbatches.")
+    if all(
+        type(actual) is LocalDecoderAssignment
+        and actual.key is key
+        and actual.assignment is assignment
+        for actual, (key, assignment) in zip(assignments, expected)
+    ):
+        return assignments
     canonical = []
     for actual, (key, assignment) in zip(assignments, expected):
         if (
