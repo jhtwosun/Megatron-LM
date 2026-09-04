@@ -129,6 +129,10 @@ class MdpRuntime:
         self._prefetch_thread = None
         self._prefetch_box: Optional[dict] = None
         self._prefetch_stream: Optional[torch.cuda.Stream] = None
+        if self.rank_map.spec.tp > 1 and self.process_groups.decoder_tp_group is None:
+            raise MdpConfigurationError(
+                "MDP: TP > 1 requires the existing native decoder TP process group."
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -335,55 +339,120 @@ class MdpRuntime:
             self._eval_outputs = tuple(chunk_outputs)
             detached = tuple(output.detach() for output in chunk_outputs)
 
-        # P3: embedding exchange straight into this rank's endpoint leaves.
+        # P3: bridge into TP0 endpoints, then replicate full leaves over the
+        # already-created native decoder TP group on PP0.
         emb_dest = {}
-        leaves = []  # (microbatch_id, valid leaf view)
-        endpoint_id = self.rank_view.decoder_endpoint_id
-        if endpoint_id is not None:
-            with nvtx_phase("p3_leaf_assembly"):
-                for layout in plan.layouts:
-                    if layout.text_only:
-                        continue
-                    leaf = self.allocator.acquire(
-                        rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
-                        width=self.hidden_size,
-                        dtype=self.params_dtype,
-                        device=self.device,
-                        tag="leaf",
-                    )
-                    for segment in layout.segments:
-                        emb_dest[BridgeBufferKey(segment.global_item_id, endpoint_id)] = leaf[
-                            segment.leaf_row_start : segment.leaf_row_start
-                            + segment.output_rows
-                        ]
-                    leaves.append((layout.microbatch_id, leaf[: layout.total_output_rows]))
-        with nvtx_phase("p3_embedding_exchange"):
-            emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
-            emb_local = {}
-            endpoint_count = len(self.rank_map.decoder_endpoint_ranks(plan.outer_dp_rank))
-            for item_id, (chunk_index, segment) in self._chunk_of_item.items():
-                output = detached[chunk_index][
-                    segment.output_row_start : segment.output_row_start + segment.output_rows
-                ]
-                for destination_id in range(endpoint_count):
-                    emb_local[BridgeBufferKey(item_id, destination_id)] = output
-            # Each endpoint receives the same full leaf. The model applies
-            # native decoder-CP partitioning after vision-token insertion.
-            self.bridge.exchange_all_to_all(
-                self._iter_ledgers[BridgePhase.EMBEDDING],
-                emb_local,
-                tensor_specs=emb_specs,
-                group=self.process_groups.planning_group,
-                group_ranks=self.rank_view.planning_group_ranks,
-                global_rank=self.rank_view.global_rank,
-                dtype=self.params_dtype,
-                device=self.device,
-                dest_views=emb_dest,
+        leaves = []  # (microbatch_id, allocation base, valid leaf view)
+        leaf_error = None
+        local_endpoint_id = self._local_decoder_endpoint_id()
+        try:
+            if local_endpoint_id is not None:
+                with nvtx_phase("p3_leaf_assembly"):
+                    for layout in plan.layouts:
+                        if layout.text_only:
+                            continue
+                        leaf = self.allocator.acquire(
+                            rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
+                            width=self.hidden_size,
+                            dtype=self.params_dtype,
+                            device=self.device,
+                            tag="leaf",
+                        )
+                        if self.rank_view.decoder_endpoint_id is not None:
+                            for segment in layout.segments:
+                                emb_dest[
+                                    BridgeBufferKey(
+                                        segment.global_item_id, local_endpoint_id
+                                    )
+                                ] = leaf[
+                                    segment.leaf_row_start : segment.leaf_row_start
+                                    + segment.output_rows
+                                ]
+                        leaves.append(
+                            (
+                                layout.microbatch_id,
+                                leaf,
+                                leaf[: layout.total_output_rows],
+                            )
+                        )
+        except BaseException as error:
+            leaf_error = error
+        if self._planning_preparation_failed(leaf_error):
+            emb_dest.clear()
+            for _, leaf, _ in leaves:
+                self.allocator.release(leaf)
+            # This coordinated preparation failure occurs before the embedding
+            # bridge and decoder. Abort the retained P2 transaction so the
+            # same runtime can start again with a fresh data iterator.
+            if self._handle is not None:
+                self._handle.release_forward_only()
+            self._handle = None
+            self._eval_outputs = ()
+            self._window = None
+            self._plan = None
+            self._iter_specs = {}
+            self._iter_ledgers = {}
+            self._chunk_layouts = ()
+            self._chunk_of_item = {}
+            self._captured_num_tokens = None
+            self._token_capture_count = 0
+            self._token_consumed = False
+            self._state = MdpRuntimeState.EMPTY
+            if leaf_error is not None:
+                raise leaf_error
+            raise MdpStateError(
+                "MDP: P3 leaf preparation failed on another planning rank; "
+                "embedding communication was not started."
             )
-        # requires_grad only after every exchange copy into the leaf is done.
-        for microbatch_id, leaf_valid in leaves:
-            leaf_valid.requires_grad_(True)
-            self.storage.put_leaf(microbatch_id, leaf_valid)
+
+        stored_microbatches = []
+        owned_leaf_bases = {id(leaf): leaf for _, leaf, _ in leaves}
+        try:
+            with nvtx_phase("p3_embedding_exchange"):
+                emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
+                emb_local = {}
+                endpoint_count = len(
+                    self.rank_map.decoder_endpoint_ranks(plan.outer_dp_rank)
+                )
+                for item_id, (chunk_index, segment) in self._chunk_of_item.items():
+                    output = detached[chunk_index][
+                        segment.output_row_start : segment.output_row_start
+                        + segment.output_rows
+                    ]
+                    for destination_id in range(endpoint_count):
+                        emb_local[BridgeBufferKey(item_id, destination_id)] = output
+                self.bridge.exchange_all_to_all(
+                    self._iter_ledgers[BridgePhase.EMBEDDING],
+                    emb_local,
+                    tensor_specs=emb_specs,
+                    group=self.process_groups.planning_group,
+                    group_ranks=self.rank_view.planning_group_ranks,
+                    global_rank=self.rank_view.global_rank,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                    dest_views=emb_dest,
+                )
+            if self.rank_map.spec.tp > 1 and local_endpoint_id is not None:
+                with nvtx_phase("p3_tp_leaf_broadcast"):
+                    source_rank = self._decoder_tp_source_rank()
+                    for _, _, leaf_valid in leaves:
+                        torch.distributed.broadcast(
+                            leaf_valid,
+                            src=source_rank,
+                            group=self.process_groups.decoder_tp_group,
+                        )
+            # requires_grad only after every exchange/broadcast copy is done.
+            for microbatch_id, leaf, leaf_valid in leaves:
+                leaf_valid.requires_grad_(True)
+                self.storage.put_leaf(microbatch_id, leaf_valid)
+                stored_microbatches.append(microbatch_id)
+                owned_leaf_bases.pop(id(leaf))
+        except BaseException:
+            for microbatch_id in reversed(stored_microbatches):
+                self.storage.release(microbatch_id)
+            for leaf in owned_leaf_bases.values():
+                self.allocator.release(leaf)
+            raise
         if forward_only and self._eval_outputs:
             # Evaluation releases producer outputs once the bridge completed.
             self._eval_outputs = ()
@@ -444,68 +513,94 @@ class MdpRuntime:
             grad_dest = {}
             endpoint_count = len(self.rank_map.decoder_endpoint_ranks(plan.outer_dp_rank))
             endpoint_id = self.rank_view.decoder_endpoint_id
+            local_endpoint_id = self._local_decoder_endpoint_id()
+            grad_bases = []
             staging_bases = []
             try:
-                if self._handle is not None:
-                    with nvtx_phase("p5_grad_regroup"):
-                        for chunk_index, chunk in enumerate(self._chunk_layouts):
-                            # Match the chunk output dtype: a mixed-precision wrapper
-                            # (Float16Module) returns fp32 at the module boundary even
-                            # when parameters and transport run in bf16.
-                            output_dtype = self._handle.output_dtype(chunk_index)
-                            grad_buffer = self.allocator.acquire(
-                                rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
-                                width=self.hidden_size,
-                                dtype=output_dtype,
-                                device=self.device,
-                                tag="grad_regroup",
-                            )
-                            for segment in chunk.segments:
-                                grad_dest[BridgeBufferKey(segment.global_item_id)] = grad_buffer[
-                                    segment.output_row_start : segment.output_row_start
-                                    + segment.output_rows
-                                ]
-                            chunk_grads.append(grad_buffer[: chunk.total_output_rows])
+                self._validate_tp_leaf_gradients(plan)
 
-                            stages = []
-                            for destination_id in range(1, endpoint_count):
-                                stage = self.allocator.acquire(
+                preparation_error = None
+                try:
+                    if self._handle is not None:
+                        with nvtx_phase("p5_grad_regroup"):
+                            for chunk_index, chunk in enumerate(self._chunk_layouts):
+                                # Match the chunk output dtype: a mixed-precision wrapper
+                                # returns fp32 at its boundary while transport may be bf16.
+                                output_dtype = self._handle.output_dtype(chunk_index)
+                                grad_buffer = self.allocator.acquire(
                                     rows=plan.capacity_policy.capacity_of(
                                         chunk.total_output_rows
                                     ),
                                     width=self.hidden_size,
                                     dtype=output_dtype,
                                     device=self.device,
-                                    tag="grad_endpoint_stage",
+                                    tag="grad_regroup",
                                 )
-                                staging_bases.append(stage)
-                                stage_valid = stage[: chunk.total_output_rows]
-                                stages.append(stage_valid)
+                                grad_bases.append(grad_buffer)
                                 for segment in chunk.segments:
                                     grad_dest[
-                                        BridgeBufferKey(
-                                            segment.global_item_id, destination_id
-                                        )
-                                    ] = stage_valid[
+                                        BridgeBufferKey(segment.global_item_id)
+                                    ] = grad_buffer[
                                         segment.output_row_start : segment.output_row_start
                                         + segment.output_rows
                                     ]
-                            endpoint_staging.append(tuple(stages))
+                                chunk_grads.append(
+                                    grad_buffer[: chunk.total_output_rows]
+                                )
+
+                                stages = []
+                                for destination_id in range(1, endpoint_count):
+                                    stage = self.allocator.acquire(
+                                        rows=plan.capacity_policy.capacity_of(
+                                            chunk.total_output_rows
+                                        ),
+                                        width=self.hidden_size,
+                                        dtype=output_dtype,
+                                        device=self.device,
+                                        tag="grad_endpoint_stage",
+                                    )
+                                    staging_bases.append(stage)
+                                    stage_valid = stage[: chunk.total_output_rows]
+                                    stages.append(stage_valid)
+                                    for segment in chunk.segments:
+                                        grad_dest[
+                                            BridgeBufferKey(
+                                                segment.global_item_id,
+                                                destination_id,
+                                            )
+                                        ] = stage_valid[
+                                            segment.output_row_start : segment.output_row_start
+                                            + segment.output_rows
+                                        ]
+                                endpoint_staging.append(tuple(stages))
+                except BaseException as error:
+                    preparation_error = error
+                if self._planning_preparation_failed(preparation_error):
+                    if preparation_error is not None:
+                        raise preparation_error
+                    raise MdpStateError(
+                        "MDP: P5 gradient preparation failed on another planning rank; "
+                        "gradient communication was not started."
+                    )
+
                 with nvtx_phase("p5_grad_exchange"):
                     grad_specs = self._iter_specs[BridgePhase.GRADIENT]
                     grad_local = {}
-                    if endpoint_id is not None:
+                    if local_endpoint_id is not None:
                         for layout in plan.layouts:
                             if layout.text_only:
                                 continue
                             grad = self.storage.pop_grad(layout.microbatch_id)
-                            for segment in layout.segments:
-                                grad_local[
-                                    BridgeBufferKey(segment.global_item_id, endpoint_id)
-                                ] = grad[
-                                    segment.leaf_row_start : segment.leaf_row_start
-                                    + segment.output_rows
-                                ]
+                            if endpoint_id is not None:
+                                for segment in layout.segments:
+                                    grad_local[
+                                        BridgeBufferKey(
+                                            segment.global_item_id, endpoint_id
+                                        )
+                                    ] = grad[
+                                        segment.leaf_row_start : segment.leaf_row_start
+                                        + segment.output_rows
+                                    ]
                     self.bridge.exchange_all_to_all(
                         self._iter_ledgers[BridgePhase.GRADIENT],
                         grad_local,
@@ -522,22 +617,24 @@ class MdpRuntime:
                         for chunk_grad, stages in zip(chunk_grads, endpoint_staging):
                             for stage in stages:
                                 chunk_grad.add_(stage)
+                if self._handle is not None:
+                    with nvtx_phase("p5_encoder_backward"):
+                        if isinstance(self._handle, EncoderWholeRecomputeHandle):
+                            self._handle.backward(
+                                chunk_grads,
+                                encoder=self.encoder_domain.encoder_ddp,
+                                encode=self.adapter.encode,
+                            )
+                        else:
+                            self._handle.backward(chunk_grads)
+                        self._handle.release()
             finally:
                 grad_dest.clear()
                 endpoint_staging.clear()
                 for stage in staging_bases:
                     self.allocator.release(stage)
-            if self._handle is not None:
-                with nvtx_phase("p5_encoder_backward"):
-                    if isinstance(self._handle, EncoderWholeRecomputeHandle):
-                        self._handle.backward(
-                            chunk_grads,
-                            encoder=self.encoder_domain.encoder_ddp,
-                            encode=self.adapter.encode,
-                        )
-                    else:
-                        self._handle.backward(chunk_grads)
-                    self._handle.release()
+                for grad_base in grad_bases:
+                    self.allocator.release(grad_base)
             with nvtx_phase("p5_finalize_encoder_grads"):
                 finalize_encoder_grads(
                     self.encoder_domain.encoder_ddp,
@@ -596,6 +693,14 @@ class MdpRuntime:
             lane_id=self.rank_view.lane_id,
             my_worker_id=self.rank_view.my_worker_id,
             num_workers=len(self.rank_view.worker_ids),
+            data_loader_source_worker_ids=self.rank_map.data_loader_source_worker_ids(
+                self.rank_view.outer_dp_rank
+            ),
+            capture_error_consensus=(
+                self._planning_preparation_failed
+                if self.rank_map.spec.tp > 1
+                else None
+            ),
         )
 
     @staticmethod
@@ -715,6 +820,128 @@ class MdpRuntime:
                     device=self.device,
                 )
         return specs
+
+    def _decoder_tp_source_rank(self) -> Optional[int]:
+        """PP0/TP0 source for this rank's native TP group, or ``None`` off PP0."""
+        source_rank = self.rank_map.tp_group_ranks(self.rank_view.global_rank)[0]
+        endpoints = self.rank_map.decoder_endpoint_ranks(self.rank_view.outer_dp_rank)
+        return source_rank if source_rank in endpoints else None
+
+    def _local_decoder_endpoint_id(self) -> Optional[int]:
+        """Decoder-CP endpoint represented by this PP0 native TP group."""
+        source_rank = self._decoder_tp_source_rank()
+        if source_rank is None:
+            return None
+        endpoints = self.rank_map.decoder_endpoint_ranks(self.rank_view.outer_dp_rank)
+        return endpoints.index(source_rank)
+
+    def _validate_tp_leaf_gradients(self, plan: MdpBatchPlan) -> None:
+        """Require exact TP-replica equality before TP0 owns the bridge source.
+
+        Leaves stay in storage until the coordinated verdict is known, so a
+        fail-closed mismatch or pre-collective allocation failure can be fixed
+        and retried on the same runtime without posting gradient communication.
+        """
+        if self.rank_map.spec.tp == 1:
+            return
+
+        local_endpoint_id = self._local_decoder_endpoint_id()
+        leaf_grads = []
+        reference = None
+        preparation_error = None
+        try:
+            if local_endpoint_id is not None:
+                for layout in plan.layouts:
+                    if layout.text_only:
+                        continue
+                    leaf = self.storage.get_leaf(layout.microbatch_id)
+                    if leaf is None or leaf.grad is None:
+                        raise MdpStateError(
+                            f"MDP: decoder TP leaf for microbatch {layout.microbatch_id} "
+                            "must have a gradient before collapse."
+                        )
+                    grad = leaf.grad
+                    expected_shape = (layout.total_output_rows, self.hidden_size)
+                    if (
+                        tuple(grad.shape) != expected_shape
+                        or grad.dtype != self.params_dtype
+                        or grad.device != self.device
+                    ):
+                        raise MdpStateError(
+                            f"MDP: decoder TP leaf gradient for microbatch "
+                            f"{layout.microbatch_id} violates expected "
+                            f"shape/dtype/device {expected_shape}/{self.params_dtype}/"
+                            f"{self.device}."
+                        )
+                    leaf_grads.append(grad)
+                if leaf_grads:
+                    reference = self.allocator.acquire(
+                        rows=max(grad.shape[0] for grad in leaf_grads),
+                        width=self.hidden_size,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                        tag="tp_grad_reference",
+                    )
+        except BaseException as error:
+            preparation_error = error
+
+        if self._planning_preparation_failed(preparation_error):
+            if reference is not None:
+                self.allocator.release(reference)
+            if preparation_error is not None:
+                raise preparation_error
+            raise MdpStateError(
+                "MDP: TP gradient preparation failed on another planning rank; "
+                "gradient communication was not started."
+            )
+
+        local_mismatch = torch.zeros(1, dtype=torch.int32, device=self.device)
+        try:
+            if local_endpoint_id is not None:
+                source_rank = self._decoder_tp_source_rank()
+                for grad in leaf_grads:
+                    reference_valid = reference[: grad.shape[0]]
+                    if self.rank_view.global_rank == source_rank:
+                        reference_valid.copy_(grad)
+                    torch.distributed.broadcast(
+                        reference_valid,
+                        src=source_rank,
+                        group=self.process_groups.decoder_tp_group,
+                    )
+                    torch.maximum(
+                        local_mismatch,
+                        torch.any(grad != reference_valid).to(torch.int32).view(1),
+                        out=local_mismatch,
+                    )
+            torch.distributed.all_reduce(
+                local_mismatch,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.process_groups.planning_group,
+            )
+            if bool(local_mismatch.item()):
+                raise MdpStateError(
+                    "MDP: replicated TP decoder-input gradients differ; only exact "
+                    "equal copies may collapse to TP0."
+                )
+        finally:
+            if reference is not None:
+                self.allocator.release(reference)
+
+    def _planning_preparation_failed(self, local_error: Optional[BaseException]) -> bool:
+        """Converge rank-local preparation failures before a TP/P2P collective."""
+        if self.rank_map.spec.tp == 1:
+            return local_error is not None
+        failed = torch.tensor(
+            [1 if local_error is not None else 0],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.distributed.all_reduce(
+            failed,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.process_groups.planning_group,
+        )
+        return bool(failed.item())
 
     def _assert_iteration_boundary(self) -> None:
         """Lifecycle invariants at every iteration boundary."""

@@ -161,7 +161,15 @@ def validate_from_args(args) -> None:
     validate_mdp_config(mdp_config_from_args(args), compatibility_options_from_args(args))
 
 
-def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_config):
+def maybe_build_mdp_domain(
+    *,
+    args,
+    model,
+    optimizer,
+    optimizer_config,
+    ddp_config,
+    decoder_pg_collection=None,
+):
     """Build the MDP runtime and encoder domain; returns the optimizer.
 
     Called in ``setup_model_and_optimizer`` after the decoder optimizer is
@@ -180,6 +188,10 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
 
     mdp_config = mdp_config_from_args(args)
     validate_mdp_config(mdp_config, compatibility_options_from_args(args))
+    if decoder_pg_collection is not None and hasattr(
+        decoder_pg_collection, "get_language_model_collection"
+    ):
+        decoder_pg_collection = decoder_pg_collection.get_language_model_collection()
 
     rank_map = build_rank_map(
         MdpRankSpec(
@@ -193,7 +205,9 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
     )
     rank_view = rank_map.view(torch.distributed.get_rank())
     process_groups = install_mdp_process_groups(
-        rank_map, group_registry=MdpGroupRegistry()
+        rank_map,
+        group_registry=MdpGroupRegistry(),
+        decoder_pg_collection=decoder_pg_collection,
     )
     encoder_pgs = build_encoder_pg_collection(
         rank_map, encoder_cp=mdp_config.encoder_cp, process_groups=process_groups

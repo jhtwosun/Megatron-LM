@@ -2703,12 +2703,19 @@ def setup_model_and_optimizer(
             # No-op unless --mdp-enable is set.
             from megatron.core.mdp import integration as mdp_integration
 
+            decoder_pg_collection = getattr(unwrapped_model[0], "pg_collection", None)
+            if decoder_pg_collection is None:
+                decoder_pg_collection = pg_collection
+            if decoder_pg_collection is None:
+                decoder_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
             optimizer = mdp_integration.maybe_build_mdp_domain(
                 args=args,
                 model=model,
                 optimizer=optimizer,
                 optimizer_config=config,
                 ddp_config=get_megatron_ddp_config(args),
+                decoder_pg_collection=decoder_pg_collection,
             )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 

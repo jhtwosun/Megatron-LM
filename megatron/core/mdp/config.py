@@ -204,12 +204,12 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "has not been validated against other orders.",
             SUPPORTED_RANK_ORDER,
         )
-    if options.tensor_parallel_size != 1:
+    if options.tensor_parallel_size < 1:
         _reject(
             "tensor_parallel_size",
             options.tensor_parallel_size,
-            "TP == 1",
-            "The current MDP support matrix requires TP=1.",
+            "decoder TP >= 1",
+            "The decoder tensor-parallel dimension must be positive.",
             "1",
         )
     if options.context_parallel_size < 1:

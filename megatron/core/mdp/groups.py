@@ -8,7 +8,7 @@ fixed-width descriptor records inside each planning group.
 """
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -29,6 +29,7 @@ class MdpProcessGroups:
     planning_group: dist.ProcessGroup
     encoder_reduction_group: dist.ProcessGroup
     world_group: dist.ProcessGroup
+    decoder_tp_group: Optional[dist.ProcessGroup] = None
 
 
 class MdpGroupRegistry:
@@ -76,7 +77,10 @@ class MdpGroupRegistry:
 
 
 def install_mdp_process_groups(
-    rank_map: MdpRankMap, *, group_registry: MdpGroupRegistry
+    rank_map: MdpRankMap,
+    *,
+    group_registry: MdpGroupRegistry,
+    decoder_pg_collection=None,
 ) -> MdpProcessGroups:
     """Install MDP process groups; every rank creates groups in the same order.
 
@@ -91,6 +95,22 @@ def install_mdp_process_groups(
         )
     world = dist.group.WORLD
     my_rank = dist.get_rank()
+    decoder_tp_group = (
+        None if decoder_pg_collection is None else getattr(decoder_pg_collection, "tp", None)
+    )
+    if rank_map.spec.tp > 1:
+        if decoder_tp_group is None:
+            raise MdpConfigurationError(
+                f"MDP: tensor_parallel_size={rank_map.spec.tp} requires the native "
+                "decoder TP ProcessGroupCollection; MDP does not create TP groups."
+            )
+        expected_tp_ranks = rank_map.tp_group_ranks(my_rank)
+        actual_tp_ranks = tuple(dist.get_process_group_ranks(decoder_tp_group))
+        if actual_tp_ranks != expected_tp_ranks:
+            raise MdpConfigurationError(
+                f"MDP: native decoder TP group ranks {actual_tp_ranks} violate: "
+                f"RankGenerator TP ranks {expected_tp_ranks}."
+            )
     my_planning_group = None
     for outer_dp_rank, ranks in enumerate(rank_map.planning_groups()):
         group = group_registry.get_or_create(("planning", outer_dp_rank), ranks)
@@ -108,6 +128,7 @@ def install_mdp_process_groups(
         planning_group=my_planning_group,
         encoder_reduction_group=world,
         world_group=world,
+        decoder_tp_group=decoder_tp_group,
     )
 
 

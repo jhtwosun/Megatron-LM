@@ -54,6 +54,68 @@ def test_decoder_cp2_endpoints_are_pp0_ranks_with_one_canonical_source():
             assert rank_map.view(rank).decoder_endpoint_id is None
 
 
+def test_decoder_tp2_endpoints_and_data_sources_follow_native_rank_order():
+    rank_map = build_rank_map(_spec(world_size=8, tp=2, pp=2, cp=2))
+
+    assert rank_map.planning_groups() == ((0, 1, 2, 3, 4, 5, 6, 7),)
+    assert rank_map.decoder_endpoint_ranks(0) == (0, 2)
+    assert rank_map.data_loader_source_worker_ids(0) == (0, 2, 4, 6)
+    assert tuple(rank_map.tp_group_ranks(rank) for rank in range(8)) == (
+        (0, 1),
+        (0, 1),
+        (2, 3),
+        (2, 3),
+        (4, 5),
+        (4, 5),
+        (6, 7),
+        (6, 7),
+    )
+
+    for endpoint_id, endpoint_rank in enumerate((0, 2)):
+        view = rank_map.view(endpoint_rank)
+        assert view.decoder_endpoint_id == endpoint_id
+        assert view.endpoint_rank == 0
+        assert view.lane_id == (0 if endpoint_id == 0 else None)
+    for follower_rank in (1, 3, 4, 5, 6, 7):
+        assert rank_map.view(follower_rank).decoder_endpoint_id is None
+
+
+def test_decoder_tp2_dp2_noncontiguous_topology_is_a_complete_partition():
+    rank_map = build_rank_map(_spec(world_size=16, tp=2, pp=2, cp=2))
+
+    assert rank_map.planning_groups() == ((0, 1, 2, 3, 8, 9, 10, 11), (4, 5, 6, 7, 12, 13, 14, 15))
+    assert tuple(rank_map.decoder_endpoint_ranks(dp) for dp in range(2)) == ((0, 2), (4, 6))
+    assert tuple(rank_map.data_loader_source_worker_ids(dp) for dp in range(2)) == (
+        (0, 2, 4, 6),
+        (0, 2, 4, 6),
+    )
+
+    planning_partition = [rank for group in rank_map.planning_groups() for rank in group]
+    tp_partition = {rank_map.tp_group_ranks(rank) for rank in range(rank_map.spec.world_size)}
+    assert sorted(planning_partition) == list(range(16))
+    assert len(planning_partition) == len(set(planning_partition))
+    assert sorted(rank for group in tp_partition for rank in group) == list(range(16))
+    assert all(len(group) == 2 for group in tp_partition)
+
+    for outer_dp_rank, planning_group in enumerate(rank_map.planning_groups()):
+        endpoints = rank_map.decoder_endpoint_ranks(outer_dp_rank)
+        assert rank_map.endpoint_rank(outer_dp_rank) == endpoints[0]
+        assert all(rank in planning_group for rank in endpoints)
+        workers = [
+            rank_map.worker_ranks(outer_dp_rank, worker_id)
+            for worker_id in range(rank_map.num_workers_per_group)
+        ]
+        assert sorted(rank for worker in workers for rank in worker) == sorted(planning_group)
+        for endpoint_id, endpoint_rank in enumerate(endpoints):
+            assert rank_map.view(endpoint_rank).decoder_endpoint_id == endpoint_id
+
+
+def test_tp1_data_sources_preserve_every_existing_logical_worker():
+    rank_map = build_rank_map(_spec(world_size=8, tp=1, pp=2, cp=2))
+    assert rank_map.data_loader_source_worker_ids(0) == (0, 1, 2, 3)
+    assert rank_map.decoder_endpoint_ranks(0) == (0, 1)
+
+
 def test_groups_form_disjoint_world_partition():
     for pp, cp, world in ((1, 1, 4), (2, 1, 8), (4, 1, 8), (2, 2, 16)):
         rank_map = build_rank_map(_spec(world_size=world, pp=pp, cp=cp))
@@ -115,7 +177,6 @@ def test_local_view_has_no_global_lists():
 @pytest.mark.parametrize(
     "kwargs, match",
     [
-        (dict(tp=2, world_size=16), "tp"),
         (dict(world_size=6, pp=4), "world_size"),
         (dict(encoder_cp=3, world_size=16, cp=2), "encoder_cp"),
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),
