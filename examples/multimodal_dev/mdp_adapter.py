@@ -9,8 +9,9 @@ vision-encoder factory, and a chunk-oblivious ``encode``. It lives in
 model packages.
 """
 
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 import torch
 
@@ -20,7 +21,418 @@ from examples.multimodal_dev.models.qwen35_vl.specs import (
     get_qwen35_vl_vision_spec,
 )
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
+from megatron.core.mdp.dynamic_cp import GlobalSampleId, GlobalVisionItemId
+from megatron.core.mdp.dynamic_cp_execution import (
+    DECODER_EXECUTION_SCHEMA_VERSION,
+    DecoderPayloadHeaderV1,
+    DecoderPayloadPacket,
+    DecoderSourceWindow,
+    DecoderTensorFieldSpec,
+    DecoderVisionItemMetadata,
+    finalize_decoder_source_window,
+    validate_decoder_payload_packet,
+    validate_decoder_source_window,
+)
+from megatron.core.mdp.dynamic_cp_plan import DecoderSampleMetadata, EncoderVisionItemMetadata
+from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError
 from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
+from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
+from megatron.core.packed_seq_params import PackedSeqParams
+
+_DECODER_ROUTED_FIELD_ORDER = ("input_ids", "labels", "loss_mask", "padding_mask", "position_ids")
+_DECODER_REQUIRED_TENSOR_FIELDS = _DECODER_ROUTED_FIELD_ORDER[:-1]
+_DECODER_ALLOWED_PAYLOAD_FIELDS = frozenset(
+    (*_DECODER_ROUTED_FIELD_ORDER, "attention_mask", "image_grid_thw")
+)
+_INTEGER_DTYPES = frozenset((torch.int32, torch.int64))
+
+
+class MultimodalDecoderPayloadCodec:
+    """Typed, pixel-free source codec for MDP decoder Dynamic-CP.
+
+    Source tensors remain on their original device and storage. The codec
+    creates per-sample physical THD views and delegates canonical catalog and
+    digest validation to :mod:`megatron.core.mdp.dynamic_cp_execution`.
+    """
+
+    @staticmethod
+    def _require_nonnegative_integer(name: str, value: Any) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise MdpConfigurationError(
+                f"MDP: {name}={value!r} violates: {name} is a non-negative integer."
+            )
+        return value
+
+    @classmethod
+    def _cu_values(cls, name: str, value: Any) -> tuple[int, ...]:
+        if not isinstance(value, torch.Tensor) or value.ndim != 1:
+            raise MdpConfigurationError(f"MDP: decoder {name} is a one-dimensional tensor.")
+        if value.dtype not in _INTEGER_DTYPES:
+            raise MdpConfigurationError(f"MDP: decoder {name} uses int32 or int64 metadata.")
+        values = tuple(int(component) for component in value.tolist())
+        if len(values) < 2 or values[0] != 0:
+            raise MdpConfigurationError(f"MDP: decoder {name} starts at zero and names samples.")
+        if any(right <= left for left, right in zip(values, values[1:])):
+            raise MdpConfigurationError(
+                f"MDP: decoder {name} has strictly increasing sample boundaries."
+            )
+        return values
+
+    @classmethod
+    def _packed_sample_lengths(cls, packed: Any) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        if not isinstance(packed, PackedSeqParams) or packed.qkv_format != "thd":
+            raise MdpConfigurationError(
+                "MDP: decoder Dynamic-CP source records require THD PackedSeqParams."
+            )
+        valid_q = cls._cu_values("cu_seqlens_q", packed.cu_seqlens_q)
+        valid_kv = cls._cu_values("cu_seqlens_kv", packed.cu_seqlens_kv)
+        padded_q = cls._cu_values("cu_seqlens_q_padded", packed.cu_seqlens_q_padded)
+        padded_kv = cls._cu_values("cu_seqlens_kv_padded", packed.cu_seqlens_kv_padded)
+        if valid_q != valid_kv or padded_q != padded_kv:
+            raise MdpConfigurationError(
+                "MDP: decoder compact and padded THD q/kv cumulative lengths agree."
+            )
+        if len(valid_q) != len(padded_q):
+            raise MdpConfigurationError(
+                "MDP: decoder compact and padded THD metadata name the same samples."
+            )
+        total_tokens = cls._require_nonnegative_integer("total_tokens", packed.total_tokens)
+        if padded_q[-1] != total_tokens:
+            raise MdpConfigurationError("MDP: decoder padded THD endpoint and total_tokens agree.")
+        valid_lengths = tuple(right - left for left, right in zip(valid_q, valid_q[1:]))
+        padded_lengths = tuple(right - left for left, right in zip(padded_q, padded_q[1:]))
+        if any(valid > padded for valid, padded in zip(valid_lengths, padded_lengths)):
+            raise MdpConfigurationError(
+                "MDP: each decoder valid THD length fits its physical padded interval."
+            )
+        return valid_lengths, padded_lengths
+
+    @staticmethod
+    def _grid_rows(value: Any) -> tuple[tuple[int, int, int], ...]:
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.ndim != 2
+            or value.shape[1] != 3
+            or value.dtype not in _INTEGER_DTYPES
+        ):
+            raise MdpConfigurationError(
+                "MDP: image_grid_thw is an integer tensor with shape [num_items, 3]."
+            )
+        rows = tuple(tuple(int(component) for component in row) for row in value.tolist())
+        if any(component <= 0 for row in rows for component in row):
+            raise MdpConfigurationError("MDP: image_grid_thw dimensions are positive.")
+        return rows
+
+    @classmethod
+    def _validate_model_payload(
+        cls, payload: Any, *, total_tokens: int
+    ) -> tuple[tuple[int, int, int], ...]:
+        if not isinstance(payload, Mapping):
+            raise MdpConfigurationError("MDP: decoder model_payload is a mapping.")
+        unexpected = tuple(name for name in payload if name not in _DECODER_ALLOWED_PAYLOAD_FIELDS)
+        if unexpected:
+            raise MdpConfigurationError(
+                f"MDP: decoder payload allowlist rejects fields {unexpected!r}."
+            )
+        missing = tuple(name for name in _DECODER_REQUIRED_TENSOR_FIELDS if name not in payload)
+        if missing:
+            raise MdpConfigurationError(
+                f"MDP: decoder payload allowlist requires fields {missing!r}."
+            )
+        if "image_grid_thw" not in payload:
+            raise MdpConfigurationError(
+                "MDP: decoder payload allowlist requires image_grid_thw metadata."
+            )
+
+        for name in _DECODER_ROUTED_FIELD_ORDER:
+            value = payload.get(name)
+            if name == "position_ids" and value is None:
+                continue
+            if not isinstance(value, torch.Tensor):
+                raise MdpConfigurationError(
+                    f"MDP: decoder field {name} is a tensor or None; nested image payload "
+                    "objects are unsupported."
+                )
+            if value.ndim == 0 or value.shape[-1] != total_tokens:
+                raise MdpConfigurationError(
+                    f"MDP: decoder field {name} token extent matches the full physical "
+                    f"record ({total_tokens})."
+                )
+            if name in _DECODER_REQUIRED_TENSOR_FIELDS and (value.ndim != 2 or value.shape[0] != 1):
+                raise MdpConfigurationError(f"MDP: decoder field {name} has Qwen THD shape [1, T].")
+            if name == "position_ids" and not (
+                (value.ndim == 2 and value.shape[0] == 1)
+                or (value.ndim == 3 and tuple(value.shape[:2]) == (3, 1))
+            ):
+                raise MdpConfigurationError(
+                    "MDP: position_ids has Qwen THD shape [1, T] or [3, 1, T]."
+                )
+
+        if payload.get("attention_mask") is not None:
+            raise MdpConfigurationError(
+                "MDP: attention_mask accepts None only; tensor or nested image payload "
+                "objects have no authorized layout-specific slicing rule."
+            )
+        return cls._grid_rows(payload["image_grid_thw"])
+
+    @staticmethod
+    def _packet_presence_signature(
+        packet: DecoderPayloadPacket,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        return (tuple(spec.name for spec in packet.field_specs), packet.none_fields)
+
+    @staticmethod
+    def _packet_schema_signature(
+        packet: DecoderPayloadPacket,
+    ) -> tuple[tuple[str, torch.dtype, str, tuple[int, ...]], ...]:
+        return tuple(
+            (spec.name, spec.dtype, spec.device_type, spec.shape[:-1])
+            for spec in packet.field_specs
+        )
+
+    @classmethod
+    def _validate_packet_collection(cls, packets: Sequence[DecoderPayloadPacket]) -> None:
+        if not packets:
+            raise MdpPlanError("MDP: decoder payload packet collection is non-empty.")
+        for packet in packets:
+            validate_decoder_payload_packet(packet)
+        presence = {cls._packet_presence_signature(packet) for packet in packets}
+        if len(presence) != 1:
+            raise MdpConfigurationError(
+                "MDP: decoder optional tensor/None field presence is consistent across packets."
+            )
+        schemas = {cls._packet_schema_signature(packet) for packet in packets}
+        if len(schemas) != 1:
+            raise MdpConfigurationError(
+                "MDP: decoder tensor dtype, device, rank, and leading shape agree across packets."
+            )
+
+    @classmethod
+    def _build_packet(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        sample_id: GlobalSampleId,
+        valid_seqlen: int,
+        padded_start: int,
+        padded_seqlen: int,
+    ) -> DecoderPayloadPacket:
+        tensor_fields = {}
+        none_fields = []
+        padded_end = padded_start + padded_seqlen
+        for name in _DECODER_ROUTED_FIELD_ORDER:
+            value = payload.get(name)
+            if value is None:
+                none_fields.append(name)
+            else:
+                tensor_fields[name] = value[..., padded_start:padded_end]
+        none_fields.append("attention_mask")
+
+        field_specs = tuple(
+            DecoderTensorFieldSpec(
+                name=name,
+                dtype=tensor.dtype,
+                shape=tuple(tensor.shape),
+                device_type=tensor.device.type,
+            )
+            for name, tensor in tensor_fields.items()
+        )
+        position_ids = payload.get("position_ids")
+        header = DecoderPayloadHeaderV1(
+            schema_version=DECODER_EXECUTION_SCHEMA_VERSION,
+            source_dp_lane=sample_id.source_dp_lane,
+            local_sample_order=sample_id.local_sample_order,
+            valid_seqlen=valid_seqlen,
+            padded_seqlen=padded_seqlen,
+            tensor_field_count=len(field_specs),
+            none_field_count=len(none_fields),
+            position_components_or_minus_one=(
+                -1 if position_ids is None else int(position_ids.shape[0])
+            ),
+        )
+        return DecoderPayloadPacket(
+            schema_version=DECODER_EXECUTION_SCHEMA_VERSION,
+            sample_id=sample_id,
+            valid_seqlen=valid_seqlen,
+            padded_seqlen=padded_seqlen,
+            header=header.to_wire_tuple(),
+            field_specs=field_specs,
+            tensor_fields=MappingProxyType(tensor_fields),
+            none_fields=tuple(none_fields),
+        )
+
+    @classmethod
+    def _record_items(
+        cls,
+        record: MdpMicrobatchRecord,
+        *,
+        source_dp_lane: int,
+        sample_base: int,
+        item_base: int,
+        valid_lengths: tuple[int, ...],
+        padded_lengths: tuple[int, ...],
+        grid_rows: tuple[tuple[int, int, int], ...],
+    ) -> tuple[
+        tuple[tuple[EncoderVisionItemMetadata, ...], ...], tuple[DecoderVisionItemMetadata, ...]
+    ]:
+        if not isinstance(record.vision_items, tuple):
+            raise MdpConfigurationError("MDP: decoder vision_items is an immutable tuple.")
+        if len(record.vision_items) != len(grid_rows):
+            raise MdpConfigurationError(
+                "MDP: decoder vision-item order and image_grid_thw rows agree."
+            )
+        if not isinstance(record.text_only, bool) or record.text_only != (
+            len(record.vision_items) == 0
+        ):
+            raise MdpConfigurationError(
+                "MDP: decoder text_only state agrees with the absence of vision items."
+            )
+
+        padded_starts = [0]
+        for length in padded_lengths:
+            padded_starts.append(padded_starts[-1] + length)
+        encoder_items = [[] for _ in valid_lengths]
+        decoder_items = []
+        for index, (item, grid_row) in enumerate(zip(record.vision_items, grid_rows)):
+            if not isinstance(item, MdpMicrobatchVisionRecord):
+                raise MdpConfigurationError(
+                    "MDP: decoder source vision records use MdpMicrobatchVisionRecord."
+                )
+            local_sample = cls._require_nonnegative_integer("vision item sample_id", item.sample_id)
+            if local_sample >= len(valid_lengths):
+                raise MdpConfigurationError(
+                    "MDP: decoder vision item names a sample in its source microbatch."
+                )
+            image_ordinal = cls._require_nonnegative_integer(
+                "vision item image_ordinal", item.image_ordinal
+            )
+            if image_ordinal != len(encoder_items[local_sample]):
+                raise MdpConfigurationError(
+                    "MDP: decoder vision-item ordinals are contiguous in source order."
+                )
+            if not isinstance(item.grid_thw, tuple) or tuple(item.grid_thw) != grid_row:
+                raise MdpConfigurationError(
+                    "MDP: decoder vision-item grid order matches image_grid_thw metadata."
+                )
+            output_rows = cls._require_nonnegative_integer(
+                "vision item output_rows", item.output_rows
+            )
+            if output_rows == 0:
+                raise MdpConfigurationError("MDP: decoder vision item output_rows is positive.")
+            if (
+                not isinstance(item.decoder_positions, tuple)
+                or len(item.decoder_positions) != output_rows
+            ):
+                raise MdpConfigurationError(
+                    "MDP: decoder vision item decoder_positions match output_rows."
+                )
+            decoder_positions = tuple(
+                cls._require_nonnegative_integer("decoder vision slot", position)
+                for position in item.decoder_positions
+            )
+            if len(set(decoder_positions)) != len(decoder_positions):
+                raise MdpConfigurationError("MDP: decoder vision item slots are unique.")
+            valid_start = padded_starts[local_sample]
+            valid_end = valid_start + valid_lengths[local_sample]
+            if any(
+                position < valid_start or position >= valid_end for position in decoder_positions
+            ):
+                raise MdpConfigurationError(
+                    "MDP: decoder vision item slot lies inside its owning sample valid interval."
+                )
+
+            sample_id = GlobalSampleId(source_dp_lane, sample_base + local_sample)
+            item_id = GlobalVisionItemId(source_dp_lane, item_base + index)
+            encoder_item = EncoderVisionItemMetadata(
+                item_id=item_id, sample_id=sample_id, image_ordinal=image_ordinal
+            )
+            encoder_items[local_sample].append(encoder_item)
+            decoder_items.append(
+                DecoderVisionItemMetadata(
+                    item_id=item_id,
+                    sample_id=sample_id,
+                    image_ordinal=image_ordinal,
+                    grid_thw=grid_row,
+                    output_rows=output_rows,
+                    decoder_offsets=tuple(position - valid_start for position in decoder_positions),
+                )
+            )
+        return tuple(tuple(items) for items in encoder_items), tuple(decoder_items)
+
+    def build_source_window(
+        self, records: Sequence[MdpMicrobatchRecord], *, source_dp_lane: int
+    ) -> DecoderSourceWindow:
+        """Catalog source-local THD views without copying decoder tensors."""
+        lane = self._require_nonnegative_integer("source_dp_lane", source_dp_lane)
+        if (
+            not isinstance(records, Sequence)
+            or isinstance(records, (str, bytes, bytearray))
+            or not records
+        ):
+            raise MdpConfigurationError(
+                "MDP: decoder source codec requires a non-empty ordered record sequence."
+            )
+
+        samples = []
+        items = []
+        packets = []
+        next_sample_order = 0
+        next_item_id = 0
+        for record in records:
+            if not isinstance(record, MdpMicrobatchRecord):
+                raise MdpConfigurationError(
+                    "MDP: decoder source codec consumes MdpMicrobatchRecord values."
+                )
+            valid_lengths, padded_lengths = self._packed_sample_lengths(
+                record.decoder_packed_seq_params
+            )
+            total_tokens = sum(padded_lengths)
+            grid_rows = self._validate_model_payload(
+                record.model_payload, total_tokens=total_tokens
+            )
+            record_encoder_items, record_decoder_items = self._record_items(
+                record,
+                source_dp_lane=lane,
+                sample_base=next_sample_order,
+                item_base=next_item_id,
+                valid_lengths=valid_lengths,
+                padded_lengths=padded_lengths,
+                grid_rows=grid_rows,
+            )
+            items.extend(record_decoder_items)
+
+            padded_start = 0
+            for local_sample, (valid_seqlen, padded_seqlen) in enumerate(
+                zip(valid_lengths, padded_lengths)
+            ):
+                sample_id = GlobalSampleId(lane, next_sample_order + local_sample)
+                samples.append(
+                    DecoderSampleMetadata(
+                        sample_id=sample_id,
+                        valid_seqlen=valid_seqlen,
+                        padded_seqlen=padded_seqlen,
+                        vision_items=record_encoder_items[local_sample],
+                    )
+                )
+                packets.append(
+                    self._build_packet(
+                        record.model_payload,
+                        sample_id=sample_id,
+                        valid_seqlen=valid_seqlen,
+                        padded_start=padded_start,
+                        padded_seqlen=padded_seqlen,
+                    )
+                )
+                padded_start += padded_seqlen
+            next_sample_order += len(valid_lengths)
+            next_item_id += len(record_decoder_items)
+
+        window = finalize_decoder_source_window(
+            source_dp_lane=lane, samples=samples, items=items, packets=packets
+        )
+        validate_decoder_source_window(window)
+        self._validate_packet_collection(window.packets)
+        return window
 
 
 class Qwen35VLMdpAdapter:
@@ -40,6 +452,10 @@ class Qwen35VLMdpAdapter:
             * self._vision_kwargs["temporal_patch_size"]
             * self._vision_kwargs["patch_size"] ** 2
         )
+
+    def build_dynamic_decoder_payload_codec(self) -> MultimodalDecoderPayloadCodec:
+        """Build one iteration-independent decoder Dynamic-CP source codec."""
+        return MultimodalDecoderPayloadCodec()
 
     # ------------------------------------------------------------------
     # Capture
@@ -154,9 +570,7 @@ class Qwen35VLMdpAdapter:
         # (~2.4 ms/iter measured) followed by D2H readbacks inside the
         # encoder. The encoder moves it to the device itself on the uncached
         # (QWEN35_VL_GRID_CACHE=0) fallback paths that do tensor math on it.
-        grid_thw = torch.tensor(
-            [segment.grid_thw for segment in layout.segments], dtype=torch.long
-        )
+        grid_thw = torch.tensor([segment.grid_thw for segment in layout.segments], dtype=torch.long)
         return encoder(payload, grid_thw)
 
 
