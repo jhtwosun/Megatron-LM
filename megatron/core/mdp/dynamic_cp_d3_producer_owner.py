@@ -19,6 +19,7 @@ __all__ = ()
 
 _MAPPING_PROXY_TYPE = type(MappingProxyType({}))
 _PENDING_OWNER_SEALS: dict[object, tuple[int, ...]] = {}
+_INT64_MAX = 2**63 - 1
 
 
 def _descriptor(tensor: torch.Tensor) -> tuple:
@@ -137,6 +138,8 @@ class _D3ProducerOwner:
         "_encoder_ddp",
         "_encoder_ddp_callable_authority",
         "_gradient_bases",
+        "_iteration",
+        "_finalization_token_authority",
     )
 
     def __init__(
@@ -187,10 +190,18 @@ class _D3ProducerOwner:
         self._encoder_domain, self._encoder_ddp = encoder_domain, encoder_ddp
         self._encoder_ddp_callable_authority = encoder_ddp_callable_authority
         self._gradient_bases = ()
+        self._iteration = runtime._iteration
+        self._finalization_token_authority = None
         self._mint_token = None
         self._producer = self._prepared = self._prepared_authority = None
         self._producer_input_authority = None
         self._state = "registered"
+        if (
+            type(self._iteration) is not int
+            or not 0 <= self._iteration <= _INT64_MAX
+            or (handle is not None and handle.iteration != self._iteration)
+        ):
+            raise MdpStateError("MDP: D3 producer owner captures one exact runtime iteration.")
 
     @property
     def producer(self):
@@ -227,6 +238,13 @@ class _D3ProducerOwner:
             raise MdpStateError("MDP: D3 producer owner requires its exact consumed producer.")
         if runtime.state is not MdpRuntimeState.EMPTY:
             raise MdpStateError("MDP: D3 producer owner retains the pre-routing P2 state.")
+        if (
+            type(runtime._iteration) is not int
+            or runtime._iteration != self._iteration
+            or not 0 <= runtime._iteration <= _INT64_MAX
+            or (self._handle is not None and self._handle.iteration != self._iteration)
+        ):
+            raise MdpStateError("MDP: D3 producer owner retains its exact runtime iteration.")
         _validate_encoder_finalization_domain(
             runtime,
             expected_domain=self._encoder_domain,
@@ -283,6 +301,145 @@ class _D3ProducerOwner:
         )
         self._state = "backward-complete"
 
+    def _prepare_native_encoder_finalization(self, completion, /) -> tuple:
+        """Release every local resource before the WORLD finalization gate."""
+        _validate_completed_native_encoder_completion(completion, owner=self)
+        runtime, handle = self._owned_runtime, self._handle
+        bases, pixels = self._gradient_bases, self._pixel_bases
+        token, ddp = completion.globally_reduced_num_tokens, completion.encoder_ddp
+        token_authority = _token_descriptor(token)
+        self._state = "finalization-preparing"
+        errors = []
+        if handle is not None:
+            runtime._handle = self._handle = None
+            try:
+                handle.release()
+            except BaseException as error:
+                errors.append(("encoder forward handle", error))
+        for index, base in enumerate(bases):
+            self._gradient_bases = bases[index + 1 :]
+            try:
+                runtime.allocator.release(base)
+            except BaseException as error:
+                errors.append(("encoder gradient regroup buffer", error))
+        for index, base in enumerate(pixels):
+            self._pixel_bases = pixels[index + 1 :]
+            runtime._chunk_payload_bases = pixels[index + 1 :]
+            try:
+                runtime.allocator.release(base)
+            except BaseException as error:
+                errors.append(("packed-pixel buffer", error))
+        try:
+            if (
+                runtime._iteration != self._iteration
+                or runtime._captured_num_tokens is not token
+                or runtime._token_capture_count != 1
+                or runtime._token_consumed is not False
+                or _token_descriptor(token) != token_authority
+            ):
+                raise MdpStateError(
+                    "MDP: local cleanup preserves exact iteration and token authority."
+                )
+            _validate_encoder_finalization_domain(
+                runtime,
+                expected_domain=self._encoder_domain,
+                expected_ddp=ddp,
+                expected_callable_authority=self._encoder_ddp_callable_authority,
+            )
+            if handle is not None and (
+                handle._backward_done is not True
+                or handle._released is not True
+                or handle.chunk_outputs
+                or handle.chunk_layouts
+            ):
+                raise MdpStateError("MDP: local cleanup releases the exact backward handle.")
+        except BaseException as error:
+            errors.append(("post-release authority validation", error))
+        self._scrub_local_completion(completion)
+        if errors:
+            self._state = "retired"
+            primary = errors[0][1]
+            for description, error in errors[1:]:
+                primary.add_note(f"another cleanup error while releasing {description}: {error!r}")
+            try:
+                runtime._abort_failed_iteration(primary)
+            except BaseException as cleanup_error:
+                primary.add_note(f"suppressed D3 finalization reset error: {cleanup_error!r}")
+            self._scrub_owner(finalized=False)
+            raise primary
+        self._state = "finalization-prepared"
+        self._finalization_token_authority = token_authority
+        self._scrub_owner(finalized=False, preserve_finalization=True)
+        return runtime, ddp, token, self._iteration
+
+    def _validate_native_encoder_finalization(self, runtime, ddp, token, iteration, /) -> None:
+        if (
+            self._state != "finalization-prepared"
+            or self._runtime is not runtime
+            or self._owned_runtime is not runtime
+            or self._encoder_ddp is not ddp
+            or self._iteration != iteration
+            or runtime._iteration != iteration
+            or runtime._captured_num_tokens is not token
+            or runtime._token_capture_count != 1
+            or runtime._token_consumed is not False
+        ):
+            raise MdpStateError(
+                "MDP: native encoder finalization retains exact prepared authority."
+            )
+        _validate_encoder_finalization_domain(
+            runtime,
+            expected_domain=self._encoder_domain,
+            expected_ddp=ddp,
+            expected_callable_authority=self._encoder_ddp_callable_authority,
+        )
+        if _token_descriptor(token) != self._finalization_token_authority:
+            raise MdpStateError("MDP: native encoder finalization retains its exact token.")
+
+    def _complete_native_encoder_finalization(self, runtime, ddp, token, iteration, /) -> None:
+        self._validate_native_encoder_finalization(runtime, ddp, token, iteration)
+        runtime._token_consumed = True
+        self._state = "retired"
+        self._scrub_owner(finalized=True)
+
+    def _scrub_local_completion(self, completion) -> None:
+        object.__setattr__(completion, "owner", None)
+        object.__setattr__(completion, "handle", None)
+        object.__setattr__(completion, "gradient_views", ())
+        object.__setattr__(completion, "allocation_bases", ())
+        object.__setattr__(completion, "runtime", None)
+        object.__setattr__(completion, "encoder_domain", None)
+        object.__setattr__(completion, "encoder_ddp", None)
+        object.__setattr__(completion, "globally_reduced_num_tokens", None)
+        object.__setattr__(completion, "_authority", None)
+
+    def _scrub_owner(self, *, finalized, preserve_finalization=False) -> None:
+        if preserve_finalization:
+            if self._finalization_token_authority is None:
+                raise MdpStateError("MDP: finalization token authority is captured before cleanup.")
+        for name, value in (
+            ("_rank_view", None),
+            ("_outputs", ()),
+            ("_output_descriptors", ()),
+            ("_layouts", ()),
+            ("_geometry", ()),
+            ("_item_outputs", MappingProxyType({})),
+            ("_item_descriptors", ()),
+            ("_pixel_descriptors", ()),
+            ("_producer", None),
+            ("_prepared", None),
+            ("_prepared_authority", None),
+            ("_mint_token", None),
+            ("_producer_input_authority", None),
+            ("_gradient_bases", ()),
+        ):
+            setattr(self, name, value)
+        if finalized or not preserve_finalization:
+            self._runtime = self._owned_runtime = None
+            self._encoder_domain = self._encoder_ddp = None
+            self._encoder_ddp_callable_authority = ()
+            self._finalization_token_authority = None
+
     def prepare_dynamic_completion(self, native_gradients: Mapping, /):
         """Regroup exact item gradients without invoking encoder backward."""
         bases = []
@@ -326,7 +483,14 @@ class _D3ProducerOwner:
 
     def abort(self, primary_error: BaseException | None = None, /) -> None:
         if (
-            self._state not in ("registered", "bound", "backward-entered", "backward-complete")
+            self._state
+            not in (
+                "registered",
+                "bound",
+                "backward-entered",
+                "backward-complete",
+                "finalization-prepared",
+            )
             or self._runtime is None
         ):
             raise MdpStateError("MDP: D3 producer owner aborts exactly once.")
@@ -396,6 +560,7 @@ class _D3ProducerOwner:
                 ("_encoder_ddp", None),
                 ("_encoder_ddp_callable_authority", ()),
                 ("_gradient_bases", ()),
+                ("_finalization_token_authority", None),
             ):
                 setattr(self, name, value)
 
