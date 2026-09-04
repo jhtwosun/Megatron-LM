@@ -2,12 +2,15 @@
 
 """MDP schedule and finalizer wiring (API design section 13).
 
-Two wrappers, neither of which modifies MCore:
+The wrappers leave the native schedules unchanged:
 
 * :func:`wrap_forward_backward` runs P1-P3 before the native schedule and
   P5/cleanup after it, substituting the replay iterators for the real data
   iterator. Training and evaluation call sites are wrapped separately; a
   callable must not be wrapped twice.
+* :func:`_wrap_d3_forward_backward` is the private training-only VPP1 seam for
+  the locked D3 composition. It replaces the source count and iterator with
+  the decoder-ready records before invoking the same native schedule.
 * :func:`wrap_finalize_model_grads` captures the global token count by
   wrapping ``config.finalize_model_grads_func`` — the one injectable exit all
   three schedule variants share. The native implementation broadcasts and
@@ -19,6 +22,7 @@ Two wrappers, neither of which modifies MCore:
 from inspect import signature
 from typing import Callable
 
+from megatron.core.mdp.dynamic_cp_d3_private_facade import _D3PrivateFacade
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.runtime import MdpRuntime
 
@@ -52,6 +56,56 @@ def wrap_forward_backward(forward_backward_func: Callable, runtime: MdpRuntime) 
 
         runtime.mark_decoder_complete()
         runtime.end_iteration()
+        return result
+
+    setattr(wrapped, _WRAPPED_MARKER, True)
+    wrapped._mdp_inner = forward_backward_func
+    return wrapped
+
+
+def _wrap_d3_forward_backward(
+    forward_backward_func: Callable, facade: _D3PrivateFacade
+) -> Callable:
+    """Wrap one native VPP1 training schedule with the private D3 lifecycle."""
+    if getattr(forward_backward_func, _WRAPPED_MARKER, False):
+        raise MdpConfigurationError(
+            "MDP: forward_backward_func is already wrapped; a callable must not be "
+            "wrapped twice."
+        )
+    if type(facade) is not _D3PrivateFacade:
+        raise MdpConfigurationError("MDP: D3 schedule wrapper requires its private facade.")
+    schedule_signature = signature(forward_backward_func)
+
+    def wrapped(*args, **kwargs):
+        bound = schedule_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        data_iterator = bound.arguments["data_iterator"]
+        if isinstance(data_iterator, (list, tuple)) and len(data_iterator) != 1:
+            raise MdpConfigurationError("MDP: D3 schedule wrapper supports VPP1 only.")
+        ready = facade.begin_iteration(
+            data_iterator,
+            num_microbatches=bound.arguments["num_microbatches"],
+            forward_only=bound.arguments["forward_only"],
+        )
+        try:
+            replay = facade.decoder_replay_cursor(ready, virtual_pipeline_parallel_size=1)
+            bound.arguments["data_iterator"] = (
+                [replay] if isinstance(data_iterator, (list, tuple)) else replay
+            )
+            bound.arguments["num_microbatches"] = len(ready.records)
+            result = forward_backward_func(*bound.args, **bound.kwargs)
+            facade.mark_decoder_complete(ready)
+        except BaseException as error:
+            try:
+                facade.abort_scheduled_iteration(ready, error)
+            except BaseException as abort_error:
+                if abort_error is not error:
+                    try:
+                        error.add_note(f"suppressed D3 scheduled-abort error: {abort_error!r}")
+                    except BaseException:
+                        pass
+            raise
+        facade.end_iteration(ready)
         return result
 
     setattr(wrapped, _WRAPPED_MARKER, True)

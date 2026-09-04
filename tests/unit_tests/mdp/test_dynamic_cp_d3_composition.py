@@ -18,6 +18,7 @@ from megatron.core.mdp.dynamic_cp_d3_private_facade import _D3PrivateFacade
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
 from megatron.core.mdp.runtime import MdpRuntimeState
+from megatron.core.mdp.schedule import _wrap_d3_forward_backward
 from megatron.core.mdp.storage import MdpEmbeddingStorage
 from megatron.core.mdp.window import pixel_capture_suppressed
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -220,16 +221,19 @@ def test_world4_composition_executes_native_producer_through_gate6(monkeypatch):
         timeout_seconds=30.0,
     )
 
-    ready = facade.begin_iteration(iter((0,)), num_microbatches=1, forward_only=False)
-    assert len(ready.records) == 1
-    assert len(ready.embedding_leaves) == 1
-    leaf = next(iter(ready.embedding_leaves.values()))
-    assert leaf.is_leaf and leaf.requires_grad
-    (leaf * float(rank + 1)).sum().backward()
-    runtime.capture_global_num_tokens(torch.tensor(32.0, device="cuda"))
-    facade.mark_decoder_complete(ready)
-    facade.end_iteration(ready)
+    def native_schedule(*, data_iterator, num_microbatches, forward_only):
+        assert num_microbatches == 1 and forward_only is False
+        record = next(data_iterator)
+        leaf = runtime.storage.get_leaf(record.microbatch_id)
+        assert leaf is not None and leaf.is_leaf and leaf.requires_grad
+        (leaf * float(rank + 1)).sum().backward()
+        runtime.capture_global_num_tokens(torch.tensor(32.0, device="cuda"))
+        return "native-result"
 
+    wrapped = _wrap_d3_forward_backward(native_schedule, facade)
+    result = wrapped(data_iterator=iter((0,)), num_microbatches=1, forward_only=False)
+
+    assert result == "native-result"
     assert facade.is_idle
     assert runtime.state is MdpRuntimeState.EMPTY
     assert runtime.iteration == 1
