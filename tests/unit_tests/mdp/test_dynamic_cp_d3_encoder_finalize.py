@@ -101,11 +101,12 @@ def test_gate5_releases_locals_then_finalizes_exactly_once(monkeypatch, contribu
     monkeypatch.setattr(encoder_api, "finalize_encoder_grads", finalize)
     binding = _binding(monkeypatch, runtime, group)
     binding.status_gate(context, None)
-    binding.finalize(ready)
+    commit_ready = binding.finalize(ready)
 
     assert events == [(runtime.encoder_domain.encoder_ddp, token)]
     assert runtime._ddp_calls == ["finish", "scale"]
     assert runtime._token_consumed is True and runtime._captured_num_tokens is token
+    assert commit_ready.runtime is runtime and commit_ready.token is token
     assert owner._state == "retired" and owner._runtime is None
     assert native.handle is None and native.gradient_views == () and native.allocation_bases == ()
     with pytest.raises(MdpTaskFatalError, match="replay"):

@@ -118,6 +118,7 @@ class _D3CoordinatorBindings:
     prepare_encoder_completion: _D3Operation
     execute_encoder_backward: _D3Operation
     execute_encoder_finalize: _D3Operation
+    execute_iteration_commit: _D3Operation
     cleanup: _D3Operation
     status_gate: _D3StatusGate
 
@@ -137,6 +138,7 @@ class _D3ActiveIteration:
     embedding_prepared: PreparedDynamicBridgeExchange | None = None
     embedding_result: Any = None
     ready: DecoderReadyIteration | None = None
+    commit_ready: Any = None
     decoder_complete: bool = False
     cleaned: bool = False
     scheduled_abort_started: bool = False
@@ -476,12 +478,17 @@ class _D3Coordinator:
             gate_id=5,
             operation=lambda: self._bindings.execute_encoder_backward(completion_prepared),
         )
-        self._run_entered_collective(
+        commit_ready = self._run_entered_collective(
             state, lambda: self._bindings.execute_encoder_finalize(finalizer)
         )
+        state.commit_ready = commit_ready
         cleanup_error = self._cleanup(state)
         try:
             self._complete_local_gate(state, gate_id=6, phase_value=None, local_error=cleanup_error)
         except BaseException as error:
             self._fail(state, error)
+        self._run_entered_collective(
+            state, lambda: self._bindings.execute_iteration_commit(state.commit_ready)
+        )
+        state.commit_ready = None
         self._active = None
