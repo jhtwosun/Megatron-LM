@@ -2,6 +2,7 @@
 
 """Focused caller-buffer contracts for Dynamic-CP bridge transport."""
 
+import os
 from dataclasses import FrozenInstanceError
 from types import MappingProxyType, SimpleNamespace
 
@@ -105,18 +106,42 @@ class _TwoWaveCp2Solver:
         return ([[6], [6], [7], [7]], [], None, [[2], [2], [3], [3]])
 
 
+class _World4Cp2Solver:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, sample_seqlens, total_gpus, max_seq_len_per_rank, min_cp_size=1):
+        assert (total_gpus, max_seq_len_per_rank, min_cp_size) == (2, 7, 1)
+        self.calls += 1
+        if self.calls == 1:
+            assert sample_seqlens == [(0, 6), (1, 7), (2, 6), (3, 7)]
+            return ([[6, 7], [6, 7]], [(2, 6), (3, 7)], None, [[0, 1], [0, 1]])
+        assert sample_seqlens == [(2, 6), (3, 7)]
+        return ([[6, 7], [6, 7]], [], None, [[2, 3], [2, 3]])
+
+
 def _state(
-    *, dtype=torch.float32, width=4, producers=None, participants=_PARTICIPANTS, text_only=False
+    *,
+    dtype=torch.float32,
+    width=4,
+    producers=None,
+    participants=_PARTICIPANTS,
+    text_only=False,
+    decoder_ranks=_DECODER_RANKS,
+    max_seqlen_per_rank=4,
+    solver=None,
+    device=None,
 ):
+    device = torch.device("cpu") if device is None else torch.device(device)
     lane3 = _source_window(3, text_only=text_only)
     lane7 = _source_window(7, text_only=text_only)
     manifest = build_decoder_global_manifest((lane7.metadata_manifest(), lane3.metadata_manifest()))
     plan = build_decoder_dynamic_plan(
         manifest.samples,
-        decoder_ranks=_DECODER_RANKS,
-        max_seqlen_per_rank=4,
+        decoder_ranks=decoder_ranks,
+        max_seqlen_per_rank=max_seqlen_per_rank,
         minimum_cp_size=1,
-        solver=_TwoWaveCp2Solver(),
+        solver=_TwoWaveCp2Solver() if solver is None else solver,
     )
     if text_only:
         producers = {}
@@ -138,7 +163,12 @@ def _state(
     )
     embedding, gradient = bridge.build_dynamic_bridge_ledgers(**authority)
     return SimpleNamespace(
-        plan=plan, manifest=manifest, authority=authority, embedding=embedding, gradient=gradient
+        plan=plan,
+        manifest=manifest,
+        authority=authority,
+        embedding=embedding,
+        gradient=gradient,
+        device=device,
     )
 
 
@@ -165,8 +195,12 @@ def _local_tensors(state, phase, rank):
             value = embedding_values[entry.key.item_id]
         else:
             base = torch.arange(rows * state.authority["width"] * 2, dtype=state.authority["dtype"])
+            base = base.to(state.device)
             value = base.view(rows, state.authority["width"] * 2)[:, ::2]
-            value.add_(100 * (index + 1))
+            source_seed = 0
+            if phase is BridgePhase.GRADIENT:
+                source_seed = 16 * (state.authority["participant_ranks"].index(rank) + 1)
+            value.add_(100 * (index + 1) + source_seed)
             if phase is BridgePhase.EMBEDDING:
                 embedding_values[entry.key.item_id] = value
         result[entry.key] = value
@@ -178,9 +212,9 @@ def _prepare(state, phase, rank, *, local_tensors=None, send=None, receive=None)
     if local_tensors is None:
         local_tensors = _local_tensors(state, phase, rank)
     if send is None:
-        send = torch.full((sum(inputs),), -1, dtype=state.authority["dtype"])
+        send = torch.full((sum(inputs),), -1, dtype=state.authority["dtype"], device=state.device)
     if receive is None:
-        receive = torch.arange(sum(outputs), dtype=state.authority["dtype"])
+        receive = torch.arange(sum(outputs), dtype=state.authority["dtype"], device=state.device)
     prepared = transport.prepare_dynamic_bridge_exchange(
         _selected(state, phase),
         state.gradient if phase is BridgePhase.EMBEDDING else state.embedding,
@@ -534,3 +568,324 @@ def test_overflowing_authority_is_rejected_before_buffer_mutation():
             **authority,
         )
     assert torch.equal(send, torch.full_like(send, -29))
+
+
+class _FakeGroup:
+    def __init__(self, participant_ranks, global_rank):
+        self.participant_ranks = participant_ranks
+        self.global_rank = global_rank
+
+    def size(self):
+        return len(self.participant_ranks)
+
+    def rank(self):
+        return self.participant_ranks.index(self.global_rank)
+
+
+def _execute(prepared, *, group=None, group_ranks_getter=None, all_to_all_single=None):
+    if group is None:
+        group = _FakeGroup(prepared.participant_ranks, prepared.global_rank)
+    if group_ranks_getter is None:
+        group_ranks_getter = lambda _selected: list(prepared.participant_ranks)
+    if all_to_all_single is None:
+        all_to_all_single = lambda *_args, **_kwargs: None
+    return getattr(transport, "execute_dynamic_bridge_exchange")(
+        prepared,
+        group=group,
+        group_ranks_getter=group_ranks_getter,
+        all_to_all_single=all_to_all_single,
+    )
+
+
+@pytest.mark.parametrize("phase", [BridgePhase.EMBEDDING, BridgePhase.GRADIENT])
+def test_execute_calls_exact_collective_once_and_returns_live_views(phase):
+    prepared, _ = _prepare(_state(), phase, 30)
+    group = _FakeGroup(prepared.participant_ranks, prepared.global_rank)
+    calls = []
+
+    def all_to_all_single(output, input_, **kwargs):
+        calls.append((output, input_, kwargs))
+        output.copy_(torch.arange(output.numel(), dtype=output.dtype) + 700)
+
+    received = _execute(prepared, group=group, all_to_all_single=all_to_all_single)
+
+    assert received is prepared.received_tensors
+    assert len(calls) == 1
+    output, input_, kwargs = calls[0]
+    assert output is prepared.receive_buffer
+    assert input_ is prepared.send_buffer
+    assert kwargs == {
+        "output_split_sizes": list(prepared.output_split_sizes),
+        "input_split_sizes": list(prepared.input_split_sizes),
+        "group": group,
+        "async_op": False,
+    }
+    for view in received.values():
+        offset = view.storage_offset() - prepared.receive_buffer.storage_offset()
+        torch.testing.assert_close(
+            view.reshape(-1),
+            torch.arange(offset + 700, offset + 700 + view.numel(), dtype=view.dtype),
+        )
+
+
+@pytest.mark.parametrize(
+    "phase,rank,role",
+    [
+        (BridgePhase.EMBEDDING, 30, "self"),
+        (BridgePhase.GRADIENT, 30, "self"),
+        (BridgePhase.EMBEDDING, 99, "idle"),
+        (BridgePhase.GRADIENT, 99, "idle"),
+    ],
+)
+def test_execute_self_and_all_zero_idle_ranks_still_call_once(phase, rank, role):
+    prepared, _ = _prepare(_state(), phase, rank)
+    calls = []
+
+    received = _execute(prepared, all_to_all_single=lambda *_args, **_kwargs: calls.append(True))
+
+    assert received is prepared.received_tensors
+    assert calls == [True]
+    local_index = prepared.participant_ranks.index(rank)
+    if role == "self":
+        assert prepared.input_split_sizes[local_index] > 0
+        assert prepared.output_split_sizes[local_index] > 0
+    else:
+        assert prepared.input_split_sizes == prepared.output_split_sizes == (0,) * 7
+
+
+@pytest.mark.parametrize("failure", ["seal", "group-getter", "collective"])
+def test_execute_validates_seal_and_both_dependencies_before_side_effects(failure):
+    prepared, _ = _prepare(_state(), BridgePhase.EMBEDDING, 30)
+    events = []
+    group_ranks_getter = lambda _group: (events.append("group") or list(_PARTICIPANTS))
+    all_to_all_single = lambda *_args, **_kwargs: events.append("collective")
+    expected_error = MdpBridgeError if failure == "seal" else MdpConfigurationError
+    if failure == "seal":
+        object.__setattr__(prepared, "route_authority_digest", b"x" * 16)
+    elif failure == "group-getter":
+        group_ranks_getter = object()
+    else:
+        all_to_all_single = object()
+
+    with pytest.raises(expected_error):
+        _execute(
+            prepared, group_ranks_getter=group_ranks_getter, all_to_all_single=all_to_all_single
+        )
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    "actual_ranks",
+    [
+        tuple(reversed(_PARTICIPANTS)),
+        (80, 30, 70, 20, 10, 40, True),
+        (80, 30, 70, 20, 10, 40, 99.0),
+        (80, 30, 70, 20, 10, 40, 40),
+        _PARTICIPANTS[:-1],
+        None,
+    ],
+)
+def test_execute_rejects_non_authoritative_native_rank_order(actual_ranks):
+    prepared, _ = _prepare(_state(), BridgePhase.EMBEDDING, 30)
+    calls = []
+
+    with pytest.raises(MdpConfigurationError, match="rank"):
+        _execute(
+            prepared,
+            group_ranks_getter=lambda _group: actual_ranks,
+            all_to_all_single=lambda *_args, **_kwargs: calls.append(True),
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("size", [True, 7.0, 6, -1])
+def test_execute_rejects_malformed_native_group_size(size):
+    prepared, _ = _prepare(_state(), BridgePhase.EMBEDDING, 30)
+    group = SimpleNamespace(size=lambda: size, rank=lambda: 1)
+    calls = []
+
+    with pytest.raises(MdpConfigurationError, match="size"):
+        _execute(
+            prepared, group=group, all_to_all_single=lambda *_args, **_kwargs: calls.append(True)
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("local_rank", [True, 1.0, 0, -1, 7])
+def test_execute_rejects_malformed_native_local_rank(local_rank):
+    prepared, _ = _prepare(_state(), BridgePhase.EMBEDDING, 30)
+    group = SimpleNamespace(size=lambda: 7, rank=lambda: local_rank)
+    calls = []
+
+    with pytest.raises(MdpConfigurationError, match="local rank"):
+        _execute(
+            prepared, group=group, all_to_all_single=lambda *_args, **_kwargs: calls.append(True)
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "query", ["ranks", "size", "local-rank", "noncallable-size", "noncallable-local-rank"]
+)
+def test_execute_normalizes_ordinary_group_query_errors_with_cause(query):
+    prepared, _ = _prepare(_state(), BridgePhase.EMBEDDING, 30)
+    error = RuntimeError(query)
+    calls = []
+
+    def fail():
+        raise error
+
+    group = SimpleNamespace(size=lambda: 7, rank=lambda: 1)
+    getter = lambda _group: list(_PARTICIPANTS)
+    if query == "ranks":
+        getter = lambda _group: fail()
+    elif query == "size":
+        group.size = fail
+    elif query == "local-rank":
+        group.rank = fail
+    elif query == "noncallable-size":
+        group.size = object()
+    else:
+        group.rank = object()
+
+    with pytest.raises(MdpConfigurationError) as caught:
+        _execute(
+            prepared,
+            group=group,
+            group_ranks_getter=getter,
+            all_to_all_single=lambda *_args, **_kwargs: calls.append(True),
+        )
+    if query.startswith("noncallable"):
+        assert isinstance(caught.value.__cause__, TypeError)
+    else:
+        assert caught.value.__cause__ is error
+    assert calls == []
+
+
+def test_execute_normalizes_collective_error_with_cause():
+    prepared, _ = _prepare(_state(), BridgePhase.EMBEDDING, 30)
+    error = RuntimeError("all-to-all")
+
+    def fail(*_args, **_kwargs):
+        raise error
+
+    with pytest.raises(MdpBridgeError, match="all-to-all") as caught:
+        _execute(prepared, all_to_all_single=fail)
+    assert caught.value.__cause__ is error
+
+
+@pytest.mark.parametrize("stage", ["ranks", "size", "local-rank", "collective"])
+def test_execute_does_not_catch_base_exception(stage):
+    prepared, _ = _prepare(_state(), BridgePhase.EMBEDDING, 30)
+
+    def fail(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    group = SimpleNamespace(size=lambda: 7, rank=lambda: 1)
+    kwargs = {}
+    if stage == "ranks":
+        kwargs["group_ranks_getter"] = fail
+    elif stage == "size":
+        group.size = fail
+    elif stage == "local-rank":
+        group.rank = fail
+    else:
+        kwargs["all_to_all_single"] = fail
+
+    with pytest.raises(KeyboardInterrupt):
+        _execute(prepared, group=group, **kwargs)
+
+
+_DISTRIBUTED = int(os.environ.get("WORLD_SIZE", "1")) == 4
+_WORLD4_PARTICIPANTS = (0, 1, 2, 3)
+_WORLD4_DECODER_RANKS = (2, 0)
+
+
+def _world4_state(dtype, device):
+    return _state(
+        dtype=dtype,
+        producers={
+            GlobalVisionItemId(3, 0): 0,
+            GlobalVisionItemId(3, 1): 0,
+            GlobalVisionItemId(7, 0): 0,
+        },
+        participants=_WORLD4_PARTICIPANTS,
+        decoder_ranks=_WORLD4_DECODER_RANKS,
+        max_seqlen_per_rank=7,
+        solver=_World4Cp2Solver(),
+        device=device,
+    )
+
+
+if _DISTRIBUTED:
+    from tests.unit_tests.test_utilities import Utils
+
+    @pytest.fixture(scope="module")
+    def bridge_group():
+        Utils.initialize_model_parallel()
+        group = torch.distributed.new_group(ranks=list(_WORLD4_PARTICIPANTS), backend="nccl")
+        yield group
+        torch.distributed.destroy_process_group(group)
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+@pytest.mark.parametrize("phase", [BridgePhase.EMBEDDING, BridgePhase.GRADIENT])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_world4_nccl_execute_preserves_self_remote_and_idle_ranks(phase, dtype, bridge_group):
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = _world4_state(dtype, device)
+    prepared, _ = _prepare(state, phase, rank)
+    calls = 0
+
+    def tracked_all_to_all_single(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return torch.distributed.all_to_all_single(*args, **kwargs)
+
+    received = getattr(transport, "execute_dynamic_bridge_exchange")(
+        prepared, group=bridge_group, all_to_all_single=tracked_all_to_all_single
+    )
+    completion = torch.ones((), dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(completion, group=bridge_group)
+
+    assert completion.item() == 4
+    assert calls == 1
+    assert received is prepared.received_tensors
+    assert tuple(torch.distributed.get_process_group_ranks(bridge_group)) == _WORLD4_PARTICIPANTS
+    assert state.plan.decoder_ranks == _WORLD4_DECODER_RANKS
+    assert any(
+        entry.src_global_rank == entry.dst_global_rank == 0
+        for entry in _selected(state, phase).entries
+    )
+    assert any(
+        entry.src_global_rank != entry.dst_global_rank for entry in _selected(state, phase).entries
+    )
+    if rank in (1, 3):
+        assert prepared.input_split_sizes == prepared.output_split_sizes == (0,) * 4
+    elif rank == 0:
+        assert sum(prepared.input_split_sizes) > 0
+        assert sum(prepared.output_split_sizes) > 0
+    elif phase is BridgePhase.EMBEDDING:
+        assert sum(prepared.input_split_sizes) == 0
+        assert sum(prepared.output_split_sizes) > 0
+    else:
+        assert sum(prepared.input_split_sizes) > 0
+        assert sum(prepared.output_split_sizes) == 0
+
+    oracle = {}
+    for source_rank in _WORLD4_PARTICIPANTS:
+        oracle.update(_local_tensors(state, phase, source_rank))
+    if phase is BridgePhase.GRADIENT:
+        values_by_item = {}
+        for key, value in oracle.items():
+            values_by_item.setdefault(key.item_id, []).append(value)
+        endpoint_values = next(values for values in values_by_item.values() if len(values) > 1)
+        assert not torch.equal(endpoint_values[0], endpoint_values[1])
+    destination_entries = tuple(
+        entry for entry in _selected(state, phase).entries if entry.dst_global_rank == rank
+    )
+    assert set(received) == {entry.key for entry in destination_entries}
+    for entry in destination_entries:
+        torch.testing.assert_close(received[entry.key], oracle[entry.key], rtol=0, atol=0)
