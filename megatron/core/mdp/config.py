@@ -74,6 +74,7 @@ class MdpCompatibilityOptions:
     # args.reuse_grad_buf_for_mxfp8_param_ag. Rejected outright under MDP; see
     # validate_mdp_config for the composite-optimizer mechanism.
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
+    dynamic_context_parallel: bool = False
 
 
 def _reject(option: str, value: Any, condition: str, why: str, suggestion: str = "") -> None:
@@ -193,6 +194,24 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "the prefetch thread concurrently with the schedule's collectives.",
             "False",
         )
+
+    if options.dynamic_context_parallel:
+        topology = (
+            options.tensor_parallel_size,
+            options.expert_parallel_size,
+            options.pipeline_parallel_size,
+            options.context_parallel_size,
+            config.encoder_cp,
+            options.virtual_pipeline_parallel_size,
+        )
+        if topology != (1, 1, 1, 1, 1, None) or config.overlap_window_capture:
+            _reject(
+                "dynamic_context_parallel",
+                options.dynamic_context_parallel,
+                "configured TP/EP/PP/CP/ECP are 1, VPP is disabled, and window capture is disabled",
+                "The concrete D3 composition has not validated wider configured topology or "
+                "overlapped source-window capture.",
+            )
 
     # --- parallel dimensions and rank mapping preconditions ---
     if options.rank_order != SUPPORTED_RANK_ORDER:

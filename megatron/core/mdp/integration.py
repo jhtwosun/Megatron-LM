@@ -161,6 +161,7 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         overlap_moe_expert_parallel_comm=bool(
             getattr(args, "overlap_moe_expert_parallel_comm", False)
         ),
+        dynamic_context_parallel=bool(getattr(args, "dynamic_context_parallel", False)),
         checkpoint_mode=getattr(args, "ckpt_format", "torch_dist"),
         save_requested=getattr(args, "save", None) is not None,
         load_requested=getattr(args, "load", None) is not None,
