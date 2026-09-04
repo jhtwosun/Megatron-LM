@@ -2,18 +2,24 @@
 
 """Private D3 authority-bound workspace contracts."""
 
+from dataclasses import replace
 from importlib import import_module
 
 import pytest
 import torch
 
 from megatron.core.mdp.allocator import DirectBufferAllocator
+from megatron.core.mdp.dynamic_cp_bridge_transport import prepare_dynamic_bridge_exchange
+from megatron.core.mdp.dynamic_cp_execution import DecoderGlobalManifest
+from megatron.core.mdp.dynamic_cp_routing import build_decoder_payload_route_ledger
+from megatron.core.mdp.dynamic_cp_transport import prepare_decoder_payload_bundle
 from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError
 from megatron.core.mdp.storage import MdpEmbeddingStorage
 from tests.unit_tests.mdp.test_dynamic_cp_d3_authority_construction import (
     _authority_api,
     _FullGroupSolver,
     _item_authority,
+    _metadata,
 )
 
 
@@ -21,16 +27,77 @@ def _workspace_api():
     return import_module("megatron.core.mdp.dynamic_cp_d3_workspace")
 
 
-def _authority(*, solver=None):
+def _payload_authority(authority, *, device_type="cuda", mixed_dtypes=False):
+    execution = import_module("megatron.core.mdp.dynamic_cp_execution")
+    payloads = tuple(
+        replace(
+            payload,
+            field_specs=tuple(
+                replace(
+                    spec,
+                    device_type=device_type,
+                    dtype=(
+                        torch.float32
+                        if mixed_dtypes and spec.name == "position_ids"
+                        else spec.dtype
+                    ),
+                )
+                for spec in payload.field_specs
+            ),
+        )
+        for payload in authority.global_manifest.payloads
+    )
+    manifest = DecoderGlobalManifest(
+        samples=authority.global_manifest.samples,
+        items=authority.global_manifest.items,
+        payloads=payloads,
+        digest=execution._manifest_digest(
+            execution._GLOBAL_MANIFEST_DOMAIN,
+            authority.global_manifest.samples,
+            authority.global_manifest.items,
+            payloads,
+        ),
+    )
+    payload_ledger = build_decoder_payload_route_ledger(
+        authority.plan,
+        global_manifest=manifest,
+        source_rank_by_lane=authority.source_rank_by_lane,
+        participant_ranks=authority.participant_ranks,
+    )
     authority_api = _authority_api()
-    return authority_api.build_d3_iteration_authority(
-        _item_authority(authority_api),
+    return authority_api._DynamicIterationAuthority(
+        global_manifest=manifest,
+        plan=authority.plan,
+        source_rank_by_lane=authority.source_rank_by_lane,
+        producer_rank_by_item=authority.producer_rank_by_item,
+        output_rows_by_item=authority.output_rows_by_item,
+        payload_ledger=payload_ledger,
+        embedding_ledger=authority.embedding_ledger,
+        gradient_ledger=authority.gradient_ledger,
+        participant_ranks=authority.participant_ranks,
+        bridge_width=authority.bridge_width,
+        bridge_dtype=authority.bridge_dtype,
+    )
+
+
+def _authority(*, solver=None, participant_ranks=(3, 5, 7), mixed_dtypes=False):
+    authority_api = _authority_api()
+    item_authority = (
+        _item_authority(authority_api)
+        if participant_ranks == (3, 5, 7)
+        else authority_api.derive_decoder_item_authority(
+            _metadata(), participant_ranks=participant_ranks, decoder_ranks=(5, 7)
+        )
+    )
+    authority = authority_api.build_d3_iteration_authority(
+        item_authority,
         max_seqlen_per_rank=8,
         minimum_cp_size=1,
         solver=solver or _FullGroupSolver(),
         bridge_width=16,
         bridge_dtype=torch.bfloat16,
     )
+    return _payload_authority(authority, mixed_dtypes=mixed_dtypes)
 
 
 class _RecordingAllocator:
@@ -58,6 +125,14 @@ class _RecordingAllocator:
         self.releases.append(id(tensor))
         if self.fail_releases:
             raise self.release_error
+
+
+class _AliasingAllocator(_RecordingAllocator):
+    def acquire(self, *, rows, width, dtype, device, tag):
+        if self.acquired:
+            self.acquire_calls.append((rows, width, dtype, device, tag))
+            return self.acquired[0]
+        return super().acquire(rows=rows, width=width, dtype=dtype, device=device, tag=tag)
 
 
 class _AllocationFailure(RuntimeError):
@@ -104,6 +179,47 @@ class _SecondPutFailsStorage(MdpEmbeddingStorage):
         super().put_leaf(mb_id, leaf)
 
 
+def _pointer(tensor):
+    return tensor.untyped_storage().data_ptr()
+
+
+def _bases(splits):
+    starts, cursor = [], 0
+    for split in splits:
+        starts.append(cursor)
+        cursor += split
+    return tuple(starts)
+
+
+def _payload_sources(authority, rank, device):
+    specs = {
+        (payload.sample_id, spec.name): spec
+        for payload in authority.global_manifest.payloads
+        for spec in payload.field_specs
+    }
+    return {
+        entry.key: torch.empty(
+            specs[(entry.key.sample_id, entry.key.field_name)].shape,
+            dtype=entry.dtype,
+            device=device,
+        )
+        for entry in authority.payload_ledger.entries
+        if entry.src_global_rank == rank
+    }
+
+
+def _bridge_sources(authority, ledger, rank, device):
+    return {
+        entry.key: torch.empty(
+            (authority.output_rows_by_item[entry.key.item_id], authority.bridge_width),
+            dtype=authority.bridge_dtype,
+            device=device,
+        )
+        for entry in ledger.entries
+        if entry.src_global_rank == rank
+    }
+
+
 def test_allocates_authority_derived_local_views_in_deterministic_order():
     api = _workspace_api()
     allocator = _RecordingAllocator()
@@ -133,9 +249,13 @@ def test_allocates_authority_derived_local_views_in_deterministic_order():
         workspace.authority.global_manifest.items[1].item_id,
     )
     assert [call[-1] for call in allocator.acquire_calls] == [
-        "dynamic_cp_payload_destination",
+        "dynamic_cp_payload_send",
+        "dynamic_cp_payload_receive",
+        "dynamic_cp_embedding_send",
+        "dynamic_cp_embedding_receive",
         "dynamic_cp_embedding_leaf",
-        "dynamic_cp_gradient_edges",
+        "dynamic_cp_gradient_send",
+        "dynamic_cp_gradient_receive",
         "dynamic_cp_summed_gradient",
     ]
     assert [tuple(view.shape) for view in workspace.embedding_views.values()] == [(1, 16), (2, 16)]
@@ -163,7 +283,9 @@ def test_allocates_authority_derived_local_views_in_deterministic_order():
         gradient_entries
     )
     for mapping in (
+        workspace.payload_transport_buffers,
         workspace.payload_views,
+        workspace.embedding_receive_views,
         workspace.embedding_views,
         workspace.gradient_views,
         workspace.summed_gradient_views,
@@ -171,7 +293,280 @@ def test_allocates_authority_derived_local_views_in_deterministic_order():
         with pytest.raises(TypeError):
             mapping[object()] = None
     workspace.release()
+
+
+def test_rejects_allocator_transport_alias_and_releases_the_prior_owned_base_once():
+    api = _workspace_api()
+    allocator = _AliasingAllocator()
+
+    with pytest.raises(MdpConfigurationError, match="disjoint buffers"):
+        api._DynamicIterationWorkspace(
+            authority=_authority(),
+            rank=5,
+            device=torch.device("cuda", 0),
+            allocator=allocator,
+            storage=MdpEmbeddingStorage(allocator),
+        )
+
+    assert len(allocator.acquire_calls) == 2
+    assert allocator.releases == [id(allocator.acquired[0])]
+
+
+def test_allocates_physical_payload_and_bridge_staging_for_mixed_dtypes_and_nonnumeric_ranks():
+    api = _workspace_api()
+    authority = _authority(participant_ranks=(7, 3, 5), mixed_dtypes=True)
+    allocator = _RecordingAllocator()
+    workspace = api._DynamicIterationWorkspace(
+        authority=authority,
+        rank=5,
+        device=torch.device("cuda", 0),
+        allocator=allocator,
+        storage=MdpEmbeddingStorage(allocator),
+    )
+
+    payload_dtypes = tuple(dict.fromkeys(entry.dtype for entry in authority.payload_ledger.entries))
+    assert tuple(workspace.payload_transport_buffers) == payload_dtypes
+    pointers = []
+    positions = {rank: index for index, rank in enumerate(authority.participant_ranks)}
+    for dtype in payload_dtypes:
+        send, receive = workspace.payload_transport_buffers[dtype]
+        input_splits, output_splits = api.decoder_payload_split_sizes(
+            authority.payload_ledger,
+            plan=authority.plan,
+            global_manifest=authority.global_manifest,
+            source_rank_by_lane=authority.source_rank_by_lane,
+            participant_ranks=authority.participant_ranks,
+            dtype=dtype,
+            global_rank=5,
+        )
+        assert send.dim() == receive.dim() == 1
+        assert send.numel() == sum(input_splits)
+        assert receive.numel() == sum(output_splits)
+        pointers.extend((send, receive))
+        receive_bases = _bases(output_splits)
+        for entry in authority.payload_ledger.entries:
+            if entry.dtype is dtype and entry.dst_global_rank == 5:
+                view = workspace.payload_views[entry.key]
+                assert _pointer(view) == _pointer(receive)
+                assert (
+                    view.storage_offset()
+                    == receive_bases[positions[entry.src_global_rank]] + entry.plan_offset
+                )
+
+    embedding_input, embedding_output = api.dynamic_bridge_split_sizes(
+        authority.embedding_ledger,
+        reverse_ledger=authority.gradient_ledger,
+        plan=authority.plan,
+        global_manifest=authority.global_manifest,
+        producer_rank_by_item=authority.producer_rank_by_item,
+        output_rows_by_item=authority.output_rows_by_item,
+        width=authority.bridge_width,
+        dtype=authority.bridge_dtype,
+        participant_ranks=authority.participant_ranks,
+        global_rank=5,
+    )
+    embedding_send, embedding_receive = workspace.embedding_transport_buffers
+    assert embedding_send.numel() == sum(embedding_input)
+    assert embedding_receive.numel() == sum(embedding_output)
+    assert tuple(workspace.embedding_receive_views) == tuple(
+        entry.key
+        for entry in sorted(
+            (entry for entry in authority.embedding_ledger.entries if entry.dst_global_rank == 5),
+            key=lambda entry: (positions[entry.src_global_rank], entry.plan_offset),
+        )
+    )
+    for key, view in workspace.embedding_receive_views.items():
+        entry = next(
+            entry
+            for entry in authority.embedding_ledger.entries
+            if entry.key == key and entry.dst_global_rank == 5
+        )
+        assert _pointer(view) == _pointer(embedding_receive)
+        assert view.storage_offset() == (
+            _bases(embedding_output)[positions[entry.src_global_rank]] + entry.plan_offset
+        )
+        assert tuple(view.shape) == (
+            authority.output_rows_by_item[key.item_id],
+            authority.bridge_width,
+        )
+        assert _pointer(view) not in {_pointer(leaf) for leaf in workspace.embedding_views.values()}
+
+    gradient_input, gradient_output = api.dynamic_bridge_split_sizes(
+        authority.gradient_ledger,
+        reverse_ledger=authority.embedding_ledger,
+        plan=authority.plan,
+        global_manifest=authority.global_manifest,
+        producer_rank_by_item=authority.producer_rank_by_item,
+        output_rows_by_item=authority.output_rows_by_item,
+        width=authority.bridge_width,
+        dtype=authority.bridge_dtype,
+        participant_ranks=authority.participant_ranks,
+        global_rank=5,
+    )
+    gradient_send, gradient_receive = workspace.gradient_transport_buffers
+    assert gradient_send.numel() == sum(gradient_input)
+    assert gradient_receive.numel() == sum(gradient_output)
+    for key, view in workspace.gradient_views.items():
+        entry = next(
+            entry
+            for entry in authority.gradient_ledger.entries
+            if entry.key == key and entry.dst_global_rank == 5
+        )
+        assert _pointer(view) == _pointer(gradient_receive)
+        assert view.storage_offset() == (
+            _bases(gradient_output)[positions[entry.src_global_rank]] + entry.plan_offset
+        )
+        assert tuple(view.shape) == (
+            authority.output_rows_by_item[key.item_id],
+            authority.bridge_width,
+        )
+    pointers.extend(
+        (
+            embedding_send,
+            embedding_receive,
+            gradient_send,
+            gradient_receive,
+            *workspace._embedding_bases.values(),
+            *workspace.summed_gradient_views.values(),
+        )
+    )
+    nonempty = [_pointer(tensor) for tensor in pointers if tensor.numel()]
+    assert len(nonempty) == len(set(nonempty))
     workspace.release()
+
+
+def test_workspace_transport_buffers_match_existing_d2_prepare_views():
+    authority = _authority(participant_ranks=(7, 3, 5), mixed_dtypes=True)
+    device = torch.device("cuda", 0)
+    allocator = _RecordingAllocator()
+    workspace = _workspace_api()._DynamicIterationWorkspace(
+        authority=authority,
+        rank=5,
+        device=device,
+        allocator=allocator,
+        storage=MdpEmbeddingStorage(allocator),
+    )
+    try:
+        payload = prepare_decoder_payload_bundle(
+            authority.payload_ledger,
+            plan=authority.plan,
+            global_manifest=authority.global_manifest,
+            source_rank_by_lane=authority.source_rank_by_lane,
+            participant_ranks=authority.participant_ranks,
+            global_rank=5,
+            local_tensors=_payload_sources(authority, 5, device),
+            buffers_by_dtype=workspace.payload_transport_buffers,
+        )
+        assert tuple(payload.received_tensors) == tuple(workspace.payload_views)
+        for key, view in payload.received_tensors.items():
+            expected = workspace.payload_views[key]
+            assert _pointer(view) == _pointer(expected)
+            assert view.storage_offset() == expected.storage_offset()
+
+        for ledger, reverse, buffers, views in (
+            (
+                authority.embedding_ledger,
+                authority.gradient_ledger,
+                workspace.embedding_transport_buffers,
+                workspace.embedding_receive_views,
+            ),
+            (
+                authority.gradient_ledger,
+                authority.embedding_ledger,
+                workspace.gradient_transport_buffers,
+                workspace.gradient_views,
+            ),
+        ):
+            bridge = prepare_dynamic_bridge_exchange(
+                ledger,
+                reverse,
+                plan=authority.plan,
+                global_manifest=authority.global_manifest,
+                producer_rank_by_item=authority.producer_rank_by_item,
+                output_rows_by_item=authority.output_rows_by_item,
+                width=authority.bridge_width,
+                dtype=authority.bridge_dtype,
+                participant_ranks=authority.participant_ranks,
+                global_rank=5,
+                local_tensors=_bridge_sources(authority, ledger, 5, device),
+                send_buffer=buffers[0],
+                receive_buffer=buffers[1],
+            )
+            assert tuple(bridge.received_tensors) == tuple(views)
+            for key, view in bridge.received_tensors.items():
+                expected = views[key]
+                assert _pointer(view) == _pointer(expected)
+                assert view.storage_offset() == expected.storage_offset()
+    finally:
+        workspace.release()
+
+
+def test_allocates_all_zero_transport_pairs_and_rejects_non_cuda_payload_before_allocation():
+    api = _workspace_api()
+    allocator = _RecordingAllocator()
+    workspace = api._DynamicIterationWorkspace(
+        authority=_authority(participant_ranks=(3, 5, 7, 9)),
+        rank=9,
+        device=torch.device("cuda", 0),
+        allocator=allocator,
+        storage=MdpEmbeddingStorage(allocator),
+    )
+
+    assert all(
+        send.numel() == receive.numel() == 0
+        for send, receive in workspace.payload_transport_buffers.values()
+    )
+    assert workspace.embedding_transport_buffers[0].numel() == 0
+    assert workspace.embedding_transport_buffers[1].numel() == 0
+    assert workspace.gradient_transport_buffers[0].numel() == 0
+    assert workspace.gradient_transport_buffers[1].numel() == 0
+    assert not workspace.payload_views
+    assert not workspace.embedding_receive_views
+    assert not workspace.embedding_views
+    assert not workspace.gradient_views
+    assert not workspace.summed_gradient_views
+    workspace.release()
+
+    allocator = _RecordingAllocator()
+    with pytest.raises(MdpConfigurationError, match="CUDA decoder payload"):
+        api._DynamicIterationWorkspace(
+            authority=_payload_authority(_authority(), device_type="cpu"),
+            rank=5,
+            device=torch.device("cuda", 0),
+            allocator=allocator,
+            storage=MdpEmbeddingStorage(allocator),
+        )
+    assert not allocator.acquire_calls
+
+
+def test_transport_cleanup_drops_staging_references_and_allows_retry_after_failure():
+    api = _workspace_api()
+    allocator = _RecordingAllocator(fail_releases=True)
+    workspace = api._DynamicIterationWorkspace(
+        authority=_authority(),
+        rank=5,
+        device=torch.device("cuda", 0),
+        allocator=allocator,
+        storage=MdpEmbeddingStorage(allocator),
+    )
+    expected_releases = len(workspace._bases)
+
+    with pytest.raises(_ReleaseFailure):
+        workspace.release()
+
+    assert len(allocator.releases) == expected_releases
+    assert not workspace.payload_transport_buffers
+    assert workspace.embedding_transport_buffers is None
+    assert workspace.gradient_transport_buffers is None
+    allocator.fail_releases = False
+    retry = api._DynamicIterationWorkspace(
+        authority=_authority(),
+        rank=5,
+        device=torch.device("cuda", 0),
+        allocator=allocator,
+        storage=MdpEmbeddingStorage(allocator),
+    )
+    retry.release()
 
 
 def test_rejects_foreign_dependencies_before_allocation():
