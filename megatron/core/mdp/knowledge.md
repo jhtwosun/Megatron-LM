@@ -17,6 +17,14 @@ code ownership, invariants, control flow, and safe extension points.
   route. There is no endpoint-star pixel mode and no pixel-sharding
   compatibility switch.
 
+The bullets above identify the reconstructed historical baseline.  The stack
+through PR90 additionally activates a training-only D3 Dynamic-CP composition,
+generic model dispatch, Energon descriptor-first materialization, and
+model-owned Qwen3-VL/Nemotron adapters.  Do not infer production support from
+the presence of their lower-level contracts: the concrete D3 builder remains
+configured-topology-locked to `TP1/EP1/PP1/CP1/ECP1/VPP1`, and Qwen3-VL
+rejects a dynamically selected decoder CP group greater than one.
+
 When this file disagrees with code, code and tests win. Update this file in the
 same commit whenever an invariant, phase, flag, support constraint, or primary
 entry point changes.
@@ -417,6 +425,13 @@ Current major constraints:
   while delayed gradient reduction, parameter-gather overlap with the optimizer
   step, and MXFP8 grad-buffer reuse for the parameter all-gather are rejected by
   `validate_mdp_config`.
+
+For the D3 training path specifically, configured TP/PP/CP/ECP/EP/VPP are still
+locked to one.  Per-record decoder CP may be selected from the WORLD DP pool;
+this is verified for Qwen3.5-VL at CP1/CP2 on one node.  Qwen3-VL DeepStack is
+verified only at selected CP1 and fails closed above it.  Static-runtime
+decoder-TP/CP and encoder-CP tests are not evidence that the concrete D3
+composition supports those configured dimensions.
 
 Always read `validate_mdp_config` before relaxing a constraint. A validation
 change without corresponding runtime/test support is not an implementation.
