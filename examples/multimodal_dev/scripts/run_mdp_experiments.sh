@@ -78,6 +78,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_OFFLINE=1
 
 MDP=${MDP:-0}
+MODEL_ARCH=${MODEL_ARCH:-qwen35_vl}
 OVERLAP=${OVERLAP:-0}
 EP_OVERLAP=${EP_OVERLAP:-0}
 PIXEL_LOCALITY=${PIXEL_LOCALITY:-0}
@@ -226,7 +227,7 @@ if [ "$NSYS" = "1" ]; then
 fi
 
 "${LAUNCH[@]}" "$ENTRY" \
-    --model-arch qwen35_vl \
+    --model-arch "$MODEL_ARCH" \
     --model-variant 35b_a3b_light \
     --dataset-provider mdp_mock \
     --use-vanilla-collate-fn \

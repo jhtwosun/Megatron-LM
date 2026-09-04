@@ -67,7 +67,7 @@ def add_multimodal_args(parser):
         "--model-arch",
         type=str,
         default="qwen35_vl",
-        help="Model architecture. Available: qwen35_vl, nemotron_omni",
+        help="Model architecture. Available: qwen35_vl, qwen3_vl, nemotron_omni",
     )
     group.add_argument(
         "--model-variant",

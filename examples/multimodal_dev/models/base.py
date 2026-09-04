@@ -206,6 +206,7 @@ class MultimodalModel(MegatronModule):
                     packed_seq_params=packed_seq_params,
                 )
 
+        decoder_block_kwargs = None
         if self.pre_process:
             # An MDP endpoint supplies the pre-encoded leaf. The native path
             # encodes pixels here; both feed the same scatter below.
@@ -222,7 +223,7 @@ class MultimodalModel(MegatronModule):
 
                 if vision_embeddings is not None:
                     with nvtx_phase("scatter_vision_embeddings"):
-                        decoder_input = self._scatter_vision_embeddings(
+                        decoder_input, decoder_block_kwargs = self.prepare_decoder_inputs(
                             input_ids, text_embeddings, vision_embeddings
                         )
                 else:
@@ -253,7 +254,7 @@ class MultimodalModel(MegatronModule):
             padding_mask=padding_mask,
         )
 
-        return dict(
+        decoder_inputs = dict(
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -263,6 +264,15 @@ class MultimodalModel(MegatronModule):
             padding_mask=padding_mask,
             packed_seq_params=packed_seq_params,
         )
+        if decoder_block_kwargs is not None:
+            decoder_inputs["extra_block_kwargs"] = decoder_block_kwargs
+        return decoder_inputs
+
+    def prepare_decoder_inputs(self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings):
+        """Build decoder input plus optional model-owned block arguments."""
+        return self._scatter_vision_embeddings(
+            input_ids, text_embeddings, vision_embeddings
+        ), None
 
     def build_schedule_plan(
         self,
