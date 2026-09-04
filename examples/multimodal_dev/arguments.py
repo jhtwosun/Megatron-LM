@@ -147,7 +147,7 @@ def add_multimodal_args(parser):
         "--mdp-encoder-cp",
         type=int,
         default=1,
-        help="MDP encoder context-parallel width (must currently be 1).",
+        help="MDP encoder context-parallel width, independent of decoder CP.",
     )
     group.add_argument(
         "--mdp-encoder-max-payload-rows",
@@ -226,7 +226,7 @@ def add_multimodal_args(parser):
             "thread and a dedicated side CUDA stream while the current "
             "iteration runs, hiding the serial P1 window-capture cost "
             "without inserting H2D copies into the main compute stream. "
-            "TP=1 only."
+            "TP=1 and encoder-CP=1 only."
         ),
     )
     group.add_argument(

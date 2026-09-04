@@ -32,6 +32,7 @@ from megatron.core.mdp.runtime import MdpRuntime, MdpRuntimeState
 from megatron.core.mdp.storage import MdpEmbeddingStorage
 from megatron.core.mdp.window import MdpIterationWindow
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 WORLD = int(os.environ.get("WORLD_SIZE", "1"))
@@ -244,25 +245,54 @@ def test_sequence_parallel_decoder_cp_split_matches_full_token_order(monkeypatch
 
 
 class _IdentityEncoder(torch.nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, cp_group):
         super().__init__()
         self.config = config
+        self.cp_group = cp_group
         self.proj = torch.nn.Linear(WIDTH, WIDTH, bias=False)
         with torch.no_grad():
             self.proj.weight.copy_(torch.eye(WIDTH))
 
     def forward(self, value):
-        return self.proj(value)
+        cp_size = self.cp_group.size()
+        if cp_size == 1:
+            return self.proj(value)
+        cp_rank = self.cp_group.rank()
+        rows_per_rank, remainder = divmod(value.shape[0], cp_size)
+        split_sizes = [
+            rows_per_rank + int(rank < remainder) for rank in range(cp_size)
+        ]
+        start = sum(split_sizes[:cp_rank])
+        local_output = self.proj(
+            value.narrow(0, start, split_sizes[cp_rank])
+        )
+        return gather_from_sequence_parallel_region(
+            local_output,
+            tensor_parallel_output_grad=True,
+            group=self.cp_group,
+            output_split_sizes=(
+                split_sizes if len(set(split_sizes)) > 1 else None
+            ),
+        )
 
 
 class _TpCaptureAdapter:
     payload_width = WIDTH
     spatial_merge_size = 2
 
-    def __init__(self, use_packed_sequence=False, *, text_only=False):
+    def __init__(
+        self,
+        use_packed_sequence=False,
+        *,
+        text_only=False,
+        record_encoder_grads=False,
+    ):
         self.use_packed_sequence = use_packed_sequence
         self.text_only = text_only
+        self.record_encoder_grads = record_encoder_grads
         self.batch_observations = []
+        self.input_grad_events = []
+        self.output_grad_events = []
         self._microbatch_id = 0
 
     def _sample(self, sample_id):
@@ -360,20 +390,33 @@ class _TpCaptureAdapter:
         return item.payload_rows
 
     def build_encoder(self, model_config, *, pg_collection):
-        del pg_collection
-        return _IdentityEncoder(model_config)
+        return _IdentityEncoder(model_config, pg_collection.cp)
 
     def encode(self, encoder, payload, layout):
         pieces = []
         for segment in layout.segments:
-            pieces.append(
-                encoder(
-                    payload[
-                        segment.payload_row_start : segment.payload_row_start + segment.output_rows
-                    ]
-                )
-            )
-        return torch.cat(pieces) if pieces else payload[:0]
+            piece = payload[
+                segment.payload_row_start : segment.payload_row_start
+                + segment.output_rows
+            ]
+            if self.record_encoder_grads and torch.is_grad_enabled():
+                piece = piece.detach().requires_grad_(True)
+
+                def _record_input_grad(grad, item_id=segment.global_item_id):
+                    self.input_grad_events.append((item_id, grad.detach().clone()))
+                    return grad
+
+                piece.register_hook(_record_input_grad)
+            pieces.append(encoder(piece))
+        output = torch.cat(pieces) if pieces else payload[:0]
+        if self.record_encoder_grads and output.requires_grad:
+
+            def _record_output_grad(grad):
+                self.output_grad_events.append(grad.detach().clone())
+                return grad
+
+            output.register_hook(_record_output_grad)
+        return output
 
 
 class _TrackingAllocator(DirectBufferAllocator):
@@ -381,6 +424,7 @@ class _TrackingAllocator(DirectBufferAllocator):
         super().__init__()
         self.acquired = []
         self.released = []
+        self.release_counts = {}
         self.fail_tag = fail_tag
         self.fail_rank = fail_rank
         self.fail_on_occurrence = fail_on_occurrence
@@ -399,16 +443,22 @@ class _TrackingAllocator(DirectBufferAllocator):
                 raise RuntimeError(f"injected {tag} allocation failure")
         tensor = super().acquire(rows=rows, width=width, dtype=dtype, device=device, tag=tag)
         self.acquired.append((tag, tensor))
+        self.release_counts[tensor.untyped_storage()._cdata] = 0
         return tensor
 
     def release(self, tensor):
         self.released.append(tensor)
+        self.release_counts[tensor.untyped_storage()._cdata] += 1
         super().release(tensor)
 
     def assert_tag_released_once(self, tag):
         bases = [tensor for acquired_tag, tensor in self.acquired if acquired_tag == tag]
         for base in bases:
             assert sum(released is base for released in self.released) == 1
+
+    def assert_all_released_once(self):
+        assert self.release_counts
+        assert all(count == 1 for count in self.release_counts.values())
 
 
 class _RecordingBridge(ModalityBridge):
@@ -422,9 +472,16 @@ class _RecordingBridge(ModalityBridge):
         return super().exchange_all_to_all(ledger, local_tensors, **kwargs)
 
 
-def _rank_map(topology):
+def _rank_map(topology, *, encoder_cp=1):
     return build_rank_map(
-        MdpRankSpec(world_size=4, tp=2, pp=topology.pp, cp=topology.cp, ep=1, encoder_cp=1)
+        MdpRankSpec(
+            world_size=4,
+            tp=2,
+            pp=topology.pp,
+            cp=topology.cp,
+            ep=1,
+            encoder_cp=encoder_cp,
+        )
     )
 
 
@@ -450,16 +507,18 @@ def _local_decoder_endpoint_id(rank_map, rank):
     return endpoints.index(source_rank) if source_rank in endpoints else None
 
 
-def _build_runtime(topology, *, allocator=None, adapter=None):
+def _build_runtime(topology, *, encoder_cp=1, allocator=None, adapter=None):
     rank = torch.distributed.get_rank()
-    rank_map = _rank_map(topology)
+    rank_map = _rank_map(topology, encoder_cp=encoder_cp)
     view = rank_map.view(rank)
     groups = install_mdp_process_groups(
         rank_map, group_registry=MdpGroupRegistry(), decoder_pg_collection=_decoder_pg_collection()
     )
-    encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
+    encoder_pgs = build_encoder_pg_collection(
+        rank_map, encoder_cp=encoder_cp, process_groups=groups
+    )
     adapter = adapter or _TpCaptureAdapter()
-    config = MdpConfig(enable=True)
+    config = MdpConfig(enable=True, encoder_cp=encoder_cp)
     domain = build_encoder_domain(
         adapter=adapter,
         model_config=TransformerConfig(
@@ -496,6 +555,133 @@ def _build_runtime(topology, *, allocator=None, adapter=None):
         params_dtype=torch.float32,
     )
     return runtime, allocator, bridge
+
+
+def _owned_optimizer_grad_shard(runtime):
+    """Return the stable DistOpt gradient shard owned by this rank."""
+    encoder_ddp = runtime.encoder_domain.encoder_ddp
+    parameter = next(encoder_ddp.module.parameters())
+    bucket_group = next(
+        group
+        for group in encoder_ddp.bucket_groups
+        + encoder_ddp.expert_parallel_bucket_groups
+        if parameter in group.param_to_bucket
+    )
+    bucket = bucket_group.param_to_bucket[parameter]
+    bucket_index = bucket_group.buckets.index(bucket)
+    shard_views = bucket_group.cached_grad_buffer_shard_list[bucket_index]
+    group_rank = bucket_group.intra_distributed_optimizer_instance_rank
+    owned_shard = shard_views[group_rank].detach().clone()
+    return owned_shard.cpu()
+
+
+def _world_summed_input_grads(adapter):
+    local = tuple(
+        (item_id, grad.cpu()) for item_id, grad in adapter.input_grad_events
+    )
+    combined = {}
+    for events in _gather(local):
+        for item_id, grad in events:
+            combined[item_id] = combined.get(
+                item_id, torch.zeros_like(grad)
+            ) + grad
+    return combined
+
+
+def _run_tp2_decoder_cp2_encoder_cp(topology, encoder_cp):
+    adapter = _TpCaptureAdapter(record_encoder_grads=True)
+    runtime, allocator, bridge = _build_runtime(
+        topology, encoder_cp=encoder_cp, adapter=adapter
+    )
+    rank = torch.distributed.get_rank()
+    rank_map = runtime.rank_map
+    endpoint_id = _local_decoder_endpoint_id(rank_map, rank)
+    assert endpoint_id is not None
+    encoder = runtime.encoder_domain.encoder_ddp.module
+    assert encoder.cp_group is runtime.process_groups.encoder_cp_group
+
+    replay = runtime.begin_iteration(
+        _source_iterator(), num_microbatches=2, forward_only=False
+    )
+    leaves = []
+    loss_terms = []
+    for microbatch_id in range(2):
+        assert next(replay[0]).microbatch_id == microbatch_id
+        leaf = runtime.storage.get_leaf(microbatch_id)
+        assert leaf is not None
+        leaves.append(leaf.detach().cpu().clone())
+        coefficient = float((endpoint_id + 1) * (microbatch_id + 1))
+        loss_terms.append(leaf.mul(coefficient).sum())
+    loss = torch.stack(loss_terms).sum()
+    loss_value = loss.detach().cpu()
+    had_handle = runtime._handle is not None
+    produced_items = (
+        tuple(
+            segment.global_item_id
+            for chunk in runtime._handle.chunk_layouts
+            for segment in chunk.segments
+        )
+        if had_handle
+        else ()
+    )
+    is_worker_leader = (
+        rank == runtime.process_groups.encoder_cp_leader_rank
+    )
+    loss.backward()
+    runtime.capture_global_num_tokens(torch.tensor(1.0, device="cuda"))
+    runtime.mark_decoder_complete()
+    runtime.end_iteration()
+
+    input_grads = _world_summed_input_grads(adapter)
+    owned_grad = _owned_optimizer_grad_shard(runtime)
+    step_success, _, _ = runtime.encoder_domain.encoder_optimizer.step()
+    assert step_success
+    parameter = next(
+        runtime.encoder_domain.encoder_ddp.module.parameters()
+    ).detach().cpu().clone()
+
+    phase_keys = {}
+    for phase, keys in bridge.local_keys_by_phase:
+        phase_keys[phase.value] = tuple(
+            (key.global_item_id, key.slice_id) for key in keys
+        )
+    result = {
+        "rank": rank,
+        "endpoint_id": endpoint_id,
+        "is_worker_leader": is_worker_leader,
+        "had_handle": had_handle,
+        "worker_id": runtime.rank_view.my_worker_id,
+        "produced_items": produced_items,
+        "encoder_cp_group_is_explicit": (
+            encoder.cp_group is runtime.process_groups.encoder_cp_group
+        ),
+        "encoder_cp_group_is_distinct_from_decoder_tp": (
+            encoder.cp_group is not runtime.process_groups.decoder_tp_group
+        ),
+        "encoder_cp_group_ranks": tuple(
+            runtime.process_groups.encoder_cp_group_ranks
+        ),
+        "decoder_tp_group_ranks": tuple(rank_map.tp_group_ranks(rank)),
+        "loss": loss_value,
+        "leaves": tuple(leaves),
+        "input_grads": input_grads,
+        "input_nonzero": sum(
+            int(torch.count_nonzero(grad))
+            for _, grad in adapter.input_grad_events
+        ),
+        "output_nonzero": tuple(
+            int(torch.count_nonzero(grad)) for grad in adapter.output_grad_events
+        ),
+        "phase_keys": phase_keys,
+        "owned_grad": owned_grad,
+        "parameter": parameter,
+    }
+    assert runtime.state is MdpRuntimeState.EMPTY
+    runtime.storage.assert_empty()
+    runtime.bridge.assert_idle()
+    assert allocator._outstanding == 0
+    allocator.assert_all_released_once()
+    return result
 
 
 @needs_world4
@@ -946,6 +1132,162 @@ def test_tp0_handoff_broadcasts_identical_full_leaf_and_collapses_equal_grads(pa
     allocator.assert_tag_released_once("tp_grad_reference")
     runtime.storage.assert_empty()
     runtime.bridge.assert_idle()
+
+
+@needs_world4
+def test_tp2_decoder_cp2_encoder_cp2_matches_ecp1(cp2_pp1_topology):
+    reference = _run_tp2_decoder_cp2_encoder_cp(cp2_pp1_topology, 1)
+    candidate = _run_tp2_decoder_cp2_encoder_cp(cp2_pp1_topology, 2)
+
+    torch.testing.assert_close(
+        candidate["loss"], reference["loss"], rtol=0, atol=0
+    )
+    assert len(candidate["leaves"]) == len(reference["leaves"]) == 2
+    for actual, expected in zip(candidate["leaves"], reference["leaves"]):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    assert candidate["input_grads"].keys() == reference["input_grads"].keys()
+    assert candidate["input_grads"].keys() == {0, 1}
+    for item_id in candidate["input_grads"]:
+        torch.testing.assert_close(
+            candidate["input_grads"][item_id],
+            reference["input_grads"][item_id],
+            rtol=0,
+            atol=0,
+        )
+    torch.testing.assert_close(
+        candidate["owned_grad"], reference["owned_grad"], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        candidate["parameter"], reference["parameter"], rtol=0, atol=0
+    )
+
+    observations = _gather(
+        {
+            key: candidate[key]
+            for key in (
+                "rank",
+                "endpoint_id",
+                "is_worker_leader",
+                "had_handle",
+                "worker_id",
+                "produced_items",
+                "encoder_cp_group_is_explicit",
+                "encoder_cp_group_is_distinct_from_decoder_tp",
+                "encoder_cp_group_ranks",
+                "decoder_tp_group_ranks",
+                "leaves",
+                "input_nonzero",
+                "output_nonzero",
+                "phase_keys",
+                "parameter",
+            )
+        }
+    )
+    by_rank = {entry["rank"]: entry for entry in observations}
+    rank_map = _rank_map(cp2_pp1_topology, encoder_cp=2)
+    leaders = {
+        rank_map.worker_leader_rank(0, worker_id)
+        for worker_id in range(rank_map.num_workers_per_group)
+    }
+    endpoint_ranks = rank_map.decoder_endpoint_ranks(0)
+    assert (
+        rank_map.spec.tp,
+        rank_map.spec.pp,
+        rank_map.spec.cp,
+        rank_map.spec.encoder_cp,
+    ) == (2, 1, 2, 2)
+    assert len(leaders) == 2
+    assert len(endpoint_ranks) == 2
+
+    worker_items = {}
+    for worker_id in range(rank_map.num_workers_per_group):
+        members = [
+            entry for entry in observations if entry["worker_id"] == worker_id
+        ]
+        assert len(members) == 2
+        assert members[0]["produced_items"] == members[1]["produced_items"]
+        assert len(members[0]["produced_items"]) == 1
+        worker_items[worker_id] = members[0]["produced_items"]
+    assert sorted(
+        item_id for items in worker_items.values() for item_id in items
+    ) == [0, 1]
+
+    source_workers = rank_map.data_loader_source_worker_ids(0)
+    expected_pixel_keys = {rank: [] for rank in by_rank}
+    for item_id in range(2):
+        owner_worker = source_workers[item_id % len(source_workers)]
+        owner_rank = rank_map.worker_leader_rank(0, owner_worker)
+        expected_pixel_keys[owner_rank].append((item_id, 0))
+
+    for observed_rank, entry in by_rank.items():
+        assert entry["endpoint_id"] == _local_decoder_endpoint_id(
+            rank_map, observed_rank
+        )
+        assert entry["is_worker_leader"] == (observed_rank in leaders)
+        assert entry["had_handle"]
+        assert entry["encoder_cp_group_is_explicit"]
+        assert entry["encoder_cp_group_is_distinct_from_decoder_tp"]
+        assert entry["encoder_cp_group_ranks"] == entry["decoder_tp_group_ranks"]
+        assert entry["input_nonzero"] > 0
+        assert entry["output_nonzero"]
+        assert entry["phase_keys"][BridgePhase.PIXEL.value] == tuple(
+            expected_pixel_keys[observed_rank]
+        )
+        if observed_rank in leaders:
+            assert all(count > 0 for count in entry["output_nonzero"])
+            assert entry["phase_keys"][BridgePhase.EMBEDDING.value] == tuple(
+                (item_id, endpoint_id)
+                for item_id in entry["produced_items"]
+                for endpoint_id in range(len(endpoint_ranks))
+            )
+            assert entry["phase_keys"][BridgePhase.GRADIENT.value] == tuple(
+                (item_id, entry["endpoint_id"]) for item_id in range(2)
+            )
+        else:
+            assert all(count == 0 for count in entry["output_nonzero"])
+            assert entry["phase_keys"][BridgePhase.EMBEDDING.value] == ()
+            assert entry["phase_keys"][BridgePhase.GRADIENT.value] == ()
+
+    for endpoint_rank in endpoint_ranks:
+        tp_ranks = rank_map.tp_group_ranks(endpoint_rank)
+        assert len(tp_ranks) == 2
+        for microbatch_id in range(2):
+            torch.testing.assert_close(
+                by_rank[tp_ranks[0]]["leaves"][microbatch_id],
+                by_rank[tp_ranks[1]]["leaves"][microbatch_id],
+                rtol=0,
+                atol=0,
+            )
+
+    pixel_keys = sorted(
+        key
+        for entry in observations
+        for key in entry["phase_keys"][BridgePhase.PIXEL.value]
+    )
+    embedding_keys = sorted(
+        key
+        for entry in observations
+        for key in entry["phase_keys"][BridgePhase.EMBEDDING.value]
+    )
+    gradient_keys = sorted(
+        key
+        for entry in observations
+        for key in entry["phase_keys"][BridgePhase.GRADIENT.value]
+    )
+    assert pixel_keys == [(item_id, 0) for item_id in range(2)]
+    assert embedding_keys == [
+        (item_id, endpoint_id)
+        for item_id in range(2)
+        for endpoint_id in range(len(endpoint_ranks))
+    ]
+    assert gradient_keys == embedding_keys
+
+    first_parameter = observations[0]["parameter"]
+    for entry in observations[1:]:
+        torch.testing.assert_close(
+            entry["parameter"], first_parameter, rtol=0, atol=0
+        )
 
 
 @needs_world4

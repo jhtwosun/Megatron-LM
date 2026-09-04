@@ -107,6 +107,35 @@ def _apply_rope_fp32_no_cp(
         nvtx_range_pop(range_name)
 
 
+def _apply_rope_fp32_encoder_cp_local(
+    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
+):
+    """Apply materialized, already-partitioned RoPE as one local BSHD sequence."""
+    if t.dim() != 3:
+        raise ValueError(
+            f"encoder-CP local RoPE expects a THD tensor, got {tuple(t.shape)}"
+        )
+    if (
+        freqs.dim() != 4
+        or freqs.shape[0] != t.shape[0]
+        or freqs.shape[1] != 1
+        or freqs.shape[2] != 1
+    ):
+        raise ValueError(
+            "encoder-CP local RoPE expects materialized row-wise frequencies "
+            f"[T, 1, 1, D], got {tuple(freqs.shape)} for T={t.shape[0]}"
+        )
+    return _apply_rope_fp32(
+        t.unsqueeze(1),
+        freqs,
+        config,
+        cu_seqlens=None,
+        mscale=mscale,
+        cp_group=_NO_CP_GROUP,
+        max_seqlen=None,
+    ).squeeze(1)
+
+
 class Qwen35VLVisionSelfAttention(SelfAttention):
     """ViT self-attention with RoPE applied in fp32.
 
@@ -122,6 +151,20 @@ class Qwen35VLVisionSelfAttention(SelfAttention):
 
         _orig = _attn_mod.apply_rotary_pos_emb
         _attn_mod.apply_rotary_pos_emb = _apply_rope_fp32_no_cp
+        try:
+            return super().forward(*args, **kwargs)
+        finally:
+            _attn_mod.apply_rotary_pos_emb = _orig
+
+
+class Qwen35VLEncoderCpSelfAttention(SelfAttention):
+    """ViT self-attention for materialized encoder-CP-local RoPE rows."""
+
+    def forward(self, *args, **kwargs):
+        import megatron.core.transformer.attention as _attn_mod
+
+        _orig = _attn_mod.apply_rotary_pos_emb
+        _attn_mod.apply_rotary_pos_emb = _apply_rope_fp32_encoder_cp_local
         try:
             return super().forward(*args, **kwargs)
         finally:
@@ -165,4 +208,11 @@ def get_qwen35_vl_vision_spec() -> ModuleSpec:
     """
     spec = get_vit_layer_with_transformer_engine_spec()
     spec.submodules.self_attention.module = Qwen35VLVisionSelfAttention
+    return spec
+
+
+def get_qwen35_vl_encoder_cp_vision_spec() -> ModuleSpec:
+    """Vision layer spec for explicitly materialized encoder-CP-local RoPE."""
+    spec = get_vit_layer_with_transformer_engine_spec()
+    spec.submodules.self_attention.module = Qwen35VLEncoderCpSelfAttention
     return spec

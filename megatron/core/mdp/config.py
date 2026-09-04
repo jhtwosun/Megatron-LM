@@ -94,13 +94,12 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
         return
 
     # --- MdpConfig field validation ---
-    if config.encoder_cp != 1:
+    if config.encoder_cp < 1:
         _reject(
             "encoder_cp",
             config.encoder_cp,
-            "encoder_cp == 1",
-            "Encoder context parallelism is a registered extension hook, not an "
-            "implemented capability.",
+            "encoder_cp >= 1",
+            "Encoder context parallelism must have a positive group size.",
             "1",
         )
     if config.encoder_max_payload_rows is not None and config.encoder_max_payload_rows <= 0:
@@ -183,14 +182,15 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "plan mismatch degrades from a diagnosable error into a collective hang.",
             "1",
         )
-    if config.overlap_window_capture and options.tensor_parallel_size != 1:
+    if config.overlap_window_capture and (
+        options.tensor_parallel_size != 1 or config.encoder_cp != 1
+    ):
         _reject(
             "overlap_window_capture",
             config.overlap_window_capture,
-            "tensor_parallel_size == 1",
-            "The capture path performs a TP broadcast per microbatch; running it "
-            "on the prefetch thread concurrently with the schedule's NCCL calls "
-            "is only validated without tensor parallelism.",
+            "tensor_parallel_size == 1 and encoder_cp == 1",
+            "TP broadcast or encoder-CP failure consensus would issue NCCL from "
+            "the prefetch thread concurrently with the schedule's collectives.",
             "False",
         )
 
@@ -232,6 +232,19 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "world_size % (TP * PP * CP) == 0",
             f"TP * PP * CP = {model_parallel} must evenly divide the world size to "
             "form outer data-parallel planning groups.",
+        )
+    physical_encoder_domain = (
+        options.tensor_parallel_size
+        * options.pipeline_parallel_size
+        * options.context_parallel_size
+    )
+    if physical_encoder_domain % config.encoder_cp != 0:
+        _reject(
+            "encoder_cp",
+            config.encoder_cp,
+            "encoder_cp divides TP * PP * CP",
+            f"TP * PP * CP = {physical_encoder_domain} physical ranks must split "
+            "into equal logical encoder workers.",
         )
     if options.overlap_moe_expert_parallel_comm:
         if options.expert_parallel_size <= 1:

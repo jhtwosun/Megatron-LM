@@ -61,6 +61,53 @@ def test_decoder_tp2_configuration_passes():
     validate_mdp_config(MdpConfig(enable=True), _options(tensor_parallel_size=2))
 
 
+def test_overlap_window_capture_rejects_encoder_cp_collectives():
+    with pytest.raises(MdpConfigurationError, match="encoder_cp == 1"):
+        validate_mdp_config(
+            MdpConfig(enable=True, encoder_cp=2, overlap_window_capture=True),
+            _options(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("encoder_cp", "option_kwargs"),
+    [
+        (2, dict(context_parallel_size=1)),
+        (2, dict(context_parallel_size=2)),
+        (4, dict(tensor_parallel_size=2, context_parallel_size=2)),
+        (
+            3,
+            dict(
+                world_size=6,
+                tensor_parallel_size=2,
+                pipeline_parallel_size=3,
+            ),
+        ),
+        (
+            6,
+            dict(
+                world_size=6,
+                tensor_parallel_size=2,
+                pipeline_parallel_size=3,
+            ),
+        ),
+    ],
+)
+def test_encoder_cp_may_differ_from_decoder_cp(encoder_cp, option_kwargs):
+    validate_mdp_config(
+        MdpConfig(enable=True, encoder_cp=encoder_cp),
+        _options(**option_kwargs),
+    )
+
+
+def test_encoder_cp_must_divide_physical_encoder_worker_domain():
+    with pytest.raises(MdpConfigurationError, match=r"encoder_cp divides TP \* PP \* CP"):
+        validate_mdp_config(
+            MdpConfig(enable=True, encoder_cp=3),
+            _options(world_size=12, tensor_parallel_size=1, pipeline_parallel_size=2),
+        )
+
+
 def test_decoder_tp_must_be_positive():
     with pytest.raises(MdpConfigurationError, match="tensor_parallel_size"):
         validate_mdp_config(MdpConfig(enable=True), _options(tensor_parallel_size=0))
@@ -105,7 +152,7 @@ def test_disabled_mdp_skips_all_checks():
 @pytest.mark.parametrize(
     "config_kwargs, match",
     [
-        (dict(encoder_cp=2), "encoder_cp"),
+        (dict(encoder_cp=0), "encoder_cp"),
         (dict(encoder_max_payload_rows=0), "encoder_max_payload_rows"),
         (
             dict(encoder_recompute_granularity="partial"),
@@ -234,6 +281,7 @@ class _FakeTransformerConfig:
     recompute_method: object = None
     recompute_num_layers: object = None
     recompute_modules: object = None
+    context_parallel_size: int = 2
     hidden_size: int = 64
     fp8: object = None
 

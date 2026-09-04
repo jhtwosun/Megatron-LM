@@ -18,10 +18,10 @@ from megatron.core.mdp.observability import nvtx_phase
 from megatron.core.mdp.protocols import CapturedMicrobatch, MdpModelAdapter, VisionDescriptor
 
 # Owner-sharded pixel reading: while ``capture`` fetches one microbatch, this
-# holds ``(microbatch_owner_worker_id, my_worker_id)`` so the model's collate
+# holds ``(microbatch_owner_worker_id, my_worker_id, is_worker_leader)`` so the model's collate
 # path (which has no microbatch context in its signature) can skip pixel
-# materialization on non-owner workers. Unset outside MDP capture, so the
-# native path is unchanged. Thread-local because the
+# materialization on non-owner workers and encoder-CP followers. Unset outside
+# MDP capture, so the native path is unchanged. Thread-local because the
 # window-capture prefetch thread may capture the next train window while the
 # main thread captures an eval window.
 _PIXEL_OWNERSHIP = threading.local()
@@ -36,8 +36,8 @@ def pixel_capture_suppressed() -> bool:
     context = getattr(_PIXEL_OWNERSHIP, "value", None)
     if context is None:
         return False
-    owner_worker_id, my_worker_id = context
-    return owner_worker_id != my_worker_id
+    owner_worker_id, my_worker_id, is_worker_leader = context
+    return owner_worker_id != my_worker_id or not is_worker_leader
 
 
 def pixel_capture_owner_state() -> Optional[bool]:
@@ -45,8 +45,8 @@ def pixel_capture_owner_state() -> Optional[bool]:
     context = getattr(_PIXEL_OWNERSHIP, "value", None)
     if context is None:
         return None
-    owner_worker_id, my_worker_id = context
-    return owner_worker_id == my_worker_id
+    owner_worker_id, my_worker_id, is_worker_leader = context
+    return owner_worker_id == my_worker_id and is_worker_leader
 
 
 @dataclass(frozen=True)
@@ -132,6 +132,7 @@ class MdpIterationWindow:
         lane_id: Optional[int],
         my_worker_id: int,
         num_workers: int,
+        is_worker_leader: Optional[bool] = None,
         data_loader_source_worker_ids: Optional[Sequence[int]] = None,
         capture_error_consensus: Optional[
             Callable[[Optional[BaseException]], bool]
@@ -144,10 +145,10 @@ class MdpIterationWindow:
         image_ordinal)`` capture order, so they are stable and unique within the
         planning group (one endpoint per group generates them).
 
-        Every worker materializes and cuts pixels only for the microbatches it owns.
-        Ownership round-robins over logical workers that contain native TP0
-        DataLoader sources; the ownership context around ``adapter.get_batch`` lets
-        the collate path keep pixels local while broadcasting decoder metadata.
+        Each logical worker leader materializes and cuts pixels only for the
+        microbatches it owns. Ownership round-robins over workers containing native
+        TP0 DataLoader sources; the capture context lets collate keep pixels local
+        while broadcasting decoder metadata. ``None`` preserves the ECP1 path.
         """
         if isinstance(data_iterators, (list, tuple)):
             iterator = data_iterators[0] if data_iterators else None
@@ -178,9 +179,10 @@ class MdpIterationWindow:
         sidecar = {}
         next_item_id = 0
         merge = adapter.spatial_merge_size
+        effective_leader = True if is_worker_leader is None else is_worker_leader
         for microbatch_id in range(num_microbatches):
             owner_worker_id = source_worker_ids[microbatch_id % len(source_worker_ids)]
-            owns_pixels = owner_worker_id == my_worker_id
+            owns_pixels = owner_worker_id == my_worker_id and effective_leader
             captured = None
             capture_error = None
             pending_record = None
@@ -188,7 +190,11 @@ class MdpIterationWindow:
             pending_sidecar = {}
             pending_next_item_id = next_item_id
             try:
-                _PIXEL_OWNERSHIP.value = (owner_worker_id, my_worker_id)
+                _PIXEL_OWNERSHIP.value = (
+                    owner_worker_id,
+                    my_worker_id,
+                    effective_leader,
+                )
                 with nvtx_phase("p1_get_batch"):
                     captured = adapter.get_batch(iterator)
                 if captured is None:

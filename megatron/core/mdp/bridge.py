@@ -131,25 +131,13 @@ class ModalityBridge:
         """
         entries = []
         for route in plan.routes:
-            producer_ranks = rank_map.worker_ranks(plan.outer_dp_rank, route.producer_worker_id)
-            if len(producer_ranks) != 1:
-                raise MdpBridgeError(
-                    f"MDP: producer_worker_id={route.producer_worker_id} resolves to "
-                    f"{len(producer_ranks)} ranks; the encoder-CP physical expansion is "
-                    "not implemented in this version."
-                )
-            producer_rank = producer_ranks[0]
+            producer_rank = rank_map.worker_leader_rank(
+                plan.outer_dp_rank, route.producer_worker_id
+            )
             if phase is BridgePhase.PIXEL:
-                owner_ranks = rank_map.worker_ranks(
+                owner_rank = rank_map.worker_leader_rank(
                     plan.outer_dp_rank, route.owner_worker_id
                 )
-                if len(owner_ranks) != 1:
-                    raise MdpBridgeError(
-                        f"MDP: owner_worker_id={route.owner_worker_id} resolves to "
-                        f"{len(owner_ranks)} ranks; the encoder-CP physical "
-                        "expansion is not implemented in this version."
-                    )
-                owner_rank = owner_ranks[0]
                 transfers = (
                     (
                         owner_rank,
