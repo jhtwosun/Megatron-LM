@@ -35,6 +35,23 @@ def test_design_doc_example_w8_pp2():
     endpoint_view = rank_map.view(1)
     assert endpoint_view.lane_id == 1
     assert endpoint_view.my_worker_id == 0
+    assert endpoint_view.decoder_endpoint_id == 0
+
+
+def test_decoder_cp2_endpoints_are_pp0_ranks_with_one_canonical_source():
+    rank_map = build_rank_map(_spec(world_size=8, pp=2, cp=2))
+    assert rank_map.planning_groups() == ((0, 1, 4, 5), (2, 3, 6, 7))
+
+    for outer_dp_rank, expected_endpoints in enumerate(((0, 1), (2, 3))):
+        assert rank_map.decoder_endpoint_ranks(outer_dp_rank) == expected_endpoints
+        assert rank_map.endpoint_rank(outer_dp_rank) == expected_endpoints[0]
+        for endpoint_id, rank in enumerate(expected_endpoints):
+            view = rank_map.view(rank)
+            assert view.decoder_endpoint_id == endpoint_id
+            assert view.endpoint_rank == expected_endpoints[0]
+            assert view.lane_id == (outer_dp_rank if endpoint_id == 0 else None)
+        for rank in rank_map.planning_groups()[outer_dp_rank][2:]:
+            assert rank_map.view(rank).decoder_endpoint_id is None
 
 
 def test_groups_form_disjoint_world_partition():
@@ -103,6 +120,7 @@ def test_local_view_has_no_global_lists():
         (dict(encoder_cp=3, world_size=16, cp=2), "encoder_cp"),
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),
         (dict(pp=0), "pp"),
+        (dict(cp=0), "cp"),
     ],
 )
 def test_invalid_specs_rejected(kwargs, match):

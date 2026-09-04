@@ -335,10 +335,11 @@ class MdpRuntime:
             self._eval_outputs = tuple(chunk_outputs)
             detached = tuple(output.detach() for output in chunk_outputs)
 
-        # P3: embedding exchange straight into the endpoint leaves.
+        # P3: embedding exchange straight into this rank's endpoint leaves.
         emb_dest = {}
         leaves = []  # (microbatch_id, valid leaf view)
-        if self.rank_view.lane_id is not None:
+        endpoint_id = self.rank_view.decoder_endpoint_id
+        if endpoint_id is not None:
             with nvtx_phase("p3_leaf_assembly"):
                 for layout in plan.layouts:
                     if layout.text_only:
@@ -351,7 +352,7 @@ class MdpRuntime:
                         tag="leaf",
                     )
                     for segment in layout.segments:
-                        emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
+                        emb_dest[BridgeBufferKey(segment.global_item_id, endpoint_id)] = leaf[
                             segment.leaf_row_start : segment.leaf_row_start
                             + segment.output_rows
                         ]
@@ -359,13 +360,15 @@ class MdpRuntime:
         with nvtx_phase("p3_embedding_exchange"):
             emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
             emb_local = {}
+            endpoint_count = len(self.rank_map.decoder_endpoint_ranks(plan.outer_dp_rank))
             for item_id, (chunk_index, segment) in self._chunk_of_item.items():
-                emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
+                output = detached[chunk_index][
                     segment.output_row_start : segment.output_row_start + segment.output_rows
                 ]
-            # One alltoall instead of batched P2P: same ledger and payload,
-            # but no per-edge kernel pairs and no torch.cuda.synchronize
-            # workaround (all_to_all_single stream-orders its receive buffer).
+                for destination_id in range(endpoint_count):
+                    emb_local[BridgeBufferKey(item_id, destination_id)] = output
+            # Each endpoint receives the same full leaf. The model applies
+            # native decoder-CP partitioning after vision-token insertion.
             self.bridge.exchange_all_to_all(
                 self._iter_ledgers[BridgePhase.EMBEDDING],
                 emb_local,
@@ -437,59 +440,93 @@ class MdpRuntime:
             # the chunk output dtype). Therefore encoder_max_payload_rows bounds
             # one replay graph, not the full set of P5 gradient buffers.
             chunk_grads = []
+            endpoint_staging = []
             grad_dest = {}
-            if self._handle is not None:
-                with nvtx_phase("p5_grad_regroup"):
-                    for chunk_index, chunk in enumerate(self._chunk_layouts):
-                        # Match the chunk output dtype: a mixed-precision wrapper
-                        # (Float16Module) returns fp32 at the module boundary even
-                        # when parameters and transport run in bf16.
-                        output_dtype = self._handle.output_dtype(chunk_index)
-                        grad_buffer = self.allocator.acquire(
-                            rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
-                            width=self.hidden_size,
-                            dtype=output_dtype,
-                            device=self.device,
-                            tag="grad_regroup",
-                        )
-                        for segment in chunk.segments:
-                            grad_dest[BridgeBufferKey(segment.global_item_id)] = grad_buffer[
-                                segment.output_row_start : segment.output_row_start
-                                + segment.output_rows
-                            ]
-                        chunk_grads.append(grad_buffer[: chunk.total_output_rows])
-                    # Drop only the loop-local base-tensor reference; this does not
-                    # release its storage. The grad_dest and chunk_grads views
-                    # intentionally keep it alive through gradient exchange and
-                    # encoder backward.
-                    del grad_buffer
-            with nvtx_phase("p5_grad_exchange"):
-                grad_specs = self._iter_specs[BridgePhase.GRADIENT]
-                grad_local = {}
-                if self.rank_view.lane_id is not None:
-                    for layout in plan.layouts:
-                        if layout.text_only:
-                            continue
-                        grad = self.storage.pop_grad(layout.microbatch_id)
-                        for segment in layout.segments:
-                            grad_local[BridgeBufferKey(segment.global_item_id)] = grad[
-                                segment.leaf_row_start : segment.leaf_row_start
-                                + segment.output_rows
-                            ]
-                self.bridge.exchange_all_to_all(
-                    self._iter_ledgers[BridgePhase.GRADIENT],
-                    grad_local,
-                    tensor_specs=grad_specs,
-                    group=self.process_groups.planning_group,
-                    group_ranks=self.rank_view.planning_group_ranks,
-                    global_rank=self.rank_view.global_rank,
-                    dtype=self.params_dtype,
-                    device=self.device,
-                    dest_views=grad_dest,
-                )
-                # The chunk views remain in chunk_grads; segment views are no
-                # longer needed after the collective has populated them.
+            endpoint_count = len(self.rank_map.decoder_endpoint_ranks(plan.outer_dp_rank))
+            endpoint_id = self.rank_view.decoder_endpoint_id
+            staging_bases = []
+            try:
+                if self._handle is not None:
+                    with nvtx_phase("p5_grad_regroup"):
+                        for chunk_index, chunk in enumerate(self._chunk_layouts):
+                            # Match the chunk output dtype: a mixed-precision wrapper
+                            # (Float16Module) returns fp32 at the module boundary even
+                            # when parameters and transport run in bf16.
+                            output_dtype = self._handle.output_dtype(chunk_index)
+                            grad_buffer = self.allocator.acquire(
+                                rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
+                                width=self.hidden_size,
+                                dtype=output_dtype,
+                                device=self.device,
+                                tag="grad_regroup",
+                            )
+                            for segment in chunk.segments:
+                                grad_dest[BridgeBufferKey(segment.global_item_id)] = grad_buffer[
+                                    segment.output_row_start : segment.output_row_start
+                                    + segment.output_rows
+                                ]
+                            chunk_grads.append(grad_buffer[: chunk.total_output_rows])
+
+                            stages = []
+                            for destination_id in range(1, endpoint_count):
+                                stage = self.allocator.acquire(
+                                    rows=plan.capacity_policy.capacity_of(
+                                        chunk.total_output_rows
+                                    ),
+                                    width=self.hidden_size,
+                                    dtype=output_dtype,
+                                    device=self.device,
+                                    tag="grad_endpoint_stage",
+                                )
+                                staging_bases.append(stage)
+                                stage_valid = stage[: chunk.total_output_rows]
+                                stages.append(stage_valid)
+                                for segment in chunk.segments:
+                                    grad_dest[
+                                        BridgeBufferKey(
+                                            segment.global_item_id, destination_id
+                                        )
+                                    ] = stage_valid[
+                                        segment.output_row_start : segment.output_row_start
+                                        + segment.output_rows
+                                    ]
+                            endpoint_staging.append(tuple(stages))
+                with nvtx_phase("p5_grad_exchange"):
+                    grad_specs = self._iter_specs[BridgePhase.GRADIENT]
+                    grad_local = {}
+                    if endpoint_id is not None:
+                        for layout in plan.layouts:
+                            if layout.text_only:
+                                continue
+                            grad = self.storage.pop_grad(layout.microbatch_id)
+                            for segment in layout.segments:
+                                grad_local[
+                                    BridgeBufferKey(segment.global_item_id, endpoint_id)
+                                ] = grad[
+                                    segment.leaf_row_start : segment.leaf_row_start
+                                    + segment.output_rows
+                                ]
+                    self.bridge.exchange_all_to_all(
+                        self._iter_ledgers[BridgePhase.GRADIENT],
+                        grad_local,
+                        tensor_specs=grad_specs,
+                        group=self.process_groups.planning_group,
+                        group_ranks=self.rank_view.planning_group_ranks,
+                        global_rank=self.rank_view.global_rank,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                        dest_views=grad_dest,
+                    )
+                if endpoint_count > 1:
+                    with nvtx_phase("p5_grad_sum"):
+                        for chunk_grad, stages in zip(chunk_grads, endpoint_staging):
+                            for stage in stages:
+                                chunk_grad.add_(stage)
+            finally:
                 grad_dest.clear()
+                endpoint_staging.clear()
+                for stage in staging_bases:
+                    self.allocator.release(stage)
             if self._handle is not None:
                 with nvtx_phase("p5_encoder_backward"):
                     if isinstance(self._handle, EncoderWholeRecomputeHandle):
@@ -663,17 +700,20 @@ class MdpRuntime:
 
     def _tensor_specs(self, plan: MdpBatchPlan, *, pixels: bool) -> dict:
         specs = {}
+        endpoint_count = len(self.rank_map.decoder_endpoint_ranks(plan.outer_dp_rank))
         for route in plan.routes:
             segment = plan.segment_for_item(route.global_item_id)
             valid = segment.payload_rows if pixels else segment.output_rows
             width = self.adapter.payload_width if pixels else self.hidden_size
-            specs[BridgeBufferKey(route.global_item_id)] = BridgeTensorSpec(
-                valid_rows=valid,
-                capacity_rows=plan.capacity_policy.capacity_of(valid),
-                width=width,
-                dtype=self.params_dtype,
-                device=self.device,
-            )
+            endpoint_ids = (0,) if pixels else range(endpoint_count)
+            for endpoint_id in endpoint_ids:
+                specs[BridgeBufferKey(route.global_item_id, endpoint_id)] = BridgeTensorSpec(
+                    valid_rows=valid,
+                    capacity_rows=plan.capacity_policy.capacity_of(valid),
+                    width=width,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                )
         return specs
 
     def _assert_iteration_boundary(self) -> None:

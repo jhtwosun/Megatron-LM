@@ -212,13 +212,12 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "The current MDP support matrix requires TP=1.",
             "1",
         )
-    if options.context_parallel_size != 1:
+    if options.context_parallel_size < 1:
         _reject(
             "context_parallel_size",
             options.context_parallel_size,
-            "decoder CP == 1",
-            "Decoder context parallelism is a registered extension hook, not an "
-            "implemented capability.",
+            "decoder CP >= 1",
+            "The decoder context-parallel dimension must be positive.",
             "1",
         )
     model_parallel = (
