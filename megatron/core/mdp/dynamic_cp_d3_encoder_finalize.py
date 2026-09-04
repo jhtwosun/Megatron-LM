@@ -16,6 +16,7 @@ from megatron.core.mdp.dynamic_cp_d3_encoder_backward import (
     _validate_d3_encoder_finalize_ready,
 )
 from megatron.core.mdp.dynamic_cp_d3_gradient_gate_binding import _validate_native_group_context
+from megatron.core.mdp.dynamic_cp_d3_iteration_commit import _mint_d3_iteration_commit_ready
 from megatron.core.mdp.dynamic_cp_d3_producer_owner import _D3ProducerOwner
 from megatron.core.mdp.dynamic_cp_execution import (
     _PrecollectiveStatus,
@@ -367,7 +368,7 @@ class _D3EncoderFinalizeBinding:
                 if error is not None:
                     error.add_note(f"suppressed Gate-5 owner cleanup error: {cleanup_error!r}")
 
-    def finalize(self, ready: _D3EncoderFinalizeReady, /) -> None:
+    def finalize(self, ready: _D3EncoderFinalizeReady, /):
         if self._state == "finalizing":
             self._state = "poisoned"
             raise MdpTaskFatalError("MDP: encoder finalization claim cannot be reentered.")
@@ -406,6 +407,9 @@ class _D3EncoderFinalizeBinding:
             prepared.owner._complete_native_encoder_finalization(
                 prepared.runtime, prepared.encoder_ddp, prepared.token, prepared.iteration
             )
+            commit_ready = _mint_d3_iteration_commit_ready(
+                prepared.runtime, prepared.token, prepared.iteration
+            )
         except BaseException as caught:
             self._state = "poisoned"
             self._abort(armed.prepared, caught, armed.owner)
@@ -424,6 +428,7 @@ class _D3EncoderFinalizeBinding:
         object.__setattr__(prepared, "_authority", None)
         _scrub_ready(ready)
         self._state = "idle"
+        return commit_ready
 
 
 def _validate_dependencies(ranks, global_rank, device, timeout, *callbacks):

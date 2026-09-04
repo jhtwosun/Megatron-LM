@@ -107,6 +107,7 @@ def _ready():
 
 def _bindings(events, *, failing_operation=None, schedule_calls=None, status_contexts=None):
     authority = _Authority()
+    commit_ready = object()
 
     def operation(name, result=None):
         def invoke(*_args):
@@ -194,7 +195,8 @@ def _bindings(events, *, failing_operation=None, schedule_calls=None, status_con
         execute_gradient=operation("gradient-execute", "gradients"),
         prepare_encoder_completion=operation("completion-prepare", "completion"),
         execute_encoder_backward=operation("backward", "finalizer"),
-        execute_encoder_finalize=operation("finalize"),
+        execute_encoder_finalize=operation("finalize", commit_ready),
+        execute_iteration_commit=operation("commit"),
         cleanup=operation("cleanup"),
         status_gate=gate,
     )
@@ -312,6 +314,7 @@ def test_d3_coordinator_runs_one_ordered_lifecycle_and_rejects_stale_handoffs():
         "finalize",
         "cleanup",
         "gate-6:False",
+        "commit",
     ]
 
 
@@ -331,6 +334,26 @@ def test_d3_coordinator_mints_exact_fresh_status_contexts_without_retaining_them
     for context, _ in contexts[3:6]:
         assert context.phase_value is not None and context.ready is ready
     assert contexts[6][0].phase_value is None and contexts[6][0].ready is ready
+    assert coordinator.is_idle
+
+
+def test_d3_coordinator_commits_only_after_successful_gate6():
+    events = []
+    bindings = _bindings(events)
+
+    def fail_gate6(context, local_error):
+        events.append(f"gate-{context.gate_id}:{local_error is not None}")
+        if context.gate_id == 6:
+            raise RuntimeError("gate-6")
+
+    coordinator = _D3Coordinator(bindings=replace(bindings, status_gate=fail_gate6))
+    ready = _begin(coordinator)
+    coordinator.mark_decoder_complete(ready)
+
+    with pytest.raises(RuntimeError, match="gate-6"):
+        coordinator.end_iteration()
+
+    assert "commit" not in events
     assert coordinator.is_idle
 
 
@@ -411,7 +434,8 @@ def test_d3_coordinator_converges_local_precollective_failures_then_cleans_up(
     assert coordinator.is_idle
     if gate_id is not None:
         context, local_error = contexts[-1]
-        assert context.gate_id == gate_id and context.phase_value is None
+        assert context.gate_id == gate_id
+        assert context.phase_value is None
         assert local_error is not None
         if gate_id < 3:
             assert context.ready is None

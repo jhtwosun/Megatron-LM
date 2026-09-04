@@ -963,6 +963,33 @@ class MdpRuntime:
         self._token_consumed = False
         self._state = MdpRuntimeState.EMPTY
 
+    def _commit_successful_d3_iteration(self, *, iteration: int, token: torch.Tensor) -> None:
+        """Commit one post-Gate-6 D3 success without re-entering P5."""
+        if (
+            type(iteration) is not int
+            or iteration != self._iteration
+            or self._state is not MdpRuntimeState.EMPTY
+            or self._pre_authority_dynamic_producer is not None
+            or self._handle is not None
+            or self._chunk_payload_bases
+            or self._captured_num_tokens is not token
+            or self._token_capture_count != 1
+            or self._token_consumed is not True
+        ):
+            raise MdpStateError("MDP: D3 success commit retains its exact completed iteration.")
+        self._window = None
+        self._plan = None
+        self._iter_specs = {}
+        self._iter_ledgers = {}
+        self._eval_outputs = ()
+        self._chunk_layouts = ()
+        self._chunk_of_item = {}
+        self._captured_num_tokens = None
+        self._token_capture_count = 0
+        self._token_consumed = False
+        self._last_metrics = None
+        self._iteration += 1
+
     def _release_chunk_payload_bases(self) -> None:
         bases = self._chunk_payload_bases
         self._chunk_payload_bases = ()
