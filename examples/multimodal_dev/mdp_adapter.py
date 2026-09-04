@@ -700,6 +700,7 @@ class Qwen35VLMdpAdapter:
     def __init__(self, out_hidden_size: int, vision_kwargs: Optional[dict] = None):
         self._vision_kwargs = dict(vision_kwargs or VISION_KWARGS)
         self._vision_kwargs["out_hidden_size"] = out_hidden_size
+        self.embedding_width = out_hidden_size
         self.spatial_merge_size = self._vision_kwargs["spatial_merge_size"]
         self.payload_width = (
             self._vision_kwargs["in_channels"]

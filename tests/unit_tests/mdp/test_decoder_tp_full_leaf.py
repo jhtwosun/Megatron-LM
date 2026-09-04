@@ -115,6 +115,7 @@ def test_integration_threads_language_tp_group_into_groups_and_runtime(monkeypat
 
     def _runtime(**kwargs):
         observed["runtime_groups"] = kwargs["process_groups"]
+        observed["runtime_hidden_size"] = kwargs["hidden_size"]
         return SimpleNamespace()
 
     monkeypatch.setattr(mdp_integration, "MdpRuntime", _runtime)
@@ -123,7 +124,8 @@ def test_integration_threads_language_tp_group_into_groups_and_runtime(monkeypat
     monkeypatch.setattr(
         mdp_optimizer, "build_mdp_composite_optimizer", lambda decoder, encoder: (decoder, encoder)
     )
-    mdp_integration.set_adapter_builder(lambda args: (object(), object()))
+    adapter = SimpleNamespace(embedding_width=4 * WIDTH)
+    mdp_integration.set_adapter_builder(lambda args: (adapter, object()))
     args = SimpleNamespace(
         mdp_enable=True,
         world_size=4,
@@ -146,6 +148,7 @@ def test_integration_threads_language_tp_group_into_groups_and_runtime(monkeypat
     assert result == ("decoder-optimizer", "encoder-optimizer")
     assert observed["decoder_pg_collection"] is language_pgc
     assert observed["runtime_groups"] is process_groups
+    assert observed["runtime_hidden_size"] == 4 * WIDTH
     mdp_integration.reset_for_testing()
 
 
