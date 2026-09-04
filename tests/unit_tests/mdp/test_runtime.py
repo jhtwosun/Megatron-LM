@@ -22,6 +22,7 @@ from megatron.core.mdp.encoder import (
     build_encoder_pg_collection,
     finalize_encoder_grads,
 )
+from megatron.core.mdp.dynamic_cp import GlobalSampleId
 from megatron.core.mdp.errors import MdpStateError
 from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
 from megatron.core.mdp.plan import RowCapacityPolicy
@@ -465,6 +466,66 @@ def _complete_training_iteration(runtime, view):
     runtime.capture_global_num_tokens(torch.tensor(20.0, device="cuda"))
     runtime.mark_decoder_complete()
     runtime.end_iteration()
+
+
+class _DynamicSourceCodec:
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = []
+
+    def build_source_window_with_locations(self, records, *, source_dp_lane):
+        self.calls.append((records, source_dp_lane))
+        if self.error is not None:
+            raise self.error
+        manifest = ("manifest", source_dp_lane)
+        source = SimpleNamespace(metadata_manifest=lambda: manifest)
+        locations = MappingProxyType(
+            {
+                GlobalSampleId(source_dp_lane, sample_id): (0, sample_id)
+                for sample_id in range(len(GRIDS))
+            }
+        )
+        return source, locations
+
+
+def test_dynamic_producer_preparation_stops_after_p2_and_owns_exact_state():
+    runtime, view = _build_runtime(decoder_pp=1)
+    codec = _DynamicSourceCodec()
+
+    producer = runtime._prepare_dynamic_encoder_producer(
+        iter(range(10)), num_microbatches=2, forward_only=False, codec=codec
+    )
+
+    assert producer.local_prepare_error is None
+    assert producer.owner is runtime._pre_authority_dynamic_producer.owner
+    assert runtime.state is MdpRuntimeState.EMPTY
+    assert runtime._handle is not None
+    assert not runtime.storage._leaves
+    assert tuple(codec.calls[0][0]) == tuple(runtime._window.records())
+    assert codec.calls[0][1] == view.lane_id
+    assert set(producer.item_outputs) == set(range(len(GRIDS)))
+    assert set(producer.sample_location_by_id) == {
+        GlobalSampleId(view.lane_id, sample_id) for sample_id in range(len(GRIDS))
+    }
+
+    producer.owner.abort()
+    assert runtime.state is MdpRuntimeState.EMPTY
+
+
+def test_dynamic_producer_codec_failure_returns_clean_rendezvous_carrier():
+    runtime, _ = _build_runtime(decoder_pp=1)
+    error = RuntimeError("injected source codec failure")
+
+    producer = runtime._prepare_dynamic_encoder_producer(
+        iter(range(10)), num_microbatches=2, forward_only=False, codec=_DynamicSourceCodec(error)
+    )
+
+    assert producer.local_prepare_error is error
+    assert producer.owner is None
+    assert runtime.state is MdpRuntimeState.EMPTY
+    assert runtime._handle is None
+    assert not runtime._chunk_payload_bases
+    assert runtime._pre_authority_dynamic_producer is None
 
 
 def test_full_training_iteration_and_state_machine():

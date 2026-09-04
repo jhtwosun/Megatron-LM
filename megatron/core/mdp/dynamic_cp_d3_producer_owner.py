@@ -859,11 +859,16 @@ def _capture_d3_producer_owner(
     geometry = _capture_geometry(runtime, handle, layouts)
     _validate_outputs(handle, geometry, outputs, encoder_cp_follower, runtime.device)
     metadata = (local_manifest, source_window, static_plan)
-    if outputs:
-        if encoder_cp_follower or not all(value is not None for value in metadata) or not locations:
-            raise MdpConfigurationError("MDP: contributor owns complete local source metadata.")
-    elif any(value is not None for value in metadata) or locations:
-        raise MdpConfigurationError("MDP: empty producer carries no local source metadata.")
+    contributor = all(value is not None for value in metadata) and bool(locations)
+    noncontributor = not any(value is not None for value in metadata) and not locations
+    if not (contributor or noncontributor):
+        raise MdpConfigurationError(
+            "MDP: producer owns complete local source metadata or no source metadata."
+        )
+    if encoder_cp_follower and contributor:
+        raise MdpConfigurationError("MDP: encoder-CP follower owns no source metadata.")
+    if outputs and not contributor:
+        raise MdpConfigurationError("MDP: encoder outputs require local source metadata.")
     pixel_bases = tuple(runtime._chunk_payload_bases)
     values = (
         runtime,
