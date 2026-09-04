@@ -3,7 +3,7 @@
 """Private one-iteration D3 coordination over existing Dynamic-CP operations."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from megatron.core.mdp.bridge import BridgePhase
@@ -19,7 +19,84 @@ from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 
 _D3Operation = Callable[..., Any]
 _D3AuthorityStatusGate = Callable[[BaseException | None], None]
-_D3StatusGate = Callable[[int, BaseException | None, Any], None]
+
+
+_PENDING_GATE_STATUS_CONTEXT_SEALS: dict[object, tuple[int, ...]] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class _D3GateStatusContext:
+    """One exact local snapshot consumed by a future physical status binding."""
+
+    gate_id: int
+    authority: _DynamicIterationAuthority
+    phase_value: Any = field(compare=False, repr=False)
+    ready: DecoderReadyIteration | None = field(compare=False, repr=False)
+    _factory_seal: object = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self) is not _D3GateStatusContext:
+            raise MdpStateError("MDP: D3 gate status context is minted by its factory.")
+        if type(self.gate_id) is not int or not 0 <= self.gate_id <= 6:
+            raise MdpConfigurationError("MDP: D3 gate status context has a supported gate ID.")
+        if type(self.authority) is not _DynamicIterationAuthority:
+            raise MdpConfigurationError("MDP: D3 gate status context retains exact authority.")
+        if self.gate_id <= 2:
+            if self.ready is not None:
+                raise MdpConfigurationError(
+                    "MDP: D3 gate 0--2 status context has no predecessor ready handoff."
+                )
+            if (
+                self.gate_id == 2
+                and self.phase_value is not None
+                and type(self.phase_value) is not DecoderReadyIteration
+            ):
+                raise MdpConfigurationError(
+                    "MDP: D3 gate 2 status context carries typed ready preparation."
+                )
+        elif type(self.ready) is not DecoderReadyIteration:
+            raise MdpConfigurationError(
+                "MDP: D3 gate 3--6 status context retains exact active ready handoff."
+            )
+        fingerprint = _PENDING_GATE_STATUS_CONTEXT_SEALS.pop(self._factory_seal, None)
+        if fingerprint != _gate_status_context_fingerprint(self):
+            raise MdpStateError("MDP: D3 gate status context is minted by its factory.")
+
+
+def _gate_status_context_fingerprint(context: _D3GateStatusContext) -> tuple[int, ...]:
+    return tuple(
+        id(value)
+        for value in (context.gate_id, context.authority, context.phase_value, context.ready)
+    )
+
+
+def _make_d3_gate_status_context(
+    *,
+    gate_id: int,
+    authority: _DynamicIterationAuthority,
+    phase_value: Any,
+    ready: DecoderReadyIteration | None,
+) -> _D3GateStatusContext:
+    """Mint one one-shot status snapshot without deriving a physical wire."""
+    token = object()
+    kwargs = dict(
+        gate_id=gate_id,
+        authority=authority,
+        phase_value=phase_value,
+        ready=ready,
+        _factory_seal=token,
+    )
+    _PENDING_GATE_STATUS_CONTEXT_SEALS[token] = tuple(
+        id(value) for name, value in kwargs.items() if name != "_factory_seal"
+    )
+    try:
+        return _D3GateStatusContext(**kwargs)
+    except BaseException:
+        _PENDING_GATE_STATUS_CONTEXT_SEALS.pop(token, None)
+        raise
+
+
+_D3StatusGate = Callable[[_D3GateStatusContext, BaseException | None], None]
 
 
 @dataclass(frozen=True)
@@ -124,10 +201,44 @@ class _D3Coordinator:
                 pass
         raise error
 
+    @staticmethod
+    def _make_gate_status_context(
+        state: _D3ActiveIteration, *, gate_id: int, phase_value: Any
+    ) -> _D3GateStatusContext:
+        authority = state.authority
+        if type(authority) is not _DynamicIterationAuthority:
+            raise MdpStateError("MDP: D3 status context requires exact iteration authority.")
+        if gate_id <= 2:
+            if state.ready is not None:
+                raise MdpStateError("MDP: D3 gate 0--2 status precedes ready publication.")
+            ready = None
+        else:
+            ready = state.ready
+            if type(ready) is not DecoderReadyIteration:
+                raise MdpStateError("MDP: D3 gate 3--6 status requires exact active ready handoff.")
+        context = _make_d3_gate_status_context(
+            gate_id=gate_id, authority=authority, phase_value=phase_value, ready=ready
+        )
+        if (
+            type(context) is not _D3GateStatusContext
+            or context.gate_id != gate_id
+            or context.authority is not authority
+            or context.phase_value is not phase_value
+            or context.ready is not ready
+        ):
+            raise MdpStateError("MDP: D3 status context preserves exact active identities.")
+        return context
+
     def _complete_local_gate(
-        self, state: _D3ActiveIteration, *, gate_id: int, local_error: BaseException | None
+        self,
+        state: _D3ActiveIteration,
+        *,
+        gate_id: int,
+        phase_value: Any,
+        local_error: BaseException | None,
     ) -> None:
-        self._bindings.status_gate(gate_id, local_error, state.authority)
+        context = self._make_gate_status_context(state, gate_id=gate_id, phase_value=phase_value)
+        self._bindings.status_gate(context, local_error)
         if local_error is not None:
             error = MdpStateError(
                 f"MDP: D3 coordinator gate {gate_id} accepted a local preparation error."
@@ -144,7 +255,9 @@ class _D3Coordinator:
             value = None
             local_error = error
         try:
-            self._complete_local_gate(state, gate_id=gate_id, local_error=local_error)
+            self._complete_local_gate(
+                state, gate_id=gate_id, phase_value=value, local_error=local_error
+            )
         except BaseException as error:
             self._fail(state, error)
         return value
@@ -315,7 +428,8 @@ class _D3Coordinator:
         state.scheduled_abort_started = True
 
         try:
-            self._bindings.status_gate(3, primary_error, state.authority)
+            context = self._make_gate_status_context(state, gate_id=3, phase_value=None)
+            self._bindings.status_gate(context, primary_error)
         except BaseException as error:
             self._add_secondary_note(primary_error, "scheduled abort gate", error)
         cleanup_error = self._cleanup(state)
@@ -367,7 +481,7 @@ class _D3Coordinator:
         )
         cleanup_error = self._cleanup(state)
         try:
-            self._complete_local_gate(state, gate_id=6, local_error=cleanup_error)
+            self._complete_local_gate(state, gate_id=6, phase_value=None, local_error=cleanup_error)
         except BaseException as error:
             self._fail(state, error)
         self._active = None
