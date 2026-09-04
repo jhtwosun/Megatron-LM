@@ -293,6 +293,23 @@ def test_exact_chunk_regroup_is_plan_ordered_and_does_not_run_backward(monkeypat
     assert api._validate_prepared_native_encoder_completion(completion, owner=owner) is completion
 
 
+def test_transport_dtype_gradients_cast_into_native_output_dtype():
+    api = _api()
+    runtime, outputs = _runtime()
+    owner = _capture(api, runtime, outputs)
+    gradients = MappingProxyType(
+        {
+            item_id: torch.ones_like(output, dtype=torch.bfloat16)
+            for item_id, output in outputs.items()
+        }
+    )
+
+    completion = owner.prepare_dynamic_completion(gradients, transport_dtype=torch.bfloat16)
+
+    assert all(view.dtype is torch.float32 for view in completion.gradient_views)
+    assert all(torch.equal(view, torch.ones_like(view)) for view in completion.gradient_views)
+
+
 def test_native_completion_requires_factory_seal():
     api = _api()
     runtime, outputs = _runtime()

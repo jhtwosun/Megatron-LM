@@ -440,7 +440,7 @@ class _D3ProducerOwner:
             self._encoder_ddp_callable_authority = ()
             self._finalization_token_authority = None
 
-    def prepare_dynamic_completion(self, native_gradients: Mapping, /):
+    def prepare_dynamic_completion(self, native_gradients: Mapping, /, *, transport_dtype=None):
         """Regroup exact item gradients without invoking encoder backward."""
         bases = []
         try:
@@ -448,7 +448,9 @@ class _D3ProducerOwner:
             if self._prepared is not None:
                 raise MdpStateError("MDP: native encoder completion is prepared exactly once.")
             globally_reduced_num_tokens = _validate_global_token_capture(runtime)
-            gradients = _validate_gradients(native_gradients, self._item_outputs)
+            gradients = _validate_gradients(
+                native_gradients, self._item_outputs, transport_dtype=transport_dtype
+            )
             views = []
             forbidden = tuple(gradients.values()) + self._outputs + self._pixel_bases
             for output, layout in zip(self._outputs, self._layouts):
@@ -635,18 +637,21 @@ def _validate_outputs(handle, geometry, item_outputs, follower, device) -> None:
             raise MdpStateError("MDP: item output is the exact detached chunk storage view.")
 
 
-def _validate_gradients(gradients, outputs):
+def _validate_gradients(gradients, outputs, *, transport_dtype=None):
     if not isinstance(gradients, _MAPPING_PROXY_TYPE):
         raise MdpConfigurationError("MDP: native encoder gradients are an immutable mapping.")
+    if transport_dtype not in (None, torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise MdpConfigurationError("MDP: gradient transport dtype is floating-point.")
     if tuple(gradients) != tuple(outputs) or any(type(key) is not int for key in gradients):
         raise MdpStateError("MDP: native gradients have exact canonical item coverage.")
     values = tuple(gradients.values())
     for item, gradient in gradients.items():
         output = outputs[item]
+        expected_dtype = output.dtype if transport_dtype is None else transport_dtype
         if (
             not isinstance(gradient, torch.Tensor)
             or gradient.shape != output.shape
-            or gradient.dtype != output.dtype
+            or gradient.dtype != expected_dtype
             or gradient.device != output.device
             or gradient.requires_grad
             or gradient.grad_fn is not None

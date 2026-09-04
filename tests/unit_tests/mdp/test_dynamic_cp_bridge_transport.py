@@ -296,6 +296,25 @@ def test_prepare_packs_exact_participant_blocks_for_both_phases(phase):
     assert transport.validate_prepared_dynamic_bridge_exchange(prepared) is prepared
 
 
+def test_prepare_casts_floating_source_to_wire_dtype_while_packing():
+    state = _state()
+    local = {
+        key: tensor.to(torch.float64)
+        for key, tensor in _local_tensors(state, BridgePhase.EMBEDDING, 30).items()
+    }
+    prepared, _ = _prepare(state, BridgePhase.EMBEDDING, 30, local_tensors=MappingProxyType(local))
+    participant_index = {rank: index for index, rank in enumerate(_PARTICIPANTS)}
+    bases = _bases(prepared.input_split_sizes)
+
+    assert prepared.send_buffer.dtype is state.authority["dtype"]
+    for entry in state.embedding.entries:
+        if entry.src_global_rank != 30:
+            continue
+        start = bases[participant_index[entry.dst_global_rank]] + entry.plan_offset
+        actual = prepared.send_buffer.narrow(0, start, entry.element_count)
+        torch.testing.assert_close(actual, local[entry.key].reshape(-1).to(actual.dtype))
+
+
 def test_embedding_and_gradient_reverse_source_endpoint_roles_and_idle_rank():
     state = _state()
     embedding = {rank: _splits(state, BridgePhase.EMBEDDING, rank) for rank in (80, 30, 10, 99)}
@@ -430,7 +449,7 @@ def test_forged_public_geometry_is_rejected_by_private_seal(mutation):
 
 
 @pytest.mark.parametrize(
-    "failure", ["shape", "dtype", "requires_grad", "send_alias", "receive_alias"]
+    "failure", ["shape", "non_floating", "requires_grad", "send_alias", "receive_alias"]
 )
 def test_late_local_tensor_validation_never_mutates_send_buffer(failure):
     state = _state()
@@ -442,8 +461,8 @@ def test_late_local_tensor_validation_never_mutates_send_buffer(failure):
     key = tuple(local)[-1]
     if failure == "shape":
         local[key] = local[key].reshape(-1)
-    elif failure == "dtype":
-        local[key] = local[key].to(torch.float64)
+    elif failure == "non_floating":
+        local[key] = local[key].to(torch.int64)
     elif failure == "requires_grad":
         local[key] = local[key].requires_grad_()
     elif failure == "send_alias":
