@@ -11,6 +11,7 @@ import torch.distributed as dist
 
 from examples.multimodal_dev.mdp_adapter import MultimodalDecoderPayloadCodec
 from megatron.core import parallel_state
+from megatron.core.mdp import integration
 from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.dynamic_cp_d3_composition import _build_d3_runtime_facade
 from megatron.core.mdp.dynamic_cp_d3_coordinator import _D3Coordinator
@@ -18,7 +19,6 @@ from megatron.core.mdp.dynamic_cp_d3_private_facade import _D3PrivateFacade
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
 from megatron.core.mdp.runtime import MdpRuntimeState
-from megatron.core.mdp.schedule import _wrap_d3_forward_backward
 from megatron.core.mdp.storage import MdpEmbeddingStorage
 from megatron.core.mdp.window import pixel_capture_suppressed
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -26,7 +26,6 @@ from tests.unit_tests.mdp import test_runtime as runtime_harness
 from tests.unit_tests.test_utilities import Utils
 
 _WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
-_WORLD_RANKS = (0, 1, 2, 3)
 _DTYPE = torch.bfloat16
 
 
@@ -139,6 +138,10 @@ def _packed(length):
 class _D3Adapter(runtime_harness._StubAdapter):
     """One source-local Qwen-style sample with one vision item."""
 
+    @staticmethod
+    def build_dynamic_decoder_payload_codec():
+        return MultimodalDecoderPayloadCodec()
+
     def get_batch(self, iterator):
         microbatch = next(iterator)
         assert microbatch == 0
@@ -186,17 +189,6 @@ class _D3Adapter(runtime_harness._StubAdapter):
         return super().encode(encoder, payload.float(), layout).to(_DTYPE)
 
 
-def _full_world_solver(sample_seqlens, total_gpus, **_kwargs):
-    sample_ids = [sample_id for sample_id, _ in sample_seqlens]
-    lengths = [length for _, length in sample_seqlens]
-    return (
-        [list(lengths) for _ in range(total_gpus)],
-        [],
-        None,
-        [list(sample_ids) for _ in range(total_gpus)],
-    )
-
-
 @pytest.mark.usefixtures("_world4_model_parallel")
 def test_world4_composition_executes_native_producer_through_gate6(monkeypatch):
     rank = dist.get_rank()
@@ -204,22 +196,15 @@ def test_world4_composition_executes_native_producer_through_gate6(monkeypatch):
     runtime, view = runtime_harness._build_runtime(decoder_pp=1)
     assert view.lane_id == rank
     runtime.params_dtype = _DTYPE
-    group = dist.group.WORLD
-    facade = _build_d3_runtime_facade(
-        producer_runtime=runtime,
-        codec=MultimodalDecoderPayloadCodec(),
-        group=group,
-        participant_ranks=_WORLD_RANKS,
-        global_rank=rank,
-        device=torch.device("cuda", torch.cuda.current_device()),
-        expected_source_lanes=_WORLD_RANKS,
-        decoder_solver=_full_world_solver,
-        max_seqlen_per_rank=32,
-        minimum_cp_size=1,
-        decoder_group_getter=lambda *, group_size: group if group_size == 4 else None,
-        decoder_group_ranks_getter=lambda selected: tuple(dist.get_process_group_ranks(selected)),
-        timeout_seconds=30.0,
+    config = SimpleNamespace(
+        dynamic_context_parallel=True,
+        sequence_packing_scheduler="default_dynamic_cp",
+        max_seqlen_per_dp_cp_rank=32,
+        min_dynamic_context_parallel_size=1,
+        finalize_model_grads_func=lambda *_args, **_kwargs: None,
     )
+    integration.reset_for_testing()
+    monkeypatch.setattr(integration, "_RUNTIME", runtime)
 
     def native_schedule(*, data_iterator, num_microbatches, forward_only):
         assert num_microbatches == 1 and forward_only is False
@@ -230,11 +215,15 @@ def test_world4_composition_executes_native_producer_through_gate6(monkeypatch):
         runtime.capture_global_num_tokens(torch.tensor(32.0, device="cuda"))
         return "native-result"
 
-    wrapped = _wrap_d3_forward_backward(native_schedule, facade)
-    result = wrapped(data_iterator=iter((0,)), num_microbatches=1, forward_only=False)
+    wrapped = integration.maybe_wrap_forward_backward(native_schedule, config)
+    try:
+        result = wrapped(data_iterator=iter((0,)), num_microbatches=1, forward_only=False)
+    finally:
+        facade = integration._D3_FACADE
+        integration.reset_for_testing()
 
     assert result == "native-result"
-    assert facade.is_idle
+    assert type(facade) is _D3PrivateFacade and facade.is_idle
     assert runtime.state is MdpRuntimeState.EMPTY
     assert runtime.iteration == 1
     runtime.storage.assert_empty()
