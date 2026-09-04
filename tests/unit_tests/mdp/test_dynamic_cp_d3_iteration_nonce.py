@@ -29,6 +29,16 @@ _CONTRIBUTIONS = {
     3: bytes.fromhex("fedcba98765432100123456789abcdef"),
     5: b"third-nonce-0003",
 }
+_DISTRIBUTED = int(os.environ.get("WORLD_SIZE", "1")) == 4
+
+if _DISTRIBUTED:
+    from tests.unit_tests.test_utilities import Utils
+
+    @pytest.fixture(scope="module")
+    def nonce_world():
+        Utils.initialize_model_parallel()
+        yield torch.distributed.group.WORLD
+        Utils.destroy_model_parallel()
 
 
 def _row(rank, contribution, *, error=0, version=1, reserved=0, domain=None):
@@ -237,6 +247,59 @@ def test_local_generation_failure_still_gathers_canonical_error_then_converges()
         _call(generator=generate, factory=lambda **_kwargs: gather)
     assert observed == [((1, 7, 1, 0, 0, 0, _api()._D3_GATE3_NONCE_DOMAIN), 0.25)]
     assert caught.value.__cause__ is failure
+
+
+def test_direct_baseexception_generation_failure_still_converges():
+    failure = BaseException("entropy interrupted")
+    observed = []
+
+    def generate(_width):
+        raise failure
+
+    def gather(local_row, *, timeout_seconds):
+        observed.append((local_row, timeout_seconds))
+        rows = list(_rows())
+        rows[0] = local_row
+        return tuple(rows)
+
+    with pytest.raises(MdpPlanError, match="contribution generation failed") as caught:
+        _call(generator=generate, factory=lambda **_kwargs: gather)
+    assert observed == [((1, 7, 1, 0, 0, 0, _api()._D3_GATE3_NONCE_DOMAIN), 0.25)]
+    assert caught.value.__cause__ is failure
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+def test_world4_direct_baseexception_converges_and_group_remains_usable(nonce_world):
+    rank = torch.distributed.get_rank()
+    ranks = tuple(range(torch.distributed.get_world_size()))
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    def fail_on_rank_two(_width):
+        if rank == 2:
+            raise BaseException("entropy interrupted")
+        return struct.pack("<qq", rank + 1, 1)
+
+    with pytest.raises(MdpPlanError, match="contribution generation failed"):
+        _api().acquire_d3_iteration_nonce(
+            group=nonce_world,
+            group_ranks=ranks,
+            global_rank=rank,
+            device=device,
+            timeout_seconds=10.0,
+            byte_generator=fail_on_rank_two,
+        )
+
+    nonce = _api().acquire_d3_iteration_nonce(
+        group=nonce_world,
+        group_ranks=ranks,
+        global_rank=rank,
+        device=device,
+        timeout_seconds=10.0,
+        byte_generator=lambda _width: struct.pack("<qq", rank + 1, 2),
+    )
+    gathered = [None] * len(ranks)
+    torch.distributed.all_gather_object(gathered, nonce)
+    assert all(value == nonce for value in gathered)
 
 
 def test_remote_generation_error_converges_without_local_cause():
