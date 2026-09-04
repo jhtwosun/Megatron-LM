@@ -136,6 +136,7 @@ class _D3ProducerOwner:
         "_encoder_domain",
         "_encoder_ddp",
         "_encoder_ddp_callable_authority",
+        "_gradient_bases",
     )
 
     def __init__(
@@ -185,6 +186,7 @@ class _D3ProducerOwner:
         self._encoder_cp_follower = encoder_cp_follower
         self._encoder_domain, self._encoder_ddp = encoder_domain, encoder_ddp
         self._encoder_ddp_callable_authority = encoder_ddp_callable_authority
+        self._gradient_bases = ()
         self._mint_token = None
         self._producer = self._prepared = self._prepared_authority = None
         self._producer_input_authority = None
@@ -209,10 +211,10 @@ class _D3ProducerOwner:
             raise MdpStateError("MDP: D3 producer owner binds its exact registered producer once.")
         self._state = "bound"
 
-    def _validate(self) -> MdpRuntime:
+    def _validate(self, *, expected_state="bound", backward_done=False) -> MdpRuntime:
         runtime = self._owned_runtime
         if (
-            self._state != "bound"
+            self._state != expected_state
             or type(runtime) is not MdpRuntime
             or self._runtime is not runtime
         ):
@@ -236,7 +238,7 @@ class _D3ProducerOwner:
         if runtime._handle is not self._handle:
             raise MdpStateError("MDP: D3 producer owner retains its exact forward handle.")
         if self._handle is not None and (
-            self._handle._backward_done is not False
+            self._handle._backward_done is not backward_done
             or self._handle._released is not False
             or len(self._handle.chunk_outputs) != len(self._outputs)
             or any(a is not b for a, b in zip(self._handle.chunk_outputs, self._outputs))
@@ -268,6 +270,18 @@ class _D3ProducerOwner:
         ):
             raise MdpStateError("MDP: D3 producer owner retains exact packed-pixel bases.")
         return runtime
+
+    def _enter_native_encoder_backward(self, completion, /) -> None:
+        """Consume the prepared state before any encoder autograd can start."""
+        _validate_prepared_native_encoder_completion(completion, owner=self)
+        self._state = "backward-entered"
+
+    def _complete_native_encoder_backward(self, completion, /) -> None:
+        """Record one returned encoder backward after full retained-state validation."""
+        _validate_native_encoder_completion(
+            completion, owner=self, expected_state="backward-entered", backward_done=True
+        )
+        self._state = "backward-complete"
 
     def prepare_dynamic_completion(self, native_gradients: Mapping, /):
         """Regroup exact item gradients without invoking encoder backward."""
@@ -306,11 +320,15 @@ class _D3ProducerOwner:
             if self._state in ("registered", "bound"):
                 self._retire(error, tuple(bases))
             raise
+        self._gradient_bases = tuple(bases)
         self._prepared, self._prepared_authority = completion, completion._authority
         return completion
 
     def abort(self, primary_error: BaseException | None = None, /) -> None:
-        if self._state not in ("registered", "bound") or self._runtime is None:
+        if (
+            self._state not in ("registered", "bound", "backward-entered", "backward-complete")
+            or self._runtime is None
+        ):
             raise MdpStateError("MDP: D3 producer owner aborts exactly once.")
         if primary_error is not None and not isinstance(primary_error, BaseException):
             raise MdpConfigurationError("MDP: D3 producer owner primary error is an exception.")
@@ -319,8 +337,7 @@ class _D3ProducerOwner:
             if primary_error is not None
             else MdpStateError("MDP: D3 producer owner aborted its iteration.")
         )
-        bases = () if self._prepared is None else self._prepared.allocation_bases
-        self._retire(error, bases)
+        self._retire(error, self._gradient_bases)
 
     def _retire(self, error: BaseException, bases: tuple) -> None:
         runtime, completion = self._owned_runtime, self._prepared
@@ -378,6 +395,7 @@ class _D3ProducerOwner:
                 ("_encoder_domain", None),
                 ("_encoder_ddp", None),
                 ("_encoder_ddp_callable_authority", ()),
+                ("_gradient_bases", ()),
             ):
                 setattr(self, name, value)
 
@@ -587,12 +605,24 @@ def _validate_global_token_capture(runtime) -> torch.Tensor:
 
 
 def _validate_prepared_native_encoder_completion(completion, *, owner):
+    return _validate_native_encoder_completion(
+        completion, owner=owner, expected_state="bound", backward_done=False
+    )
+
+
+def _validate_completed_native_encoder_completion(completion, *, owner):
+    return _validate_native_encoder_completion(
+        completion, owner=owner, expected_state="backward-complete", backward_done=True
+    )
+
+
+def _validate_native_encoder_completion(completion, *, owner, expected_state, backward_done):
     if (
         type(owner) is not _D3ProducerOwner
         or type(completion) is not _PreparedNativeEncoderCompletion
     ):
         raise MdpConfigurationError("MDP: native completion has exact private types.")
-    runtime = owner._validate()
+    runtime = owner._validate(expected_state=expected_state, backward_done=backward_done)
     domain, ddp, _ = _validate_encoder_finalization_domain(
         runtime,
         expected_domain=owner._encoder_domain,
@@ -600,6 +630,10 @@ def _validate_prepared_native_encoder_completion(completion, *, owner):
         expected_callable_authority=owner._encoder_ddp_callable_authority,
     )
     token = _validate_global_token_capture(runtime)
+    try:
+        completion_authority = _completion_authority(completion)
+    except BaseException as error:
+        raise MdpStateError("MDP: native completion retains valid exact resources.") from error
     if (
         owner._prepared is not completion
         or completion.owner is not owner
@@ -609,9 +643,14 @@ def _validate_prepared_native_encoder_completion(completion, *, owner):
         or completion.encoder_ddp is not ddp
         or completion.globally_reduced_num_tokens is not token
         or completion._authority != owner._prepared_authority
-        or completion._authority != _completion_authority(completion)
+        or completion._authority != completion_authority
         or len(completion.gradient_views) != len(owner._layouts)
         or len(completion.allocation_bases) != len(owner._layouts)
+        or len(completion.allocation_bases) != len(owner._gradient_bases)
+        or any(
+            value is not expected
+            for value, expected in zip(completion.allocation_bases, owner._gradient_bases)
+        )
     ):
         raise MdpStateError("MDP: native encoder completion matches its exact owner and seal.")
     for view, base, output, layout in zip(
