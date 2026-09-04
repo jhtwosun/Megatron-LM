@@ -65,6 +65,11 @@ _DECODER_READY_AUTHORITY_DOMAIN = b"megatron.mdp.dynamic-cp.decoder-ready"
 _DECODER_READY_AUTHORITY_SCHEMA_VERSION = 1
 _DECODER_GRADIENT_WAVE_AUTHORITY_DOMAIN = b"megatron.mdp.dynamic-cp.decoder-gradient-wave"
 _DECODER_ROLES = ("decoder", "non-decoder")
+DYNAMIC_RUNTIME_SCHEMA_VERSION = 5
+DYNAMIC_EXECUTION_CONFIG_WIRE_WIDTH = 20
+_DYNAMIC_EXECUTION_CONFIG_DOMAIN = b"megatron.mdp.dynamic-cp.runtime-config-v2"
+_PARTITION_MODE_IDS = {"contiguous": 1, "zigzag": 2}
+_EMBEDDING_DTYPE_IDS = frozenset((2, 3))
 
 
 @dataclass(frozen=True)
@@ -199,6 +204,19 @@ def _require_integer(name: str, value: Any) -> int:
     return value
 
 
+def _require_positive_integer(name: str, value: Any) -> int:
+    value = _require_integer(name, value)
+    if value == 0:
+        raise MdpConfigurationError(f"MDP: {name} is a positive signed-int64 integer.")
+    return value
+
+
+def _require_exact_bool(name: str, value: Any) -> bool:
+    if type(value) is not bool:
+        raise MdpConfigurationError(f"MDP: {name} is an exact bool.")
+    return value
+
+
 def _require_ranks(name: str, value: Any) -> tuple[int, ...]:
     if not isinstance(value, tuple) or not value:
         raise MdpConfigurationError(f"MDP: {name} is a non-empty immutable rank tuple.")
@@ -206,6 +224,268 @@ def _require_ranks(name: str, value: Any) -> tuple[int, ...]:
     if len(set(ranks)) != len(ranks):
         raise MdpConfigurationError(f"MDP: {name} contains unique ranks in authoritative order.")
     return ranks
+
+
+def _digest_words(payload: bytes) -> tuple[int, int]:
+    digest = hashlib.blake2b(payload, digest_size=16).digest()
+    return struct.unpack("<qq", digest)
+
+
+@dataclass(frozen=True)
+class _DynamicExecutionConfigAuthority:
+    """Private seal for one immutable Dynamic-CP topology contract."""
+
+    config_identity: int
+    wire: tuple[int, ...]
+    digest: bytes
+
+
+@dataclass(frozen=True)
+class _DynamicExecutionConfig:
+    """Fixed-wire, digest-consensus topology contract for the staged runtime.
+
+    It deliberately accepts only the legacy singleton encoder domain or a
+    contiguous, repeated four-rank joint D4 domain. Later controller slices
+    exchange its digest through the existing status wire before any payload
+    collective.
+    """
+
+    schema_version: int
+    forward_only: bool
+    partition_mode: str
+    embedding_width: int
+    embedding_dtype_id: int
+    participant_ranks: tuple[int, ...]
+    tensor_parallel_size: int
+    expert_parallel_size: int
+    pipeline_parallel_size: int
+    configured_context_parallel_size: int
+    encoder_context_parallel_size: int
+    virtual_pipeline_parallel_size: int
+    expert_group_ranks: tuple[int, ...] | None
+    sequence_parallel: bool
+    dynamic_encoder_context_parallel: bool
+    overlap_window_capture: bool
+    digest: bytes = field(init=False, repr=False)
+    _wire: tuple[int, ...] = field(init=False, repr=False, compare=False)
+    _authority: _DynamicExecutionConfigAuthority | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        if _require_integer("dynamic runtime schema_version", self.schema_version) != (
+            DYNAMIC_RUNTIME_SCHEMA_VERSION
+        ):
+            raise MdpConfigurationError(
+                "MDP: dynamic runtime uses the current configuration schema version."
+            )
+        forward_only = _require_exact_bool("dynamic runtime forward_only", self.forward_only)
+        if forward_only:
+            raise MdpConfigurationError("MDP: staged Dynamic-CP runtime is training-only.")
+        if self.partition_mode not in _PARTITION_MODE_IDS:
+            raise MdpConfigurationError(
+                "MDP: dynamic runtime partition_mode is contiguous or zigzag."
+            )
+        width = _require_positive_integer("dynamic runtime embedding_width", self.embedding_width)
+        dtype_id = _require_positive_integer(
+            "dynamic runtime embedding_dtype_id", self.embedding_dtype_id
+        )
+        if dtype_id not in _EMBEDDING_DTYPE_IDS:
+            raise MdpConfigurationError(
+                "MDP: dynamic runtime embedding dtype id represents BF16 or FP16."
+            )
+        participants = _require_ranks("dynamic runtime participant ranks", self.participant_ranks)
+        topology = tuple(
+            _require_positive_integer(f"dynamic runtime {name}", value)
+            for name, value in (
+                ("tensor_parallel_size", self.tensor_parallel_size),
+                ("expert_parallel_size", self.expert_parallel_size),
+                ("pipeline_parallel_size", self.pipeline_parallel_size),
+                ("configured_context_parallel_size", self.configured_context_parallel_size),
+                ("encoder_context_parallel_size", self.encoder_context_parallel_size),
+                ("virtual_pipeline_parallel_size", self.virtual_pipeline_parallel_size),
+            )
+        )
+        sequence_parallel = _require_exact_bool(
+            "dynamic runtime sequence_parallel", self.sequence_parallel
+        )
+        dynamic_encoder_cp = _require_exact_bool(
+            "dynamic runtime dynamic_encoder_context_parallel",
+            self.dynamic_encoder_context_parallel,
+        )
+        overlap_capture = _require_exact_bool(
+            "dynamic runtime overlap_window_capture", self.overlap_window_capture
+        )
+        tp, ep, pp, cp, encoder_cp, vpp = topology
+        legacy_d3 = (tp, pp, cp, encoder_cp, vpp) == (1, 1, 1, 1, 1) and not dynamic_encoder_cp
+        repeated_d4_domain = (
+            len(participants) == 4
+            and participants[0] % 4 == 0
+            and participants == tuple(range(participants[0], participants[0] + 4))
+        )
+        joint_d4 = (
+            repeated_d4_domain
+            and (tp, pp, cp, encoder_cp, vpp) == (1, 1, 4, 4, 1)
+            and ep in (1, 4)
+            and dynamic_encoder_cp
+        )
+        expert_group = self.expert_group_ranks
+        if ep == 1:
+            if expert_group is not None:
+                raise MdpConfigurationError(
+                    "MDP: Dynamic-CP EP1 has no multi-rank expert group authority."
+                )
+            expert_group_size = 0
+            expert_group_words = (0, 0)
+        else:
+            expert_group = _require_ranks("dynamic runtime expert group ranks", expert_group)
+            if len(expert_group) != ep:
+                raise MdpConfigurationError(
+                    "MDP: Dynamic-CP expert group width matches expert parallel size."
+                )
+            if expert_group != participants:
+                raise MdpConfigurationError(
+                    "MDP: Dynamic-CP EP4 expert group exactly matches its local D4 domain."
+                )
+            expert_group_size = len(expert_group)
+            expert_group_words = _digest_words(
+                struct.pack(f"<{expert_group_size}q", *expert_group)
+            )
+        if legacy_d3 and self.partition_mode != "contiguous":
+            raise MdpConfigurationError(
+                "MDP: legacy D3 runtime partition_mode is the locked contiguous layout."
+            )
+        if sequence_parallel or overlap_capture or not (legacy_d3 or joint_d4):
+            raise MdpConfigurationError(
+                "MDP: dynamic runtime accepts the legacy D3 topology or the exact joint D4 "
+                "size-four CP4/ECP4 domain with EP1 or domain-local EP4 and sequence "
+                "parallel and overlap off."
+            )
+        participant_words = _digest_words(struct.pack(f"<{len(participants)}q", *participants))
+        wire = (
+            DYNAMIC_RUNTIME_SCHEMA_VERSION,
+            int(forward_only),
+            _PARTITION_MODE_IDS[self.partition_mode],
+            width,
+            dtype_id,
+            *topology,
+            int(sequence_parallel),
+            int(dynamic_encoder_cp),
+            int(overlap_capture),
+            len(participants),
+            *participant_words,
+            expert_group_size,
+            *expert_group_words,
+        )
+        if len(wire) != DYNAMIC_EXECUTION_CONFIG_WIRE_WIDTH:
+            raise AssertionError("dynamic runtime configuration wire width drifted")
+        hasher = hashlib.blake2b(digest_size=16)
+        hasher.update(_DYNAMIC_EXECUTION_CONFIG_DOMAIN)
+        hasher.update(struct.pack(f"<{len(wire)}q", *wire))
+        object.__setattr__(self, "_wire", wire)
+        object.__setattr__(self, "digest", hasher.digest())
+        object.__setattr__(
+            self,
+            "_authority",
+            _DynamicExecutionConfigAuthority(
+                config_identity=id(self), wire=wire, digest=hasher.digest()
+            ),
+        )
+
+    def to_wire_tuple(self) -> tuple[int, ...]:
+        """Return the fixed-width signed-int64 consensus wire."""
+        return self._wire
+
+
+def _validate_dynamic_execution_config(config: Any) -> _DynamicExecutionConfig:
+    """Rebuild and compare one config so post-construction mutation cannot lie."""
+    if type(config) is not _DynamicExecutionConfig:
+        raise MdpConfigurationError("MDP: runtime config consensus uses its typed carrier.")
+    authority = config._authority
+    if type(authority) is not _DynamicExecutionConfigAuthority or authority.config_identity != id(config):
+        raise MdpStateError("MDP: dynamic runtime config retains its private seal.")
+    canonical = _DynamicExecutionConfig(
+        schema_version=config.schema_version,
+        forward_only=config.forward_only,
+        partition_mode=config.partition_mode,
+        embedding_width=config.embedding_width,
+        embedding_dtype_id=config.embedding_dtype_id,
+        participant_ranks=config.participant_ranks,
+        tensor_parallel_size=config.tensor_parallel_size,
+        expert_parallel_size=config.expert_parallel_size,
+        pipeline_parallel_size=config.pipeline_parallel_size,
+        configured_context_parallel_size=config.configured_context_parallel_size,
+        encoder_context_parallel_size=config.encoder_context_parallel_size,
+        virtual_pipeline_parallel_size=config.virtual_pipeline_parallel_size,
+        expert_group_ranks=config.expert_group_ranks,
+        sequence_parallel=config.sequence_parallel,
+        dynamic_encoder_context_parallel=config.dynamic_encoder_context_parallel,
+        overlap_window_capture=config.overlap_window_capture,
+    )
+    if (
+        authority.wire != canonical._wire
+        or authority.digest != canonical.digest
+        or config._wire != canonical._wire
+        or config.digest != canonical.digest
+    ):
+        raise MdpStateError("MDP: dynamic runtime config matches its private seal.")
+    return config
+
+
+def _consensus_dynamic_execution_config(
+    *,
+    config: _DynamicExecutionConfig,
+    group_ranks: tuple[int, ...],
+    global_rank: int,
+    all_gather_status: Any,
+    timeout_seconds: float,
+) -> None:
+    """Require every runtime participant to advertise the same configuration digest.
+
+    ``group_ranks`` and ``all_gather_status`` are rank-symmetric rendezvous
+    context, just as for the lower bridge gates. A local typed-carrier error
+    becomes a status error; an asymmetric process-group binding cannot safely
+    be discovered because it has no common collective to enter.
+    """
+    rank = _require_integer("dynamic runtime config global rank", global_rank)
+    ranks = _require_ranks("dynamic runtime config group ranks", group_ranks)
+    if rank not in ranks:
+        raise MdpConfigurationError("MDP: runtime config global rank belongs to its group.")
+    if not callable(all_gather_status):
+        raise MdpConfigurationError("MDP: runtime config status gather is callable.")
+    local_error = None
+    digest = bytes(16)
+    try:
+        config = _validate_dynamic_execution_config(config)
+        if ranks != config.participant_ranks:
+            raise MdpConfigurationError(
+                "MDP: runtime config participants match the exact status group order."
+            )
+        digest = config.digest
+    except Exception as error:
+        local_error = error
+    status = _PrecollectiveStatus(
+        global_rank=rank,
+        global_manifest_digest=digest,
+        plan_digest=digest,
+        error_code=int(local_error is not None),
+        gate_id=0,
+    )
+    try:
+        _run_precollective_consensus(
+            status,
+            group_ranks=ranks,
+            all_gather_status=all_gather_status,
+            timeout_seconds=timeout_seconds,
+        )
+    except (MdpBridgeError, MdpPlanError) as error:
+        if local_error is not None and error.__cause__ is None:
+            raise error from local_error
+        raise
+    if local_error is not None:
+        raise MdpStateError(
+            "MDP: runtime config consensus succeeded despite a local error."
+        ) from local_error
 
 
 def _require_digest(name: str, value: Any) -> bytes:
