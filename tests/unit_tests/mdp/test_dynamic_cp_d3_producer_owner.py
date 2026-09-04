@@ -88,6 +88,7 @@ def _runtime(*, contributor=True, follower=False, mixed_dtype=False, allocator=N
     runtime._captured_num_tokens = torch.zeros((), device=runtime.device)
     runtime._token_capture_count = 1
     runtime._token_consumed = False
+    runtime._iteration = 0
     runtime._ddp_calls = []
     runtime.encoder_domain = _EncoderDomain(_EncoderDdp(runtime._ddp_calls))
     runtime._state = MdpRuntimeState.EMPTY
