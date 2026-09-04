@@ -48,6 +48,8 @@ _INT64_MAX = 2**63 - 1
 _MAPPING_PROXY_TYPE = type(MappingProxyType({}))
 _PAYLOAD_ROUTE_AUTHORITY_DOMAIN = b"megatron.mdp.dynamic-cp.decoder-payload-route"
 _PAYLOAD_ROUTE_AUTHORITY_SCHEMA_VERSION = 1
+_PAYLOAD_BUNDLE_AUTHORITY_DOMAIN = b"megatron.mdp.dynamic-cp.decoder-payload-bundle"
+_PAYLOAD_BUNDLE_AUTHORITY_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,36 @@ class PreparedDecoderPayloadExchange:
     )
 
 
+@dataclass(frozen=True)
+class _PreparedDecoderPayloadBundleAuthority:
+    bundle_authority_digest: bytes
+    global_rank: int
+    participant_ranks: tuple[int, ...]
+    dtypes: tuple[torch.dtype, ...]
+    device: torch.device
+    exchange_ids: tuple[int, ...]
+    exchange_authorities: tuple[_PreparedDecoderPayloadAuthority, ...]
+    receive_descriptors: tuple[
+        tuple[DecoderPayloadRouteKey, int, torch.dtype, tuple[int, ...], int, int], ...
+    ]
+
+
+@dataclass(frozen=True)
+class PreparedDecoderPayloadBundle:
+    """All typed decoder payload exchanges sealed for one gate-0 consensus."""
+
+    bundle_authority_digest: bytes
+    global_rank: int
+    participant_ranks: tuple[int, ...]
+    dtypes: tuple[torch.dtype, ...]
+    device: torch.device
+    exchanges: tuple[PreparedDecoderPayloadExchange, ...]
+    received_tensors: Mapping[DecoderPayloadRouteKey, Tensor] = field(compare=False, repr=False)
+    _authority: _PreparedDecoderPayloadBundleAuthority | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
+
+
 def _validate_buffer(name: str, buffer: Any, *, dtype: torch.dtype, elements: int) -> Tensor:
     if not isinstance(buffer, Tensor):
         raise MdpConfigurationError(f"MDP: decoder payload {name} is a tensor.")
@@ -107,6 +139,37 @@ def _field_specs(
         for payload in global_manifest.payloads
         for spec in payload.field_specs
     }
+
+
+def _snapshot_source_rank_by_lane(value: Any) -> Mapping[int, int]:
+    if not isinstance(value, Mapping):
+        raise MdpConfigurationError(
+            "MDP: decoder payload source ranks form a lane-to-rank mapping."
+        )
+    try:
+        pairs = tuple((lane, value[lane]) for lane in value)
+        lanes = tuple(lane for lane, _ in pairs)
+        if len(set(lanes)) != len(lanes):
+            raise ValueError("source lanes are unique")
+    except Exception as error:
+        raise MdpConfigurationError(
+            "MDP: decoder payload source rank mapping can be snapshotted exactly once."
+        ) from error
+    if any(
+        not isinstance(lane, int)
+        or isinstance(lane, bool)
+        or lane < 0
+        or lane > _INT64_MAX
+        or not isinstance(rank, int)
+        or isinstance(rank, bool)
+        or rank < 0
+        or rank > _INT64_MAX
+        for lane, rank in pairs
+    ):
+        raise MdpConfigurationError(
+            "MDP: decoder payload source lanes and ranks are signed-int64 integers."
+        )
+    return MappingProxyType(dict(pairs))
 
 
 def _route_digest_integers(hasher: Any, *values: int) -> None:
@@ -158,6 +221,63 @@ def _payload_route_authority_digest(
     _route_digest_integers(hasher, len(source_ranks))
     for lane, rank in source_ranks:
         _route_digest_integers(hasher, lane, rank)
+    _route_digest_integers(hasher, len(ledger.entries))
+    for entry in ledger.entries:
+        _route_digest_integers(
+            hasher,
+            entry.src_global_rank,
+            entry.dst_global_rank,
+            *entry.key.sample_id.to_wire_tuple(),
+            entry.key.endpoint_rank,
+            entry.element_count,
+            entry.plan_offset,
+        )
+        _route_digest_text(hasher, entry.key.field_name)
+        _route_digest_text(hasher, str(entry.dtype))
+    return hasher.digest()
+
+
+def _decoder_payload_dtype_order(
+    global_manifest: DecoderGlobalManifest, ledger: DecoderPayloadRouteLedger
+) -> tuple[torch.dtype, ...]:
+    order = tuple(
+        dict.fromkeys(
+            spec.dtype for payload in global_manifest.payloads for spec in payload.field_specs
+        )
+    )
+    ledger_dtypes = tuple(dict.fromkeys(entry.dtype for entry in ledger.entries))
+    if not order or set(order) != set(ledger_dtypes):
+        raise MdpPlanError(
+            "MDP: decoder payload bundle dtype order exactly covers all routed dtypes."
+        )
+    return order
+
+
+def _payload_bundle_authority_digest(
+    ledger: DecoderPayloadRouteLedger,
+    *,
+    plan: DecoderDynamicPlan,
+    global_manifest: DecoderGlobalManifest,
+    source_rank_by_lane: Mapping[int, int],
+    participant_ranks: tuple[int, ...],
+    dtypes: tuple[torch.dtype, ...],
+) -> bytes:
+    """Digest the rank-common authority for every typed payload exchange."""
+    hasher = hashlib.blake2b(digest_size=16)
+    _route_digest_integers(
+        hasher, len(_PAYLOAD_BUNDLE_AUTHORITY_DOMAIN), _PAYLOAD_BUNDLE_AUTHORITY_SCHEMA_VERSION
+    )
+    hasher.update(_PAYLOAD_BUNDLE_AUTHORITY_DOMAIN)
+    _route_digest_bytes(hasher, global_manifest.digest)
+    _route_digest_bytes(hasher, plan.digest)
+    _route_digest_integers(hasher, len(participant_ranks), *participant_ranks)
+    source_ranks = tuple(sorted(source_rank_by_lane.items()))
+    _route_digest_integers(hasher, len(source_ranks))
+    for lane, rank in source_ranks:
+        _route_digest_integers(hasher, lane, rank)
+    _route_digest_integers(hasher, len(dtypes))
+    for dtype in dtypes:
+        _route_digest_text(hasher, str(dtype))
     _route_digest_integers(hasher, len(ledger.entries))
     for entry in ledger.entries:
         _route_digest_integers(
@@ -329,6 +449,128 @@ def _validate_prepared_exchange(prepared: Any) -> PreparedDecoderPayloadExchange
     return prepared
 
 
+def _capture_bundle_authority(
+    bundle: PreparedDecoderPayloadBundle,
+) -> _PreparedDecoderPayloadBundleAuthority:
+    exchange_by_dtype = {exchange.dtype: index for index, exchange in enumerate(bundle.exchanges)}
+    return _PreparedDecoderPayloadBundleAuthority(
+        bundle_authority_digest=bundle.bundle_authority_digest,
+        global_rank=bundle.global_rank,
+        participant_ranks=bundle.participant_ranks,
+        dtypes=bundle.dtypes,
+        device=bundle.device,
+        exchange_ids=tuple(id(exchange) for exchange in bundle.exchanges),
+        exchange_authorities=tuple(exchange._authority for exchange in bundle.exchanges),
+        receive_descriptors=tuple(
+            (
+                key,
+                exchange_by_dtype[tensor.dtype],
+                tensor.dtype,
+                tuple(tensor.shape),
+                _storage_pointer(tensor),
+                tensor.storage_offset(),
+            )
+            for key, tensor in bundle.received_tensors.items()
+        ),
+    )
+
+
+def _validate_bundle_buffer_storage(exchanges: tuple[PreparedDecoderPayloadExchange, ...]) -> None:
+    nonempty = tuple(
+        buffer
+        for exchange in exchanges
+        for buffer in (exchange.send_buffer, exchange.receive_buffer)
+        if buffer.numel()
+    )
+    pointers = tuple(_storage_pointer(buffer) for buffer in nonempty)
+    if len(set(pointers)) != len(pointers):
+        raise MdpConfigurationError(
+            "MDP: decoder payload bundle transport buffers use pairwise disjoint storage."
+        )
+
+
+def validate_prepared_decoder_payload_bundle(bundle: Any) -> PreparedDecoderPayloadBundle:
+    """Validate a locally sealed all-dtype payload bundle without trusting its fields."""
+    if type(bundle) is not PreparedDecoderPayloadBundle:
+        raise MdpBridgeError("MDP: decoder payload gate requires its exact prepared bundle type.")
+    if type(bundle._authority) is not _PreparedDecoderPayloadBundleAuthority:
+        raise MdpBridgeError(
+            "MDP: decoder payload bundle requires its sealed local authority snapshot."
+        )
+    if (
+        type(bundle.bundle_authority_digest) is not bytes
+        or len(bundle.bundle_authority_digest) != 16
+    ):
+        raise MdpBridgeError("MDP: decoder payload bundle has a fixed 16-byte authority digest.")
+    participants = bundle.participant_ranks
+    if not isinstance(participants, tuple) or not participants:
+        raise MdpConfigurationError(
+            "MDP: decoder payload bundle participants form a non-empty immutable tuple."
+        )
+    if any(
+        not isinstance(rank, int) or isinstance(rank, bool) or rank < 0 or rank > _INT64_MAX
+        for rank in participants
+    ) or len(set(participants)) != len(participants):
+        raise MdpConfigurationError(
+            "MDP: decoder payload bundle participants are unique signed-int64 ranks."
+        )
+    if (
+        not isinstance(bundle.global_rank, int)
+        or isinstance(bundle.global_rank, bool)
+        or bundle.global_rank < 0
+        or bundle.global_rank > _INT64_MAX
+        or bundle.global_rank not in participants
+    ):
+        raise MdpConfigurationError(
+            "MDP: decoder payload bundle global rank is an exact signed-int64 participant."
+        )
+    if not isinstance(bundle.dtypes, tuple) or not bundle.dtypes:
+        raise MdpConfigurationError(
+            "MDP: decoder payload bundle dtypes form a non-empty immutable tuple."
+        )
+    if any(not isinstance(dtype, torch.dtype) for dtype in bundle.dtypes) or len(
+        set(bundle.dtypes)
+    ) != len(bundle.dtypes):
+        raise MdpConfigurationError("MDP: decoder payload bundle dtypes are unique torch dtypes.")
+    if not isinstance(bundle.exchanges, tuple) or len(bundle.exchanges) != len(bundle.dtypes):
+        raise MdpBridgeError("MDP: decoder payload bundle has one immutable exchange per dtype.")
+    if not isinstance(bundle.device, torch.device):
+        raise MdpConfigurationError("MDP: decoder payload bundle device is a torch.device.")
+    exchanges = tuple(_validate_prepared_exchange(exchange) for exchange in bundle.exchanges)
+    if tuple(exchange.dtype for exchange in exchanges) != bundle.dtypes:
+        raise MdpBridgeError(
+            "MDP: decoder payload bundle exchange order matches its canonical dtype order."
+        )
+    if any(
+        exchange.global_rank != bundle.global_rank
+        or exchange.participant_ranks != bundle.participant_ranks
+        or exchange.send_buffer.device != bundle.device
+        or exchange.receive_buffer.device != bundle.device
+        for exchange in exchanges
+    ):
+        raise MdpBridgeError(
+            "MDP: decoder payload bundle child rank, participants, and device agree."
+        )
+    _validate_bundle_buffer_storage(exchanges)
+    if type(bundle.received_tensors) is not _MAPPING_PROXY_TYPE:
+        raise MdpBridgeError("MDP: decoder payload bundle receive views form an immutable mapping.")
+    child_view_items = tuple(
+        item for exchange in exchanges for item in exchange.received_tensors.items()
+    )
+    if len(child_view_items) != len({key for key, _ in child_view_items}):
+        raise MdpBridgeError("MDP: decoder payload bundle child receive keys are unique.")
+    child_views = dict(child_view_items)
+    if set(child_views) != set(bundle.received_tensors) or any(
+        child_views[key] is not tensor for key, tensor in bundle.received_tensors.items()
+    ):
+        raise MdpBridgeError("MDP: decoder payload bundle views are the exact child receive views.")
+    if _capture_bundle_authority(bundle) != bundle._authority:
+        raise MdpBridgeError(
+            "MDP: decoder payload bundle public geometry matches its local authority snapshot."
+        )
+    return bundle
+
+
 def _validate_group_binding(
     prepared: PreparedDecoderPayloadExchange,
     *,
@@ -430,6 +672,17 @@ def _execute_validated_decoder_payload_exchange(
     return carrier.received_tensors
 
 
+def _execute_validated_decoder_payload_bundle(
+    bundle: PreparedDecoderPayloadBundle, *, group: Any, all_to_all_single: Callable[..., Any]
+) -> Mapping[DecoderPayloadRouteKey, Tensor]:
+    """Execute already-validated child exchanges in canonical dtype order."""
+    for exchange in bundle.exchanges:
+        _execute_validated_decoder_payload_exchange(
+            exchange, group=group, all_to_all_single=all_to_all_single
+        )
+    return bundle.received_tensors
+
+
 def _validate_payload_gate_context(
     *, global_rank: Any, group_ranks: Any, all_gather_status: Any, timeout_seconds: Any
 ) -> tuple[int, tuple[int, ...], Callable[..., Any], float]:
@@ -482,7 +735,6 @@ def _run_decoder_payload_gate(
     plan: DecoderDynamicPlan,
     ledger: DecoderPayloadRouteLedger,
     source_rank_by_lane: Mapping[int, int],
-    dtype: torch.dtype,
     global_rank: int,
     group_ranks: tuple[int, ...],
     all_gather_status: Any,
@@ -492,7 +744,7 @@ def _run_decoder_payload_gate(
     group_ranks_getter: Callable[[Any], Any] = dist.get_process_group_ranks,
     all_to_all_single: Callable[..., Any] = dist.all_to_all_single,
 ) -> Mapping[DecoderPayloadRouteKey, Tensor]:
-    """Gate one decoder payload exchange with deterministic rank consensus.
+    """Gate one complete all-dtype decoder payload bundle with one consensus.
 
     Local validation and preparation precede the fixed gate-0 consensus. The
     synchronous payload collective runs only after every rank reports success.
@@ -508,8 +760,8 @@ def _run_decoder_payload_gate(
         timeout_seconds=timeout_seconds,
     )
     manifest_digest = _snapshot_payload_gate_digest(global_manifest)
-    route_authority_digest = bytes(16)
-    carrier = None
+    bundle_authority_digest = bytes(16)
+    bundle = None
     local_error = None
     try:
         if type(global_manifest) is not DecoderGlobalManifest:
@@ -520,21 +772,20 @@ def _run_decoder_payload_gate(
         validate_decoder_dynamic_plan(plan)
         if global_manifest.samples != plan.samples:
             raise MdpPlanError("MDP: decoder payload gate manifest and plan catalogs agree.")
-        if not isinstance(dtype, torch.dtype):
-            raise MdpConfigurationError("MDP: decoder payload gate dtype is a torch dtype.")
         expected_ledger = build_decoder_payload_route_ledger(
             plan,
             global_manifest=global_manifest,
             source_rank_by_lane=source_rank_by_lane,
             participant_ranks=ranks,
         )
-        route_authority_digest = _payload_route_authority_digest(
+        dtypes = _decoder_payload_dtype_order(global_manifest, expected_ledger)
+        bundle_authority_digest = _payload_bundle_authority_digest(
             expected_ledger,
             plan=plan,
             global_manifest=global_manifest,
             source_rank_by_lane=source_rank_by_lane,
             participant_ranks=ranks,
-            dtype=dtype,
+            dtypes=dtypes,
         )
         validate_decoder_payload_route_ledger(
             ledger,
@@ -547,24 +798,55 @@ def _run_decoder_payload_gate(
             raise MdpConfigurationError("MDP: decoder payload gate local_prepare is callable.")
         if not callable(all_to_all_single):
             raise MdpConfigurationError("MDP: decoder payload gate all_to_all_single is callable.")
-        carrier = _validate_prepared_exchange(local_prepare())
-        if carrier.dtype != dtype:
+        bundle = validate_prepared_decoder_payload_bundle(local_prepare())
+        if bundle.bundle_authority_digest != bundle_authority_digest:
             raise MdpBridgeError(
-                "MDP: prepared decoder payload dtype matches the gate route authority."
+                "MDP: prepared decoder payload bundle matches the gate authority digest."
             )
-        if carrier._authority.route_authority_digest != route_authority_digest:
+        if bundle.dtypes != dtypes:
             raise MdpBridgeError(
-                "MDP: prepared decoder payload matches the gate route authority digest."
+                "MDP: prepared decoder payload bundle uses the canonical dtype order."
             )
-        if carrier.global_rank != rank:
+        if bundle.global_rank != rank:
             raise MdpBridgeError(
-                "MDP: prepared decoder payload global rank matches the gate context."
+                "MDP: prepared decoder payload bundle global rank matches the gate context."
             )
-        if carrier.participant_ranks != ranks:
+        if bundle.participant_ranks != ranks:
             raise MdpBridgeError(
-                "MDP: prepared decoder payload participants match the gate context."
+                "MDP: prepared decoder payload bundle participants match the gate context."
             )
-        _validate_group_binding(carrier, group=group, group_ranks_getter=group_ranks_getter)
+        for dtype, exchange in zip(dtypes, bundle.exchanges):
+            expected_child_digest = _payload_route_authority_digest(
+                expected_ledger,
+                plan=plan,
+                global_manifest=global_manifest,
+                source_rank_by_lane=source_rank_by_lane,
+                participant_ranks=ranks,
+                dtype=dtype,
+            )
+            if exchange._authority.route_authority_digest != expected_child_digest:
+                raise MdpBridgeError(
+                    "MDP: prepared decoder payload child matches its dtype route authority."
+                )
+            expected_keys = tuple(
+                entry.key
+                for entry in expected_ledger.entries
+                if entry.dtype == dtype and entry.dst_global_rank == rank
+            )
+            if tuple(exchange.received_tensors) != expected_keys:
+                raise MdpBridgeError(
+                    "MDP: prepared decoder payload child has the exact destination key order."
+                )
+        expected_bundle_keys = tuple(
+            entry.key for entry in expected_ledger.entries if entry.dst_global_rank == rank
+        )
+        if tuple(bundle.received_tensors) != expected_bundle_keys:
+            raise MdpBridgeError(
+                "MDP: prepared decoder payload bundle has the exact destination key order."
+            )
+        _validate_group_binding(
+            bundle.exchanges[0], group=group, group_ranks_getter=group_ranks_getter
+        )
     except Exception as error:
         local_error = error
 
@@ -572,7 +854,7 @@ def _run_decoder_payload_gate(
     status = _PrecollectiveStatus(
         global_rank=rank,
         global_manifest_digest=manifest_digest,
-        plan_digest=route_authority_digest,
+        plan_digest=bundle_authority_digest,
         error_code=int(local_error is not None),
         gate_id=0,
     )
@@ -588,8 +870,8 @@ def _run_decoder_payload_gate(
         raise MdpStateError(
             "MDP: decoder payload gate consensus succeeded despite a local error."
         ) from local_error
-    return _execute_validated_decoder_payload_exchange(
-        carrier, group=group, all_to_all_single=all_to_all_single
+    return _execute_validated_decoder_payload_bundle(
+        bundle, group=group, all_to_all_single=all_to_all_single
     )
 
 
@@ -737,6 +1019,189 @@ def prepare_decoder_payload_exchange(
         _capture_prepared_authority(prepared, route_authority_digest=route_authority_digest),
     )
     return prepared
+
+
+def prepare_decoder_payload_bundle(
+    ledger: DecoderPayloadRouteLedger,
+    *,
+    plan: DecoderDynamicPlan,
+    global_manifest: DecoderGlobalManifest,
+    source_rank_by_lane: Mapping[int, int],
+    participant_ranks: tuple[int, ...],
+    global_rank: int,
+    local_tensors: Mapping[DecoderPayloadRouteKey, Tensor],
+    buffers_by_dtype: Mapping[torch.dtype, tuple[Tensor, Tensor]],
+) -> PreparedDecoderPayloadBundle:
+    """Prepare every routed dtype before the single payload-ready consensus.
+
+    Buffer-map iteration order is ignored. Child exchanges and merged receive
+    views always follow manifest/ledger authority order. All caller inputs are
+    validated before the first send-buffer copy.
+    """
+    source_ranks = _snapshot_source_rank_by_lane(source_rank_by_lane)
+    expected = validate_decoder_payload_route_ledger(
+        ledger,
+        plan=plan,
+        global_manifest=global_manifest,
+        source_rank_by_lane=source_ranks,
+        participant_ranks=participant_ranks,
+    )
+    dtypes = _decoder_payload_dtype_order(global_manifest, expected)
+    if not isinstance(local_tensors, Mapping):
+        raise MdpConfigurationError("MDP: decoder payload bundle local tensors form a mapping.")
+    if not isinstance(buffers_by_dtype, Mapping):
+        raise MdpConfigurationError("MDP: decoder payload bundle buffers form a dtype mapping.")
+    if set(buffers_by_dtype) != set(dtypes):
+        raise MdpConfigurationError(
+            "MDP: decoder payload bundle has one caller buffer pair for every routed dtype."
+        )
+
+    specs = _field_specs(global_manifest)
+    source_entries = tuple(
+        entry for entry in expected.entries if entry.src_global_rank == global_rank
+    )
+    expected_source_keys = {entry.key for entry in source_entries}
+    try:
+        actual_source_keys = set(local_tensors)
+    except Exception as error:
+        raise MdpBridgeError(
+            "MDP: decoder payload bundle local tensor keys are hashable route keys."
+        ) from error
+    if actual_source_keys != expected_source_keys:
+        raise MdpBridgeError(
+            "MDP: decoder payload bundle local tensors cover every routed dtype exactly."
+        )
+
+    checked_buffers = {}
+    common_device = None
+    for dtype in dtypes:
+        pair = buffers_by_dtype[dtype]
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise MdpConfigurationError(
+                "MDP: decoder payload bundle buffer values are immutable send/receive pairs."
+            )
+        input_splits, output_splits = decoder_payload_split_sizes(
+            expected,
+            plan=plan,
+            global_manifest=global_manifest,
+            source_rank_by_lane=source_ranks,
+            participant_ranks=participant_ranks,
+            dtype=dtype,
+            global_rank=global_rank,
+        )
+        send = _validate_buffer(
+            "bundle send buffer", pair[0], dtype=dtype, elements=sum(input_splits)
+        )
+        receive = _validate_buffer(
+            "bundle receive buffer", pair[1], dtype=dtype, elements=sum(output_splits)
+        )
+        if send.device != receive.device:
+            raise MdpConfigurationError(
+                "MDP: decoder payload bundle send and receive buffers use the same device."
+            )
+        if common_device is None:
+            common_device = send.device
+        elif send.device != common_device:
+            raise MdpConfigurationError(
+                "MDP: every decoder payload bundle dtype uses the same device."
+            )
+        typed_device_types = {
+            specs[(entry.key.sample_id, entry.key.field_name)].device_type
+            for entry in expected.entries
+            if entry.dtype == dtype
+        }
+        if len(typed_device_types) != 1 or send.device.type != next(iter(typed_device_types)):
+            raise MdpConfigurationError(
+                "MDP: decoder payload bundle buffers match manifest device authority."
+            )
+        checked_buffers[dtype] = (send, receive)
+
+    transport_buffers = tuple(buffer for pair in checked_buffers.values() for buffer in pair)
+    nonempty_pointers = tuple(
+        _storage_pointer(buffer) for buffer in transport_buffers if buffer.numel()
+    )
+    if len(set(nonempty_pointers)) != len(nonempty_pointers):
+        raise MdpConfigurationError(
+            "MDP: decoder payload bundle transport buffers use pairwise disjoint storage."
+        )
+    transport_pointer_set = set(nonempty_pointers)
+    checked_local_tensors = {}
+    for entry in source_entries:
+        try:
+            tensor = local_tensors[entry.key]
+        except Exception as error:
+            raise MdpBridgeError(
+                "MDP: decoder payload bundle source tensor lookup succeeded."
+            ) from error
+        spec = specs[(entry.key.sample_id, entry.key.field_name)]
+        if (
+            not isinstance(tensor, Tensor)
+            or tensor.dtype != entry.dtype
+            or tensor.device != common_device
+            or tensor.device.type != spec.device_type
+            or tuple(tensor.shape) != spec.shape
+            or tensor.numel() != entry.element_count
+        ):
+            raise MdpBridgeError(
+                "MDP: decoder payload bundle source tensors match exact route metadata."
+            )
+        if tensor.numel() and _storage_pointer(tensor) in transport_pointer_set:
+            raise MdpBridgeError(
+                "MDP: decoder payload bundle source tensors do not alias transport buffers."
+            )
+        checked_local_tensors[entry.key] = tensor
+
+    exchanges = []
+    for dtype in dtypes:
+        send, receive = checked_buffers[dtype]
+        exchanges.append(
+            prepare_decoder_payload_exchange(
+                expected,
+                plan=plan,
+                global_manifest=global_manifest,
+                source_rank_by_lane=source_ranks,
+                participant_ranks=participant_ranks,
+                dtype=dtype,
+                global_rank=global_rank,
+                local_tensors=MappingProxyType(
+                    {
+                        entry.key: checked_local_tensors[entry.key]
+                        for entry in source_entries
+                        if entry.dtype == dtype
+                    }
+                ),
+                send_buffer=send,
+                receive_buffer=receive,
+            )
+        )
+    exchange_tuple = tuple(exchanges)
+    exchange_by_dtype = {exchange.dtype: exchange for exchange in exchange_tuple}
+    received = MappingProxyType(
+        {
+            entry.key: exchange_by_dtype[entry.dtype].received_tensors[entry.key]
+            for entry in expected.entries
+            if entry.dst_global_rank == global_rank
+        }
+    )
+    digest = _payload_bundle_authority_digest(
+        expected,
+        plan=plan,
+        global_manifest=global_manifest,
+        source_rank_by_lane=source_ranks,
+        participant_ranks=participant_ranks,
+        dtypes=dtypes,
+    )
+    bundle = PreparedDecoderPayloadBundle(
+        bundle_authority_digest=digest,
+        global_rank=global_rank,
+        participant_ranks=participant_ranks,
+        dtypes=dtypes,
+        device=common_device,
+        exchanges=exchange_tuple,
+        received_tensors=received,
+    )
+    object.__setattr__(bundle, "_authority", _capture_bundle_authority(bundle))
+    return validate_prepared_decoder_payload_bundle(bundle)
 
 
 def _validate_status_wire(value: Any) -> tuple[int, ...]:

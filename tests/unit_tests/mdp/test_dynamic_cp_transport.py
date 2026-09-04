@@ -32,7 +32,7 @@ from megatron.core.mdp.errors import (
 _DECODER_RANKS = (30, 10, 40, 20)
 _PARTICIPANTS = (80, 30, 99, 70, 20, 10, 40)
 _SOURCE_RANKS = {3: 70, 7: 80}
-_FIELDS = ("tokens", "loss_mask")
+_FIELDS = ("tokens", "loss_mask", "padding_mask")
 
 
 def _strided_values(seed, *, dtype, device="cpu"):
@@ -41,12 +41,14 @@ def _strided_values(seed, *, dtype, device="cpu"):
 
 
 def _packet(lane, order, *, device="cpu"):
+    padding_values = _strided_values(lane * 100 + order * 10, dtype=torch.int64, device=device)
     tensors = MappingProxyType(
         {
             "tokens": _strided_values(lane * 100 + order * 10, dtype=torch.int64, device=device),
             "loss_mask": _strided_values(
                 lane * 100 + order * 10, dtype=torch.float32, device=device
             ),
+            "padding_mask": padding_values.remainder(4).lt(2),
         }
     )
     specs = tuple(
@@ -64,7 +66,7 @@ def _packet(lane, order, *, device="cpu"):
         local_sample_order=order,
         valid_seqlen=3,
         padded_seqlen=4,
-        tensor_field_count=2,
+        tensor_field_count=3,
         none_field_count=1,
         position_components_or_minus_one=-1,
     )
@@ -180,6 +182,48 @@ def _idle_state(*, device, source_rank=0):
     )
 
 
+def _bundle_world4_state(*, device, source_ranks=None):
+    source_ranks = {3: 0, 7: 1} if source_ranks is None else source_ranks
+    lane3 = _window(3, device=device)
+    lane7 = _window(7, device=device)
+    manifest = build_decoder_global_manifest((lane7.metadata_manifest(), lane3.metadata_manifest()))
+
+    def solver(sample_seqlens, total_gpus, **kwargs):
+        del kwargs
+        assert total_gpus == 2
+        selected = sample_seqlens[:total_gpus]
+        return (
+            [[length] for _, length in selected],
+            sample_seqlens[total_gpus:],
+            None,
+            [[sample_id] for sample_id, _ in selected],
+        )
+
+    plan = build_decoder_dynamic_plan(
+        manifest.samples,
+        decoder_ranks=(0, 2),
+        max_seqlen_per_rank=4,
+        minimum_cp_size=1,
+        solver=solver,
+    )
+    authority = dict(
+        plan=plan,
+        global_manifest=manifest,
+        source_rank_by_lane=source_ranks,
+        participant_ranks=(0, 1, 2, 3),
+    )
+    return SimpleNamespace(
+        lane3=lane3,
+        lane7=lane7,
+        source_windows=MappingProxyType({3: lane3, 7: lane7}),
+        manifest=manifest,
+        plan=plan,
+        authority=authority,
+        ledger=routing.build_decoder_payload_route_ledger(**authority),
+        device=torch.device(device),
+    )
+
+
 def _local_tensors(state, rank, dtype):
     lane_by_rank = {
         source_rank: state.source_windows[lane]
@@ -214,6 +258,44 @@ def _prepare(state, rank, dtype, *, local_tensors=None, send=None, receive=None)
         ),
         send_buffer=send,
         receive_buffer=receive,
+    )
+
+
+def _bundle_dtypes(state):
+    return tuple(
+        dict.fromkeys(
+            spec.dtype for payload in state.manifest.payloads for spec in payload.field_specs
+        )
+    )
+
+
+def _all_local_tensors(state, rank):
+    tensors = {}
+    for dtype in _bundle_dtypes(state):
+        tensors.update(_local_tensors(state, rank, dtype))
+    return MappingProxyType(tensors)
+
+
+def _bundle_buffers(state, rank):
+    buffers = {}
+    for dtype in _bundle_dtypes(state):
+        input_splits, output_splits = routing.decoder_payload_split_sizes(
+            state.ledger, **state.authority, dtype=dtype, global_rank=rank
+        )
+        buffers[dtype] = (
+            torch.empty(sum(input_splits), dtype=dtype, device=state.device),
+            torch.empty(sum(output_splits), dtype=dtype, device=state.device),
+        )
+    return buffers
+
+
+def _prepare_bundle(state, rank, *, local_tensors=None, buffers=None):
+    return transport.prepare_decoder_payload_bundle(
+        state.ledger,
+        **state.authority,
+        global_rank=rank,
+        local_tensors=(_all_local_tensors(state, rank) if local_tensors is None else local_tensors),
+        buffers_by_dtype=(_bundle_buffers(state, rank) if buffers is None else buffers),
     )
 
 
@@ -263,6 +345,25 @@ def _replace_preserving_authority(prepared, **changes):
     return forged
 
 
+def _replace_bundle_preserving_authority(bundle, **changes):
+    authority = bundle._authority
+    forged = replace(bundle, **changes)
+    object.__setattr__(forged, "_authority", authority)
+    return forged
+
+
+class _OneReadMapping(dict):
+    def __init__(self, values):
+        super().__init__(values)
+        self.reads = {key: 0 for key in self}
+
+    def __getitem__(self, key):
+        self.reads[key] = self.reads.get(key, 0) + 1
+        if self.reads[key] > 1:
+            raise RuntimeError(f"duplicate read for {key!r}")
+        return super().__getitem__(key)
+
+
 def _consensus_rows(
     wire, ranks, *, errors=None, gate_ids=None, manifest_digests=None, plan_digests=None
 ):
@@ -292,7 +393,6 @@ def _run_payload_gate(state, *, global_rank, local_prepare, **overrides):
         plan=state.plan,
         ledger=state.ledger,
         source_rank_by_lane=state.authority["source_rank_by_lane"],
-        dtype=torch.int64,
         global_rank=global_rank,
         group_ranks=ranks,
         all_gather_status=lambda wire, **_kwargs: _consensus_rows(wire, ranks),
@@ -306,7 +406,7 @@ def _run_payload_gate(state, *, global_rank, local_prepare, **overrides):
     return getattr(transport, "_run_decoder_payload_gate")(**values)
 
 
-def test_payload_gate_composes_actual_prepare_consensus_then_execute_once():
+def test_payload_gate_composes_one_consensus_then_all_dtypes_in_manifest_order():
     state = _state(source_ranks={3: 30, 7: 80})
     rank = 30
     events = []
@@ -314,7 +414,7 @@ def test_payload_gate_composes_actual_prepare_consensus_then_execute_once():
 
     def local_prepare():
         events.append("prepare")
-        prepared = _prepare(state, rank, torch.int64)
+        prepared = _prepare_bundle(state, rank)
         prepared_values.append(prepared)
         return prepared
 
@@ -323,7 +423,7 @@ def test_payload_gate_composes_actual_prepare_consensus_then_execute_once():
         status = execution._PrecollectiveStatus.from_wire_tuple(wire)
         assert status.global_rank == rank
         assert status.global_manifest_digest == state.manifest.digest
-        assert status.plan_digest == prepared_values[0]._authority.route_authority_digest
+        assert status.plan_digest == prepared_values[0].bundle_authority_digest
         assert status.plan_digest not in (state.manifest.digest, state.plan.digest)
         assert status.error_code == status.gate_id == 0
         assert kwargs == {"timeout_seconds": 0.001}
@@ -341,9 +441,10 @@ def test_payload_gate_composes_actual_prepare_consensus_then_execute_once():
         all_to_all_single=all_to_all_single,
     )
 
-    assert events == ["prepare", "status", "exchange"]
+    assert events == ["prepare", "status", "exchange", "exchange", "exchange"]
     assert len(prepared_values) == 1
     assert received is prepared_values[0].received_tensors
+    assert prepared_values[0].dtypes == (torch.int64, torch.float32, torch.bool)
 
 
 @pytest.mark.parametrize(
@@ -367,7 +468,6 @@ def test_payload_gate_validates_consensus_context_before_prepare(overrides, mess
         plan=state.plan,
         ledger=state.ledger,
         source_rank_by_lane=state.authority["source_rank_by_lane"],
-        dtype=torch.int64,
         global_rank=30,
         group_ranks=state.authority["participant_ranks"],
         all_gather_status=lambda *_args, **_kwargs: calls.append("gather"),
@@ -441,7 +541,6 @@ def test_payload_gate_converges_local_preflight_failure_before_exchange(failure)
             plan=plan,
             ledger=state.ledger,
             source_rank_by_lane=state.authority["source_rank_by_lane"],
-            dtype=torch.int64,
             global_rank=30,
             group_ranks=ranks,
             all_gather_status=gather,
@@ -501,7 +600,7 @@ def test_payload_gate_rejects_remote_error_without_exchanging():
         _run_payload_gate(
             state,
             global_rank=30,
-            local_prepare=lambda: (calls.append("prepare") or _prepare(state, 30, torch.int64)),
+            local_prepare=lambda: (calls.append("prepare") or _prepare_bundle(state, 30)),
             all_gather_status=gather,
             all_to_all_single=lambda *_args, **_kwargs: calls.append("exchange"),
         )
@@ -529,7 +628,7 @@ def test_payload_gate_rejects_consensus_metadata_mismatch_without_exchanging(mis
         _run_payload_gate(
             state,
             global_rank=30,
-            local_prepare=lambda: (calls.append("prepare") or _prepare(state, 30, torch.int64)),
+            local_prepare=lambda: (calls.append("prepare") or _prepare_bundle(state, 30)),
             all_gather_status=gather,
             all_to_all_single=lambda *_args, **_kwargs: calls.append("exchange"),
         )
@@ -549,7 +648,7 @@ def test_payload_gate_does_not_catch_exchange_error_after_successful_consensus()
         _run_payload_gate(
             state,
             global_rank=30,
-            local_prepare=lambda: (calls.append("prepare") or _prepare(state, 30, torch.int64)),
+            local_prepare=lambda: (calls.append("prepare") or _prepare_bundle(state, 30)),
             all_gather_status=lambda wire, **_kwargs: (
                 calls.append("gather")
                 or _consensus_rows(wire, state.authority["participant_ranks"])
@@ -569,7 +668,7 @@ def test_payload_gate_does_not_catch_base_exception(phase):
 
     kwargs = dict(
         global_rank=30,
-        local_prepare=(fail if phase == "prepare" else lambda: _prepare(state, 30, torch.int64)),
+        local_prepare=(fail if phase == "prepare" else lambda: _prepare_bundle(state, 30)),
         all_to_all_single=fail if phase == "exchange" else lambda *_args, **_kwargs: None,
     )
     if phase == "gather":
@@ -594,22 +693,36 @@ def test_payload_gate_treats_consensus_success_with_local_error_as_invalid_state
 
 @pytest.mark.parametrize(
     "failure",
-    ("object", "forged-authority", "forged-splits", "context-participants", "native-group"),
+    (
+        "object",
+        "single-child",
+        "forged-authority",
+        "forged-splits",
+        "context-participants",
+        "native-group",
+    ),
 )
 def test_payload_gate_converges_prepared_and_group_failures_before_exchange(failure):
     state = _state()
     ranks = state.authority["participant_ranks"]
-    prepared = _prepare(state, 30, torch.int64)
+    prepared = _prepare_bundle(state, 30)
     context_ranks = ranks
     group = _FakeGroup(ranks, 30)
     if failure == "object":
         prepared = object()
+    elif failure == "single-child":
+        prepared = _replace_bundle_preserving_authority(
+            prepared, dtypes=prepared.dtypes[:1], exchanges=prepared.exchanges[:1]
+        )
     elif failure == "forged-authority":
         object.__setattr__(prepared, "_authority", object())
     elif failure == "forged-splits":
-        splits = list(prepared.input_split_sizes)
+        first = prepared.exchanges[0]
+        splits = list(first.input_split_sizes)
         splits[0] += 1
-        prepared = _replace_preserving_authority(prepared, input_split_sizes=tuple(splits))
+        forged = _replace_preserving_authority(first, input_split_sizes=tuple(splits))
+        prepared = replace(prepared, exchanges=(forged, *prepared.exchanges[1:]))
+        object.__setattr__(prepared, "_authority", _prepare_bundle(state, 30)._authority)
     elif failure == "context-participants":
         context_ranks = tuple(reversed(ranks))
     else:
@@ -663,12 +776,76 @@ def test_payload_gate_rejects_valid_foreign_prepared_route_authority():
         _run_payload_gate(
             state,
             global_rank=30,
-            local_prepare=lambda: _prepare(foreign, 30, torch.int64),
+            local_prepare=lambda: _prepare_bundle(foreign, 30),
             all_gather_status=gather,
             all_to_all_single=lambda *_args, **_kwargs: calls.append("exchange"),
         )
     assert isinstance(caught.value.__cause__, MdpBridgeError)
-    assert "route authority" in str(caught.value.__cause__)
+    assert "bundle" in str(caught.value.__cause__)
+    assert calls == ["gather"]
+
+
+def test_payload_gate_rejects_resealed_bundle_with_one_foreign_child_before_exchange():
+    state = _state()
+    foreign = _state(source_ranks={3: 30, 7: 80})
+    bundle = _prepare_bundle(state, 30)
+    foreign_child = _prepare_bundle(foreign, 30).exchanges[0]
+    exchanges = (foreign_child, *bundle.exchanges[1:])
+    exchange_by_dtype = {exchange.dtype: exchange for exchange in exchanges}
+    received = MappingProxyType(
+        {
+            entry.key: exchange_by_dtype[entry.dtype].received_tensors[entry.key]
+            for entry in state.ledger.entries
+            if entry.dst_global_rank == 30
+        }
+    )
+    forged = replace(bundle, exchanges=exchanges, received_tensors=received)
+    object.__setattr__(forged, "_authority", transport._capture_bundle_authority(forged))
+    calls = []
+
+    def gather(wire, **_kwargs):
+        calls.append("gather")
+        status = execution._PrecollectiveStatus.from_wire_tuple(wire)
+        assert status.error_code == 1
+        return _consensus_rows(wire, state.authority["participant_ranks"])
+
+    with pytest.raises(MdpPlanError, match="error code 1") as caught:
+        _run_payload_gate(
+            state,
+            global_rank=30,
+            local_prepare=lambda: forged,
+            all_gather_status=gather,
+            all_to_all_single=lambda *_args, **_kwargs: calls.append("exchange"),
+        )
+    assert isinstance(caught.value.__cause__, MdpBridgeError)
+    assert "dtype route authority" in str(caught.value.__cause__)
+    assert calls == ["gather"]
+
+
+def test_payload_gate_rejects_resealed_reordered_top_views_before_exchange():
+    state = _state()
+    bundle = _prepare_bundle(state, 30)
+    reordered = MappingProxyType(dict(reversed(tuple(bundle.received_tensors.items()))))
+    forged = replace(bundle, received_tensors=reordered)
+    object.__setattr__(forged, "_authority", transport._capture_bundle_authority(forged))
+    calls = []
+
+    def gather(wire, **_kwargs):
+        calls.append("gather")
+        status = execution._PrecollectiveStatus.from_wire_tuple(wire)
+        assert status.error_code == 1
+        return _consensus_rows(wire, state.authority["participant_ranks"])
+
+    with pytest.raises(MdpPlanError, match="error code 1") as caught:
+        _run_payload_gate(
+            state,
+            global_rank=30,
+            local_prepare=lambda: forged,
+            all_gather_status=gather,
+            all_to_all_single=lambda *_args, **_kwargs: calls.append("exchange"),
+        )
+    assert isinstance(caught.value.__cause__, MdpBridgeError)
+    assert "bundle has the exact destination key order" in str(caught.value.__cause__)
     assert calls == ["gather"]
 
 
@@ -676,15 +853,15 @@ def test_payload_gate_consensus_binds_rank_local_expected_source_mapping():
     state = _state()
     foreign = _state(source_ranks={3: 30, 7: 80})
     ranks = state.authority["participant_ranks"]
-    state_digest = _prepare(state, 30, torch.int64)._authority.route_authority_digest
-    foreign_prepared = _prepare(foreign, 30, torch.int64)
+    state_digest = _prepare_bundle(state, 30).bundle_authority_digest
+    foreign_prepared = _prepare_bundle(foreign, 30)
     calls = []
 
     def gather(wire, **_kwargs):
         calls.append("gather")
         status = execution._PrecollectiveStatus.from_wire_tuple(wire)
         assert status.error_code == 0
-        assert status.plan_digest == foreign_prepared._authority.route_authority_digest
+        assert status.plan_digest == foreign_prepared.bundle_authority_digest
         assert status.plan_digest != state_digest
         return _consensus_rows(wire, ranks, plan_digests={ranks[0]: state_digest})
 
@@ -1194,6 +1371,266 @@ def test_rank_and_dtype_are_validated_by_route_authority():
         )
 
 
+def test_bundle_factory_uses_manifest_dtype_order_and_exact_child_views():
+    state = _state(source_ranks={3: 30, 7: 80})
+    buffers = _bundle_buffers(state, 30)
+    buffers = dict(reversed(tuple(buffers.items())))
+
+    bundle = _prepare_bundle(state, 30, buffers=buffers)
+
+    assert transport.validate_prepared_decoder_payload_bundle(bundle) is bundle
+    assert bundle.dtypes == (torch.int64, torch.float32, torch.bool)
+    assert tuple(exchange.dtype for exchange in bundle.exchanges) == bundle.dtypes
+    assert type(bundle.received_tensors) is MappingProxyType
+    expected_keys = tuple(
+        entry.key for entry in state.ledger.entries if entry.dst_global_rank == 30
+    )
+    assert tuple(bundle.received_tensors) == expected_keys
+    children = {exchange.dtype: exchange for exchange in bundle.exchanges}
+    for key, tensor in bundle.received_tensors.items():
+        assert tensor is children[tensor.dtype].received_tensors[key]
+    assert type(bundle.bundle_authority_digest) is bytes
+    assert len(bundle.bundle_authority_digest) == 16
+    assert all("position_ids" in payload.none_fields for payload in state.manifest.payloads)
+    with pytest.raises(FrozenInstanceError):
+        bundle.global_rank = 80
+    with pytest.raises(TypeError):
+        bundle.received_tensors[object()] = torch.empty(1)
+    assert "send_buffer" not in repr(bundle)
+
+
+def test_bundle_authority_is_rank_common_and_binds_source_mapping():
+    state = _state(source_ranks={3: 30, 7: 80})
+    foreign = _state(source_ranks={3: 70, 7: 80})
+
+    digests = {_prepare_bundle(state, rank).bundle_authority_digest for rank in _PARTICIPANTS}
+    assert len(digests) == 1
+    assert _prepare_bundle(foreign, 30).bundle_authority_digest not in digests
+
+
+def test_bundle_keeps_idle_rank_in_every_dtype_collective_with_empty_views():
+    state = _state(source_ranks={3: 30, 7: 80})
+    bundle = _prepare_bundle(state, 99)
+
+    assert bundle.dtypes == (torch.int64, torch.float32, torch.bool)
+    assert not bundle.received_tensors
+    assert all(
+        exchange.send_buffer.numel() == exchange.receive_buffer.numel() == 0
+        for exchange in bundle.exchanges
+    )
+
+
+def test_bundle_snapshots_stateful_source_and_local_mappings_once_per_key():
+    state = _state(source_ranks={3: 30, 7: 80})
+    source_ranks = _OneReadMapping(state.authority["source_rank_by_lane"])
+    local_tensors = _OneReadMapping(_all_local_tensors(state, 30))
+
+    bundle = transport.prepare_decoder_payload_bundle(
+        state.ledger,
+        plan=state.plan,
+        global_manifest=state.manifest,
+        source_rank_by_lane=source_ranks,
+        participant_ranks=state.authority["participant_ranks"],
+        global_rank=30,
+        local_tensors=local_tensors,
+        buffers_by_dtype=_bundle_buffers(state, 30),
+    )
+
+    assert transport.validate_prepared_decoder_payload_bundle(bundle) is bundle
+    assert set(source_ranks.reads.values()) == {1}
+    assert set(local_tensors.reads.values()) == {1}
+
+
+def test_bundle_mapping_validation_failure_leaves_every_send_buffer_unchanged():
+    state = _state(source_ranks={3: 30, 7: 80})
+    source_ranks = _OneReadMapping(state.authority["source_rank_by_lane"])
+    local_values = dict(_all_local_tensors(state, 30))
+    source_keys = tuple(entry.key for entry in state.ledger.entries if entry.src_global_rank == 30)
+    local_values[source_keys[-1]] = local_values[source_keys[-1]].reshape(-1)
+    local_tensors = _OneReadMapping(local_values)
+    buffers = _bundle_buffers(state, 30)
+    for send, _ in buffers.values():
+        send.fill_(True if send.dtype == torch.bool else -29)
+    snapshots = {dtype: send.clone() for dtype, (send, _) in buffers.items()}
+
+    with pytest.raises(MdpBridgeError, match="exact route metadata"):
+        transport.prepare_decoder_payload_bundle(
+            state.ledger,
+            plan=state.plan,
+            global_manifest=state.manifest,
+            source_rank_by_lane=source_ranks,
+            participant_ranks=state.authority["participant_ranks"],
+            global_rank=30,
+            local_tensors=local_tensors,
+            buffers_by_dtype=buffers,
+        )
+
+    assert set(source_ranks.reads.values()) == {1}
+    assert set(local_tensors.reads.values()) == {1}
+    for dtype, (send, _) in buffers.items():
+        torch.testing.assert_close(send, snapshots[dtype], rtol=0, atol=0)
+
+
+def test_bundle_validates_last_dtype_before_mutating_any_send_buffer():
+    state = _state(source_ranks={3: 30, 7: 80})
+    buffers = _bundle_buffers(state, 30)
+    for send, _ in buffers.values():
+        send.fill_(True if send.dtype == torch.bool else -19)
+    snapshots = {dtype: send.clone() for dtype, (send, _) in buffers.items()}
+    send, receive = buffers[torch.bool]
+    buffers[torch.bool] = (send, torch.empty(receive.numel() + 1, dtype=torch.bool))
+
+    with pytest.raises(MdpConfigurationError, match="exactly"):
+        _prepare_bundle(state, 30, buffers=buffers)
+
+    for dtype, (send, _) in buffers.items():
+        torch.testing.assert_close(send, snapshots[dtype], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mutation", ("dtype-order", "child-order", "merged-view", "authority"))
+def test_bundle_validator_rejects_forged_local_seal_geometry(mutation):
+    state = _state(source_ranks={3: 30, 7: 80})
+    bundle = _prepare_bundle(state, 30)
+    if mutation == "dtype-order":
+        bundle = _replace_bundle_preserving_authority(bundle, dtypes=tuple(reversed(bundle.dtypes)))
+    elif mutation == "child-order":
+        bundle = _replace_bundle_preserving_authority(
+            bundle, exchanges=tuple(reversed(bundle.exchanges))
+        )
+    elif mutation == "merged-view":
+        views = dict(bundle.received_tensors)
+        key = next(iter(views))
+        views[key] = views[key].clone()
+        bundle = _replace_bundle_preserving_authority(
+            bundle, received_tensors=MappingProxyType(views)
+        )
+    else:
+        object.__setattr__(bundle, "_authority", object())
+
+    with pytest.raises((MdpBridgeError, MdpConfigurationError)):
+        transport.validate_prepared_decoder_payload_bundle(bundle)
+
+
+def test_bundle_validator_rejects_duplicate_key_across_valid_resealed_children():
+    state = _state(source_ranks={3: 30, 7: 80})
+    bundle = _prepare_bundle(state, 30)
+    duplicate_key = next(iter(bundle.exchanges[0].received_tensors))
+    second = bundle.exchanges[1]
+    second_items = list(second.received_tensors.items())
+    second_items[0] = (duplicate_key, second_items[0][1])
+    duplicate_child = replace(second, received_tensors=MappingProxyType(dict(second_items)))
+    object.__setattr__(
+        duplicate_child,
+        "_authority",
+        transport._capture_prepared_authority(
+            duplicate_child, route_authority_digest=second._authority.route_authority_digest
+        ),
+    )
+    forged = _replace_bundle_preserving_authority(
+        bundle, exchanges=(bundle.exchanges[0], duplicate_child, *bundle.exchanges[2:])
+    )
+
+    with pytest.raises(MdpBridgeError, match="child receive keys are unique"):
+        transport.validate_prepared_decoder_payload_bundle(forged)
+
+
+@pytest.mark.parametrize("mutation", ("global-rank", "participant"))
+def test_bundle_validator_rejects_boolean_top_level_rank_authority(mutation):
+    bundle = _prepare_bundle(_state(), 30)
+    if mutation == "global-rank":
+        forged = _replace_bundle_preserving_authority(bundle, global_rank=True)
+        message = "global rank"
+    else:
+        forged = _replace_bundle_preserving_authority(
+            bundle, participant_ranks=(True, *bundle.participant_ranks[1:])
+        )
+        message = "participants"
+
+    with pytest.raises(MdpConfigurationError, match=message):
+        transport.validate_prepared_decoder_payload_bundle(forged)
+
+
+def test_bundle_rejects_cross_dtype_buffer_alias_before_any_copy():
+    state = _state(source_ranks={3: 30, 7: 80})
+    buffers = _bundle_buffers(state, 30)
+    int_send, int_receive = buffers[torch.int64]
+    float_send, float_receive = buffers[torch.float32]
+    shared = torch.full((max(int_send.numel() * 2, float_send.numel()),), -7.0)
+    buffers[torch.int64] = (shared.view(torch.int64)[: int_send.numel()], int_receive)
+    buffers[torch.float32] = (shared[: float_send.numel()], float_receive)
+
+    with pytest.raises(MdpConfigurationError, match="pairwise disjoint"):
+        _prepare_bundle(state, 30, buffers=buffers)
+
+
+@pytest.mark.parametrize("mutation", ("missing-last-dtype", "extra", "source-buffer-alias"))
+def test_bundle_requires_exact_all_dtype_sources_disjoint_from_every_buffer(mutation):
+    state = _state(source_ranks={3: 30, 7: 80})
+    local = dict(_all_local_tensors(state, 30))
+    buffers = _bundle_buffers(state, 30)
+    if mutation == "missing-last-dtype":
+        key = next(key for key, tensor in local.items() if tensor.dtype == torch.bool)
+        local.pop(key)
+    elif mutation == "extra":
+        local[object()] = torch.empty(1)
+    else:
+        key = next(key for key, tensor in local.items() if tensor.dtype == torch.int64)
+        float_send = buffers[torch.float32][0]
+        local[key] = float_send.view(torch.int64)[: local[key].numel()].view(local[key].shape)
+
+    with pytest.raises(MdpBridgeError):
+        _prepare_bundle(state, 30, local_tensors=local, buffers=buffers)
+
+
+def test_bundle_gate_stops_after_failing_dtype_and_preserves_collective_cause():
+    state = _state(source_ranks={3: 30, 7: 80})
+    calls = []
+    failure = RuntimeError("float exchange")
+
+    def exchange(*_args, **_kwargs):
+        calls.append("exchange")
+        if len(calls) == 2:
+            raise failure
+
+    with pytest.raises(MdpBridgeError) as caught:
+        _run_payload_gate(
+            state,
+            global_rank=30,
+            local_prepare=lambda: _prepare_bundle(state, 30),
+            all_to_all_single=exchange,
+        )
+    assert caught.value.__cause__ is failure
+    assert calls == ["exchange", "exchange"]
+
+
+def test_bundle_gate_converges_last_dtype_preparation_failure_before_any_exchange():
+    state = _state(source_ranks={3: 30, 7: 80})
+    events = []
+
+    def local_prepare():
+        events.append("prepare")
+        buffers = _bundle_buffers(state, 30)
+        send, receive = buffers[torch.bool]
+        buffers[torch.bool] = (send, torch.empty(receive.numel() + 1, dtype=torch.bool))
+        return _prepare_bundle(state, 30, buffers=buffers)
+
+    def gather(wire, **_kwargs):
+        events.append("gather")
+        status = execution._PrecollectiveStatus.from_wire_tuple(wire)
+        assert status.error_code == 1
+        return _consensus_rows(wire, state.authority["participant_ranks"])
+
+    with pytest.raises(MdpPlanError, match="error code 1"):
+        _run_payload_gate(
+            state,
+            global_rank=30,
+            local_prepare=local_prepare,
+            all_gather_status=gather,
+            all_to_all_single=lambda *_args, **_kwargs: events.append("exchange"),
+        )
+    assert events == ["prepare", "gather"]
+
+
 _DISTRIBUTED = int(os.environ.get("WORLD_SIZE", "1")) == 4
 _WORLD4_PARTICIPANTS = (0, 1, 2, 3)
 _WORLD4_DECODER_RANKS = (2, 0, 3, 1)
@@ -1295,15 +1732,16 @@ def test_world4_nccl_exchange_includes_source_only_destination_only_and_idle_ran
 
 
 @pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
-def test_world4_nccl_payload_gate_composes_status_and_actual_payload_exchange(payload_group):
+def test_world4_nccl_bundle_composes_one_status_and_three_payload_exchanges(payload_group):
     rank = torch.distributed.get_rank()
     device = torch.device("cuda", torch.cuda.current_device())
-    state = _idle_state(device=device)
+    state = _bundle_world4_state(device=device)
     prepared_values = []
     payload_calls = 0
+    status_calls = 0
 
     def local_prepare():
-        prepared = _prepare(state, rank, torch.int64)
+        prepared = _prepare_bundle(state, rank)
         prepared_values.append(prepared)
         return prepared
 
@@ -1312,6 +1750,15 @@ def test_world4_nccl_payload_gate_composes_status_and_actual_payload_exchange(pa
         payload_calls += 1
         return torch.distributed.all_to_all_single(*args, **kwargs)
 
+    status_gather = transport.make_precollective_status_gather(
+        group=payload_group, group_ranks=_WORLD4_PARTICIPANTS, global_rank=rank, device=device
+    )
+
+    def tracked_status_gather(*args, **kwargs):
+        nonlocal status_calls
+        status_calls += 1
+        return status_gather(*args, **kwargs)
+
     received = _run_payload_gate(
         state,
         global_rank=rank,
@@ -1319,44 +1766,63 @@ def test_world4_nccl_payload_gate_composes_status_and_actual_payload_exchange(pa
         group=payload_group,
         group_ranks_getter=torch.distributed.get_process_group_ranks,
         all_to_all_single=tracked_all_to_all_single,
-        all_gather_status=transport.make_precollective_status_gather(
-            group=payload_group, group_ranks=_WORLD4_PARTICIPANTS, global_rank=rank, device=device
-        ),
+        all_gather_status=tracked_status_gather,
         timeout_seconds=30.0,
     )
 
-    assert len(prepared_values) == payload_calls == 1
+    assert len(prepared_values) == 1
+    assert status_calls == 1
+    assert payload_calls == 3
     assert received is prepared_values[0].received_tensors
+    for exchange in prepared_values[0].exchanges:
+        if rank == 0:
+            assert exchange.send_buffer.numel() > 0
+            assert exchange.receive_buffer.numel() > 0
+        elif rank == 1:
+            assert exchange.send_buffer.numel() > 0
+            assert exchange.receive_buffer.numel() == 0
+        elif rank == 2:
+            assert exchange.send_buffer.numel() == 0
+            assert exchange.receive_buffer.numel() > 0
+        else:
+            assert exchange.send_buffer.numel() == exchange.receive_buffer.numel() == 0
     packets = {
         packet.sample_id: packet
         for window in state.source_windows.values()
         for packet in window.packets
     }
     destination_entries = tuple(
-        entry
-        for entry in state.ledger.entries
-        if entry.dtype == torch.int64 and entry.dst_global_rank == rank
+        entry for entry in state.ledger.entries if entry.dst_global_rank == rank
     )
     assert set(received) == {entry.key for entry in destination_entries}
     for entry in destination_entries:
         expected = packets[entry.key.sample_id].tensor_fields[entry.key.field_name]
         torch.testing.assert_close(received[entry.key], expected, rtol=0, atol=0)
+    bool_values = tuple(
+        tensor.reshape(-1) for tensor in received.values() if tensor.dtype == torch.bool
+    )
+    if bool_values:
+        flattened = torch.cat(bool_values)
+        assert flattened.any() and not flattened.all()
     completion = torch.ones((), dtype=torch.int64, device=device)
     torch.distributed.all_reduce(completion, group=payload_group)
     assert completion.item() == 4
 
 
 @pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
-@pytest.mark.parametrize("failure", ("raise", "malformed", "foreign-carrier", "mapping"))
-def test_world4_nccl_payload_gate_converges_one_rank_preflight_failure_without_exchange(
+@pytest.mark.parametrize(
+    "failure", ("raise", "malformed", "last-dtype", "foreign-carrier", "reordered", "mapping")
+)
+def test_world4_nccl_bundle_converges_one_rank_preflight_failure_without_exchange(
     payload_group, failure
 ):
     rank = torch.distributed.get_rank()
     device = torch.device("cuda", torch.cuda.current_device())
-    state = _idle_state(device=device)
-    foreign = _idle_state(device=device, source_rank=2)
+    state = _bundle_world4_state(device=device)
+    foreign = _bundle_world4_state(device=device, source_ranks={3: 2, 7: 1})
     local_error = RuntimeError("rank-2 prepare")
     payload_calls = 0
+    status_calls = 0
 
     def local_prepare():
         if rank == 2:
@@ -1364,13 +1830,40 @@ def test_world4_nccl_payload_gate_converges_one_rank_preflight_failure_without_e
                 raise local_error
             if failure == "malformed":
                 return object()
-            return _prepare(foreign, rank, torch.int64)
-        return _prepare(state, rank, torch.int64)
+            if failure == "last-dtype":
+                buffers = _bundle_buffers(state, rank)
+                send, receive = buffers[torch.bool]
+                buffers[torch.bool] = (
+                    send,
+                    torch.empty(receive.numel() + 1, dtype=torch.bool, device=device),
+                )
+                return _prepare_bundle(state, rank, buffers=buffers)
+            candidate = _prepare_bundle(
+                foreign if failure in ("foreign-carrier", "mapping") else state, rank
+            )
+            if failure == "reordered":
+                candidate = replace(
+                    candidate,
+                    dtypes=tuple(reversed(candidate.dtypes)),
+                    exchanges=tuple(reversed(candidate.exchanges)),
+                )
+                object.__setattr__(candidate, "_authority", _prepare_bundle(state, rank)._authority)
+            return candidate
+        return _prepare_bundle(state, rank)
 
     def tracked_all_to_all_single(*args, **kwargs):
         nonlocal payload_calls
         payload_calls += 1
         return torch.distributed.all_to_all_single(*args, **kwargs)
+
+    status_gather = transport.make_precollective_status_gather(
+        group=payload_group, group_ranks=_WORLD4_PARTICIPANTS, global_rank=rank, device=device
+    )
+
+    def tracked_status_gather(*args, **kwargs):
+        nonlocal status_calls
+        status_calls += 1
+        return status_gather(*args, **kwargs)
 
     message = "plan digest mismatch at rank 2" if failure == "mapping" else "error code 1"
     with pytest.raises(MdpPlanError, match=message) as caught:
@@ -1387,19 +1880,14 @@ def test_world4_nccl_payload_gate_converges_one_rank_preflight_failure_without_e
             group=payload_group,
             group_ranks_getter=torch.distributed.get_process_group_ranks,
             all_to_all_single=tracked_all_to_all_single,
-            all_gather_status=transport.make_precollective_status_gather(
-                group=payload_group,
-                group_ranks=_WORLD4_PARTICIPANTS,
-                global_rank=rank,
-                device=device,
-            ),
+            all_gather_status=tracked_status_gather,
             timeout_seconds=30.0,
         )
     if rank == 2:
         if failure == "raise":
             assert caught.value.__cause__ is local_error
-        elif failure in ("malformed", "foreign-carrier"):
-            assert isinstance(caught.value.__cause__, MdpBridgeError)
+        elif failure in ("malformed", "last-dtype", "foreign-carrier", "reordered"):
+            assert isinstance(caught.value.__cause__, (MdpBridgeError, MdpConfigurationError))
         else:
             assert caught.value.__cause__ is None
     else:
@@ -1407,6 +1895,31 @@ def test_world4_nccl_payload_gate_converges_one_rank_preflight_failure_without_e
     payload_count = torch.tensor(payload_calls, dtype=torch.int64, device=device)
     torch.distributed.all_reduce(payload_count, group=payload_group)
     assert payload_count.item() == 0
+    assert status_calls == 1
     completion = torch.ones((), dtype=torch.int64, device=device)
     torch.distributed.all_reduce(completion, group=payload_group)
     assert completion.item() == 4
+
+    retry_calls = 0
+
+    def retry_all_to_all(*args, **kwargs):
+        nonlocal retry_calls
+        retry_calls += 1
+        return torch.distributed.all_to_all_single(*args, **kwargs)
+
+    retried = _run_payload_gate(
+        state,
+        global_rank=rank,
+        local_prepare=lambda: _prepare_bundle(state, rank),
+        group=payload_group,
+        group_ranks_getter=torch.distributed.get_process_group_ranks,
+        all_to_all_single=retry_all_to_all,
+        all_gather_status=transport.make_precollective_status_gather(
+            group=payload_group, group_ranks=_WORLD4_PARTICIPANTS, global_rank=rank, device=device
+        ),
+        timeout_seconds=30.0,
+    )
+    assert retry_calls == 3
+    assert set(retried) == {
+        entry.key for entry in state.ledger.entries if entry.dst_global_rank == rank
+    }
