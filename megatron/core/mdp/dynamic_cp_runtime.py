@@ -63,6 +63,7 @@ _INT64_MAX = 2**63 - 1
 _MAPPING_PROXY_TYPE = type(MappingProxyType({}))
 _DECODER_READY_AUTHORITY_DOMAIN = b"megatron.mdp.dynamic-cp.decoder-ready"
 _DECODER_READY_AUTHORITY_SCHEMA_VERSION = 1
+_DECODER_GRADIENT_WAVE_AUTHORITY_DOMAIN = b"megatron.mdp.dynamic-cp.decoder-gradient-wave"
 _DECODER_ROLES = ("decoder", "non-decoder")
 
 
@@ -276,6 +277,27 @@ def _digest_bytes(hasher: Any, value: bytes) -> None:
     checked = _require_digest("decoder-ready digest input", value)
     _digest_integers(hasher, len(checked))
     hasher.update(checked)
+
+
+def _decoder_gradient_wave_authority_digest(ready: Any, iteration_nonce: Any) -> bytes:
+    """Return gate-safe wave authority, or neutral authority for a local fault."""
+    try:
+        if (
+            type(ready) is not DecoderReadyIteration
+            or type(ready._authority) is not _DecoderReadyCarrierAuthority
+        ):
+            return bytes(16)
+        nonce = _require_iteration_nonce(iteration_nonce)
+        ready_digest = _require_digest(
+            "decoder gradient ready authority", ready._authority.authority_digest
+        )
+    except Exception:
+        return bytes(16)
+    hasher = hashlib.blake2s(digest_size=16)
+    hasher.update(_DECODER_GRADIENT_WAVE_AUTHORITY_DOMAIN)
+    _digest_bytes(hasher, ready_digest)
+    _digest_bytes(hasher, nonce)
+    return hasher.digest()
 
 
 def _digest_text(hasher: Any, value: str) -> None:
@@ -1149,6 +1171,107 @@ def _retire_decoder_gradient_receipt_lifecycle(lifecycle: Any) -> None:
     _seal_decoder_gradient_receipt_lifecycle(lifecycle, state="retired", receipt_identity=None)
 
 
+def _complete_decoder_gradient_phase(
+    ready: DecoderReadyIteration,
+    *,
+    iteration_nonce: bytes,
+    global_manifest: DecoderGlobalManifest,
+    plan: DecoderDynamicPlan,
+    embedding_ledger: DynamicBridgeLedger,
+    gradient_ledger: DynamicBridgeLedger,
+    producer_rank_by_item: Mapping[GlobalVisionItemId, int],
+    output_rows_by_item: Mapping[GlobalVisionItemId, int],
+    embedding_width: int,
+    embedding_dtype: torch.dtype,
+    cp_partition_mode: str,
+    global_rank: int,
+    participant_ranks: tuple[int, ...],
+    group_ranks: tuple[int, ...],
+    send_buffer: Tensor,
+    receive_buffer: Tensor,
+    destination_tensors: Mapping[GlobalVisionItemId, Tensor],
+    all_gather_status: Any,
+    timeout_seconds: float,
+    group: Any,
+    group_ranks_getter: Callable[[Any], Any] = dist.get_process_group_ranks,
+    all_to_all_single: Callable[..., Any] = dist.all_to_all_single,
+) -> Mapping[GlobalVisionItemId, Tensor]:
+    """Complete one successful reverse-gradient wave from ready leaves to producers.
+
+    The caller invokes this only after the native decoder schedule populated the
+    retained endpoint-leaf gradients. It owns every buffer and the surrounding
+    schedule state. This helper seals one local receipt lifecycle; it does not
+    make an iteration nonce globally fresh or recover from a failed collective.
+    """
+
+    def prepare_gradient() -> PreparedDecoderGradientExchange:
+        participants = _require_ranks("decoder gradient participant ranks", participant_ranks)
+        if participants != _require_ranks("decoder gradient group ranks", group_ranks):
+            raise MdpConfigurationError(
+                "MDP: decoder gradient participants and collective group ranks match exactly."
+            )
+        return _prepare_decoder_gradient_exchange(
+            ready,
+            global_manifest=global_manifest,
+            plan=plan,
+            embedding_ledger=embedding_ledger,
+            gradient_ledger=gradient_ledger,
+            producer_rank_by_item=producer_rank_by_item,
+            output_rows_by_item=output_rows_by_item,
+            embedding_width=embedding_width,
+            embedding_dtype=embedding_dtype,
+            cp_partition_mode=cp_partition_mode,
+            global_rank=global_rank,
+            participant_ranks=participants,
+            send_buffer=send_buffer,
+            receive_buffer=receive_buffer,
+        )
+
+    receipt = _run_decoder_gradient_phase(
+        None,
+        iteration_nonce=iteration_nonce,
+        local_prepare=prepare_gradient,
+        predecessor_authority_digest=_decoder_gradient_wave_authority_digest(
+            ready, iteration_nonce
+        ),
+        global_manifest=global_manifest,
+        plan=plan,
+        embedding_ledger=embedding_ledger,
+        gradient_ledger=gradient_ledger,
+        producer_rank_by_item=producer_rank_by_item,
+        output_rows_by_item=output_rows_by_item,
+        embedding_width=embedding_width,
+        embedding_dtype=embedding_dtype,
+        cp_partition_mode=cp_partition_mode,
+        global_rank=global_rank,
+        group_ranks=group_ranks,
+        all_gather_status=all_gather_status,
+        timeout_seconds=timeout_seconds,
+        group=group,
+        group_ranks_getter=group_ranks_getter,
+        all_to_all_single=all_to_all_single,
+    )
+    lifecycle = _begin_decoder_gradient_receipt_lifecycle(iteration_nonce)
+    destinations = _consume_decoder_gradient_receipt(
+        lifecycle,
+        receipt,
+        global_manifest=global_manifest,
+        plan=plan,
+        embedding_ledger=embedding_ledger,
+        gradient_ledger=gradient_ledger,
+        producer_rank_by_item=producer_rank_by_item,
+        output_rows_by_item=output_rows_by_item,
+        global_rank=global_rank,
+        participant_ranks=participant_ranks,
+        embedding_width=embedding_width,
+        embedding_dtype=embedding_dtype,
+        cp_partition_mode=cp_partition_mode,
+        destination_tensors=destination_tensors,
+    )
+    _retire_decoder_gradient_receipt_lifecycle(lifecycle)
+    return destinations
+
+
 def _prepare_decoder_gradient_exchange(
     ready: DecoderReadyIteration,
     *,
@@ -1245,6 +1368,8 @@ def _run_decoder_gradient_gate(
     all_gather_status: Any,
     timeout_seconds: float,
     group: Any,
+    local_prepare: Callable[[], PreparedDecoderGradientExchange] | None = None,
+    predecessor_authority_digest: bytes | None = None,
     group_ranks_getter: Callable[[Any], Any] = dist.get_process_group_ranks,
     all_to_all_single: Callable[..., Any] = dist.all_to_all_single,
 ) -> Mapping[DynamicBridgeKey, Tensor]:
@@ -1254,24 +1379,38 @@ def _run_decoder_gradient_gate(
     predecessor. The local preparation callback then records the validation
     error, so all ranks converge before the helper can issue gradient A2A.
     """
-    predecessor_authority_digest = bytes(16)
-    if (
-        type(prepared) is PreparedDecoderGradientExchange
-        and type(prepared._authority) is _PreparedDecoderGradientAuthority
-    ):
-        predecessor_authority_digest = prepared._authority.ready_authority_digest
+    if predecessor_authority_digest is None:
+        predecessor_authority_digest = bytes(16)
+        if (
+            type(prepared) is PreparedDecoderGradientExchange
+            and type(prepared._authority) is _PreparedDecoderGradientAuthority
+        ):
+            predecessor_authority_digest = prepared._authority.ready_authority_digest
 
-    def local_prepare() -> PreparedDynamicBridgeExchange:
-        carrier = validate_prepared_decoder_gradient_exchange(
-            prepared,
-            global_manifest=global_manifest,
-            plan=plan,
-            global_rank=global_rank,
-            participant_ranks=group_ranks,
-            embedding_width=embedding_width,
-            embedding_dtype=embedding_dtype,
-            cp_partition_mode=cp_partition_mode,
-        )
+    def prepare_exchange() -> PreparedDynamicBridgeExchange:
+        if local_prepare is None:
+            carrier = validate_prepared_decoder_gradient_exchange(
+                prepared,
+                global_manifest=global_manifest,
+                plan=plan,
+                global_rank=global_rank,
+                participant_ranks=group_ranks,
+                embedding_width=embedding_width,
+                embedding_dtype=embedding_dtype,
+                cp_partition_mode=cp_partition_mode,
+            )
+        else:
+            carrier = local_prepare()
+            carrier = validate_prepared_decoder_gradient_exchange(
+                carrier,
+                global_manifest=global_manifest,
+                plan=plan,
+                global_rank=global_rank,
+                participant_ranks=group_ranks,
+                embedding_width=embedding_width,
+                embedding_dtype=embedding_dtype,
+                cp_partition_mode=cp_partition_mode,
+            )
         return carrier.exchange
 
     return _run_dynamic_bridge_gate(
@@ -1287,7 +1426,7 @@ def _run_decoder_gradient_gate(
         global_rank=global_rank,
         group_ranks=group_ranks,
         all_gather_status=all_gather_status,
-        local_prepare=local_prepare,
+        local_prepare=prepare_exchange,
         timeout_seconds=timeout_seconds,
         group=group,
         predecessor_authority_digest=predecessor_authority_digest,
@@ -1297,12 +1436,40 @@ def _run_decoder_gradient_gate(
 
 
 def _run_decoder_gradient_phase(
-    prepared: PreparedDecoderGradientExchange, *, iteration_nonce: bytes, **kwargs: Any
+    prepared: Any,
+    *,
+    iteration_nonce: bytes,
+    local_prepare: Callable[[], PreparedDecoderGradientExchange] | None = None,
+    predecessor_authority_digest: bytes | None = None,
+    **kwargs: Any,
 ) -> DecoderGradientReceipt:
-    """Run gate 3 and seal its exact received mapping for local aggregation."""
-    received_tensors = _run_decoder_gradient_gate(prepared, **kwargs)
+    """Run nonce-bound gate 3 and seal its exact received mapping for aggregation."""
+
+    prepared_slot: dict[str, PreparedDecoderGradientExchange] = {}
+
+    def prepare_phase() -> PreparedDecoderGradientExchange:
+        _require_iteration_nonce(iteration_nonce)
+        carrier = prepared if local_prepare is None else local_prepare()
+        if type(carrier) is PreparedDecoderGradientExchange:
+            prepared_slot["value"] = carrier
+        return carrier
+
+    if predecessor_authority_digest is None:
+        ready = prepared.ready if type(prepared) is PreparedDecoderGradientExchange else None
+        predecessor_authority_digest = _decoder_gradient_wave_authority_digest(
+            ready, iteration_nonce
+        )
+    received_tensors = _run_decoder_gradient_gate(
+        prepared,
+        local_prepare=prepare_phase,
+        predecessor_authority_digest=predecessor_authority_digest,
+        **kwargs,
+    )
+    receipt_prepared = prepared_slot.get("value")
+    if receipt_prepared is None:
+        raise MdpBridgeError("MDP: decoder gradient gate retains its successful prepared exchange.")
     return _make_decoder_gradient_receipt(
-        prepared, received_tensors, iteration_nonce=iteration_nonce
+        receipt_prepared, received_tensors, iteration_nonce=iteration_nonce
     )
 
 
