@@ -143,16 +143,24 @@ class _TwoWaveSolver:
         )
 
 
-def _state(*, device="cpu", images_per_sample=1, text_only=False):
+class _SingleWaveCp2Solver:
+    def __call__(self, sample_seqlens, total_gpus, max_seq_len_per_rank, min_cp_size=1):
+        assert (total_gpus, max_seq_len_per_rank, min_cp_size) == (2, 8, 1)
+        lengths = [sample[1] for sample in sample_seqlens]
+        sample_ids = [sample[0] for sample in sample_seqlens]
+        return ([lengths, lengths], [], None, [sample_ids, sample_ids])
+
+
+def _state(*, device="cpu", images_per_sample=1, text_only=False, solver=None, capacity=4):
     device = torch.device(device)
     window = _source_window(device=device, images_per_sample=images_per_sample, text_only=text_only)
     manifest = build_decoder_global_manifest((window.metadata_manifest(),))
     plan = build_decoder_dynamic_plan(
         manifest.samples,
         decoder_ranks=_DECODER_RANKS,
-        max_seqlen_per_rank=4,
+        max_seqlen_per_rank=capacity,
         minimum_cp_size=1,
-        solver=_TwoWaveSolver(),
+        solver=_TwoWaveSolver() if solver is None else solver,
     )
     payload_authority = dict(
         plan=plan,
@@ -310,7 +318,7 @@ def _prepare_gradient(state, ready, rank, *, buffers=None, **overrides):
     return runtime._prepare_decoder_gradient_exchange(ready, **values)
 
 
-def _run_gradient_gate(state, prepared, rank, *, events, **overrides):
+def _run_gradient_gate(state, prepared, rank, *, events, phase=False, **overrides):
     runtime = _runtime()
     group = overrides.pop("group", _FakeGroup(_PARTICIPANTS, rank))
 
@@ -343,7 +351,27 @@ def _run_gradient_gate(state, prepared, rank, *, events, **overrides):
         all_to_all_single=all_to_all_single,
     )
     values.update(overrides)
-    return runtime._run_decoder_gradient_gate(prepared, **values)
+    runner = runtime._run_decoder_gradient_phase if phase else runtime._run_decoder_gradient_gate
+    return runner(prepared, **values)
+
+
+def _gradient_destinations(state, rank, *, fill_value=None):
+    item_ids = tuple(
+        item.item_id
+        for item in state.manifest.items
+        if any(
+            entry.dst_global_rank == rank and entry.key.item_id == item.item_id
+            for entry in state.gradient.entries
+        )
+    )
+    destinations = {}
+    for item_id in item_ids:
+        rows = next(item.output_rows for item in state.manifest.items if item.item_id == item_id)
+        destination = torch.empty(rows, _WIDTH, dtype=torch.float32, device=state.device)
+        if fill_value is not None:
+            destination.fill_(fill_value)
+        destinations[item_id] = destination
+    return MappingProxyType(destinations)
 
 
 class _FakeGroup:
@@ -379,8 +407,10 @@ def _decoder_group_dependencies(state, rank, *, actual_groups=None):
     groups = {} if actual_groups is None else actual_groups
 
     def getter(*, group_size):
-        assert group_size == 1
-        return groups.setdefault(rank, _FakeGroup((rank,), rank))
+        if group_size == 1:
+            return groups.setdefault(rank, _FakeGroup((rank,), rank))
+        assert group_size == 2
+        return groups.setdefault(_DECODER_RANKS, _FakeGroup(_DECODER_RANKS, rank))
 
     return getter, lambda group: list(group.ranks)
 
@@ -902,7 +932,10 @@ def test_decoder_gradient_preparation_discriminator_is_available():
 
 
 def test_decoder_gradient_gate_discriminator_is_available():
-    assert callable(_runtime()._run_decoder_gradient_gate)
+    runtime = _runtime()
+    assert callable(runtime._run_decoder_gradient_gate)
+    assert callable(runtime._run_decoder_gradient_phase)
+    assert runtime.DecoderGradientReceipt.__module__ == runtime.__name__
 
 
 def test_decoder_gradient_gate_runs_one_status_gate_before_reverse_exchange():
@@ -929,6 +962,166 @@ def test_decoder_gradient_gate_converges_forged_preparation_before_a2a():
     with pytest.raises(MdpPlanError, match="rejected rank 1"):
         _run_gradient_gate(state, forged, 1, events=events)
     assert events == ["status-3"]
+
+
+def test_decoder_gradient_receipt_aggregates_exact_endpoint_gradients():
+    state = _state(images_per_sample=2, solver=_SingleWaveCp2Solver(), capacity=8)
+    ready = _run(state, 1)
+    _set_leaf_grads(ready)
+    prepared = _prepare_gradient(state, ready, 1)
+    events = []
+    receipt = _run_gradient_gate(state, prepared, 1, events=events, phase=True)
+    for index, tensor in enumerate(receipt.received_tensors.values(), start=1):
+        tensor.fill_(index)
+    destinations = _gradient_destinations(state, 1, fill_value=-7)
+    assembled = _runtime()._assemble_decoder_gradient_receipt(
+        receipt,
+        global_manifest=state.manifest,
+        plan=state.plan,
+        embedding_ledger=state.embedding,
+        gradient_ledger=state.gradient,
+        producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+        output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+        global_rank=1,
+        participant_ranks=_PARTICIPANTS,
+        embedding_width=_WIDTH,
+        embedding_dtype=torch.float32,
+        cp_partition_mode="contiguous",
+        destination_tensors=destinations,
+    )
+    assert events == ["status-3", "a2a-torch.float32"]
+    assert tuple(assembled) == tuple(destinations)
+    for item_id, destination in assembled.items():
+        expected = torch.zeros_like(destination)
+        for index, entry in enumerate(
+            entry for entry in state.gradient.entries if entry.dst_global_rank == 1
+        ):
+            if entry.key.item_id == item_id:
+                expected.add_(index + 1)
+        assert destination is destinations[item_id]
+        torch.testing.assert_close(destination, expected)
+    assert receipt.received_tensors is prepared.exchange.received_tensors
+    assert all(leaf.grad is not None for leaf in ready.embedding_leaves.values())
+
+
+def test_decoder_gradient_receipt_rejects_forgery_without_mutating_destinations():
+    state = _state()
+    ready = _run(state, 1)
+    _set_leaf_grads(ready)
+    prepared = _prepare_gradient(state, ready, 1)
+    receipt = _run_gradient_gate(state, prepared, 1, events=[], phase=True)
+    forged = replace(receipt)
+    object.__setattr__(forged, "_authority", receipt._authority)
+    destinations = _gradient_destinations(state, 1, fill_value=-7)
+    with pytest.raises(MdpBridgeError, match="private authority seal"):
+        _runtime()._assemble_decoder_gradient_receipt(
+            forged,
+            global_manifest=state.manifest,
+            plan=state.plan,
+            embedding_ledger=state.embedding,
+            gradient_ledger=state.gradient,
+            producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+            output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+            global_rank=1,
+            participant_ranks=_PARTICIPANTS,
+            embedding_width=_WIDTH,
+            embedding_dtype=torch.float32,
+            cp_partition_mode="contiguous",
+            destination_tensors=destinations,
+        )
+    assert all(
+        torch.equal(destination, torch.full_like(destination, -7))
+        for destination in destinations.values()
+    )
+
+
+def test_decoder_gradient_receipt_rejects_decoder_gradient_alias_before_mutation():
+    state = _state()
+    ready = _run(state, 1)
+    _set_leaf_grads(ready)
+    prepared = _prepare_gradient(state, ready, 1)
+    receipt = _run_gradient_gate(state, prepared, 1, events=[], phase=True)
+    item_id = next(iter(_gradient_destinations(state, 1)))
+    source = prepared.source_tensors[bridge.DynamicBridgeKey(item_id, 1)]
+    source_before = source.clone()
+    with pytest.raises(MdpBridgeError, match="do not alias"):
+        _runtime()._assemble_decoder_gradient_receipt(
+            receipt,
+            global_manifest=state.manifest,
+            plan=state.plan,
+            embedding_ledger=state.embedding,
+            gradient_ledger=state.gradient,
+            producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+            output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+            global_rank=1,
+            participant_ranks=_PARTICIPANTS,
+            embedding_width=_WIDTH,
+            embedding_dtype=torch.float32,
+            cp_partition_mode="contiguous",
+            destination_tensors=MappingProxyType({item_id: source}),
+        )
+    torch.testing.assert_close(source, source_before)
+
+
+def test_decoder_gradient_receipt_rejects_transport_buffer_alias_before_mutation():
+    state = _state()
+    ready = _run(state, 1)
+    _set_leaf_grads(ready)
+    prepared = _prepare_gradient(state, ready, 1)
+    receipt = _run_gradient_gate(state, prepared, 1, events=[], phase=True)
+    item_id = next(iter(_gradient_destinations(state, 1)))
+    destination = prepared.exchange.send_buffer[:_WIDTH].reshape(1, _WIDTH)
+    destination_before = destination.clone()
+    with pytest.raises(MdpBridgeError, match="do not alias"):
+        _runtime()._assemble_decoder_gradient_receipt(
+            receipt,
+            global_manifest=state.manifest,
+            plan=state.plan,
+            embedding_ledger=state.embedding,
+            gradient_ledger=state.gradient,
+            producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+            output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+            global_rank=1,
+            participant_ranks=_PARTICIPANTS,
+            embedding_width=_WIDTH,
+            embedding_dtype=torch.float32,
+            cp_partition_mode="contiguous",
+            destination_tensors=MappingProxyType({item_id: destination}),
+        )
+    torch.testing.assert_close(destination, destination_before)
+
+
+def test_decoder_gradient_receipt_rejects_decoder_leaf_alias_before_mutation():
+    state = _state()
+    ready = _run(state, 1)
+    _set_leaf_grads(ready)
+    prepared = _prepare_gradient(state, ready, 1)
+    receipt = _run_gradient_gate(state, prepared, 1, events=[], phase=True)
+    item_id = next(iter(_gradient_destinations(state, 1)))
+    leaf = next(
+        ready.embedding_leaves[assignment.key]
+        for assignment, record in zip(ready.assignments, ready.records)
+        if record.vision_items[0].global_item_id == item_id
+    )
+    destination = leaf.detach()
+    destination_before = destination.clone()
+    with pytest.raises(MdpBridgeError, match="do not alias"):
+        _runtime()._assemble_decoder_gradient_receipt(
+            receipt,
+            global_manifest=state.manifest,
+            plan=state.plan,
+            embedding_ledger=state.embedding,
+            gradient_ledger=state.gradient,
+            producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+            output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+            global_rank=1,
+            participant_ranks=_PARTICIPANTS,
+            embedding_width=_WIDTH,
+            embedding_dtype=torch.float32,
+            cp_partition_mode="contiguous",
+            destination_tensors=MappingProxyType({item_id: destination}),
+        )
+    torch.testing.assert_close(destination, destination_before)
 
 
 @pytest.mark.parametrize("rank,images_per_sample", ((0, 1), (1, 1), (3, 1), (1, 2)))
@@ -1215,8 +1408,11 @@ if _DISTRIBUTED:
         participant = torch.distributed.new_group(ranks=list(_PARTICIPANTS), backend="nccl")
         cp_rank_1 = torch.distributed.new_group(ranks=[1], backend="nccl")
         cp_rank_2 = torch.distributed.new_group(ranks=[2], backend="nccl")
-        yield participant, {1: cp_rank_1, 2: cp_rank_2}
+        cp_ranks_1_2 = torch.distributed.new_group(ranks=[1, 2], backend="nccl")
+        yield participant, {1: cp_rank_1, 2: cp_rank_2, (1, 2): cp_ranks_1_2}
         rank = torch.distributed.get_rank()
+        if rank in (1, 2):
+            torch.distributed.destroy_process_group(cp_ranks_1_2)
         if rank == 2:
             torch.distributed.destroy_process_group(cp_rank_2)
         if rank == 1:
@@ -1245,8 +1441,10 @@ def _run_world4(state, rank, groups, *, fail_local=False, events=None):
         return torch.distributed.all_to_all_single(*args, **kwargs)
 
     def decoder_group_getter(*, group_size):
-        assert group_size == 1
-        return cp_groups[rank]
+        if group_size == 1:
+            return cp_groups[rank]
+        assert group_size == 2
+        return cp_groups[(1, 2)]
 
     def local_prepare(payload_tensors, embedding_tensors, assignments):
         events.append("local-prepare")
@@ -1281,7 +1479,9 @@ def _run_world4(state, rank, groups, *, fail_local=False, events=None):
     )
 
 
-def _run_world4_gradient_gate(state, ready, rank, groups, *, fail_local=False, events=None):
+def _run_world4_gradient_gate(
+    state, ready, rank, groups, *, fail_local=False, events=None, phase=False
+):
     runtime = _runtime()
     participant, _ = groups
     events = [] if events is None else events
@@ -1304,7 +1504,8 @@ def _run_world4_gradient_gate(state, ready, rank, groups, *, fail_local=False, e
         events.append(f"a2a-{input_tensor.dtype}")
         return torch.distributed.all_to_all_single(*args, **kwargs)
 
-    return runtime._run_decoder_gradient_gate(
+    runner = runtime._run_decoder_gradient_phase if phase else runtime._run_decoder_gradient_gate
+    return runner(
         prepared,
         global_manifest=state.manifest,
         plan=state.plan,
@@ -1458,3 +1659,43 @@ def test_world4_nccl_decoder_gradient_gate_composes_and_reuses_group(decoder_rea
     _run_world4_gradient_gate(state, ready, rank, decoder_ready_groups, events=retry_events)
     torch.distributed.all_reduce(completion, group=decoder_ready_groups[0])
     assert retry_events == ["status-3", "a2a-torch.float32"]
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+def test_world4_nccl_decoder_gradient_receipt_aggregates_cp2_endpoints(decoder_ready_groups):
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = _state(device=device, solver=_SingleWaveCp2Solver(), capacity=8)
+    ready = _run_world4(state, rank, decoder_ready_groups)
+    _set_leaf_grads(ready)
+
+    events = []
+    receipt = _run_world4_gradient_gate(
+        state, ready, rank, decoder_ready_groups, events=events, phase=True
+    )
+    destinations = _gradient_destinations(state, rank, fill_value=-7)
+    assembled = _runtime()._assemble_decoder_gradient_receipt(
+        receipt,
+        global_manifest=state.manifest,
+        plan=state.plan,
+        embedding_ledger=state.embedding,
+        gradient_ledger=state.gradient,
+        producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+        output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+        global_rank=rank,
+        participant_ranks=_PARTICIPANTS,
+        embedding_width=_WIDTH,
+        embedding_dtype=torch.float32,
+        cp_partition_mode="contiguous",
+        destination_tensors=destinations,
+    )
+    completion = torch.ones((), dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(completion, group=decoder_ready_groups[0])
+    assert completion.item() == 4
+    assert events == ["status-3", "a2a-torch.float32"]
+    for item_id, destination in assembled.items():
+        expected = torch.zeros_like(destination)
+        for entry in state.gradient.entries:
+            if entry.dst_global_rank == rank and entry.key.item_id == item_id:
+                expected.add_(receipt.received_tensors[entry.key])
+        torch.testing.assert_close(destination, expected)

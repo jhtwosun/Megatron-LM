@@ -6,9 +6,10 @@ The caller owns buffers, encoder outputs, process groups, and resource
 retirement. A trusted rank-local adapter constructs the structural VPP1
 records and leaf views. This module serializes the existing all-dtype decoder
 payload gate, the existing embedding bridge gate, one decoder-ready status
-gate, and one reverse-gradient preparation/transport gate. It does not enter
-a decoder schedule, create replay cursors, execute backward, retire gradient
-state, retry, or recover from a failure inside an entered collective.
+gate, one reverse-gradient preparation/transport gate, and local caller-owned
+producer aggregation. It does not enter a decoder schedule, create replay
+cursors, execute backward, retire gradient state, retry, or recover from a
+failure inside an entered collective.
 """
 
 import hashlib
@@ -141,6 +142,27 @@ class PreparedDecoderGradientExchange:
     source_tensors: Mapping[DynamicBridgeKey, Tensor] = field(compare=False, repr=False)
     exchange: PreparedDynamicBridgeExchange = field(compare=False, repr=False)
     _authority: _PreparedDecoderGradientAuthority | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
+
+
+@dataclass(frozen=True)
+class _DecoderGradientReceiptAuthority:
+    receipt_identity: int
+    prepared_identity: int
+    received_mapping_identity: int
+    received_descriptors: tuple[
+        tuple[DynamicBridgeKey, int, tuple[int, ...], torch.dtype, torch.device, int, int], ...
+    ]
+
+
+@dataclass(frozen=True)
+class DecoderGradientReceipt:
+    """One sealed gate-3 result, ready for caller-owned producer aggregation."""
+
+    prepared: PreparedDecoderGradientExchange = field(compare=False, repr=False)
+    received_tensors: Mapping[DynamicBridgeKey, Tensor] = field(compare=False, repr=False)
+    _authority: _DecoderGradientReceiptAuthority | None = field(
         default=None, init=False, compare=False, repr=False
     )
 
@@ -675,7 +697,7 @@ def _validate_retained_decoder_ready_iteration(
 
 
 def _gradient_source_descriptors(
-    sources: Mapping[DynamicBridgeKey, Tensor]
+    sources: Mapping[DynamicBridgeKey, Tensor],
 ) -> tuple[tuple[DynamicBridgeKey, int, tuple[int, ...], torch.dtype, torch.device, int, int], ...]:
     return tuple(
         (
@@ -798,6 +820,187 @@ def validate_prepared_decoder_gradient_exchange(
             "MDP: decoder gradient preparation matches its private authority seal."
         )
     return prepared
+
+
+def _capture_decoder_gradient_receipt_authority(
+    receipt: DecoderGradientReceipt,
+) -> _DecoderGradientReceiptAuthority:
+    return _DecoderGradientReceiptAuthority(
+        receipt_identity=id(receipt),
+        prepared_identity=id(receipt.prepared),
+        received_mapping_identity=id(receipt.received_tensors),
+        received_descriptors=_gradient_source_descriptors(receipt.received_tensors),
+    )
+
+
+def _validate_decoder_gradient_receipt(
+    receipt: Any,
+    *,
+    global_manifest: DecoderGlobalManifest,
+    plan: DecoderDynamicPlan,
+    embedding_ledger: DynamicBridgeLedger,
+    gradient_ledger: DynamicBridgeLedger,
+    producer_rank_by_item: Mapping[GlobalVisionItemId, int],
+    output_rows_by_item: Mapping[GlobalVisionItemId, int],
+    global_rank: int,
+    participant_ranks: tuple[int, ...],
+    embedding_width: int,
+    embedding_dtype: torch.dtype,
+    cp_partition_mode: str,
+) -> DecoderGradientReceipt:
+    """Validate one sealed gate-3 result before local producer aggregation."""
+    if type(receipt) is not DecoderGradientReceipt:
+        raise MdpConfigurationError("MDP: decoder gradient receipt has its exact carrier type.")
+    if type(receipt._authority) is not _DecoderGradientReceiptAuthority:
+        raise MdpBridgeError("MDP: decoder gradient receipt has a private authority seal.")
+    prepared = validate_prepared_decoder_gradient_exchange(
+        receipt.prepared,
+        global_manifest=global_manifest,
+        plan=plan,
+        global_rank=global_rank,
+        participant_ranks=participant_ranks,
+        embedding_width=embedding_width,
+        embedding_dtype=embedding_dtype,
+        cp_partition_mode=cp_partition_mode,
+    )
+    if receipt.received_tensors is not prepared.exchange.received_tensors:
+        raise MdpBridgeError("MDP: decoder gradient receipt retains the exact gate-3 mapping.")
+    if _capture_decoder_gradient_receipt_authority(receipt) != receipt._authority:
+        raise MdpBridgeError("MDP: decoder gradient receipt matches its private authority seal.")
+    route_authority_digest = build_dynamic_bridge_route_authority_digest(
+        gradient_ledger,
+        embedding_ledger,
+        plan=plan,
+        global_manifest=global_manifest,
+        producer_rank_by_item=producer_rank_by_item,
+        output_rows_by_item=output_rows_by_item,
+        width=embedding_width,
+        dtype=embedding_dtype,
+        participant_ranks=participant_ranks,
+    )
+    if route_authority_digest != prepared.exchange.route_authority_digest:
+        raise MdpBridgeError(
+            "MDP: decoder gradient receipt route matches retained transport authority."
+        )
+    expected_keys = tuple(
+        entry.key for entry in gradient_ledger.entries if entry.dst_global_rank == global_rank
+    )
+    if tuple(receipt.received_tensors) != expected_keys:
+        raise MdpPlanError("MDP: decoder gradient receipt covers the exact local producer routes.")
+    return receipt
+
+
+def _make_decoder_gradient_receipt(
+    prepared: PreparedDecoderGradientExchange, received_tensors: Mapping[DynamicBridgeKey, Tensor]
+) -> DecoderGradientReceipt:
+    """Seal the exact immutable mapping returned by a successful gate-3 exchange."""
+    if received_tensors is not prepared.exchange.received_tensors:
+        raise MdpBridgeError("MDP: decoder gradient receipt receives the exact gate-3 mapping.")
+    receipt = DecoderGradientReceipt(prepared=prepared, received_tensors=received_tensors)
+    object.__setattr__(receipt, "_authority", _capture_decoder_gradient_receipt_authority(receipt))
+    return receipt
+
+
+def _assemble_decoder_gradient_receipt(
+    receipt: DecoderGradientReceipt,
+    *,
+    global_manifest: DecoderGlobalManifest,
+    plan: DecoderDynamicPlan,
+    embedding_ledger: DynamicBridgeLedger,
+    gradient_ledger: DynamicBridgeLedger,
+    producer_rank_by_item: Mapping[GlobalVisionItemId, int],
+    output_rows_by_item: Mapping[GlobalVisionItemId, int],
+    global_rank: int,
+    participant_ranks: tuple[int, ...],
+    embedding_width: int,
+    embedding_dtype: torch.dtype,
+    cp_partition_mode: str,
+    destination_tensors: Mapping[GlobalVisionItemId, Tensor],
+) -> Mapping[GlobalVisionItemId, Tensor]:
+    """Sum endpoint gradients into exact caller-owned producer item buffers.
+
+    This is local, non-destructive receipt consumption only.  It neither runs
+    encoder backward nor retires the receipt, decoder leaves, or caller buffers.
+    """
+    receipt = _validate_decoder_gradient_receipt(
+        receipt,
+        global_manifest=global_manifest,
+        plan=plan,
+        embedding_ledger=embedding_ledger,
+        gradient_ledger=gradient_ledger,
+        producer_rank_by_item=producer_rank_by_item,
+        output_rows_by_item=output_rows_by_item,
+        global_rank=global_rank,
+        participant_ranks=participant_ranks,
+        embedding_width=embedding_width,
+        embedding_dtype=embedding_dtype,
+        cp_partition_mode=cp_partition_mode,
+    )
+    if not isinstance(destination_tensors, Mapping):
+        raise MdpConfigurationError("MDP: decoder gradient destinations are an item mapping.")
+    local_items = tuple(
+        item.item_id
+        for item in global_manifest.items
+        if any(
+            entry.dst_global_rank == global_rank and entry.key.item_id == item.item_id
+            for entry in gradient_ledger.entries
+        )
+    )
+    if set(destination_tensors) != set(local_items):
+        raise MdpPlanError("MDP: decoder gradient destinations cover exact local producer items.")
+    sources = tuple(receipt.received_tensors.values()) + tuple(
+        receipt.prepared.source_tensors.values()
+    )
+    source_pointers = {_storage_pointer(source) for source in sources if source.numel()}
+    source_pointers.update(
+        _storage_pointer(buffer)
+        for buffer in (
+            receipt.prepared.exchange.send_buffer,
+            receipt.prepared.exchange.receive_buffer,
+        )
+        if buffer.numel()
+    )
+    source_pointers.update(
+        _storage_pointer(gradient)
+        for leaf in receipt.prepared.ready.embedding_leaves.values()
+        if isinstance((gradient := leaf.grad), Tensor) and gradient.numel()
+    )
+    source_pointers.update(
+        _storage_pointer(leaf)
+        for leaf in receipt.prepared.ready.embedding_leaves.values()
+        if leaf.numel()
+    )
+    receipt_device = receipt.prepared.exchange.receive_buffer.device
+    destinations = {}
+    destination_pointers = set()
+    for item_id in local_items:
+        destination = destination_tensors[item_id]
+        rows = next(item.output_rows for item in global_manifest.items if item.item_id == item_id)
+        if (
+            not isinstance(destination, Tensor)
+            or tuple(destination.shape) != (rows, embedding_width)
+            or destination.dtype != embedding_dtype
+            or destination.device != receipt_device
+            or destination.requires_grad
+            or destination.grad_fn is not None
+            or not destination.is_contiguous()
+        ):
+            raise MdpConfigurationError(
+                "MDP: decoder gradient destination is one detached contiguous item tensor."
+            )
+        pointer = _storage_pointer(destination)
+        if pointer in source_pointers or pointer in destination_pointers:
+            raise MdpBridgeError(
+                "MDP: decoder gradient destinations do not alias receipt or peers."
+            )
+        destination_pointers.add(pointer)
+        destinations[item_id] = destination
+    for destination in destinations.values():
+        destination.zero_()
+    for entry in gradient_ledger.entries:
+        if entry.dst_global_rank == global_rank:
+            destinations[entry.key.item_id].add_(receipt.received_tensors[entry.key])
+    return MappingProxyType({item_id: destinations[item_id] for item_id in local_items})
 
 
 def _prepare_decoder_gradient_exchange(
@@ -945,6 +1148,14 @@ def _run_decoder_gradient_gate(
         group_ranks_getter=group_ranks_getter,
         all_to_all_single=all_to_all_single,
     )
+
+
+def _run_decoder_gradient_phase(
+    prepared: PreparedDecoderGradientExchange, **kwargs: Any
+) -> DecoderGradientReceipt:
+    """Run gate 3 and seal its exact received mapping for local aggregation."""
+    received_tensors = _run_decoder_gradient_gate(prepared, **kwargs)
+    return _make_decoder_gradient_receipt(prepared, received_tensors)
 
 
 def _build_decoder_ready_iteration(
