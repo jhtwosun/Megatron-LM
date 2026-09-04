@@ -807,6 +807,11 @@ class MdpRuntime:
     def _consume_pre_authority_dynamic_producer(self, owner: Any, producer: Any) -> None:
         """Consume one exact producer handoff after successful private binding."""
         self._validate_pre_authority_dynamic_producer(owner, producer)
+        bind_owner = getattr(owner, "_mark_pre_authority_dynamic_producer_bound", None)
+        if bind_owner is not None:
+            if not callable(bind_owner):
+                raise MdpStateError("MDP: dynamic producer owner binding hook is callable.")
+            bind_owner(producer)
         self._retire_pre_authority_dynamic_producer()
 
     def _abort_pre_authority_dynamic_producer(self, owner: Any | None = None) -> None:
