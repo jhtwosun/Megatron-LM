@@ -53,9 +53,9 @@ def _validate_context(
 
 def _local_row(
     global_rank: int, byte_generator: Callable[[int], Any]
-) -> tuple[tuple[int, ...], Exception | None]:
+) -> tuple[tuple[int, ...], BaseException | None]:
     contribution = _ZERO_NONCE
-    error: Exception | None = None
+    error: BaseException | None = None
     try:
         generated = byte_generator(_NONCE_BYTES)
         if type(generated) is not bytes or len(generated) != _NONCE_BYTES:
@@ -63,7 +63,7 @@ def _local_row(
         if generated == _ZERO_NONCE:
             raise MdpConfigurationError("MDP: D3 nonce contribution is nonzero.")
         contribution = generated
-    except Exception as caught:
+    except BaseException as caught:
         error = caught
     words = struct.unpack("<qq", contribution)
     return (
