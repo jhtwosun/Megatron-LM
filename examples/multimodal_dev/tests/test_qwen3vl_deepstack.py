@@ -23,7 +23,10 @@ from examples.multimodal_dev.models.qwen3_vl.factory import (
     validate_qwen3_vl_support,
 )
 from examples.multimodal_dev.models.qwen3_vl.mdp import Qwen3VLMdpAdapter
-from examples.multimodal_dev.models.qwen3_vl.model import prepare_qwen3_vl_decoder_inputs
+from examples.multimodal_dev.models.qwen3_vl.model import (
+    Qwen3VLModel,
+    prepare_qwen3_vl_decoder_inputs,
+)
 from megatron.core.mdp.protocols import CapturedMicrobatch
 
 
@@ -185,6 +188,23 @@ def test_adapter_rejects_video_before_encoder_execution(monkeypatch):
     adapter = Qwen3VLMdpAdapter(out_hidden_size=4)
     with pytest.raises(ValueError, match="video"):
         adapter.get_batch(iter(()))
+
+
+def test_qwen3_vl_rejects_dynamic_decoder_cp(monkeypatch):
+    from examples.multimodal_dev.models.base import MultimodalModel
+
+    model = object.__new__(Qwen3VLModel)
+    model.video_token_id = VIDEO_TOKEN_ID
+    input_ids = torch.tensor([[1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 2, 3, IMAGE_TOKEN_ID, 4, 5]])
+    packed = SimpleNamespace(
+        cu_seqlens_q_padded=torch.tensor((0, 8), dtype=torch.int32),
+        cp_group=SimpleNamespace(size=lambda: 2, rank=lambda: 1),
+        cp_partition_mode="contiguous",
+    )
+    monkeypatch.setattr(MultimodalModel, "forward", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(ValueError, match="dynamic decoder CP"):
+        model.forward(input_ids, packed_seq_params=packed)
 
 
 def test_mdp_mock_removes_random_video_sentinel(monkeypatch):

@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from examples.multimodal_dev.models.base import MultimodalModel
+from examples.multimodal_dev.models.base import MultimodalModel, _cp_size_rank
 from examples.multimodal_dev.models.qwen3_vl.configuration import (
     IMAGE_TOKEN_ID,
     ROTARY_BASE,
@@ -157,4 +157,7 @@ class Qwen3VLModel(MultimodalModel):
     def forward(self, input_ids, *args, **kwargs):
         if input_ids is not None and bool((input_ids == self.video_token_id).any()):
             raise ValueError("Qwen3-VL video inputs are not supported in this image-only path.")
+        cp_size, _ = _cp_size_rank(kwargs.get("packed_seq_params"))
+        if cp_size != 1:
+            raise ValueError("Qwen3-VL M2 does not support dynamic decoder CP sharding.")
         return super().forward(input_ids, *args, **kwargs)

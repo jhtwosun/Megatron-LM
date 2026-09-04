@@ -558,6 +558,30 @@ def test_codec_rebuild_preserves_optional_none_and_text_only_records():
     assert record.decoder_packed_seq_params.cp_group is group
 
 
+def test_codec_rebuild_aligns_contiguous_dynamic_cp_tail():
+    codec, lane7, _, manifest, _ = _destination_state(position_components=None)
+    assignment = DecoderCpAssignment((GlobalSampleId(7, 2),), (30, 40))
+    group = _FakeGroup(2)
+
+    record = codec.rebuild_microbatch(
+        manifest,
+        assignment,
+        packets=(lane7.packets[2],),
+        key=DecoderMicrobatchKey(5),
+        cp_group=group,
+        cp_partition_mode="contiguous",
+    )
+
+    assert record.model_payload["input_ids"].tolist() == [[1000, 1001, 1002, 0]]
+    assert record.model_payload["labels"][0, -1].item() == -100
+    assert record.model_payload["loss_mask"][0, -1].item() == 0
+    assert record.model_payload["padding_mask"][0, -1].item() is True
+    packed = record.decoder_packed_seq_params
+    assert packed.cu_seqlens_q.tolist() == [0, 2]
+    assert packed.cu_seqlens_q_padded.tolist() == [0, 4]
+    assert packed.total_tokens == 4
+
+
 def test_codec_validate_packet_rejects_noncanonical_qwen_field_order():
     codec, lane7, _, _, _ = _destination_state()
     packet = lane7.packets[0]
