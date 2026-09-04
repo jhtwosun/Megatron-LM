@@ -94,22 +94,83 @@ def _facade(*, ready=None, begin_error=None):
     coordinator = _Coordinator(ready, begin_error=begin_error)
     return (
         _D3PrivateFacade(
-            config_factory=_Config,
-            producer_factory=_Producer,
-            coordinator_factory=lambda: coordinator,
+            config_factory=lambda *_args, **_kwargs: _Config(),
+            producer_factory=lambda *_args, **_kwargs: _Producer(),
+            coordinator_factory=lambda *_args, **_kwargs: coordinator,
         ),
         coordinator,
     )
 
 
+def _begin(facade, *, raw_iterator=None, num_microbatches=1):
+    raw_iterator = object() if raw_iterator is None else raw_iterator
+    return facade.begin_iteration(
+        raw_iterator, num_microbatches=num_microbatches, forward_only=False
+    )
+
+
+def test_private_facade_forwards_exact_iteration_inputs_to_all_factories():
+    raw_iterator = object()
+    events = []
+    coordinator = _Coordinator(_ready())
+
+    def config_factory(received_iterator, *, num_microbatches, forward_only):
+        events.append(("config", received_iterator, num_microbatches, forward_only))
+        return _Config()
+
+    def coordinator_factory(received_iterator, *, num_microbatches, forward_only):
+        events.append(("coordinator", received_iterator, num_microbatches, forward_only))
+        return coordinator
+
+    def producer_factory(received_iterator, *, num_microbatches, forward_only):
+        events.append(("producer", received_iterator, num_microbatches, forward_only))
+        return _Producer()
+
+    facade = _D3PrivateFacade(
+        config_factory=config_factory,
+        producer_factory=producer_factory,
+        coordinator_factory=coordinator_factory,
+    )
+
+    ready = _begin(facade, raw_iterator=raw_iterator, num_microbatches=3)
+
+    assert ready is coordinator.ready
+    assert events == [
+        ("config", raw_iterator, 3, False),
+        ("coordinator", raw_iterator, 3, False),
+        ("producer", raw_iterator, 3, False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("num_microbatches", "forward_only"),
+    ((0, False), (-1, False), (True, False), (1.0, False), (1, True), (1, 0)),
+)
+def test_private_facade_rejects_invalid_iteration_inputs_before_factories(
+    num_microbatches, forward_only
+):
+    events = []
+    facade = _D3PrivateFacade(
+        config_factory=lambda *_args, **_kwargs: events.append("config"),
+        producer_factory=lambda *_args, **_kwargs: events.append("producer"),
+        coordinator_factory=lambda *_args, **_kwargs: events.append("coordinator"),
+    )
+
+    with pytest.raises(MdpConfigurationError):
+        facade.begin_iteration(
+            object(), num_microbatches=num_microbatches, forward_only=forward_only
+        )
+    assert events == []
+
+
 def test_private_facade_begins_completes_and_ends_exact_handoff():
     facade, coordinator = _facade()
 
-    ready = facade.begin_iteration()
+    ready = _begin(facade)
     assert ready is coordinator.ready
     assert coordinator.events[0][0] == "begin"
     with pytest.raises(MdpStateError, match="idle"):
-        facade.begin_iteration()
+        _begin(facade)
     with pytest.raises(MdpStateError, match="exact decoder-ready"):
         facade.mark_decoder_complete(_ready())
 
@@ -122,7 +183,7 @@ def test_private_facade_begins_completes_and_ends_exact_handoff():
 
 def test_private_facade_aborts_with_exact_primary_then_retries_from_idle():
     facade, coordinator = _facade()
-    ready = facade.begin_iteration()
+    ready = _begin(facade)
     primary = RuntimeError("native decoder failed")
 
     with pytest.raises(RuntimeError) as error:
@@ -131,20 +192,20 @@ def test_private_facade_aborts_with_exact_primary_then_retries_from_idle():
     assert error.value is primary
     assert coordinator.events[-1] == ("abort", ready, primary)
     assert facade.is_idle
-    assert facade.begin_iteration() is ready
+    assert _begin(facade) is ready
 
 
 def test_private_facade_rolls_back_factory_and_begin_failures_without_activation():
     with pytest.raises(MdpConfigurationError, match="config_factory"):
         _D3PrivateFacade(
             config_factory=None,
-            producer_factory=_Producer,
-            coordinator_factory=lambda: _Coordinator(_ready()),
+            producer_factory=lambda *_args, **_kwargs: _Producer(),
+            coordinator_factory=lambda *_args, **_kwargs: _Coordinator(_ready()),
         )
 
     facade, coordinator = _facade(begin_error=RuntimeError("begin"))
     with pytest.raises(RuntimeError, match="begin"):
-        facade.begin_iteration()
+        _begin(facade)
     assert coordinator.events[0][0] == "begin"
     assert facade.is_idle
 
@@ -155,22 +216,22 @@ def test_private_facade_validates_coordinator_before_constructing_producer(case)
     coordinator = _Coordinator(_ready())
     if case == "raise":
 
-        def coordinator_factory():
+        def coordinator_factory(*_args, **_kwargs):
             raise RuntimeError("coordinator")
 
     elif case == "wrong":
-        coordinator_factory = object
+        coordinator_factory = lambda *_args, **_kwargs: object()
     else:
         coordinator.is_idle = False
-        coordinator_factory = lambda: coordinator
+        coordinator_factory = lambda *_args, **_kwargs: coordinator
     facade = _D3PrivateFacade(
-        config_factory=_Config,
-        producer_factory=lambda: events.append("producer"),
+        config_factory=lambda *_args, **_kwargs: _Config(),
+        producer_factory=lambda *_args, **_kwargs: events.append("producer"),
         coordinator_factory=coordinator_factory,
     )
 
     with pytest.raises((MdpConfigurationError, MdpStateError, RuntimeError)):
-        facade.begin_iteration()
+        _begin(facade)
     assert events == []
     assert facade.is_idle
 
@@ -178,44 +239,44 @@ def test_private_facade_validates_coordinator_before_constructing_producer(case)
 @pytest.mark.parametrize(
     "factory_name, value, message",
     (
-        ("config_factory", lambda: object(), "typed dynamic config"),
-        ("producer_factory", lambda: object(), "typed pre-authority producer"),
-        ("coordinator_factory", lambda: object(), "typed D3 coordinator"),
+        ("config_factory", lambda *_args, **_kwargs: object(), "typed dynamic config"),
+        ("producer_factory", lambda *_args, **_kwargs: object(), "typed pre-authority producer"),
+        ("coordinator_factory", lambda *_args, **_kwargs: object(), "typed D3 coordinator"),
     ),
 )
 def test_private_facade_rejects_malformed_factory_results_before_begin(
     factory_name, value, message
 ):
     factories = {
-        "config_factory": _Config,
-        "producer_factory": _Producer,
-        "coordinator_factory": lambda: _Coordinator(_ready()),
+        "config_factory": lambda *_args, **_kwargs: _Config(),
+        "producer_factory": lambda *_args, **_kwargs: _Producer(),
+        "coordinator_factory": lambda *_args, **_kwargs: _Coordinator(_ready()),
     }
     factories[factory_name] = value
     facade = _D3PrivateFacade(**factories)
 
     with pytest.raises(MdpConfigurationError, match=message):
-        facade.begin_iteration()
+        _begin(facade)
     assert facade.is_idle
 
 
 def test_private_facade_rejects_evaluation_before_factory_or_distributed_start():
     events = []
     facade = _D3PrivateFacade(
-        config_factory=lambda: events.append("config"),
-        producer_factory=lambda: events.append("producer"),
-        coordinator_factory=lambda: events.append("coordinator"),
+        config_factory=lambda *_args, **_kwargs: events.append("config"),
+        producer_factory=lambda *_args, **_kwargs: events.append("producer"),
+        coordinator_factory=lambda *_args, **_kwargs: events.append("coordinator"),
     )
 
     with pytest.raises(MdpConfigurationError, match="training-only"):
-        facade.begin_iteration(forward_only=True)
+        facade.begin_iteration(object(), num_microbatches=1, forward_only=True)
     assert events == []
     assert facade.is_idle
 
 
 def test_private_facade_rejects_stale_end_and_abort_without_retiring_active_state():
     facade, coordinator = _facade()
-    ready = facade.begin_iteration()
+    ready = _begin(facade)
 
     with pytest.raises(MdpStateError, match="exact decoder-ready"):
         facade.end_iteration(_ready())
@@ -230,7 +291,7 @@ def test_private_facade_rejects_stale_end_and_abort_without_retiring_active_stat
 
 def test_private_facade_retains_active_coordinator_after_valid_handoff_precondition_errors():
     facade, coordinator = _facade()
-    ready = facade.begin_iteration()
+    ready = _begin(facade)
 
     with pytest.raises(MdpStateError, match="decoder completion"):
         facade.end_iteration(ready)
@@ -249,7 +310,7 @@ def test_private_facade_retains_active_coordinator_after_valid_handoff_precondit
 def test_private_facade_vpp1_replay_preserves_ordered_record_identity_and_overrun():
     records = (_record(0), _record(1))
     facade, _ = _facade(ready=_ready(records=records))
-    ready = facade.begin_iteration()
+    ready = _begin(facade)
 
     cursor = facade.decoder_replay_cursor(ready, virtual_pipeline_parallel_size=1)
     assert iter(cursor) is cursor
