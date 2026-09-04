@@ -56,6 +56,10 @@ schedule model list.
 
 ## Support matrix (v1)
 
+This section describes the original static-runtime baseline.  The stacked
+extensions through PR90 add capabilities without redefining that historical
+baseline; their narrower production boundary is recorded below.
+
 Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP=1`,
 `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
 `calculate_per_token_loss=True`, bf16 main path (fp16 covered by
@@ -135,3 +139,25 @@ endpoints + multi-slice routes for decoder CP, the typed encoder configuration
 + row-capacity policy for encoder FP8, and the unified buffer allocator
 for full-iteration CUDA graphs. The hooks guarantee no breaking schema change is
 needed later; they do not mean the capability is implemented.
+
+### Stacked extension boundary through PR90
+
+The static runtime now has tested routing/runtime contracts for decoder TP and
+CP, encoder CP, and unequal encoder/decoder CP.  These tests do not widen the
+Dynamic-CP production composition by themselves.
+
+Training with `--dynamic-context-parallel` uses the D3 composition and gives it
+exclusive ownership of source-window scheduling.  The concrete D3 composition
+is currently built only when the configured topology is
+`TP1/EP1/PP1/CP1/ECP1/VPP1`; inside that WORLD DP pool it may select a
+per-record contiguous decoder CP group.  Qwen3.5-VL has one-node CP1/CP2
+one-step parity evidence.  Qwen3-VL DeepStack remains restricted to a selected
+CP1 group and rejects selected CP greater than one.  VPP, configured decoder
+CP, encoder CP, TP, EP/MTP, overlap capture, multi-node, checkpoint resume,
+long-run, real-data training, memory-limit, and throughput claims remain open
+for D3.
+
+The model registry also contains image-only adapters for Qwen3-VL DeepStack
+and Nemotron Omni, plus a generic Energon descriptor/materialization boundary.
+Those additions have model/loader contract evidence only where stated in their
+tests; they are not a blanket production-support claim.
