@@ -61,6 +61,44 @@ def test_decoder_tp2_configuration_passes():
     validate_mdp_config(MdpConfig(enable=True), _options(tensor_parallel_size=2))
 
 
+def test_dynamic_cp_locked_topology_passes_startup_validation():
+    validate_mdp_config(
+        MdpConfig(enable=True), _options(pipeline_parallel_size=1, dynamic_context_parallel=True)
+    )
+
+
+@pytest.mark.parametrize(
+    "option_overrides",
+    [
+        {"tensor_parallel_size": 2, "pipeline_parallel_size": 1},
+        {"pipeline_parallel_size": 2},
+        {"context_parallel_size": 2, "pipeline_parallel_size": 1},
+        {"expert_parallel_size": 2, "pipeline_parallel_size": 1},
+        {"virtual_pipeline_parallel_size": 2, "pipeline_parallel_size": 1},
+    ],
+)
+def test_dynamic_cp_rejects_unimplemented_topology_at_startup(option_overrides):
+    with pytest.raises(MdpConfigurationError, match="dynamic_context_parallel"):
+        validate_mdp_config(
+            MdpConfig(enable=True), _options(dynamic_context_parallel=True, **option_overrides)
+        )
+
+
+def test_dynamic_cp_rejects_encoder_cp_and_overlap_capture_at_startup():
+    with pytest.raises(MdpConfigurationError, match="dynamic_context_parallel"):
+        validate_mdp_config(
+            MdpConfig(enable=True, encoder_cp=2),
+            _options(
+                pipeline_parallel_size=1, context_parallel_size=2, dynamic_context_parallel=True
+            ),
+        )
+    with pytest.raises(MdpConfigurationError, match="dynamic_context_parallel"):
+        validate_mdp_config(
+            MdpConfig(enable=True, overlap_window_capture=True),
+            _options(pipeline_parallel_size=1, dynamic_context_parallel=True),
+        )
+
+
 def test_overlap_window_capture_rejects_encoder_cp_collectives():
     with pytest.raises(MdpConfigurationError, match="encoder_cp == 1"):
         validate_mdp_config(
@@ -416,6 +454,13 @@ def test_snapshot_reports_decoder_ep_overlap():
         _fake_args(overlap_moe_expert_parallel_comm=True)
     )
     assert options.overlap_moe_expert_parallel_comm is True
+
+
+def test_snapshot_reports_dynamic_context_parallel():
+    from megatron.core.mdp.integration import compatibility_options_from_args
+
+    options = compatibility_options_from_args(_fake_args(dynamic_context_parallel=True))
+    assert options.dynamic_context_parallel is True
 
 
 @pytest.mark.parametrize(
