@@ -5,14 +5,17 @@
 The module keeps global sample and vision-item identities beside the existing
 static descriptors. Decoder tensor payload stays in source-local packets;
 global manifests contain only immutable metadata required for planning and
-routing. This module validates metadata, local packet carriers, and rank-local
-native-group bindings but performs no transport.
+routing. This module validates metadata, local packet carriers, rank-local
+native-group bindings, and injected status consensus. The consensus path
+performs no payload transport or group lookup.
 """
 
 import hashlib
 import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import timedelta
+from math import isfinite
 from types import MappingProxyType
 from typing import Any, ClassVar
 
@@ -31,9 +34,18 @@ from megatron.core.mdp.dynamic_cp_plan import (
     EncoderVisionItemMetadata,
     validate_decoder_dynamic_plan,
 )
-from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError
+from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError, MdpPlanError
 
 DECODER_EXECUTION_SCHEMA_VERSION = 1
+DYNAMIC_PRECOLLECTIVE_GATES = (
+    "payload-ready",
+    "embedding-ready",
+    "decoder-ready",
+    "gradient-ready",
+    "encoder-backward-ready",
+    "encoder-finalize-ready",
+    "encoder-complete",
+)
 
 _SOURCE_MANIFEST_DOMAIN = b"megatron.mdp.dynamic-cp.decoder-source"
 _GLOBAL_MANIFEST_DOMAIN = b"megatron.mdp.dynamic-cp.decoder-global"
@@ -991,3 +1003,153 @@ def build_decoder_global_manifest(
         )
     digest = _manifest_digest(_GLOBAL_MANIFEST_DOMAIN, samples, items, payloads)
     return DecoderGlobalManifest(samples=samples, items=items, payloads=payloads, digest=digest)
+
+
+@dataclass(frozen=True)
+class _PrecollectiveStatus:
+    """Fixed-width status exchanged before one Dynamic-CP payload phase."""
+
+    global_rank: int
+    global_manifest_digest: bytes
+    plan_digest: bytes
+    error_code: int
+    gate_id: int
+
+    WIRE_WIDTH: ClassVar[int] = 7
+
+    def __post_init__(self) -> None:
+        _require_integer("precollective status global_rank", self.global_rank)
+        _require_digest("precollective global manifest digest", self.global_manifest_digest)
+        _require_digest("precollective plan digest", self.plan_digest)
+        _require_integer("precollective status error_code", self.error_code)
+        gate = _require_integer("precollective status gate_id", self.gate_id)
+        if gate >= len(DYNAMIC_PRECOLLECTIVE_GATES):
+            raise MdpPlanError(
+                "MDP: precollective status gate_id is one of the seven Dynamic-CP gates."
+            )
+
+    def to_wire_tuple(self) -> tuple[int, ...]:
+        """Encode both digests as stable little-endian signed-int64 words."""
+        manifest_words = struct.unpack("<qq", self.global_manifest_digest)
+        plan_words = struct.unpack("<qq", self.plan_digest)
+        return (self.global_rank, *manifest_words, *plan_words, self.error_code, self.gate_id)
+
+    @classmethod
+    def from_wire_tuple(cls, value: tuple[int, ...]) -> "_PrecollectiveStatus":
+        """Decode and validate the exact seven-signed-int64 status wire."""
+        if type(value) is not tuple or len(value) != cls.WIRE_WIDTH:
+            raise MdpPlanError(f"MDP: precollective status wire has fixed width {cls.WIRE_WIDTH}.")
+        rank, manifest_word_0, manifest_word_1, plan_word_0, plan_word_1, error, gate = value
+        manifest_words = (
+            _require_signed_integer("precollective manifest digest word 0", manifest_word_0),
+            _require_signed_integer("precollective manifest digest word 1", manifest_word_1),
+        )
+        plan_words = (
+            _require_signed_integer("precollective plan digest word 0", plan_word_0),
+            _require_signed_integer("precollective plan digest word 1", plan_word_1),
+        )
+        return cls(
+            global_rank=rank,
+            global_manifest_digest=struct.pack("<qq", *manifest_words),
+            plan_digest=struct.pack("<qq", *plan_words),
+            error_code=error,
+            gate_id=gate,
+        )
+
+
+def _validate_precollective_timeout(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MdpConfigurationError(
+            "MDP: precollective timeout is a finite number of at least one millisecond."
+        )
+    try:
+        seconds = float(value)
+    except (OverflowError, ValueError) as error:
+        raise MdpConfigurationError(
+            "MDP: precollective timeout is a finite number of at least one millisecond."
+        ) from error
+    if not isfinite(seconds) or seconds < 0.001:
+        raise MdpConfigurationError(
+            "MDP: precollective timeout is a finite number of at least one millisecond."
+        )
+    try:
+        duration = timedelta(seconds=seconds)
+    except (OverflowError, ValueError) as error:
+        raise MdpConfigurationError(
+            "MDP: precollective timeout fits the native bounded-wait duration."
+        ) from error
+    if duration < timedelta(milliseconds=1):
+        raise MdpConfigurationError("MDP: precollective timeout is at least one millisecond.")
+    return seconds
+
+
+def _run_precollective_consensus(
+    local_status: _PrecollectiveStatus,
+    *,
+    group_ranks: tuple[int, ...],
+    all_gather_status: Any,
+    timeout_seconds: float,
+) -> None:
+    """Run one injected status gather and require rank-ordered phase agreement."""
+    if type(local_status) is not _PrecollectiveStatus:
+        raise MdpPlanError("MDP: precollective consensus has a typed local status.")
+    ranks = _require_ordered_ranks("precollective group ranks", group_ranks, immutable=True)
+    if local_status.global_rank not in ranks:
+        raise MdpConfigurationError(
+            "MDP: precollective status global rank belongs to the group ranks."
+        )
+    if not callable(all_gather_status):
+        raise MdpConfigurationError("MDP: precollective status gather is callable.")
+    timeout = _validate_precollective_timeout(timeout_seconds)
+
+    try:
+        gathered = all_gather_status(local_status.to_wire_tuple(), timeout_seconds=timeout)
+    except Exception as error:
+        raise MdpBridgeError(
+            "MDP: precollective status consensus failed before payload exchange."
+        ) from error
+    if type(gathered) is not tuple or len(gathered) != len(ranks):
+        raise MdpPlanError(
+            "MDP: precollective consensus returns one ordered status per group rank."
+        )
+
+    parsed = []
+    for expected_rank, wire in zip(ranks, gathered):
+        try:
+            status = _PrecollectiveStatus.from_wire_tuple(wire)
+        except (MdpConfigurationError, MdpPlanError) as error:
+            raise MdpPlanError(
+                f"MDP: precollective consensus received malformed status for rank "
+                f"{expected_rank}."
+            ) from error
+        if status.global_rank != expected_rank:
+            raise MdpPlanError(
+                f"MDP: precollective consensus rank order expected rank {expected_rank}, "
+                f"received rank {status.global_rank}."
+            )
+        parsed.append(status)
+
+    reference = parsed[0]
+    shared_fields = (
+        ("manifest digest", "global_manifest_digest"),
+        ("plan digest", "plan_digest"),
+        ("gate", "gate_id"),
+    )
+    for status in parsed[1:]:
+        for label, field_name in shared_fields:
+            if getattr(status, field_name) != getattr(reference, field_name):
+                raise MdpPlanError(
+                    f"MDP: precollective consensus {label} mismatch at rank "
+                    f"{status.global_rank}."
+                )
+    local_index = ranks.index(local_status.global_rank)
+    if parsed[local_index] != local_status:
+        raise MdpPlanError(
+            "MDP: precollective consensus gathered local status matches its submitted status."
+        )
+    for status in parsed:
+        if status.error_code:
+            raise MdpPlanError(
+                f"MDP: precollective consensus rejected rank {status.global_rank} with "
+                f"error code {status.error_code}."
+            )
