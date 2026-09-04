@@ -105,9 +105,8 @@ def _ready():
     )
 
 
-def _bindings(events, *, failing_operation=None, schedule_calls=None):
+def _bindings(events, *, failing_operation=None, schedule_calls=None, status_contexts=None):
     authority = _Authority()
-    ready = _ready()
 
     def operation(name, result=None):
         def invoke(*_args):
@@ -118,9 +117,11 @@ def _bindings(events, *, failing_operation=None, schedule_calls=None):
 
         return invoke
 
-    def gate(gate_id, local_error, received_authority):
-        assert received_authority is authority
-        events.append(f"gate-{gate_id}:{local_error is not None}")
+    def gate(context, local_error):
+        assert context.authority is authority
+        if status_contexts is not None:
+            status_contexts.append((context, local_error))
+        events.append(f"gate-{context.gate_id}:{local_error is not None}")
 
     def authority_gate(local_error):
         events.append(f"authority-gate:{local_error is not None}")
@@ -176,7 +177,7 @@ def _bindings(events, *, failing_operation=None, schedule_calls=None):
             )
         if failing_operation == "schedule-prepare":
             raise RuntimeError("schedule-prepare")
-        return ready
+        return _ready()
 
     return _D3CoordinatorBindings(
         execution_config_consensus=operation("config"),
@@ -201,6 +202,66 @@ def _bindings(events, *, failing_operation=None, schedule_calls=None):
 
 def _begin(coordinator):
     return coordinator.begin_iteration(config=object(), producer=_producer())
+
+
+def _status_context_api():
+    return coordinator_module
+
+
+def test_d3_gate_status_context_is_factory_sealed_and_has_exact_gate_contract():
+    api = _status_context_api()
+    authority = _Authority()
+    ready = _ready()
+    context = api._make_d3_gate_status_context(
+        gate_id=2, authority=authority, phase_value=ready, ready=None
+    )
+
+    assert context.gate_id == 2
+    assert context.authority is authority
+    assert context.phase_value is ready
+    assert context.ready is None
+    assert api._D3GateStatusContext.__slots__ == (
+        "gate_id",
+        "authority",
+        "phase_value",
+        "ready",
+        "_factory_seal",
+    )
+    with pytest.raises(MdpStateError, match="factory"):
+        api._D3GateStatusContext(gate_id=2, authority=authority, phase_value=ready, ready=None)
+    with pytest.raises(MdpStateError, match="factory"):
+        replace(context)
+    forged_type = type("ForgedContext", (api._D3GateStatusContext,), {})
+    with pytest.raises(MdpStateError, match="factory"):
+        forged_type(gate_id=2, authority=authority, phase_value=ready, ready=None)
+
+    for gate_id in (True, -1, 7, "2"):
+        with pytest.raises(MdpConfigurationError):
+            api._make_d3_gate_status_context(
+                gate_id=gate_id, authority=authority, phase_value=None, ready=None
+            )
+    for gate_id in (0, 1):
+        assert (
+            api._make_d3_gate_status_context(
+                gate_id=gate_id, authority=authority, phase_value=object(), ready=None
+            ).ready
+            is None
+        )
+    for gate_id in range(3, 7):
+        assert (
+            api._make_d3_gate_status_context(
+                gate_id=gate_id, authority=authority, phase_value=object(), ready=ready
+            ).ready
+            is ready
+        )
+    with pytest.raises(MdpConfigurationError):
+        api._make_d3_gate_status_context(
+            gate_id=2, authority=authority, phase_value=object(), ready=None
+        )
+    with pytest.raises(MdpConfigurationError):
+        api._make_d3_gate_status_context(
+            gate_id=3, authority=authority, phase_value=None, ready=None
+        )
 
 
 def test_d3_coordinator_bindings_require_every_exact_callable():
@@ -254,6 +315,48 @@ def test_d3_coordinator_runs_one_ordered_lifecycle_and_rejects_stale_handoffs():
     ]
 
 
+def test_d3_coordinator_mints_exact_fresh_status_contexts_without_retaining_them():
+    events = []
+    contexts = []
+    coordinator = _D3Coordinator(bindings=_bindings(events, status_contexts=contexts))
+    ready = _begin(coordinator)
+    coordinator.mark_decoder_complete(ready)
+    coordinator.end_iteration()
+
+    assert tuple(context.gate_id for context, _ in contexts) == tuple(range(7))
+    assert all(context.authority is contexts[0][0].authority for context, _ in contexts)
+    assert contexts[0][0].phase_value is not None and contexts[0][0].ready is None
+    assert contexts[1][0].phase_value is not None and contexts[1][0].ready is None
+    assert contexts[2][0].phase_value is ready and contexts[2][0].ready is None
+    for context, _ in contexts[3:6]:
+        assert context.phase_value is not None and context.ready is ready
+    assert contexts[6][0].phase_value is None and contexts[6][0].ready is ready
+    assert coordinator.is_idle
+
+
+def test_d3_coordinator_rejects_a_status_context_not_bound_to_its_active_ready(monkeypatch):
+    events = []
+    original = coordinator_module._make_d3_gate_status_context
+
+    def mint(**kwargs):
+        context = original(**kwargs)
+        if kwargs["gate_id"] == 3:
+            object.__setattr__(context, "ready", _ready())
+        return context
+
+    monkeypatch.setattr(coordinator_module, "_make_d3_gate_status_context", mint)
+    coordinator = _D3Coordinator(bindings=_bindings(events))
+    ready = _begin(coordinator)
+    coordinator.mark_decoder_complete(ready)
+
+    with pytest.raises(MdpStateError, match="exact active identities"):
+        coordinator.end_iteration()
+
+    assert "gate-3:False" not in events
+    assert events.count("cleanup") == 1
+    assert coordinator.is_idle
+
+
 def test_d3_coordinator_passes_exact_completed_transport_objects_to_schedule_once():
     events = []
     schedule_calls = []
@@ -290,9 +393,13 @@ def test_d3_coordinator_converges_local_precollective_failures_then_cleans_up(
     failing_operation, gate_id, needs_decoder_completion, status_event, cause_type
 ):
     events = []
-    coordinator = _D3Coordinator(bindings=_bindings(events, failing_operation=failing_operation))
+    contexts = []
+    coordinator = _D3Coordinator(
+        bindings=_bindings(events, failing_operation=failing_operation, status_contexts=contexts)
+    )
 
     message = "authority status" if gate_id is None else f"gate {gate_id}"
+    ready = None
     with pytest.raises(MdpStateError, match=message) as error:
         ready = _begin(coordinator)
         if needs_decoder_completion:
@@ -302,6 +409,14 @@ def test_d3_coordinator_converges_local_precollective_failures_then_cleans_up(
     assert status_event in events
     assert events.count("cleanup") == 1
     assert coordinator.is_idle
+    if gate_id is not None:
+        context, local_error = contexts[-1]
+        assert context.gate_id == gate_id and context.phase_value is None
+        assert local_error is not None
+        if gate_id < 3:
+            assert context.ready is None
+        else:
+            assert context.ready is ready
 
 
 @pytest.mark.parametrize("failing_operation", ("config", "metadata"))
@@ -368,7 +483,10 @@ def test_d3_coordinator_preserves_primary_error_when_cleanup_raises_base_excepti
 
 def test_d3_coordinator_never_advances_after_an_entered_collective_fails():
     events = []
-    coordinator = _D3Coordinator(bindings=_bindings(events, failing_operation="payload-execute"))
+    contexts = []
+    coordinator = _D3Coordinator(
+        bindings=_bindings(events, failing_operation="payload-execute", status_contexts=contexts)
+    )
 
     with pytest.raises(RuntimeError, match="payload-execute"):
         _begin(coordinator)
@@ -384,6 +502,7 @@ def test_d3_coordinator_never_advances_after_an_entered_collective_fails():
         "payload-execute",
         "cleanup",
     ]
+    assert tuple(context.gate_id for context, _ in contexts) == (0,)
     assert coordinator.is_idle
 
 
@@ -408,22 +527,33 @@ def test_d3_coordinator_rejects_entered_collective_result_without_later_gate(fai
 def test_d3_coordinator_retry_never_retains_prior_transport_objects():
     events = []
     schedule_calls = []
-    coordinator = _D3Coordinator(bindings=_bindings(events, schedule_calls=schedule_calls))
+    contexts = []
+    coordinator = _D3Coordinator(
+        bindings=_bindings(events, schedule_calls=schedule_calls, status_contexts=contexts)
+    )
     first = _begin(coordinator)
 
     with pytest.raises(RuntimeError, match="first"):
         coordinator.abort_scheduled_iteration(first, RuntimeError("first"))
     second = _begin(coordinator)
 
-    assert second is first
+    assert second is not first
     assert len(schedule_calls) == 2
     for previous, current in zip(schedule_calls[0][2:], schedule_calls[1][2:]):
         assert current is not previous
+    first_contexts = contexts[:4]
+    second_contexts = contexts[4:]
+    assert tuple(context.gate_id for context, _ in first_contexts) == (0, 1, 2, 3)
+    assert tuple(context.gate_id for context, _ in second_contexts) == (0, 1, 2)
+    assert all(
+        current[0] is not previous[0] for previous, current in zip(first_contexts, second_contexts)
+    )
 
 
 def test_d3_scheduled_abort_preserves_exact_primary_and_retries_from_idle():
     events = []
-    coordinator = _D3Coordinator(bindings=_bindings(events))
+    contexts = []
+    coordinator = _D3Coordinator(bindings=_bindings(events, status_contexts=contexts))
     ready = _begin(coordinator)
     primary = RuntimeError("native decoder schedule failed")
 
@@ -446,11 +576,44 @@ def test_d3_scheduled_abort_preserves_exact_primary_and_retries_from_idle():
         )
     )
     assert coordinator.is_idle
+    context, local_error = contexts[-1]
+    assert context.gate_id == 3 and context.phase_value is None and context.ready is ready
+    assert local_error is primary
+    assert not getattr(primary, "__notes__", ())
 
     retry = _begin(coordinator)
     with pytest.raises(RuntimeError, match="retry"):
         coordinator.abort_scheduled_iteration(retry, RuntimeError("retry"))
     assert coordinator.is_idle
+
+
+def test_d3_scheduled_abort_rejects_a_factory_context_with_the_wrong_gate_id(monkeypatch):
+    events = []
+    original = coordinator_module._make_d3_gate_status_context
+
+    def mint(**kwargs):
+        if kwargs["gate_id"] == 3:
+            return original(
+                gate_id=4,
+                authority=kwargs["authority"],
+                phase_value=object(),
+                ready=kwargs["ready"],
+            )
+        return original(**kwargs)
+
+    monkeypatch.setattr(coordinator_module, "_make_d3_gate_status_context", mint)
+    coordinator = _D3Coordinator(bindings=_bindings(events))
+    ready = _begin(coordinator)
+    primary = RuntimeError("primary")
+
+    with pytest.raises(RuntimeError) as error:
+        coordinator.abort_scheduled_iteration(ready, primary)
+
+    assert error.value is primary
+    assert "gate-3:True" not in events and "gate-4:True" not in events
+    assert events.count("cleanup") == 1
+    assert coordinator.is_idle
+    assert any("exact active identities" in note for note in getattr(primary, "__notes__", ()))
 
 
 def test_d3_scheduled_abort_rejects_stale_handoff_and_non_exception_primary():
@@ -481,9 +644,9 @@ def test_d3_scheduled_abort_suppresses_gate_and_cleanup_secondaries_on_base_prim
     events = []
     bindings = _bindings(events)
 
-    def gate(gate_id, local_error, _authority):
-        events.append(f"abort-gate-{gate_id}")
-        if gate_id != 3:
+    def gate(context, local_error):
+        events.append(f"abort-gate-{context.gate_id}")
+        if context.gate_id != 3:
             return
         assert local_error is primary
         raise GateSecondary("gate")
@@ -518,12 +681,12 @@ def test_d3_scheduled_abort_rejects_reentry_without_duplicate_gate_or_cleanup(re
     def reenter():
         active["coordinator"].abort_scheduled_iteration(ready, RuntimeError("nested primary"))
 
-    def gate(gate_id, local_error, authority):
-        events.append(f"abort-gate-{gate_id}")
-        if gate_id == 3 and reentry_phase == "gate":
+    def gate(context, local_error):
+        events.append(f"abort-gate-{context.gate_id}")
+        if context.gate_id == 3 and reentry_phase == "gate":
             reenter()
-        elif gate_id != 3:
-            bindings.status_gate(gate_id, local_error, authority)
+        elif context.gate_id != 3:
+            bindings.status_gate(context, local_error)
 
     def cleanup(producer):
         events.append("abort-cleanup")
