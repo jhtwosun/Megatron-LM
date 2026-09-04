@@ -143,8 +143,35 @@ def broadcast_data_batch(data, device="cuda"):
 
 
 def _move_owner_pixels_to_device(pixel_values, device):
-    """Move the one owner-local pixel payload after TP metadata broadcast."""
-    return pixel_values.to(device, non_blocking=pixel_values.is_pinned())
+    """Move pixels on the TP source and converge source failures across TP."""
+    if not torch.distributed.is_initialized():
+        if pixel_values is None:
+            return None
+        return pixel_values.to(device, non_blocking=pixel_values.is_pinned())
+    group = get_tensor_model_parallel_group()
+    is_src = get_tensor_model_parallel_rank() == 0
+    status = torch.zeros(1, dtype=torch.uint8, device=device)
+    owner_pixels = None
+    source_error = None
+    source_traceback = None
+    if is_src and pixel_values is not None:
+        try:
+            owner_pixels = pixel_values.to(
+                device, non_blocking=pixel_values.is_pinned()
+            )
+        except BaseException as exc:
+            source_error = exc
+            source_traceback = exc.__traceback__
+            status.fill_(1)
+
+    torch.distributed.broadcast(
+        status, get_tensor_model_parallel_src_rank(), group=group
+    )
+    if int(status.item()) != 0:
+        if is_src:
+            raise source_error.with_traceback(source_traceback)
+        raise RuntimeError("TP source pixel H2D failed after metadata broadcast")
+    return owner_pixels
 
 
 # -------------------------------------------------------------------
@@ -303,6 +330,7 @@ def build_vision_sidecar(
     cu_seqlens_padded: list[int],
     image_token_id: int,
     spatial_merge_size: int,
+    expect_pixels: Optional[bool] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the per-item vision sidecar for a THD-packed batch.
 
@@ -313,7 +341,8 @@ def build_vision_sidecar(
 
     Consistency guards (fail the batch rather than silently degrade):
 
-    * pixel data and grid metadata are all-or-nothing per sample;
+    * pixel data and grid metadata are all-or-nothing per sample unless an
+      owner-sharded capture explicitly supplies ``expect_pixels=False``;
     * per-sample pixel rows equal ``sum(t*h*w)`` over its grids;
     * per-sample image-token slots equal ``sum(t*(h/m)*(w/m))``, so truncation
       can never leave a cut image block;
@@ -328,7 +357,12 @@ def build_vision_sidecar(
         pixels = sample.get("pixel_values")
         num_items = 0 if grids is None else int(grids.shape[0])
         pixel_rows = 0 if pixels is None else int(pixels.shape[0])
-        if (num_items == 0) != (pixel_rows == 0):
+        if expect_pixels is False and pixel_rows:
+            raise ValueError(
+                f"sample {sample_index}: suppressed pixel capture must not carry "
+                f"pixel rows (found {pixel_rows})"
+            )
+        if expect_pixels is not False and (num_items == 0) != (pixel_rows == 0):
             raise ValueError(
                 f"sample {sample_index}: pixel data and grid metadata must either both "
                 f"exist or both be absent (items={num_items}, pixel_rows={pixel_rows})"
@@ -348,7 +382,7 @@ def build_vision_sidecar(
             expected_rows += t * h * w
             item_slot_counts.append(t * (h // merge) * (w // merge))
             expected_slots += item_slot_counts[-1]
-        if expected_rows != pixel_rows:
+        if expect_pixels is not False and expected_rows != pixel_rows:
             raise ValueError(
                 f"sample {sample_index}: pixel rows {pixel_rows} != sum(t*h*w) "
                 f"{expected_rows} over its grids"
@@ -416,9 +450,14 @@ def pack_or_pad_batch(
     # get_args() itself raises in test contexts where megatron globals are
     # not initialised.
     try:
-        has_sp = bool(getattr(get_args(), "sequence_parallel", False))
+        args = get_args()
+        has_sp = bool(getattr(args, "sequence_parallel", False))
+        owner_only_pixels = pixel_owner_state is not None or (
+            tp_size > 1 and getattr(args, "dataset_provider", None) == "energon"
+        )
     except AssertionError:
         has_sp = False
+        owner_only_pixels = pixel_owner_state is not None
 
     if cp_size > 1:
         divisible_by = (tp_size * cp_size * 2) if has_sp else (cp_size * 2)
@@ -568,6 +607,7 @@ def pack_or_pad_batch(
                         cu_seqlens_padded,
                         image_token_id=sidecar_image_token_id,
                         spatial_merge_size=sidecar_merge,
+                        expect_pixels=False if suppress_pixels else None,
                     )
                 )
 
@@ -626,16 +666,16 @@ def pack_or_pad_batch(
                     sidecar_cpu[key] = packed_batch.pop(key)
 
         owner_pixel_values = None
-        if tp_size > 1 and pixel_owner_state is not None and is_src:
+        if owner_only_pixels and is_src:
             if "pixel_values" in packed_batch:
                 pixel_values = packed_batch.pop("pixel_values")
                 if pixel_values.numel():
                     owner_pixel_values = pixel_values
         packed_batch = broadcast_data_batch(packed_batch, device=device)
-        if owner_pixel_values is not None:
-            packed_batch["pixel_values"] = _move_owner_pixels_to_device(
-                owner_pixel_values, device
-            )
+        if owner_only_pixels:
+            owner_pixels = _move_owner_pixels_to_device(owner_pixel_values, device)
+            if owner_pixels is not None:
+                packed_batch["pixel_values"] = owner_pixels
         packed_batch.update(sidecar_cpu)
 
         cu_seqlens_t = packed_batch.pop("cu_seqlens")
@@ -712,16 +752,16 @@ def pack_or_pad_batch(
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
 
     owner_pixel_values = None
-    if tp_size > 1 and pixel_owner_state is not None and is_src:
+    if owner_only_pixels and is_src:
         if "pixel_values" in padded_batch:
             pixel_values = padded_batch.pop("pixel_values")
             if pixel_values.numel():
                 owner_pixel_values = pixel_values
     padded_batch = broadcast_data_batch(padded_batch, device=device)
-    if owner_pixel_values is not None:
-        padded_batch["pixel_values"] = _move_owner_pixels_to_device(
-            owner_pixel_values, device
-        )
+    if owner_only_pixels:
+        owner_pixels = _move_owner_pixels_to_device(owner_pixel_values, device)
+        if owner_pixels is not None:
+            padded_batch["pixel_values"] = owner_pixels
     return padded_batch
 
 
@@ -775,6 +815,20 @@ def quantized_row_alignment(args) -> Optional[int]:
     )
 
 
+def _prepare_energon_batch(data, args):
+    """Materialize selected Energon pixels before the existing native packer."""
+    if getattr(args, "dataset_provider", None) != "energon":
+        return data
+    from examples.multimodal_dev.data.energon.materializer import prepare_energon_batch
+    from megatron.core.mdp.window import pixel_capture_suppressed
+
+    return prepare_energon_batch(
+        data,
+        args=args,
+        materialize_pixels=not pixel_capture_suppressed(),
+    )
+
+
 def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
@@ -789,23 +843,49 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
             data = next(data_iterator)
         except StopIteration:
             return None
+        data = _prepare_energon_batch(data, args)
     else:
         if get_tensor_model_parallel_rank() == 0:
+            source_error = None
+            source_traceback = None
             try:
                 data = next(data_iterator)
-                has_data = torch.tensor([1], dtype=torch.uint8, device=device)
             except StopIteration:
-                has_data = torch.tensor([0], dtype=torch.uint8, device=device)
                 data = None
+                status_value = 0
+            except BaseException as exc:
+                data = None
+                source_error = exc
+                source_traceback = exc.__traceback__
+                status_value = 2
+            else:
+                try:
+                    data = _prepare_energon_batch(data, args)
+                except BaseException as exc:
+                    source_error = exc
+                    source_traceback = exc.__traceback__
+                    status_value = 2
+                else:
+                    status_value = 1
+            status = torch.tensor([status_value], dtype=torch.uint8, device=device)
         else:
-            has_data = torch.empty(1, dtype=torch.uint8, device=device)
+            status = torch.empty(1, dtype=torch.uint8, device=device)
             data = None
 
         src = get_tensor_model_parallel_src_rank()
-        torch.distributed.broadcast(has_data, src, group=group)
+        torch.distributed.broadcast(status, src, group=group)
 
-        if has_data.item() == 0:
+        status_value = int(status.item())
+        if status_value == 0:
             return None
+        if status_value == 2:
+            if get_tensor_model_parallel_rank() == 0:
+                raise source_error.with_traceback(source_traceback)
+            raise RuntimeError(
+                "TP source fetch or Energon materialization failed before native pack broadcast"
+            )
+        if status_value != 1:
+            raise RuntimeError(f"invalid TP source batch status {status_value}")
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
     batch = pack_or_pad_batch(
