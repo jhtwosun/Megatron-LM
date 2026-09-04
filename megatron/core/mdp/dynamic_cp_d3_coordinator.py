@@ -6,12 +6,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from megatron.core.mdp.bridge import BridgePhase
+from megatron.core.mdp.dynamic_cp_bridge_transport import PreparedDynamicBridgeExchange
 from megatron.core.mdp.dynamic_cp_runtime import (
     DecoderReadyIteration,
     _DynamicIterationAuthority,
     _DynamicProducerCarrier,
     _PreAuthorityDynamicProducer,
 )
+from megatron.core.mdp.dynamic_cp_transport import PreparedDecoderPayloadBundle
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 
 _D3Operation = Callable[..., Any]
@@ -52,6 +55,10 @@ class _D3ActiveIteration:
     producer: _PreAuthorityDynamicProducer
     authority: _DynamicIterationAuthority | None = None
     bound_producer: _DynamicProducerCarrier | None = None
+    payload_prepared: PreparedDecoderPayloadBundle | None = None
+    payload_result: Any = None
+    embedding_prepared: PreparedDynamicBridgeExchange | None = None
+    embedding_result: Any = None
     ready: DecoderReadyIteration | None = None
     decoder_complete: bool = False
     cleaned: bool = False
@@ -205,7 +212,13 @@ class _D3Coordinator:
                 )
             state.bound_producer = bound
             _validate_consumed_pre_authority_producer(producer, bound, runtime)
-            return self._bindings.prepare_payload(state.authority, state.bound_producer)
+            prepared = self._bindings.prepare_payload(state.authority, state.bound_producer)
+            if type(prepared) is not PreparedDecoderPayloadBundle:
+                raise MdpConfigurationError(
+                    "MDP: D3 coordinator payload preparation returns typed transport state."
+                )
+            state.payload_prepared = prepared
+            return prepared
 
         payload_prepared = self._run_precollective(
             state, gate_id=0, operation=bind_and_prepare_payload
@@ -213,21 +226,54 @@ class _D3Coordinator:
         payload_result = self._run_entered_collective(
             state, lambda: self._bindings.execute_payload(payload_prepared)
         )
+        if payload_result is not payload_prepared.received_tensors:
+            self._fail(
+                state,
+                MdpStateError(
+                    "MDP: D3 coordinator payload execute returns its exact received mapping."
+                ),
+            )
+        state.payload_result = payload_result
         assert state.bound_producer is not None
-        embedding_prepared = self._run_precollective(
-            state,
-            gate_id=1,
-            operation=lambda: self._bindings.prepare_embedding(
+
+        def prepare_embedding():
+            prepared = self._bindings.prepare_embedding(
                 state.authority, state.bound_producer, payload_result
-            ),
-        )
+            )
+            if type(prepared) is not PreparedDynamicBridgeExchange:
+                raise MdpConfigurationError(
+                    "MDP: D3 coordinator embedding preparation returns typed transport state."
+                )
+            if prepared.phase is not BridgePhase.EMBEDDING:
+                raise MdpConfigurationError(
+                    "MDP: D3 coordinator embedding preparation returns embedding phase state."
+                )
+            state.embedding_prepared = prepared
+            return prepared
+
+        embedding_prepared = self._run_precollective(state, gate_id=1, operation=prepare_embedding)
         embedding_result = self._run_entered_collective(
             state, lambda: self._bindings.execute_embedding(embedding_prepared)
         )
+        if embedding_result is not embedding_prepared.received_tensors:
+            self._fail(
+                state,
+                MdpStateError(
+                    "MDP: D3 coordinator embedding execute returns its exact received mapping."
+                ),
+            )
+        state.embedding_result = embedding_result
 
         def prepare_schedule():
+            assert state.payload_prepared is not None and state.payload_result is not None
+            assert state.embedding_prepared is not None and state.embedding_result is not None
             ready = self._bindings.prepare_schedule(
-                state.authority, state.bound_producer, embedding_result
+                state.authority,
+                state.bound_producer,
+                state.payload_prepared,
+                state.payload_result,
+                state.embedding_prepared,
+                state.embedding_result,
             )
             if type(ready) is not DecoderReadyIteration:
                 raise MdpConfigurationError(
