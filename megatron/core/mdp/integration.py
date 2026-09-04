@@ -31,6 +31,7 @@ from megatron.core.mdp.config import (
     MdpConfig,
     validate_mdp_config,
 )
+from megatron.core.mdp.dynamic_cp_d3_composition import _build_d3_runtime_facade
 from megatron.core.mdp.encoder import (
     assert_parameter_disjointness,
     build_encoder_domain,
@@ -53,6 +54,8 @@ _ADAPTER_BUILDER: Optional[Callable] = None
 #: The runtime for this process, once built. Module-level because the seams
 #: are far apart in the training loop.
 _RUNTIME: Optional[MdpRuntime] = None
+
+_D3_STATUS_TIMEOUT_SECONDS = 30.0
 
 
 def set_adapter_builder(builder: Callable) -> None:
@@ -285,6 +288,47 @@ def maybe_wrap_forward_backward(forward_backward_func: Callable, config=None) ->
     if config is not None:
         wrap_finalize_model_grads(config, _RUNTIME)
     return wrap_forward_backward(forward_backward_func, _RUNTIME)
+
+
+def _build_d3_facade_from_mcore(runtime: MdpRuntime, config):
+    """Bind the locked D3 composition to native Dynamic-CP dependencies."""
+    if getattr(config, "dynamic_context_parallel", None) is not True:
+        raise MdpConfigurationError("MDP: D3 requires native Dynamic-CP groups.")
+    if getattr(config, "sequence_packing_scheduler", None) != "default_dynamic_cp":
+        raise MdpConfigurationError(
+            "MDP: D3 requires the native default_dynamic_cp planning contract."
+        )
+    max_seqlen = getattr(config, "max_seqlen_per_dp_cp_rank", None)
+    minimum_cp = getattr(config, "min_dynamic_context_parallel_size", None)
+    if type(max_seqlen) is not int or max_seqlen <= 0:
+        raise MdpConfigurationError("MDP: D3 max sequence length must be a positive integer.")
+    if type(minimum_cp) is not int or minimum_cp <= 0:
+        raise MdpConfigurationError("MDP: D3 minimum CP size must be a positive integer.")
+
+    codec_factory = getattr(runtime.adapter, "build_dynamic_decoder_payload_codec", None)
+    if not callable(codec_factory):
+        raise MdpConfigurationError("MDP: D3 model adapter must provide its decoder codec.")
+
+    from megatron.core import parallel_state
+    from megatron.core.datasets.data_schedule_utils import next_hdp_group_packing_aware
+
+    group = runtime.process_groups.world_group
+    ranks = tuple(torch.distributed.get_process_group_ranks(group))
+    return _build_d3_runtime_facade(
+        producer_runtime=runtime,
+        codec=codec_factory(),
+        group=group,
+        participant_ranks=ranks,
+        global_rank=torch.distributed.get_rank(),
+        device=runtime.device,
+        expected_source_lanes=tuple(range(len(ranks))),
+        decoder_solver=next_hdp_group_packing_aware,
+        max_seqlen_per_rank=max_seqlen,
+        minimum_cp_size=minimum_cp,
+        decoder_group_getter=parallel_state.get_dynamic_data_context_parallel_groups,
+        decoder_group_ranks_getter=torch.distributed.get_process_group_ranks,
+        timeout_seconds=_D3_STATUS_TIMEOUT_SECONDS,
+    )
 
 
 def reset_for_testing() -> None:
