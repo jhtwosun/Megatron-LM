@@ -757,13 +757,24 @@ class _SingleWaveCp2Solver:
         return ([lengths, lengths], [], None, [sample_ids, sample_ids])
 
 
-def _state(*, device="cpu", images_per_sample=1, text_only=False, solver=None, capacity=4):
+def _state(
+    *,
+    device="cpu",
+    images_per_sample=1,
+    text_only=False,
+    solver=None,
+    capacity=4,
+    participant_ranks=_PARTICIPANTS,
+    decoder_ranks=_DECODER_RANKS,
+    source_rank=0,
+    producer_rank_by_item=None,
+):
     device = torch.device(device)
     window = _source_window(device=device, images_per_sample=images_per_sample, text_only=text_only)
     manifest = build_decoder_global_manifest((window.metadata_manifest(),))
     plan = build_decoder_dynamic_plan(
         manifest.samples,
-        decoder_ranks=_DECODER_RANKS,
+        decoder_ranks=decoder_ranks,
         max_seqlen_per_rank=capacity,
         minimum_cp_size=1,
         solver=_TwoWaveSolver() if solver is None else solver,
@@ -771,13 +782,15 @@ def _state(*, device="cpu", images_per_sample=1, text_only=False, solver=None, c
     payload_authority = dict(
         plan=plan,
         global_manifest=manifest,
-        source_rank_by_lane=_SOURCE_RANKS,
-        participant_ranks=_PARTICIPANTS,
+        source_rank_by_lane={3: source_rank},
+        participant_ranks=participant_ranks,
     )
     payload_ledger = routing.build_decoder_payload_route_ledger(**payload_authority)
-    producers = {
-        item.item_id: (1 if item.item_id.local_item_id == 0 else 0) for item in manifest.items
-    }
+    producers = (
+        {item.item_id: (1 if item.item_id.local_item_id == 0 else 0) for item in manifest.items}
+        if producer_rank_by_item is None
+        else producer_rank_by_item
+    )
     rows = {item.item_id: item.output_rows for item in manifest.items}
     bridge_authority = dict(
         plan=plan,
@@ -786,7 +799,7 @@ def _state(*, device="cpu", images_per_sample=1, text_only=False, solver=None, c
         output_rows_by_item=rows,
         width=_WIDTH,
         dtype=torch.float32,
-        participant_ranks=_PARTICIPANTS,
+        participant_ranks=participant_ranks,
     )
     embedding, gradient = bridge.build_dynamic_bridge_ledgers(**bridge_authority)
     return SimpleNamespace(
@@ -830,7 +843,7 @@ def _payload_dtypes(state):
 
 
 def _payload_local_tensors(state, rank):
-    if rank != 0:
+    if rank not in state.payload_authority["source_rank_by_lane"].values():
         return MappingProxyType({})
     return routing.attach_local_decoder_payload_tensors(
         state.payload_ledger,
@@ -935,7 +948,7 @@ def _prepare_gradient(state, ready, rank, *, buffers=None, **overrides):
         embedding_dtype=torch.float32,
         cp_partition_mode="contiguous",
         global_rank=rank,
-        participant_ranks=_PARTICIPANTS,
+        participant_ranks=state.bridge_authority["participant_ranks"],
         send_buffer=send_buffer,
         receive_buffer=receive_buffer,
     )
@@ -945,14 +958,15 @@ def _prepare_gradient(state, ready, rank, *, buffers=None, **overrides):
 
 def _run_gradient_gate(state, prepared, rank, *, events, phase=False, **overrides):
     runtime = _runtime()
-    group = overrides.pop("group", _FakeGroup(_PARTICIPANTS, rank))
+    participant_ranks = state.bridge_authority["participant_ranks"]
+    group = overrides.pop("group", _FakeGroup(participant_ranks, rank))
     iteration_nonce = overrides.pop("iteration_nonce", b"\x01" * 16) if phase else None
 
     def gather(wire, **kwargs):
         status = execution._PrecollectiveStatus.from_wire_tuple(wire)
         events.append(f"status-{status.gate_id}")
         assert kwargs == {"timeout_seconds": 0.001}
-        return _consensus_rows(wire, _PARTICIPANTS)
+        return _consensus_rows(wire, participant_ranks)
 
     def all_to_all_single(*args, **kwargs):
         input_tensor = kwargs["input"] if "input" in kwargs else args[1]
@@ -969,7 +983,7 @@ def _run_gradient_gate(state, prepared, rank, *, events, phase=False, **override
         embedding_dtype=torch.float32,
         cp_partition_mode="contiguous",
         global_rank=rank,
-        group_ranks=_PARTICIPANTS,
+        group_ranks=participant_ranks,
         all_gather_status=gather,
         timeout_seconds=0.001,
         group=group,
@@ -1120,7 +1134,8 @@ def _run(state, rank, *, events=None, captured=None, local_prepare=None, **overr
     runtime = _runtime()
     events = [] if events is None else events
     captured = {} if captured is None else captured
-    group = overrides.pop("group", _FakeGroup(_PARTICIPANTS, rank))
+    participant_ranks = state.bridge_authority["participant_ranks"]
+    group = overrides.pop("group", _FakeGroup(participant_ranks, rank))
     decoder_getter, decoder_ranks_getter = _decoder_group_dependencies(state, rank)
 
     def payload_prepare():
@@ -1147,7 +1162,7 @@ def _run(state, rank, *, events=None, captured=None, local_prepare=None, **overr
         status = execution._PrecollectiveStatus.from_wire_tuple(wire)
         events.append(f"status-{status.gate_id}")
         assert kwargs == {"timeout_seconds": 0.001}
-        return _consensus_rows(wire, _PARTICIPANTS)
+        return _consensus_rows(wire, participant_ranks)
 
     def all_to_all_single(*_args, **kwargs):
         input_tensor = kwargs["input"] if "input" in kwargs else _args[1]
@@ -1157,7 +1172,7 @@ def _run(state, rank, *, events=None, captured=None, local_prepare=None, **overr
         global_manifest=state.manifest,
         plan=state.plan,
         payload_ledger=state.payload_ledger,
-        source_rank_by_lane=_SOURCE_RANKS,
+        source_rank_by_lane=state.payload_authority["source_rank_by_lane"],
         payload_local_prepare=payload_prepare,
         embedding_ledger=state.embedding,
         gradient_ledger=state.gradient,
@@ -1171,7 +1186,7 @@ def _run(state, rank, *, events=None, captured=None, local_prepare=None, **overr
         decoder_group_getter=decoder_getter,
         decoder_group_ranks_getter=decoder_ranks_getter,
         global_rank=rank,
-        group_ranks=_PARTICIPANTS,
+        group_ranks=participant_ranks,
         all_gather_status=gather,
         timeout_seconds=0.001,
         group=group,
@@ -1636,6 +1651,79 @@ def test_decoder_gradient_receipt_aggregates_exact_endpoint_gradients():
         torch.testing.assert_close(destination, expected)
     assert receipt.received_tensors is prepared.exchange.received_tensors
     assert all(leaf.grad is not None for leaf in ready.embedding_leaves.values())
+
+
+def test_decoder_gradient_receipt_uses_physical_participant_receive_order():
+    participants = (7, 3, 5)
+    state = _state(
+        participant_ranks=participants,
+        decoder_ranks=(7, 3),
+        source_rank=5,
+        producer_rank_by_item={item.item_id: 5 for item in _source_window(device="cpu").items},
+    )
+    ready = _run(
+        state,
+        5,
+        group=_FakeGroup(participants, 5),
+        group_ranks=participants,
+        source_rank_by_lane=state.payload_authority["source_rank_by_lane"],
+    )
+    prepared = _prepare_gradient(state, ready, 5)
+    receipt = _run_gradient_gate(state, prepared, 5, events=[], phase=True)
+    local_entries = tuple(entry for entry in state.gradient.entries if entry.dst_global_rank == 5)
+    raw_ledger_keys = tuple(entry.key for entry in local_entries)
+    participant_index = {rank: index for index, rank in enumerate(participants)}
+    physical_receive_keys = tuple(
+        entry.key
+        for entry in sorted(
+            local_entries,
+            key=lambda entry: (participant_index[entry.src_global_rank], entry.plan_offset),
+        )
+    )
+    assert raw_ledger_keys != physical_receive_keys
+    assert tuple(receipt.received_tensors) == physical_receive_keys
+
+    runtime = _runtime()
+    forged = replace(
+        receipt,
+        received_tensors=MappingProxyType(
+            {
+                key: receipt.received_tensors[key]
+                for key in reversed(tuple(receipt.received_tensors))
+            }
+        ),
+    )
+    object.__setattr__(
+        forged, "_authority", runtime._capture_decoder_gradient_receipt_authority(forged)
+    )
+    receipt_kwargs = dict(
+        global_manifest=state.manifest,
+        plan=state.plan,
+        embedding_ledger=state.embedding,
+        gradient_ledger=state.gradient,
+        producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+        output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+        global_rank=5,
+        participant_ranks=participants,
+        embedding_width=_WIDTH,
+        embedding_dtype=torch.float32,
+        cp_partition_mode="contiguous",
+    )
+    with pytest.raises(MdpBridgeError, match="exact gate-3 mapping"):
+        runtime._assemble_decoder_gradient_receipt(
+            _gradient_lifecycle(),
+            forged,
+            destination_tensors=_gradient_destinations(state, 5),
+            **receipt_kwargs,
+        )
+
+    assembled = runtime._assemble_decoder_gradient_receipt(
+        _gradient_lifecycle(),
+        receipt,
+        destination_tensors=_gradient_destinations(state, 5),
+        **receipt_kwargs,
+    )
+    assert tuple(assembled) == tuple(_gradient_destinations(state, 5))
 
 
 def test_decoder_gradient_receipt_lifecycle_consumes_once_then_retires():

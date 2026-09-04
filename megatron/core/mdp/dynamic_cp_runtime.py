@@ -1606,8 +1606,13 @@ def _validate_decoder_gradient_receipt(
         raise MdpBridgeError(
             "MDP: decoder gradient receipt route matches retained transport authority."
         )
+    participant_index = {rank: index for index, rank in enumerate(participant_ranks)}
     expected_keys = tuple(
-        entry.key for entry in gradient_ledger.entries if entry.dst_global_rank == global_rank
+        entry.key
+        for entry in sorted(
+            (entry for entry in gradient_ledger.entries if entry.dst_global_rank == global_rank),
+            key=lambda entry: (participant_index[entry.src_global_rank], entry.plan_offset),
+        )
     )
     if tuple(receipt.received_tensors) != expected_keys:
         raise MdpPlanError("MDP: decoder gradient receipt covers the exact local producer routes.")
