@@ -57,6 +57,27 @@ from examples.multimodal_dev.models.qwen35_vl.factory import (
     set_vision_flops_metadata as _qwen35_vl_vision_flops,
 )
 
+
+def _build_nemotron_omni_model(*args, **kwargs):
+    from examples.multimodal_dev.models.nemotron_omni.factory import build_model
+
+    return build_model(*args, **kwargs)
+
+
+def _nemotron_omni_vision_config(*args, **kwargs):
+    from examples.multimodal_dev.models.nemotron_omni.configuration import (
+        get_nemotron_omni_vision_config,
+    )
+
+    return get_nemotron_omni_vision_config(*args, **kwargs)
+
+
+def _nemotron_omni_post_language_config(*args, **kwargs):
+    from examples.multimodal_dev.models.nemotron_omni.factory import post_language_config
+
+    return post_language_config(*args, **kwargs)
+
+
 MODEL_REGISTRY = {
     "qwen35_vl": {
         "model_factory_fn": _build_qwen35_vl_model,
@@ -89,6 +110,24 @@ MODEL_REGISTRY = {
             "energon": (
                 "examples.multimodal_dev.data.energon.provider"
                 ".train_valid_test_datasets_provider"
+            ),
+        },
+    },
+    "nemotron_omni": {
+        "model_factory_fn": _build_nemotron_omni_model,
+        "vision_config_fn": _nemotron_omni_vision_config,
+        "post_language_config_fn": _nemotron_omni_post_language_config,
+        "mdp_adapter_factory": (
+            "examples.multimodal_dev.models.nemotron_omni.mdp.build_mdp_adapter"
+        ),
+        "dataset_providers": {
+            "mock": (
+                "examples.multimodal_dev.models.nemotron_omni.data"
+                ".mock_dataset_provider"
+            ),
+            "mdp_mock": (
+                "examples.multimodal_dev.models.nemotron_omni.data"
+                ".mdp_mock_dataset_provider"
             ),
         },
     },

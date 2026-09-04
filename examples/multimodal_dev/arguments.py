@@ -67,7 +67,7 @@ def add_multimodal_args(parser):
         "--model-arch",
         type=str,
         default="qwen35_vl",
-        help="Model architecture. Available: qwen35_vl",
+        help="Model architecture. Available: qwen35_vl, nemotron_omni",
     )
     group.add_argument(
         "--model-variant",
@@ -122,6 +122,18 @@ def add_multimodal_args(parser):
         type=int,
         default=2,
         help="Energon loader prefetch factor.",
+    )
+    group.add_argument(
+        "--nemotron-omni-input-contract",
+        type=str,
+        default="expanded_sequence_v1",
+        help="Nemotron Omni input contract (only expanded_sequence_v1 is supported).",
+    )
+    group.add_argument(
+        "--nemotron-omni-enable-sound",
+        action="store_true",
+        default=False,
+        help="Enable Nemotron Omni sound input (unsupported by this image-only integration).",
     )
     group.add_argument(
         "--image-token-id",
