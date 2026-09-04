@@ -300,3 +300,126 @@ def test_d3_coordinator_never_advances_after_an_entered_collective_fails():
         "cleanup",
     ]
     assert coordinator.is_idle
+
+
+def test_d3_scheduled_abort_preserves_exact_primary_and_retries_from_idle():
+    events = []
+    coordinator = _D3Coordinator(bindings=_bindings(events))
+    ready = _begin(coordinator)
+    primary = RuntimeError("native decoder schedule failed")
+
+    with pytest.raises(RuntimeError) as error:
+        coordinator.abort_scheduled_iteration(ready, primary)
+
+    assert error.value is primary
+    assert events[-2:] == ["gate-3:True", "cleanup"]
+    assert not any(
+        event in events
+        for event in (
+            "gradient-prepare",
+            "gradient-execute",
+            "completion-prepare",
+            "backward",
+            "finalize",
+            "gate-4:False",
+            "gate-5:False",
+            "gate-6:False",
+        )
+    )
+    assert coordinator.is_idle
+
+    retry = _begin(coordinator)
+    with pytest.raises(RuntimeError, match="retry"):
+        coordinator.abort_scheduled_iteration(retry, RuntimeError("retry"))
+    assert coordinator.is_idle
+
+
+def test_d3_scheduled_abort_rejects_stale_handoff_and_non_exception_primary():
+    events = []
+    coordinator = _D3Coordinator(bindings=_bindings(events))
+    ready = _begin(coordinator)
+
+    with pytest.raises(MdpStateError, match="exact active decoder-ready"):
+        coordinator.abort_scheduled_iteration(_ready(), RuntimeError("primary"))
+    with pytest.raises(MdpConfigurationError, match="BaseException"):
+        coordinator.abort_scheduled_iteration(ready, object())
+    assert not any(event.startswith("gate-3") or event == "cleanup" for event in events)
+
+    with pytest.raises(RuntimeError, match="primary"):
+        coordinator.abort_scheduled_iteration(ready, RuntimeError("primary"))
+
+
+def test_d3_scheduled_abort_suppresses_gate_and_cleanup_secondaries_on_base_primary():
+    class Primary(BaseException):
+        pass
+
+    class GateSecondary(BaseException):
+        pass
+
+    class CleanupSecondary(BaseException):
+        pass
+
+    events = []
+    bindings = _bindings(events)
+
+    def gate(gate_id, local_error, _authority):
+        events.append(f"abort-gate-{gate_id}")
+        if gate_id != 3:
+            return
+        assert local_error is primary
+        raise GateSecondary("gate")
+
+    def cleanup(_producer):
+        events.append("abort-cleanup")
+        raise CleanupSecondary("cleanup")
+
+    coordinator = _D3Coordinator(bindings=replace(bindings, status_gate=gate, cleanup=cleanup))
+    ready = _begin(coordinator)
+    primary = Primary("primary")
+
+    with pytest.raises(Primary) as error:
+        coordinator.abort_scheduled_iteration(ready, primary)
+
+    assert error.value is primary
+    notes = getattr(primary, "__notes__", ())
+    assert any("GateSecondary" in note for note in notes)
+    assert any("CleanupSecondary" in note for note in notes)
+    assert events[-2:] == ["abort-gate-3", "abort-cleanup"]
+    assert coordinator.is_idle
+
+
+@pytest.mark.parametrize("reentry_phase", ("gate", "cleanup"))
+def test_d3_scheduled_abort_rejects_reentry_without_duplicate_gate_or_cleanup(reentry_phase):
+    events = []
+    bindings = _bindings(events)
+    active = {}
+    ready = None
+    primary = RuntimeError("outer primary")
+
+    def reenter():
+        active["coordinator"].abort_scheduled_iteration(ready, RuntimeError("nested primary"))
+
+    def gate(gate_id, local_error, authority):
+        events.append(f"abort-gate-{gate_id}")
+        if gate_id == 3 and reentry_phase == "gate":
+            reenter()
+        elif gate_id != 3:
+            bindings.status_gate(gate_id, local_error, authority)
+
+    def cleanup(producer):
+        events.append("abort-cleanup")
+        if reentry_phase == "cleanup":
+            reenter()
+        else:
+            bindings.cleanup(producer)
+
+    coordinator = _D3Coordinator(bindings=replace(bindings, status_gate=gate, cleanup=cleanup))
+    active["coordinator"] = coordinator
+    ready = _begin(coordinator)
+    with pytest.raises(RuntimeError) as error:
+        coordinator.abort_scheduled_iteration(ready, primary)
+
+    assert error.value is primary
+    assert events.count("abort-gate-3") == 1
+    assert events.count("abort-cleanup") == 1
+    assert coordinator.is_idle
