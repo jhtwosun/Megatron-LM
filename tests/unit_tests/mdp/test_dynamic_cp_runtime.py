@@ -294,6 +294,7 @@ def test_dynamic_producer_carrier_requires_mapping_views_and_callbacks():
         local_manifest="manifest",
         source_window="window",
         static_plan="plan",
+        native_item_outputs=views,
         item_outputs=views,
         payload_destination_views=views,
         embedding_destination_views=views,
@@ -313,6 +314,7 @@ def test_dynamic_producer_carrier_requires_mapping_views_and_callbacks():
             local_manifest="manifest",
             source_window="window",
             static_plan="plan",
+            native_item_outputs=views,
             item_outputs=(),
             payload_destination_views=views,
             embedding_destination_views=views,
@@ -345,6 +347,7 @@ def test_dynamic_producer_carrier_requires_mapping_views_and_callbacks():
             local_manifest="manifest",
             source_window="window",
             static_plan="plan",
+            native_item_outputs=views,
             item_outputs=views,
             payload_destination_views=views,
             embedding_destination_views=views,
@@ -362,6 +365,7 @@ def test_dynamic_producer_carrier_requires_mapping_views_and_callbacks():
             local_manifest="manifest",
             source_window="window",
             static_plan="plan",
+            native_item_outputs=views,
             item_outputs=views,
             payload_destination_views=views,
             embedding_destination_views=views,
@@ -386,6 +390,97 @@ def test_dynamic_iteration_authority_requires_mapping_fields():
         replace(authority, source_rank_by_lane=())
     with pytest.raises(MdpConfigurationError, match="exact typed carrier"):
         replace(authority, global_manifest="manifest")
+
+
+def test_bind_pre_authority_producer_preserves_identity_and_globalizes_outputs(monkeypatch):
+    runtime = _runtime()
+    authority = _dynamic_authority(runtime)
+    rank = 0
+    lane = 3
+    local_items = tuple(
+        item_id
+        for item_id, producer_rank in authority.producer_rank_by_item.items()
+        if producer_rank == rank
+    )
+    local_outputs = MappingProxyType(
+        {
+            item_id.local_item_id: torch.zeros(
+                authority.output_rows_by_item[item_id], _WIDTH, dtype=torch.float32
+            )
+            for item_id in local_items
+        }
+    )
+    events = []
+
+    class OwnerRuntime:
+        producer = None
+
+        def _validate_pre_authority_dynamic_producer(self, owner, producer):
+            events.append("validate")
+            if owner is not owner_object or producer is not self.producer:
+                raise MdpStateError("producer identity mismatch")
+
+        def _consume_pre_authority_dynamic_producer(self, owner, producer):
+            self._validate_pre_authority_dynamic_producer(owner, producer)
+            events.append("consume")
+            self.producer = None
+
+    class Owner:
+        def __init__(self):
+            self._runtime = OwnerRuntime()
+
+        def prepare_dynamic_completion(self, gradients):
+            events.append(("complete", gradients))
+            return "completion"
+
+        def abort(self):
+            events.append("abort")
+            self._runtime = None
+
+    owner_object = Owner()
+    producer = runtime._PreAuthorityDynamicProducer(
+        rank_view=SimpleNamespace(global_rank=rank, lane_id=lane),
+        local_manifest="manifest",
+        source_window="window",
+        static_plan="plan",
+        item_outputs=local_outputs,
+        sample_location_by_id=MappingProxyType({GlobalSampleId(lane, 0): (0, 0)}),
+        owner=owner_object,
+        local_prepare_error=None,
+        forward_only=False,
+    )
+    owner_object._runtime.producer = producer
+    proof_calls = []
+    monkeypatch.setattr(
+        runtime,
+        "_validate_local_singleton_producer_proof",
+        lambda **kwargs: proof_calls.append(kwargs),
+        raising=False,
+    )
+    binder = getattr(runtime, "_bind_pre_authority_dynamic_producer", None)
+    assert callable(binder), "production must provide the private producer binder"
+    views = MappingProxyType({})
+
+    bound = binder(
+        producer=producer,
+        authority=authority,
+        payload_destination_views=views,
+        embedding_destination_views=views,
+        gradient_destination_views=views,
+        summed_gradient_destination_views=views,
+    )
+
+    assert bound.authority is authority and bound.pre_authority is producer
+    assert tuple(bound.item_outputs) == local_items
+    assert events == ["validate", "validate", "consume"]
+    assert proof_calls[0]["sample_location_by_id"] == producer.sample_location_by_id
+    gradients = MappingProxyType(
+        {item_id: torch.ones_like(bound.item_outputs[item_id]) for item_id in local_items}
+    )
+    assert bound.backward(gradients) == "completion"
+    assert tuple(events[-1][1]) == tuple(item_id.local_item_id for item_id in local_items)
+    bound.cleanup()
+    assert events[-1] == "abort"
 
 
 def test_dynamic_iteration_authority_rejects_mixed_valid_iteration_components():
