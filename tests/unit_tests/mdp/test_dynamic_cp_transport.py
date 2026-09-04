@@ -1,7 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Focused contracts for pre-collective Dynamic-CP decoder payload packing."""
+"""Contracts for preparing and synchronously exchanging Dynamic-CP decoder payloads."""
 
+import os
 from dataclasses import FrozenInstanceError, replace
 from types import MappingProxyType, SimpleNamespace
 
@@ -28,16 +29,18 @@ _SOURCE_RANKS = {3: 70, 7: 80}
 _FIELDS = ("tokens", "loss_mask")
 
 
-def _strided_values(seed, *, dtype):
-    base = torch.arange(seed, seed + 16, dtype=dtype).reshape(2, 8)
+def _strided_values(seed, *, dtype, device="cpu"):
+    base = torch.arange(seed, seed + 16, dtype=dtype, device=device).reshape(2, 8)
     return base[1:2, 1::2]
 
 
-def _packet(lane, order):
+def _packet(lane, order, *, device="cpu"):
     tensors = MappingProxyType(
         {
-            "tokens": _strided_values(lane * 100 + order * 10, dtype=torch.int64),
-            "loss_mask": _strided_values(lane * 100 + order * 10, dtype=torch.float32),
+            "tokens": _strided_values(lane * 100 + order * 10, dtype=torch.int64, device=device),
+            "loss_mask": _strided_values(
+                lane * 100 + order * 10, dtype=torch.float32, device=device
+            ),
         }
     )
     specs = tuple(
@@ -71,8 +74,8 @@ def _packet(lane, order):
     )
 
 
-def _window(lane):
-    packets = tuple(_packet(lane, order) for order in range(2))
+def _window(lane, *, device="cpu", sample_count=2):
+    packets = tuple(_packet(lane, order, device=device) for order in range(sample_count))
     samples = tuple(
         DecoderSampleMetadata(
             sample_id=packet.sample_id,
@@ -87,20 +90,26 @@ def _window(lane):
     )
 
 
-def _state(*, source_ranks=_SOURCE_RANKS):
-    lane3 = _window(3)
-    lane7 = _window(7)
+def _state(
+    *,
+    source_ranks=_SOURCE_RANKS,
+    decoder_ranks=_DECODER_RANKS,
+    participant_ranks=_PARTICIPANTS,
+    device="cpu",
+):
+    lane3 = _window(3, device=device)
+    lane7 = _window(7, device=device)
     manifest = build_decoder_global_manifest((lane7.metadata_manifest(), lane3.metadata_manifest()))
 
     def solver(sample_seqlens, total_gpus, **kwargs):
         del kwargs
         assert sample_seqlens == [(0, 4), (1, 4), (2, 4), (3, 4)]
-        assert total_gpus == 4
+        assert total_gpus == len(decoder_ranks)
         return ([[4], [4], [4], [4]], [], None, [[0], [1], [2], [3]])
 
     plan = build_decoder_dynamic_plan(
         manifest.samples,
-        decoder_ranks=_DECODER_RANKS,
+        decoder_ranks=decoder_ranks,
         max_seqlen_per_rank=4,
         minimum_cp_size=1,
         solver=solver,
@@ -109,18 +118,66 @@ def _state(*, source_ranks=_SOURCE_RANKS):
         plan=plan,
         global_manifest=manifest,
         source_rank_by_lane=source_ranks,
-        participant_ranks=_PARTICIPANTS,
+        participant_ranks=participant_ranks,
     )
     ledger = routing.build_decoder_payload_route_ledger(**authority)
     return SimpleNamespace(
-        lane3=lane3, lane7=lane7, manifest=manifest, plan=plan, authority=authority, ledger=ledger
+        lane3=lane3,
+        lane7=lane7,
+        source_windows=MappingProxyType({3: lane3, 7: lane7}),
+        manifest=manifest,
+        plan=plan,
+        authority=authority,
+        ledger=ledger,
+        device=torch.device(device),
+    )
+
+
+def _idle_state(*, device):
+    source_window = _window(3, device=device, sample_count=4)
+    manifest = build_decoder_global_manifest((source_window.metadata_manifest(),))
+
+    def solver(sample_seqlens, total_gpus, **kwargs):
+        del kwargs
+        assert total_gpus == 2
+        selected = sample_seqlens[:total_gpus]
+        assert len(selected) == total_gpus
+        return (
+            [[length] for _, length in selected],
+            sample_seqlens[total_gpus:],
+            None,
+            [[sample_id] for sample_id, _ in selected],
+        )
+
+    plan = build_decoder_dynamic_plan(
+        manifest.samples,
+        decoder_ranks=(1, 2),
+        max_seqlen_per_rank=4,
+        minimum_cp_size=1,
+        solver=solver,
+    )
+    authority = dict(
+        plan=plan,
+        global_manifest=manifest,
+        source_rank_by_lane={3: 0},
+        participant_ranks=(0, 1, 2, 3),
+    )
+    return SimpleNamespace(
+        lane3=source_window,
+        lane7=None,
+        source_windows=MappingProxyType({3: source_window}),
+        manifest=manifest,
+        plan=plan,
+        authority=authority,
+        ledger=routing.build_decoder_payload_route_ledger(**authority),
+        device=torch.device(device),
     )
 
 
 def _local_tensors(state, rank, dtype):
     lane_by_rank = {
-        state.authority["source_rank_by_lane"][3]: state.lane3,
-        state.authority["source_rank_by_lane"][7]: state.lane7,
+        source_rank: state.source_windows[lane]
+        for lane, source_rank in state.authority["source_rank_by_lane"].items()
     }
     window = lane_by_rank.get(rank)
     if window is None:
@@ -138,9 +195,9 @@ def _prepare(state, rank, dtype, *, local_tensors=None, send=None, receive=None)
         state.ledger, **state.authority, dtype=dtype, global_rank=rank
     )
     if send is None:
-        send = torch.empty(sum(input_splits), dtype=dtype)
+        send = torch.empty(sum(input_splits), dtype=dtype, device=state.device)
     if receive is None:
-        receive = torch.empty(sum(output_splits), dtype=dtype)
+        receive = torch.empty(sum(output_splits), dtype=dtype, device=state.device)
     return transport.prepare_decoder_payload_exchange(
         state.ledger,
         **state.authority,
@@ -156,7 +213,7 @@ def _prepare(state, rank, dtype, *, local_tensors=None, send=None, receive=None)
 
 def _expected_send(state, rank, dtype, local_tensors):
     chunks = []
-    for destination in _PARTICIPANTS:
+    for destination in state.authority["participant_ranks"]:
         chunks.extend(
             local_tensors[entry.key].reshape(-1)
             for entry in state.ledger.entries
@@ -164,7 +221,224 @@ def _expected_send(state, rank, dtype, local_tensors):
             and entry.src_global_rank == rank
             and entry.dst_global_rank == destination
         )
-    return torch.cat(chunks) if chunks else torch.empty(0, dtype=dtype)
+    return torch.cat(chunks) if chunks else torch.empty(0, dtype=dtype, device=state.device)
+
+
+class _FakeGroup:
+    def __init__(self, participant_ranks, global_rank):
+        self.participant_ranks = participant_ranks
+        self.global_rank = global_rank
+
+    def size(self):
+        return len(self.participant_ranks)
+
+    def rank(self):
+        return self.participant_ranks.index(self.global_rank)
+
+
+def _execute(prepared, *, group=None, group_ranks_getter=None, all_to_all_single=None):
+    group = group or _FakeGroup(prepared.participant_ranks, prepared.global_rank)
+    kwargs = {"group": group}
+    if group_ranks_getter is not None:
+        kwargs["group_ranks_getter"] = group_ranks_getter
+    else:
+        kwargs["group_ranks_getter"] = lambda selected: list(selected.participant_ranks)
+    if all_to_all_single is not None:
+        kwargs["all_to_all_single"] = all_to_all_single
+    else:
+        kwargs["all_to_all_single"] = lambda *_args, **_kwargs: None
+    return transport.execute_decoder_payload_exchange(prepared, **kwargs)
+
+
+def _replace_preserving_authority(prepared, **changes):
+    authority = prepared._authority
+    forged = replace(prepared, **changes)
+    object.__setattr__(forged, "_authority", authority)
+    return forged
+
+
+def test_execute_calls_one_sync_collective_with_exact_buffers_splits_and_group():
+    prepared = _prepare(_state(), 30, torch.int64)
+    group = _FakeGroup(prepared.participant_ranks, prepared.global_rank)
+    calls = []
+
+    def all_to_all_single(output, input, **kwargs):
+        calls.append((output, input, kwargs))
+        output.copy_(torch.arange(output.numel(), dtype=output.dtype))
+
+    received = _execute(prepared, group=group, all_to_all_single=all_to_all_single)
+
+    assert received is prepared.received_tensors
+    assert calls == [
+        (
+            prepared.receive_buffer,
+            prepared.send_buffer,
+            {
+                "output_split_sizes": list(prepared.output_split_sizes),
+                "input_split_sizes": list(prepared.input_split_sizes),
+                "group": group,
+                "async_op": False,
+            },
+        )
+    ]
+    assert any(torch.count_nonzero(tensor).item() for tensor in received.values())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "carrier",
+        "participant-order",
+        "global-rank",
+        "input-splits",
+        "output-splits",
+        "send-size",
+        "receive-view",
+    ),
+)
+def test_execute_revalidates_exact_carrier_geometry_before_collective(mutation):
+    prepared = _prepare(_state(), 30, torch.int64)
+    original_participants = prepared.participant_ranks
+    if mutation == "carrier":
+        prepared = object()
+    elif mutation == "participant-order":
+        prepared = replace(prepared, participant_ranks=tuple(reversed(prepared.participant_ranks)))
+    elif mutation == "global-rank":
+        prepared = replace(prepared, global_rank=123)
+    elif mutation == "input-splits":
+        prepared = replace(prepared, input_split_sizes=(*prepared.input_split_sizes[:-1], 1))
+    elif mutation == "output-splits":
+        prepared = replace(prepared, output_split_sizes=(*prepared.output_split_sizes[:-1], 1))
+    elif mutation == "send-size":
+        prepared = replace(prepared, send_buffer=torch.empty(1, dtype=prepared.dtype))
+    else:
+        key = next(iter(prepared.received_tensors))
+        prepared = replace(
+            prepared,
+            received_tensors=MappingProxyType(
+                {**dict(prepared.received_tensors), key: prepared.receive_buffer[:1]}
+            ),
+        )
+    calls = []
+    group = _FakeGroup(original_participants, 30)
+
+    with pytest.raises((MdpBridgeError, MdpConfigurationError)):
+        _execute(
+            prepared,
+            group=group,
+            group_ranks_getter=lambda _group: list(original_participants),
+            all_to_all_single=lambda *_args, **_kwargs: calls.append(True),
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("split_name", "rank"), (("input_split_sizes", 70), ("output_split_sizes", 30))
+)
+def test_execute_rejects_total_preserving_peer_split_relocation(split_name, rank):
+    prepared = _prepare(_state(), rank, torch.int64)
+    splits = list(getattr(prepared, split_name))
+    source = next(index for index, split in enumerate(splits) if split > 0)
+    idle = next(index for index, split in enumerate(splits) if split == 0)
+    splits[source] -= 1
+    splits[idle] += 1
+    forged = _replace_preserving_authority(prepared, **{split_name: tuple(splits)})
+    calls = []
+
+    with pytest.raises(MdpBridgeError, match="authority snapshot"):
+        _execute(forged, all_to_all_single=lambda *_args, **_kwargs: calls.append(True))
+    assert calls == []
+
+
+@pytest.mark.parametrize("mutation", ("typed-key", "same-interval-reshape"))
+def test_execute_rejects_receive_descriptor_mutation_with_exact_partition(mutation):
+    prepared = _prepare(_state(), 30, torch.int64)
+    views = list(prepared.received_tensors.items())
+    key, tensor = views[0]
+    if mutation == "typed-key":
+        views[0] = (replace(key, sample_id=GlobalSampleId(99, 99)), tensor)
+    else:
+        views[0] = (key, tensor.reshape(-1))
+    forged = _replace_preserving_authority(prepared, received_tensors=MappingProxyType(dict(views)))
+    calls = []
+
+    with pytest.raises(MdpBridgeError, match="authority snapshot"):
+        _execute(forged, all_to_all_single=lambda *_args, **_kwargs: calls.append(True))
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("ranks-reordered", "rank order"),
+        ("ranks-bool", "rank order"),
+        ("size", "group size"),
+        ("local-rank", "local rank"),
+    ),
+)
+def test_execute_rejects_native_group_geometry_mismatch(mutation, message):
+    prepared = _prepare(_state(), 30, torch.int64)
+    group = _FakeGroup(prepared.participant_ranks, prepared.global_rank)
+    ranks = list(prepared.participant_ranks)
+    if mutation == "ranks-reordered":
+        ranks.reverse()
+    elif mutation == "ranks-bool":
+        ranks[0] = True
+    elif mutation == "size":
+        group.size = lambda: len(ranks) - 1
+    else:
+        group.rank = lambda: 0
+
+    with pytest.raises(MdpConfigurationError, match=message):
+        _execute(prepared, group=group, group_ranks_getter=lambda _group: ranks)
+
+
+@pytest.mark.parametrize("phase", ("group-ranks", "group-size", "group-rank", "collective"))
+def test_execute_normalizes_ordinary_query_and_collective_errors_with_cause(phase):
+    prepared = _prepare(_state(), 30, torch.int64)
+    group = _FakeGroup(prepared.participant_ranks, prepared.global_rank)
+    error = RuntimeError(phase)
+
+    def fail():
+        raise error
+
+    kwargs = {}
+    if phase == "group-ranks":
+        kwargs["group_ranks_getter"] = lambda _group: fail()
+    elif phase == "group-size":
+        group.size = fail
+    elif phase == "group-rank":
+        group.rank = fail
+    else:
+        kwargs["all_to_all_single"] = lambda *_args, **_kwargs: fail()
+
+    expected = MdpBridgeError if phase == "collective" else MdpConfigurationError
+    with pytest.raises(expected) as caught:
+        _execute(prepared, group=group, **kwargs)
+    assert caught.value.__cause__ is error
+
+
+@pytest.mark.parametrize("phase", ("group-ranks", "collective"))
+def test_execute_does_not_catch_base_exception(phase):
+    prepared = _prepare(_state(), 30, torch.int64)
+
+    def fail(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    kwargs = {"group_ranks_getter": fail} if phase == "group-ranks" else {"all_to_all_single": fail}
+    with pytest.raises(KeyboardInterrupt):
+        _execute(prepared, **kwargs)
+
+
+@pytest.mark.parametrize("dependency", ("group_ranks_getter", "all_to_all_single"))
+def test_execute_requires_callable_injected_dependencies(dependency):
+    prepared = _prepare(_state(), 30, torch.int64)
+    kwargs = {dependency: object()}
+
+    with pytest.raises(MdpConfigurationError, match="callable"):
+        transport.execute_decoder_payload_exchange(
+            prepared, group=_FakeGroup(prepared.participant_ranks, prepared.global_rank), **kwargs
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.int64, torch.float32])
@@ -185,7 +459,7 @@ def test_receive_views_follow_source_blocks_offsets_and_manifest_shapes():
     input_splits, output_splits = routing.decoder_payload_split_sizes(
         state.ledger, **state.authority, dtype=torch.int64, global_rank=30
     )
-    receive = torch.arange(sum(output_splits), dtype=torch.int64)
+    receive = torch.arange(sum(output_splits), dtype=torch.int64, device=state.device)
 
     prepared = _prepare(
         state,
@@ -418,3 +692,103 @@ def test_rank_and_dtype_are_validated_by_route_authority():
             send_buffer=torch.empty(0, dtype=torch.int64),
             receive_buffer=torch.empty(0, dtype=torch.int64),
         )
+
+
+_DISTRIBUTED = int(os.environ.get("WORLD_SIZE", "1")) == 4
+_WORLD4_PARTICIPANTS = (0, 1, 2, 3)
+_WORLD4_DECODER_RANKS = (2, 0, 3, 1)
+
+if _DISTRIBUTED:
+    from tests.unit_tests.test_utilities import Utils
+
+    @pytest.fixture(scope="module")
+    def payload_group():
+        Utils.initialize_model_parallel()
+        group = torch.distributed.new_group(ranks=list(_WORLD4_PARTICIPANTS), backend="nccl")
+        yield group
+        torch.distributed.destroy_process_group(group)
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+@pytest.mark.parametrize("dtype", (torch.int64, torch.float32))
+def test_world4_nccl_exchange_preserves_self_and_remote_payloads(dtype, payload_group):
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = _state(
+        source_ranks={3: 0, 7: 2},
+        decoder_ranks=_WORLD4_DECODER_RANKS,
+        participant_ranks=_WORLD4_PARTICIPANTS,
+        device=device,
+    )
+    prepared = _prepare(state, rank, dtype)
+
+    assert tuple(torch.distributed.get_process_group_ranks(payload_group)) == (_WORLD4_PARTICIPANTS)
+    received = transport.execute_decoder_payload_exchange(prepared, group=payload_group)
+
+    assert received is prepared.received_tensors
+    packets = {
+        packet.sample_id: packet
+        for window in (state.lane3, state.lane7)
+        for packet in window.packets
+    }
+    destination_entries = tuple(
+        entry
+        for entry in state.ledger.entries
+        if entry.dtype == dtype and entry.dst_global_rank == rank
+    )
+    assert set(received) == {entry.key for entry in destination_entries}
+    for entry in destination_entries:
+        expected = packets[entry.key.sample_id].tensor_fields[entry.key.field_name]
+        torch.testing.assert_close(received[entry.key], expected, rtol=0, atol=0)
+    if rank == 0:
+        assert any(entry.src_global_rank == entry.dst_global_rank for entry in destination_entries)
+    else:
+        assert all(entry.src_global_rank != entry.dst_global_rank for entry in destination_entries)
+    assert (prepared.send_buffer.numel() > 0) == (rank in (0, 2))
+    assert prepared.receive_buffer.numel() > 0
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+def test_world4_nccl_exchange_includes_source_only_destination_only_and_idle_ranks(payload_group):
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = _idle_state(device=device)
+    prepared = _prepare(state, rank, torch.int64)
+    calls = 0
+
+    def tracked_all_to_all_single(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return torch.distributed.all_to_all_single(*args, **kwargs)
+
+    received = transport.execute_decoder_payload_exchange(
+        prepared, group=payload_group, all_to_all_single=tracked_all_to_all_single
+    )
+
+    assert calls == 1
+    if rank == 0:
+        assert prepared.send_buffer.numel() > 0
+        assert prepared.receive_buffer.numel() == 0
+    elif rank in (1, 2):
+        assert prepared.send_buffer.numel() == 0
+        assert prepared.receive_buffer.numel() > 0
+    else:
+        assert prepared.send_buffer.numel() == prepared.receive_buffer.numel() == 0
+    packets = {
+        packet.sample_id: packet
+        for window in state.source_windows.values()
+        for packet in window.packets
+    }
+    destination_entries = tuple(
+        entry
+        for entry in state.ledger.entries
+        if entry.dtype == torch.int64 and entry.dst_global_rank == rank
+    )
+    assert set(received) == {entry.key for entry in destination_entries}
+    for entry in destination_entries:
+        expected = packets[entry.key.sample_id].tensor_fields[entry.key.field_name]
+        torch.testing.assert_close(received[entry.key], expected, rtol=0, atol=0)
+    completion = torch.ones((), dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(completion, group=payload_group)
+    assert completion.item() == 4
