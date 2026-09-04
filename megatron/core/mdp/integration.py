@@ -225,6 +225,9 @@ def maybe_build_mdp_domain(
     )
 
     adapter, vision_config = _ADAPTER_BUILDER(args)
+    embedding_width = getattr(adapter, "embedding_width", args.hidden_size)
+    if type(embedding_width) is not int or embedding_width <= 0:
+        raise MdpConfigurationError("MDP: model adapter embedding_width must be a positive integer.")
     encoder_domain = build_encoder_domain(
         adapter=adapter,
         model_config=vision_config,
@@ -266,7 +269,7 @@ def maybe_build_mdp_domain(
         bridge=ModalityBridge(allocator),
         storage=MdpEmbeddingStorage(allocator),
         allocator=allocator,
-        hidden_size=args.hidden_size,
+        hidden_size=embedding_width,
         params_dtype=params_dtype,
         num_vpp_chunks=len(model),
     )

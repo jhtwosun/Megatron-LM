@@ -86,9 +86,15 @@ class VisionDescriptor:
 
 
 class MdpModelAdapter(Protocol):
-    """Everything model-specific MDP core needs, and nothing more."""
+    """Everything model-specific MDP core needs, and nothing more.
+
+    ``embedding_width`` is the width of the opaque encoder/decoder bridge
+    tensor. Models with aligned auxiliary planes may concatenate them in this
+    dimension without changing the planner's token-row accounting.
+    """
 
     payload_width: int
+    embedding_width: int
     spatial_merge_size: int
 
     def get_batch(self, data_iterator: Iterator) -> Optional[CapturedMicrobatch]:
