@@ -310,6 +310,42 @@ def _prepare_gradient(state, ready, rank, *, buffers=None, **overrides):
     return runtime._prepare_decoder_gradient_exchange(ready, **values)
 
 
+def _run_gradient_gate(state, prepared, rank, *, events, **overrides):
+    runtime = _runtime()
+    group = overrides.pop("group", _FakeGroup(_PARTICIPANTS, rank))
+
+    def gather(wire, **kwargs):
+        status = execution._PrecollectiveStatus.from_wire_tuple(wire)
+        events.append(f"status-{status.gate_id}")
+        assert kwargs == {"timeout_seconds": 0.001}
+        return _consensus_rows(wire, _PARTICIPANTS)
+
+    def all_to_all_single(*args, **kwargs):
+        input_tensor = kwargs["input"] if "input" in kwargs else args[1]
+        events.append(f"a2a-{input_tensor.dtype}")
+
+    values = dict(
+        global_manifest=state.manifest,
+        plan=state.plan,
+        embedding_ledger=state.embedding,
+        gradient_ledger=state.gradient,
+        producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+        output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+        embedding_width=_WIDTH,
+        embedding_dtype=torch.float32,
+        cp_partition_mode="contiguous",
+        global_rank=rank,
+        group_ranks=_PARTICIPANTS,
+        all_gather_status=gather,
+        timeout_seconds=0.001,
+        group=group,
+        group_ranks_getter=lambda selected: list(selected.ranks),
+        all_to_all_single=all_to_all_single,
+    )
+    values.update(overrides)
+    return runtime._run_decoder_gradient_gate(prepared, **values)
+
+
 class _FakeGroup:
     def __init__(self, ranks, global_rank):
         self.ranks = tuple(ranks)
@@ -865,6 +901,36 @@ def test_decoder_gradient_preparation_discriminator_is_available():
     assert callable(runtime.validate_prepared_decoder_gradient_exchange)
 
 
+def test_decoder_gradient_gate_discriminator_is_available():
+    assert callable(_runtime()._run_decoder_gradient_gate)
+
+
+def test_decoder_gradient_gate_runs_one_status_gate_before_reverse_exchange():
+    state = _state()
+    ready = _run(state, 1)
+    _set_leaf_grads(ready)
+    prepared = _prepare_gradient(state, ready, 1)
+    events = []
+    received = _run_gradient_gate(state, prepared, 1, events=events)
+    assert received is prepared.exchange.received_tensors
+    assert events == ["status-3", "a2a-torch.float32"]
+    for key, leaf in ready.embedding_leaves.items():
+        assert leaf.grad is not None
+
+
+def test_decoder_gradient_gate_converges_forged_preparation_before_a2a():
+    state = _state()
+    ready = _run(state, 1)
+    _set_leaf_grads(ready)
+    prepared = _prepare_gradient(state, ready, 1)
+    forged = replace(prepared)
+    object.__setattr__(forged, "_authority", prepared._authority)
+    events = []
+    with pytest.raises(MdpPlanError, match="rejected rank 1"):
+        _run_gradient_gate(state, forged, 1, events=events)
+    assert events == ["status-3"]
+
+
 @pytest.mark.parametrize("rank,images_per_sample", ((0, 1), (1, 1), (3, 1), (1, 2)))
 def test_decoder_gradient_preparation_covers_exact_local_source_geometry(rank, images_per_sample):
     state = _state(images_per_sample=images_per_sample)
@@ -1215,6 +1281,50 @@ def _run_world4(state, rank, groups, *, fail_local=False, events=None):
     )
 
 
+def _run_world4_gradient_gate(state, ready, rank, groups, *, fail_local=False, events=None):
+    runtime = _runtime()
+    participant, _ = groups
+    events = [] if events is None else events
+    prepared = _prepare_gradient(state, ready, rank)
+    if fail_local and rank == 2:
+        forged = replace(prepared)
+        object.__setattr__(forged, "_authority", prepared._authority)
+        prepared = forged
+    gather = payload_transport.make_precollective_status_gather(
+        group=participant, group_ranks=_PARTICIPANTS, global_rank=rank, device=state.device
+    )
+
+    def tracked_gather(wire, **kwargs):
+        status = execution._PrecollectiveStatus.from_wire_tuple(wire)
+        events.append(f"status-{status.gate_id}")
+        return gather(wire, **kwargs)
+
+    def tracked_all_to_all_single(*args, **kwargs):
+        input_tensor = kwargs["input"] if "input" in kwargs else args[1]
+        events.append(f"a2a-{input_tensor.dtype}")
+        return torch.distributed.all_to_all_single(*args, **kwargs)
+
+    return runtime._run_decoder_gradient_gate(
+        prepared,
+        global_manifest=state.manifest,
+        plan=state.plan,
+        embedding_ledger=state.embedding,
+        gradient_ledger=state.gradient,
+        producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+        output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+        embedding_width=_WIDTH,
+        embedding_dtype=torch.float32,
+        cp_partition_mode="contiguous",
+        global_rank=rank,
+        group_ranks=_PARTICIPANTS,
+        all_gather_status=tracked_gather,
+        timeout_seconds=30.0,
+        group=participant,
+        group_ranks_getter=torch.distributed.get_process_group_ranks,
+        all_to_all_single=tracked_all_to_all_single,
+    )
+
+
 def _world4_oracles(state):
     packets = {packet.sample_id: packet for packet in state.window.packets}
     embeddings = {}
@@ -1318,3 +1428,33 @@ def test_world4_nccl_decoder_ready_converges_rank2_failure_then_reuses_group(dec
         "status-2",
     ]
     assert len([event for event in retry_events if event.startswith("a2a-")]) == 4
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+def test_world4_nccl_decoder_gradient_gate_composes_and_reuses_group(decoder_ready_groups):
+    rank = torch.distributed.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    state = _state(device=device)
+    ready = _run_world4(state, rank, decoder_ready_groups)
+    _set_leaf_grads(ready)
+
+    events = []
+    received = _run_world4_gradient_gate(state, ready, rank, decoder_ready_groups, events=events)
+    completion = torch.ones((), dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(completion, group=decoder_ready_groups[0])
+    assert completion.item() == 4
+    assert events == ["status-3", "a2a-torch.float32"]
+    assert received is not None
+
+    failure_events = []
+    with pytest.raises(MdpPlanError, match="error code 1"):
+        _run_world4_gradient_gate(
+            state, ready, rank, decoder_ready_groups, fail_local=True, events=failure_events
+        )
+    torch.distributed.all_reduce(completion, group=decoder_ready_groups[0])
+    assert failure_events == ["status-3"]
+
+    retry_events = []
+    _run_world4_gradient_gate(state, ready, rank, decoder_ready_groups, events=retry_events)
+    torch.distributed.all_reduce(completion, group=decoder_ready_groups[0])
+    assert retry_events == ["status-3", "a2a-torch.float32"]
