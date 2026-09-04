@@ -768,12 +768,19 @@ def _bind_pre_authority_dynamic_producer(
             not isinstance(output, Tensor)
             or output.ndim != 2
             or tuple(output.shape) != (rows, authority.bridge_width)
-            or output.dtype != authority.bridge_dtype
+            or not output.is_floating_point()
         ):
-            raise MdpPlanError("MDP: local encoder output matches authoritative rows and schema.")
+            raise MdpPlanError(
+                "MDP: local encoder output does not match authoritative rows and schema "
+                f"(item={item_id!r}, actual_shape={getattr(output, 'shape', None)}, "
+                f"expected_shape={(rows, authority.bridge_width)}, "
+                f"actual_dtype={getattr(output, 'dtype', None)})."
+            )
 
     def prepare_completion(global_gradients: Mapping[GlobalVisionItemId, Tensor]):
-        if not isinstance(global_gradients, Mapping) or set(global_gradients) != set(global_outputs):
+        if not isinstance(global_gradients, Mapping) or set(global_gradients) != set(
+            global_outputs
+        ):
             raise MdpStateError("MDP: producer gradients exactly cover its global item outputs.")
         native_gradients = {}
         for item_id, output in global_outputs.items():
@@ -781,12 +788,16 @@ def _bind_pre_authority_dynamic_producer(
             if (
                 not isinstance(gradient, Tensor)
                 or gradient.shape != output.shape
-                or gradient.dtype != output.dtype
+                or gradient.dtype != authority.bridge_dtype
                 or gradient.device != output.device
             ):
-                raise MdpStateError("MDP: producer gradient matches its local encoder output.")
+                raise MdpStateError(
+                    "MDP: producer gradient matches local output shape/device and wire dtype."
+                )
             native_gradients[item_id.local_item_id] = gradient
-        return owner.prepare_dynamic_completion(MappingProxyType(native_gradients))
+        return owner.prepare_dynamic_completion(
+            MappingProxyType(native_gradients), transport_dtype=authority.bridge_dtype
+        )
 
     def cleanup() -> None:
         if getattr(owner, "_runtime", None) is not None:

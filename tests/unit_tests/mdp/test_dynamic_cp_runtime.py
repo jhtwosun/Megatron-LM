@@ -592,8 +592,8 @@ def test_bind_pre_authority_producer_preserves_identity_and_globalizes_outputs(m
         def __init__(self):
             self._runtime = OwnerRuntime()
 
-        def prepare_dynamic_completion(self, gradients):
-            events.append(("complete", gradients))
+        def prepare_dynamic_completion(self, gradients, *, transport_dtype=None):
+            events.append(("complete", gradients, transport_dtype))
             return "completion"
 
         def abort(self):
@@ -641,6 +641,7 @@ def test_bind_pre_authority_producer_preserves_identity_and_globalizes_outputs(m
         {item_id: torch.ones_like(bound.item_outputs[item_id]) for item_id in local_items}
     )
     assert bound.backward(gradients) == "completion"
+    assert events[-1][2] is authority.bridge_dtype
     assert tuple(events[-1][1]) == tuple(item_id.local_item_id for item_id in local_items)
     bound.cleanup()
     assert events[-1] == "abort"

@@ -725,9 +725,9 @@ def prepare_dynamic_bridge_exchange(
             raise MdpConfigurationError("MDP: dynamic bridge local values are tensors.")
         if tuple(tensor.shape) != expected_shape or tensor.numel() != entry.element_count:
             raise MdpConfigurationError("MDP: dynamic bridge local tensor shape matches authority.")
-        if tensor.dtype != dtype or tensor.device != send.device:
+        if not tensor.is_floating_point() or tensor.device != send.device:
             raise MdpConfigurationError(
-                "MDP: dynamic bridge local tensor dtype and device match its send buffer."
+                "MDP: dynamic bridge local tensor is floating-point on the send-buffer device."
             )
         if tensor.requires_grad:
             raise MdpConfigurationError("MDP: dynamic bridge local transport tensors are detached.")
