@@ -159,12 +159,11 @@ def datasets_provider(train_val_test_num_samples, vp_stage=None):
 
 
 def _mdp_adapter_builder(args):
-    """Build the Qwen3.5-VL MDP adapter plus its vision TransformerConfig.
+    """Build the selected model's MDP adapter and vision TransformerConfig.
 
     Mirrors model_provider's vision-config assembly so the MDP encoder is
     built from exactly the same configuration as the native path.
     """
-    from examples.multimodal_dev.mdp_adapter import build_mdp_adapter
     from examples.multimodal_dev.models import MODEL_REGISTRY
 
     registry = MODEL_REGISTRY[getattr(args, "model_arch", "qwen35_vl")]
@@ -183,7 +182,12 @@ def _mdp_adapter_builder(args):
     # The encoder DDP derives its gradient prescale from this flag; MDP
     # requires prescale 1 (WORLD sum, normalized once by 1/T_global).
     vision_config.calculate_per_token_loss = language_config.calculate_per_token_loss
-    return build_mdp_adapter(args, language_config), vision_config
+    adapter_factory = registry.get("mdp_adapter_factory")
+    if adapter_factory is None:
+        raise ValueError(
+            f"Model arch {getattr(args, 'model_arch', None)!r} has no MDP adapter factory."
+        )
+    return _resolve_provider_fn(adapter_factory)(args, language_config), vision_config
 
 
 def _setup_mdp(args):
