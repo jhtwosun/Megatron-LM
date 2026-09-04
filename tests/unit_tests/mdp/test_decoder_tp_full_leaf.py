@@ -867,11 +867,21 @@ def test_asymmetric_owner_pixel_h2d_failure_converges_and_retries(
     original_move = multimodal_forward_step._move_owner_pixels_to_device
     inject_failure = rank == 0
 
+    class _FailingPixelTransfer:
+        def __init__(self, value):
+            self.value = value
+
+        def is_pinned(self):
+            return self.value.is_pinned()
+
+        def to(self, *_args, **_kwargs):
+            raise RuntimeError("injected owner pixel H2D failure")
+
     def _fail_owner_once(pixel_values, device):
         nonlocal inject_failure
         if inject_failure:
             inject_failure = False
-            raise RuntimeError("injected owner pixel H2D failure")
+            pixel_values = _FailingPixelTransfer(pixel_values)
         return original_move(pixel_values, device)
 
     monkeypatch.setattr(multimodal_forward_step, "_move_owner_pixels_to_device", _fail_owner_once)
@@ -884,7 +894,12 @@ def test_asymmetric_owner_pixel_h2d_failure_converges_and_retries(
     errors = _gather(error)
     assert errors[0] == ("RuntimeError", "injected owner pixel H2D failure")
     for observed_rank, observed_error in enumerate(errors):
-        if observed_rank != 0:
+        if observed_rank == 1:
+            assert observed_error == (
+                "RuntimeError",
+                "TP source pixel H2D failed after metadata broadcast",
+            )
+        elif observed_rank != 0:
             assert observed_error is not None
             assert "capture failed on another planning rank" in observed_error[1]
     assert bridge.local_keys_by_phase == []
