@@ -11,9 +11,11 @@ import torch
 from examples.multimodal_dev.mdp_adapter import MultimodalDecoderPayloadCodec, Qwen35VLMdpAdapter
 from megatron.core.mdp.dynamic_cp import GlobalSampleId, GlobalVisionItemId
 from megatron.core.mdp.dynamic_cp_execution import (
+    DecoderMicrobatchKey,
     build_decoder_global_manifest,
     build_decoder_source_window,
 )
+from megatron.core.mdp.dynamic_cp_plan import DecoderCpAssignment
 from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError
 from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -79,7 +81,7 @@ def _payload(base, padded_lengths, *, grids, position_components=1, attention_ma
     return MappingProxyType(payload)
 
 
-def _records(*, position_components=1, attention_mask=_MISSING):
+def _records(*, base=0, position_components=1, attention_mask=_MISSING):
     record_zero = MdpMicrobatchRecord(
         microbatch_id=0,
         text_only=False,
@@ -103,7 +105,7 @@ def _records(*, position_components=1, attention_mask=_MISSING):
         ),
         decoder_packed_seq_params=_packed((3, 4), (4, 6)),
         model_payload=_payload(
-            0,
+            base,
             (4, 6),
             grids=((1, 2, 2), (1, 2, 2)),
             position_components=position_components,
@@ -116,7 +118,7 @@ def _records(*, position_components=1, attention_mask=_MISSING):
         vision_items=(),
         decoder_packed_seq_params=_packed((2,), (3,)),
         model_payload=_payload(
-            1000,
+            base + 1000,
             (3,),
             grids=(),
             position_components=position_components,
@@ -371,3 +373,326 @@ def test_codec_rejects_overlapping_decoder_slots_within_one_sample():
 
     with pytest.raises(MdpConfigurationError, match="unique"):
         MultimodalDecoderPayloadCodec().build_source_window(tuple(records), source_dp_lane=0)
+
+
+class _FakeGroup:
+    def __init__(self, size, *, error=None):
+        self._size = size
+        self._error = error
+
+    def size(self):
+        if self._error is not None:
+            raise self._error
+        return self._size
+
+
+class _RaisingGroupQuery:
+    @property
+    def size(self):
+        raise RuntimeError("boom")
+
+
+def _destination_state(*, position_components=1):
+    codec = MultimodalDecoderPayloadCodec()
+    lane7 = codec.build_source_window(
+        _records(base=0, position_components=position_components), source_dp_lane=7
+    )
+    lane8 = codec.build_source_window(
+        _records(base=2000, position_components=position_components), source_dp_lane=8
+    )
+    manifest = build_decoder_global_manifest((lane8.metadata_manifest(), lane7.metadata_manifest()))
+    packet_by_id = {
+        packet.sample_id: packet for window in (lane7, lane8) for packet in window.packets
+    }
+    return codec, lane7, lane8, manifest, packet_by_id
+
+
+_REBUILD_CASES = (
+    {
+        "name": "cross-lane",
+        "sample_ids": (GlobalSampleId(7, 1), GlobalSampleId(8, 0)),
+        "tokens": (*range(4, 10), *range(2000, 2004)),
+        "loss_mask": (*range(4, 10), *range(4)),
+        "valid_cu": (0, 4, 7),
+        "padded_cu": (0, 6, 10),
+        "items": (
+            (GlobalVisionItemId(7, 1), 0, 0, (1, 2, 2), 1, (1,)),
+            (GlobalVisionItemId(8, 0), 1, 0, (1, 2, 2), 1, (7,)),
+        ),
+    },
+    {
+        "name": "destination-reorder",
+        "sample_ids": (GlobalSampleId(8, 0), GlobalSampleId(7, 1)),
+        "tokens": (*range(2000, 2004), *range(4, 10)),
+        "loss_mask": (*range(4), *range(4, 10)),
+        "valid_cu": (0, 3, 7),
+        "padded_cu": (0, 4, 10),
+        "items": (
+            (GlobalVisionItemId(8, 0), 0, 0, (1, 2, 2), 1, (1,)),
+            (GlobalVisionItemId(7, 1), 1, 0, (1, 2, 2), 1, (5,)),
+        ),
+    },
+)
+
+
+@pytest.mark.parametrize("position_components", (1, 3), ids=("rope", "mrope"))
+@pytest.mark.parametrize("partition_mode", ("contiguous", "zigzag"))
+@pytest.mark.parametrize("case", _REBUILD_CASES, ids=lambda case: case["name"])
+def test_codec_rebuilds_exact_multilane_destination_record(
+    position_components, partition_mode, case
+):
+    codec, _, _, manifest, packet_by_id = _destination_state(
+        position_components=position_components
+    )
+    assignment = DecoderCpAssignment(case["sample_ids"], (30, 40))
+    packets = tuple(packet_by_id[sample_id] for sample_id in assignment.sample_ids)
+    packet_values = tuple(
+        MappingProxyType({name: tensor.clone() for name, tensor in packet.tensor_fields.items()})
+        for packet in packets
+    )
+    group = _FakeGroup(2)
+    key = DecoderMicrobatchKey(9)
+
+    for packet in packets:
+        assert codec.validate_packet(packet) is None
+    record = codec.rebuild_microbatch(
+        manifest,
+        assignment,
+        packets=packets,
+        key=key,
+        cp_group=group,
+        cp_partition_mode=partition_mode,
+    )
+
+    tokens = list(case["tokens"])
+    assert type(record.microbatch_id) is int
+    assert record.microbatch_id == key.microbatch_index
+    assert record.text_only is False
+    assert type(record.model_payload) is MappingProxyType
+    with pytest.raises(TypeError):
+        record.model_payload["new_field"] = None
+    assert record.model_payload["input_ids"].tolist() == [tokens]
+    assert record.model_payload["labels"].tolist() == [[token + 100 for token in tokens]]
+    assert record.model_payload["loss_mask"].tolist() == [
+        [float(value) for value in case["loss_mask"]]
+    ]
+    assert record.model_payload["padding_mask"].tolist() == [[False] * len(tokens)]
+    expected_positions = torch.tensor(tokens, dtype=torch.int64).add(200).view(1, -1)
+    if position_components == 3:
+        expected_positions = expected_positions.repeat(3, 1, 1)
+    torch.testing.assert_close(record.model_payload["position_ids"], expected_positions)
+    assert record.model_payload["attention_mask"] is None
+    assert record.model_payload["image_grid_thw"].tolist() == [[1, 2, 2], [1, 2, 2]]
+    assert (
+        tuple(
+            (
+                item.global_item_id,
+                item.sample_id,
+                item.image_ordinal,
+                item.grid_thw,
+                item.output_rows,
+                item.decoder_positions,
+            )
+            for item in record.vision_items
+        )
+        == case["items"]
+    )
+    for packet, expected_fields in zip(packets, packet_values):
+        assert tuple(packet.tensor_fields) == tuple(expected_fields)
+        for name, tensor in packet.tensor_fields.items():
+            torch.testing.assert_close(tensor, expected_fields[name])
+
+    packed = record.decoder_packed_seq_params
+    assert packed.qkv_format == "thd"
+    assert packed.cu_seqlens_q.tolist() == list(case["valid_cu"])
+    assert packed.cu_seqlens_kv.tolist() == list(case["valid_cu"])
+    assert packed.cu_seqlens_q_padded.tolist() == list(case["padded_cu"])
+    assert packed.cu_seqlens_kv_padded.tolist() == list(case["padded_cu"])
+    assert packed.max_seqlen_q == packed.max_seqlen_kv == 6
+    assert packed.total_tokens == 10
+    assert packed.local_cp_size == 2
+    assert packed.cp_group is group
+    assert packed.cp_partition_mode == partition_mode
+
+
+def test_codec_rebuild_preserves_optional_none_and_text_only_records():
+    codec, lane7, _, manifest, _ = _destination_state(position_components=None)
+    assignment = DecoderCpAssignment((GlobalSampleId(7, 2),), (30,))
+    packet = lane7.packets[2]
+    group = _FakeGroup(1)
+
+    record = codec.rebuild_microbatch(
+        manifest,
+        assignment,
+        packets=(packet,),
+        key=DecoderMicrobatchKey(5),
+        cp_group=group,
+        cp_partition_mode="contiguous",
+    )
+
+    assert record.text_only is True
+    assert record.vision_items == ()
+    assert record.model_payload["input_ids"].tolist() == [[1000, 1001, 1002]]
+    assert record.model_payload["position_ids"] is None
+    assert record.model_payload["attention_mask"] is None
+    assert record.model_payload["image_grid_thw"].shape == (0, 3)
+    assert record.decoder_packed_seq_params.local_cp_size == 1
+    assert record.decoder_packed_seq_params.cp_group is group
+
+
+def test_codec_validate_packet_rejects_noncanonical_qwen_field_order():
+    codec, lane7, _, _, _ = _destination_state()
+    packet = lane7.packets[0]
+    names = tuple(packet.tensor_fields)
+    reordered_names = (names[1], names[0], *names[2:])
+    spec_by_name = {spec.name: spec for spec in packet.field_specs}
+    malformed = replace(
+        packet,
+        field_specs=tuple(spec_by_name[name] for name in reordered_names),
+        tensor_fields=MappingProxyType(
+            {name: packet.tensor_fields[name] for name in reordered_names}
+        ),
+    )
+
+    with pytest.raises(MdpConfigurationError, match="fixed routed-field order"):
+        codec.validate_packet(malformed)
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    (
+        (lambda assignment: object(), "DecoderCpAssignment"),
+        (lambda assignment: replace(assignment, sample_ids=[]), "immutable.*sample"),
+        (lambda assignment: replace(assignment, sample_ids=()), "non-empty sample"),
+        (lambda assignment: replace(assignment, sample_ids=([],)), "GlobalSampleId"),
+        (
+            lambda assignment: replace(
+                assignment, sample_ids=(assignment.sample_ids[0], assignment.sample_ids[0])
+            ),
+            "unique",
+        ),
+        (lambda assignment: replace(assignment, endpoint_ranks=[]), "endpoint ranks"),
+        (lambda assignment: replace(assignment, endpoint_ranks=()), "non-empty endpoint"),
+        (lambda assignment: replace(assignment, endpoint_ranks=(30, 30)), "unique"),
+        (lambda assignment: replace(assignment, endpoint_ranks=(30, True)), "integer"),
+    ),
+)
+def test_codec_rebuild_rejects_malformed_assignment(mutation, match):
+    codec, _, _, manifest, packet_by_id = _destination_state()
+    assignment = DecoderCpAssignment((GlobalSampleId(7, 1), GlobalSampleId(8, 0)), (30, 40))
+    packets = tuple(packet_by_id[sample_id] for sample_id in assignment.sample_ids)
+
+    with pytest.raises(MdpPlanError, match=match):
+        codec.rebuild_microbatch(
+            manifest,
+            mutation(assignment),
+            packets=packets,
+            key=DecoderMicrobatchKey(0),
+            cp_group=_FakeGroup(2),
+            cp_partition_mode="contiguous",
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation,error,match",
+    (
+        (lambda packets: None, MdpConfigurationError, "ordered packet tuple"),
+        (lambda packets: [*packets], MdpConfigurationError, "ordered packet tuple"),
+        (lambda packets: (object(), packets[1]), MdpConfigurationError, "typed packet"),
+        (lambda packets: packets[:1], MdpPlanError, "exact assignment sample order"),
+        (lambda packets: (*packets, packets[0]), MdpPlanError, "exact assignment sample order"),
+        (lambda packets: tuple(reversed(packets)), MdpPlanError, "exact assignment sample order"),
+    ),
+)
+def test_codec_rebuild_rejects_malformed_or_misordered_packets(mutation, error, match):
+    codec, _, _, manifest, packet_by_id = _destination_state()
+    assignment = DecoderCpAssignment((GlobalSampleId(7, 1), GlobalSampleId(8, 0)), (30, 40))
+    packets = tuple(packet_by_id[sample_id] for sample_id in assignment.sample_ids)
+
+    with pytest.raises(error, match=match):
+        codec.rebuild_microbatch(
+            manifest,
+            assignment,
+            packets=mutation(packets),
+            key=DecoderMicrobatchKey(0),
+            cp_group=_FakeGroup(2),
+            cp_partition_mode="contiguous",
+        )
+
+
+def test_codec_rebuild_rejects_packet_metadata_not_bound_to_manifest():
+    codec, _, _, manifest, packet_by_id = _destination_state()
+    assignment = DecoderCpAssignment((GlobalSampleId(7, 1), GlobalSampleId(8, 0)), (30, 40))
+    packets = tuple(packet_by_id[sample_id] for sample_id in assignment.sample_ids)
+    malformed_packets = []
+    for packet in packets:
+        tensors = dict(packet.tensor_fields)
+        tensors["input_ids"] = tensors["input_ids"].to(dtype=torch.float32)
+        specs = tuple(
+            replace(spec, dtype=torch.float32) if spec.name == "input_ids" else spec
+            for spec in packet.field_specs
+        )
+        malformed_packets.append(
+            replace(packet, field_specs=specs, tensor_fields=MappingProxyType(tensors))
+        )
+
+    with pytest.raises(MdpPlanError, match="exactly match.*manifest"):
+        codec.rebuild_microbatch(
+            manifest,
+            assignment,
+            packets=tuple(malformed_packets),
+            key=DecoderMicrobatchKey(0),
+            cp_group=_FakeGroup(2),
+            cp_partition_mode="contiguous",
+        )
+
+
+def test_codec_rebuild_validates_manifest_before_using_item_offsets():
+    codec, _, _, manifest, packet_by_id = _destination_state()
+    first_item = manifest.items[0]
+    stale = replace(
+        manifest, items=(replace(first_item, decoder_offsets=(2,)), *manifest.items[1:])
+    )
+    assignment = DecoderCpAssignment((GlobalSampleId(7, 1), GlobalSampleId(8, 0)), (30, 40))
+    packets = tuple(packet_by_id[sample_id] for sample_id in assignment.sample_ids)
+
+    with pytest.raises(MdpPlanError, match="digest matches"):
+        codec.rebuild_microbatch(
+            stale,
+            assignment,
+            packets=packets,
+            key=DecoderMicrobatchKey(0),
+            cp_group=_FakeGroup(2),
+            cp_partition_mode="contiguous",
+        )
+
+
+@pytest.mark.parametrize(
+    "key,mode,group,match",
+    (
+        (0, "contiguous", _FakeGroup(2), "DecoderMicrobatchKey"),
+        (DecoderMicrobatchKey(0), "interleaved", _FakeGroup(2), "zigzag or contiguous"),
+        (DecoderMicrobatchKey(0), "contiguous", object(), "group.*size"),
+        (DecoderMicrobatchKey(0), "contiguous", _FakeGroup(1), "group.*size"),
+        (DecoderMicrobatchKey(0), "contiguous", _FakeGroup(True), "group.*size"),
+        (DecoderMicrobatchKey(0), "contiguous", _FakeGroup(2.0), "group.*size"),
+        (DecoderMicrobatchKey(0), "contiguous", _FakeGroup(0), "group.*size"),
+        (DecoderMicrobatchKey(0), "contiguous", _FakeGroup(-1), "group.*size"),
+        (DecoderMicrobatchKey(0), "contiguous", _RaisingGroupQuery(), "group query failed"),
+        (
+            DecoderMicrobatchKey(0),
+            "contiguous",
+            _FakeGroup(2, error=RuntimeError("boom")),
+            "group query failed",
+        ),
+    ),
+)
+def test_codec_rebuild_rejects_malformed_key_mode_or_group(key, mode, group, match):
+    codec, _, _, manifest, packet_by_id = _destination_state()
+    assignment = DecoderCpAssignment((GlobalSampleId(7, 1), GlobalSampleId(8, 0)), (30, 40))
+    packets = tuple(packet_by_id[sample_id] for sample_id in assignment.sample_ids)
+
+    with pytest.raises(MdpConfigurationError, match=match):
+        codec.rebuild_microbatch(
+            manifest, assignment, packets=packets, key=key, cp_group=group, cp_partition_mode=mode
+        )
