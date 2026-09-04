@@ -44,6 +44,22 @@ class _TrackingAllocator(DirectBufferAllocator):
         super().release(tensor)
 
 
+class _EncoderDdp:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def finish_grad_sync(self):
+        self.calls.append("finish")
+
+    def scale_gradients(self, _scale):
+        self.calls.append("scale")
+
+
+class _EncoderDomain:
+    def __init__(self, ddp):
+        self.encoder_ddp = ddp
+
+
 def _segment(item_id, rows, output_start):
     return EncoderThdSegment(
         global_item_id=item_id,
@@ -69,9 +85,11 @@ def _runtime(*, contributor=True, follower=False, mixed_dtype=False, allocator=N
     runtime._iter_specs = {}
     runtime._iter_ledgers = {}
     runtime._eval_outputs = ()
-    runtime._captured_num_tokens = None
-    runtime._token_capture_count = 0
+    runtime._captured_num_tokens = torch.zeros((), device=runtime.device)
+    runtime._token_capture_count = 1
     runtime._token_consumed = False
+    runtime._ddp_calls = []
+    runtime.encoder_domain = _EncoderDomain(_EncoderDdp(runtime._ddp_calls))
     runtime._state = MdpRuntimeState.EMPTY
     runtime._chunk_payload_bases = (torch.empty(3, 4, device="cuda"),)
 
@@ -167,6 +185,11 @@ def test_factory_captures_and_registers_exact_contributor():
             item_outputs=outputs,
             pixel_bases=runtime._chunk_payload_bases,
             encoder_cp_follower=False,
+            encoder_domain=runtime.encoder_domain,
+            encoder_ddp=runtime.encoder_domain.encoder_ddp,
+            encoder_ddp_callable_authority=api._encoder_ddp_callable_authority(
+                runtime.encoder_domain.encoder_ddp
+            ),
         )
 
 
@@ -203,6 +226,9 @@ def test_empty_noncontributor_and_future_ecp_follower_capture(follower):
     assert completion.handle is runtime._handle
     assert len(completion.gradient_views) == (2 if follower else 0)
     assert all(torch.count_nonzero(view).item() == 0 for view in completion.gradient_views)
+    assert completion.encoder_domain is runtime.encoder_domain
+    assert completion.encoder_ddp is runtime.encoder_domain.encoder_ddp
+    assert completion.globally_reduced_num_tokens is runtime._captured_num_tokens
     assert api._validate_prepared_native_encoder_completion(completion, owner=owner) is completion
 
 
@@ -226,19 +252,11 @@ def test_exact_chunk_regroup_is_plan_ordered_and_does_not_run_backward(monkeypat
         "finalize_encoder_grads",
         lambda *_args, **_kwargs: pytest.fail("unexpected encoder finalization"),
     )
-    ddp_calls = []
-    runtime.encoder_domain = SimpleNamespace(
-        encoder_ddp=SimpleNamespace(
-            finish_grad_sync=lambda: ddp_calls.append("finish"),
-            scale_gradients=lambda _scale: ddp_calls.append("scale"),
-        )
-    )
-
     gradients = _gradients(outputs)
     completion = owner.prepare_dynamic_completion(gradients)
 
     assert backward_calls == []
-    assert ddp_calls == []
+    assert runtime._ddp_calls == []
     assert tuple(completion.gradient_views[0][:, 0].tolist()) == (1.0, 1.0, 2.0)
     assert tuple(completion.gradient_views[1][:, 0].tolist()) == (3.0, 3.0)
     assert completion.gradient_views[0].dtype == torch.float32
@@ -262,7 +280,185 @@ def test_native_completion_requires_factory_seal():
             gradient_views=(),
             allocation_bases=(),
             encoder_cp_follower=False,
+            encoder_domain=runtime.encoder_domain,
+            encoder_ddp=runtime.encoder_domain.encoder_ddp,
+            globally_reduced_num_tokens=runtime._captured_num_tokens,
         )
+
+
+def test_p2_capture_precedes_late_token_capture_and_completion_seals_prerequisites():
+    api = _api()
+    runtime, outputs = _runtime()
+    runtime._captured_num_tokens = None
+    runtime._token_capture_count = 0
+    owner = _capture(api, runtime, outputs)
+    token = torch.zeros((), device=runtime.device)
+    runtime._captured_num_tokens = token
+    runtime._token_capture_count = 1
+
+    completion = owner.prepare_dynamic_completion(_gradients(outputs))
+
+    assert completion.encoder_domain is runtime.encoder_domain
+    assert completion.encoder_ddp is runtime.encoder_domain.encoder_ddp
+    assert completion.globally_reduced_num_tokens is token
+    assert api._validate_prepared_native_encoder_completion(completion, owner=owner) is completion
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ("count-zero", "count-two", "count-bool", "consumed", "none", "object", "rows", "cpu", "grad"),
+)
+def test_finalize_prerequisite_faults_reject_before_regroup_allocation(monkeypatch, fault):
+    api = _api()
+    runtime, outputs = _runtime()
+    owner = _capture(api, runtime, outputs)
+    handle, payload = runtime._handle, runtime._chunk_payload_bases[0]
+    release_calls = []
+    release_forward_only = EncoderForwardHandle.release_forward_only
+
+    def tracked_release(candidate):
+        if candidate is handle:
+            release_calls.append(candidate)
+        return release_forward_only(candidate)
+
+    monkeypatch.setattr(EncoderForwardHandle, "release_forward_only", tracked_release)
+    if fault == "count-zero":
+        runtime._token_capture_count = 0
+    elif fault == "count-two":
+        runtime._token_capture_count = 2
+    elif fault == "count-bool":
+        runtime._token_capture_count = True
+    elif fault == "consumed":
+        runtime._token_consumed = True
+    elif fault == "none":
+        runtime._captured_num_tokens = None
+    elif fault == "object":
+        runtime._captured_num_tokens = object()
+    elif fault == "rows":
+        runtime._captured_num_tokens = torch.zeros(2, device=runtime.device)
+    elif fault == "cpu":
+        runtime._captured_num_tokens = torch.zeros((), device="cpu")
+    else:
+        runtime._captured_num_tokens = torch.zeros((), device=runtime.device, requires_grad=True)
+
+    with pytest.raises((MdpConfigurationError, MdpStateError), match="token"):
+        owner.prepare_dynamic_completion(_gradients(outputs))
+    assert runtime.allocator.acquired == []
+    assert owner._runtime is None
+    assert release_calls == [handle]
+    assert handle._released is True
+    assert sum(value is payload for value in runtime.allocator.released) == 1
+
+
+@pytest.mark.parametrize("fault", ("domain", "ddp", "finish", "scale"))
+def test_p2_capture_rejects_invalid_encoder_finalization_domain_without_ownership(fault):
+    api = _api()
+    runtime, outputs = _runtime()
+    handle, payload = runtime._handle, runtime._chunk_payload_bases
+    if fault == "domain":
+        runtime.encoder_domain = None
+    elif fault == "ddp":
+        runtime.encoder_domain.encoder_ddp = None
+    elif fault == "finish":
+        runtime.encoder_domain.encoder_ddp.finish_grad_sync = None
+    else:
+        runtime.encoder_domain.encoder_ddp.scale_gradients = None
+
+    with pytest.raises(MdpConfigurationError, match="encoder DDP"):
+        _capture(api, runtime, outputs)
+    assert runtime._pre_authority_dynamic_producer is None
+    assert runtime._handle is handle
+    assert runtime._chunk_payload_bases is payload
+    assert runtime.allocator.acquired == runtime.allocator.released == []
+
+
+@pytest.mark.parametrize("method", ("finish_grad_sync", "scale_gradients"))
+def test_callable_substitution_before_prepare_rejects_before_allocation(monkeypatch, method):
+    api = _api()
+    runtime, outputs = _runtime()
+    owner = _capture(api, runtime, outputs)
+    handle, payload = runtime._handle, runtime._chunk_payload_bases[0]
+    release_calls = []
+    release_forward_only = EncoderForwardHandle.release_forward_only
+
+    def tracked_release(candidate):
+        if candidate is handle:
+            release_calls.append(candidate)
+        return release_forward_only(candidate)
+
+    monkeypatch.setattr(EncoderForwardHandle, "release_forward_only", tracked_release)
+    replacement = (lambda: None) if method == "finish_grad_sync" else (lambda _scale: None)
+    setattr(runtime.encoder_domain.encoder_ddp, method, replacement)
+
+    with pytest.raises(MdpConfigurationError, match="encoder DDP"):
+        owner.prepare_dynamic_completion(_gradients(outputs))
+    assert runtime.allocator.acquired == []
+    assert owner._runtime is None
+    assert release_calls == [handle]
+    assert handle._released is True
+    assert sum(value is payload for value in runtime.allocator.released) == 1
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "runtime-token",
+        "completion-token",
+        "token-version",
+        "token-shape",
+        "count",
+        "consumed",
+        "domain",
+        "ddp",
+        "finish",
+        "scale",
+        "finish-replaced",
+        "scale-replaced",
+        "completion-domain",
+        "completion-ddp",
+    ),
+)
+def test_completion_validator_rejects_finalize_prerequisite_substitution(fault):
+    api = _api()
+    runtime, outputs = _runtime()
+    owner = _capture(api, runtime, outputs)
+    completion = owner.prepare_dynamic_completion(_gradients(outputs))
+    if fault == "runtime-token":
+        runtime._captured_num_tokens = torch.zeros((), device=runtime.device)
+    elif fault == "completion-token":
+        object.__setattr__(
+            completion, "globally_reduced_num_tokens", torch.zeros((), device=runtime.device)
+        )
+    elif fault == "token-version":
+        runtime._captured_num_tokens.add_(1)
+    elif fault == "token-shape":
+        runtime._captured_num_tokens.resize_(2)
+    elif fault == "count":
+        runtime._token_capture_count = 2
+    elif fault == "consumed":
+        runtime._token_consumed = True
+    elif fault == "domain":
+        runtime.encoder_domain = SimpleNamespace(encoder_ddp=completion.encoder_ddp)
+    elif fault == "ddp":
+        runtime.encoder_domain.encoder_ddp = SimpleNamespace(
+            finish_grad_sync=lambda: None, scale_gradients=lambda _scale: None
+        )
+    elif fault == "finish":
+        runtime.encoder_domain.encoder_ddp.finish_grad_sync = None
+    elif fault == "scale":
+        runtime.encoder_domain.encoder_ddp.scale_gradients = None
+    elif fault == "finish-replaced":
+        runtime.encoder_domain.encoder_ddp.finish_grad_sync = lambda: None
+    elif fault == "scale-replaced":
+        runtime.encoder_domain.encoder_ddp.scale_gradients = lambda _scale: None
+    elif fault == "completion-domain":
+        object.__setattr__(completion, "encoder_domain", object())
+    else:
+        object.__setattr__(completion, "encoder_ddp", object())
+
+    with pytest.raises((MdpConfigurationError, MdpStateError)):
+        api._validate_prepared_native_encoder_completion(completion, owner=owner)
+    owner.abort()
 
 
 def test_existing_binder_uses_real_owner_without_fake_completion(monkeypatch):
@@ -562,6 +758,30 @@ def test_abort_retires_registry_releases_all_state_and_is_exactly_once():
     assert completion.gradient_views == completion.allocation_bases == ()
     with pytest.raises(MdpStateError, match="exactly once"):
         owner.abort()
+
+
+def test_retired_completion_does_not_retain_finalize_prerequisites():
+    api = _api()
+    runtime, outputs = _runtime()
+    owner = _capture(api, runtime, outputs)
+    completion = owner.prepare_dynamic_completion(_gradients(outputs))
+    domain, ddp, token = (
+        runtime.encoder_domain,
+        runtime.encoder_domain.encoder_ddp,
+        runtime._captured_num_tokens,
+    )
+    runtime_ref, domain_ref, ddp_ref, token_ref = map(weakref.ref, (runtime, domain, ddp, token))
+
+    owner.abort()
+
+    assert completion.runtime is None
+    assert completion.encoder_domain is None
+    assert completion.encoder_ddp is None
+    assert completion.globally_reduced_num_tokens is None
+    assert completion._authority is None
+    del runtime, outputs, owner, domain, ddp, token
+    gc.collect()
+    assert runtime_ref() is domain_ref() is ddp_ref() is token_ref() is None
 
 
 @pytest.mark.parametrize("prepared", (False, True))

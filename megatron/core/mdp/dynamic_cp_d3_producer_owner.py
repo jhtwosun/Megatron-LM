@@ -53,6 +53,9 @@ class _PreparedNativeEncoderCompletion:
     gradient_views: tuple[torch.Tensor, ...] = field(compare=False, repr=False)
     allocation_bases: tuple[torch.Tensor, ...] = field(compare=False, repr=False)
     encoder_cp_follower: bool
+    encoder_domain: Any = field(compare=False, repr=False)
+    encoder_ddp: Any = field(compare=False, repr=False)
+    globally_reduced_num_tokens: torch.Tensor = field(compare=False, repr=False)
     _authority: tuple | None = field(default=None, init=False, compare=False, repr=False)
     _factory_seal: object | None = field(default=None, compare=False, repr=False)
 
@@ -75,10 +78,16 @@ def _completion_authority(completion: _PreparedNativeEncoderCompletion) -> tuple
         tuple(_descriptor(view) for view in completion.gradient_views),
         tuple(_descriptor(base) for base in completion.allocation_bases),
         completion.encoder_cp_follower,
+        id(completion.encoder_domain),
+        id(completion.encoder_ddp),
+        tuple(id(value) for value in _encoder_ddp_callable_authority(completion.encoder_ddp)),
+        _token_descriptor(completion.globally_reduced_num_tokens),
     )
 
 
-def _mint_completion(owner, views, bases) -> _PreparedNativeEncoderCompletion:
+def _mint_completion(
+    owner, views, bases, globally_reduced_num_tokens
+) -> _PreparedNativeEncoderCompletion:
     token = object()
     owner._mint_token = token
     try:
@@ -89,6 +98,9 @@ def _mint_completion(owner, views, bases) -> _PreparedNativeEncoderCompletion:
             views,
             bases,
             owner._encoder_cp_follower,
+            owner._encoder_domain,
+            owner._encoder_ddp,
+            globally_reduced_num_tokens,
             _factory_seal=token,
         )
     except BaseException:
@@ -121,6 +133,9 @@ class _D3ProducerOwner:
         "_prepared_authority",
         "_state",
         "_producer_input_authority",
+        "_encoder_domain",
+        "_encoder_ddp",
+        "_encoder_ddp_callable_authority",
     )
 
     def __init__(
@@ -134,6 +149,9 @@ class _D3ProducerOwner:
         item_outputs,
         pixel_bases,
         encoder_cp_follower,
+        encoder_domain,
+        encoder_ddp,
+        encoder_ddp_callable_authority,
         _factory_seal=None,
     ) -> None:
         values = (
@@ -145,6 +163,9 @@ class _D3ProducerOwner:
             item_outputs,
             pixel_bases,
             encoder_cp_follower,
+            encoder_domain,
+            encoder_ddp,
+            encoder_ddp_callable_authority,
         )
         fingerprint = _PENDING_OWNER_SEALS.pop(_factory_seal, None)
         if type(self) is not _D3ProducerOwner or fingerprint != tuple(
@@ -162,6 +183,8 @@ class _D3ProducerOwner:
         self._pixel_bases = pixel_bases
         self._pixel_descriptors = tuple(_descriptor(value) for value in pixel_bases)
         self._encoder_cp_follower = encoder_cp_follower
+        self._encoder_domain, self._encoder_ddp = encoder_domain, encoder_ddp
+        self._encoder_ddp_callable_authority = encoder_ddp_callable_authority
         self._mint_token = None
         self._producer = self._prepared = self._prepared_authority = None
         self._producer_input_authority = None
@@ -202,6 +225,12 @@ class _D3ProducerOwner:
             raise MdpStateError("MDP: D3 producer owner requires its exact consumed producer.")
         if runtime.state is not MdpRuntimeState.EMPTY:
             raise MdpStateError("MDP: D3 producer owner retains the pre-routing P2 state.")
+        _validate_encoder_finalization_domain(
+            runtime,
+            expected_domain=self._encoder_domain,
+            expected_ddp=self._encoder_ddp,
+            expected_callable_authority=self._encoder_ddp_callable_authority,
+        )
         if runtime.rank_view is not self._rank_view:
             raise MdpStateError("MDP: D3 producer owner retains its exact rank view.")
         if runtime._handle is not self._handle:
@@ -247,6 +276,7 @@ class _D3ProducerOwner:
             runtime = self._validate()
             if self._prepared is not None:
                 raise MdpStateError("MDP: native encoder completion is prepared exactly once.")
+            globally_reduced_num_tokens = _validate_global_token_capture(runtime)
             gradients = _validate_gradients(native_gradients, self._item_outputs)
             views = []
             forbidden = tuple(gradients.values()) + self._outputs + self._pixel_bases
@@ -269,7 +299,9 @@ class _D3ProducerOwner:
             for item, gradient in gradients.items():
                 chunk, start, rows = by_item[item]
                 views[chunk][start : start + rows].copy_(gradient)
-            completion = _mint_completion(self, tuple(views), tuple(bases))
+            completion = _mint_completion(
+                self, tuple(views), tuple(bases), globally_reduced_num_tokens
+            )
         except BaseException as error:
             if self._state in ("registered", "bound"):
                 self._retire(error, tuple(bases))
@@ -321,6 +353,11 @@ class _D3ProducerOwner:
                 object.__setattr__(completion, "handle", None)
                 object.__setattr__(completion, "gradient_views", ())
                 object.__setattr__(completion, "allocation_bases", ())
+                object.__setattr__(completion, "runtime", None)
+                object.__setattr__(completion, "encoder_domain", None)
+                object.__setattr__(completion, "encoder_ddp", None)
+                object.__setattr__(completion, "globally_reduced_num_tokens", None)
+                object.__setattr__(completion, "_authority", None)
             for name, value in (
                 ("_runtime", None),
                 ("_owned_runtime", None),
@@ -338,6 +375,9 @@ class _D3ProducerOwner:
                 ("_prepared_authority", None),
                 ("_mint_token", None),
                 ("_producer_input_authority", None),
+                ("_encoder_domain", None),
+                ("_encoder_ddp", None),
+                ("_encoder_ddp_callable_authority", ()),
             ):
                 setattr(self, name, value)
 
@@ -481,18 +521,93 @@ def _producer_input_authority(producer) -> tuple:
     )
 
 
+def _callable_authority(value) -> tuple:
+    bound_self = getattr(value, "__self__", None)
+    bound_function = getattr(value, "__func__", None)
+    return (bound_self, bound_function) if bound_function is not None else (None, value)
+
+
+def _encoder_ddp_callable_authority(ddp) -> tuple:
+    return (
+        *_callable_authority(getattr(ddp, "finish_grad_sync", None)),
+        *_callable_authority(getattr(ddp, "scale_gradients", None)),
+    )
+
+
+def _validate_encoder_finalization_domain(
+    runtime, *, expected_domain=None, expected_ddp=None, expected_callable_authority=None
+) -> tuple:
+    domain = getattr(runtime, "encoder_domain", None)
+    ddp = getattr(domain, "encoder_ddp", None)
+    callable_authority = _encoder_ddp_callable_authority(ddp)
+    if (
+        domain is None
+        or ddp is None
+        or (expected_domain is not None and domain is not expected_domain)
+        or (expected_ddp is not None and ddp is not expected_ddp)
+        or not callable(getattr(ddp, "finish_grad_sync", None))
+        or not callable(getattr(ddp, "scale_gradients", None))
+        or (
+            expected_callable_authority is not None
+            and (
+                len(callable_authority) != len(expected_callable_authority)
+                or any(
+                    value is not expected
+                    for value, expected in zip(callable_authority, expected_callable_authority)
+                )
+            )
+        )
+    ):
+        raise MdpConfigurationError(
+            "MDP: D3 producer owner retains its exact encoder DDP finalization surface."
+        )
+    return domain, ddp, callable_authority
+
+
+def _token_descriptor(token: torch.Tensor) -> tuple:
+    return (*_descriptor(token), token._version)
+
+
+def _validate_global_token_capture(runtime) -> torch.Tensor:
+    token = getattr(runtime, "_captured_num_tokens", None)
+    if (
+        type(getattr(runtime, "_token_capture_count", None)) is not int
+        or runtime._token_capture_count != 1
+        or getattr(runtime, "_token_consumed", None) is not False
+        or not isinstance(token, torch.Tensor)
+        or token.numel() != 1
+        or token.device != runtime.device
+        or token.requires_grad
+        or token.grad_fn is not None
+    ):
+        raise MdpStateError(
+            "MDP: D3 encoder completion requires one detached unconsumed global token tensor."
+        )
+    return token
+
+
 def _validate_prepared_native_encoder_completion(completion, *, owner):
     if (
         type(owner) is not _D3ProducerOwner
         or type(completion) is not _PreparedNativeEncoderCompletion
     ):
         raise MdpConfigurationError("MDP: native completion has exact private types.")
-    owner._validate()
+    runtime = owner._validate()
+    domain, ddp, _ = _validate_encoder_finalization_domain(
+        runtime,
+        expected_domain=owner._encoder_domain,
+        expected_ddp=owner._encoder_ddp,
+        expected_callable_authority=owner._encoder_ddp_callable_authority,
+    )
+    token = _validate_global_token_capture(runtime)
     if (
         owner._prepared is not completion
         or completion.owner is not owner
         or completion.runtime is not owner._runtime
         or completion.handle is not owner._handle
+        or completion.encoder_domain is not domain
+        or completion.encoder_ddp is not ddp
+        or completion.globally_reduced_num_tokens is not token
         or completion._authority != owner._prepared_authority
         or completion._authority != _completion_authority(completion)
         or len(completion.gradient_views) != len(owner._layouts)
@@ -533,6 +648,9 @@ def _capture_d3_producer_owner(
         dict(sample_location_by_id)
     )
     _sample_location_authority(locations)
+    encoder_domain, encoder_ddp, encoder_ddp_callable_authority = (
+        _validate_encoder_finalization_domain(runtime)
+    )
     handle, layouts = runtime._handle, tuple(runtime._chunk_layouts)
     geometry = _capture_geometry(runtime, handle, layouts)
     _validate_outputs(handle, geometry, outputs, encoder_cp_follower, runtime.device)
@@ -552,6 +670,9 @@ def _capture_d3_producer_owner(
         outputs,
         pixel_bases,
         encoder_cp_follower,
+        encoder_domain,
+        encoder_ddp,
+        encoder_ddp_callable_authority,
     )
     token = object()
     _PENDING_OWNER_SEALS[token] = tuple(id(value) for value in values)
@@ -565,6 +686,9 @@ def _capture_d3_producer_owner(
             item_outputs=outputs,
             pixel_bases=pixel_bases,
             encoder_cp_follower=encoder_cp_follower,
+            encoder_domain=encoder_domain,
+            encoder_ddp=encoder_ddp,
+            encoder_ddp_callable_authority=encoder_ddp_callable_authority,
             _factory_seal=token,
         )
     except BaseException:
