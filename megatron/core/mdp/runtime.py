@@ -17,8 +17,10 @@ empty ledgers, zero local encoder work, and zero encoder gradients.
 import logging
 import threading
 import time
+import weakref
 from enum import Enum, auto
-from typing import Iterator, Optional, Sequence, Union
+from types import MappingProxyType
+from typing import Any, Iterator, Mapping, Optional, Sequence, Union
 
 import torch
 
@@ -120,6 +122,11 @@ class MdpRuntime:
         self._decoder_schedule_ms = 0.0
         self._decoder_start = 0.0
         self._last_metrics: Optional[MdpIterationMetrics] = None
+        # Dynamic-CP keeps one short-lived, exact-identity P0--P2 producer
+        # handoff until the private D3 binder consumes or aborts it. The static
+        # phase machine never reads this slot.
+        self._pre_authority_dynamic_producer: Any | None = None
+        self._retired_pre_authority_dynamic_producers: dict[int, weakref.ReferenceType[Any]] = {}
         # Window-capture overlap: one in-flight prefetch keyed by the data
         # iterator's identity, so an interleaved eval (different iterator)
         # leaves a pending train prefetch untouched. The prefetch thread runs
@@ -770,6 +777,135 @@ class MdpRuntime:
         """The captured token tensor (test hook for the data_ptr assertion)."""
         return self._captured_num_tokens
 
+    def _register_pre_authority_dynamic_producer(self, owner: Any, producer: Any) -> None:
+        """Install one caller-owned Dynamic-CP producer by exact identity."""
+        self._validate_pre_authority_dynamic_producer_owner(owner, producer)
+        if self._pre_authority_dynamic_producer is not None:
+            raise MdpStateError("MDP: runtime already owns one producer handoff.")
+        bound_runtime = getattr(producer, "_mdp_pre_authority_runtime", None)
+        if bound_runtime is not None and bound_runtime is not self:
+            raise MdpStateError("MDP: dynamic producer belongs to its exact runtime owner.")
+        if self._pre_authority_dynamic_producer_is_retired(producer):
+            raise MdpStateError("MDP: runtime rejects a retired producer handoff.")
+        try:
+            weakref.ref(producer)
+            object.__setattr__(producer, "_mdp_pre_authority_runtime", self)
+        except (AttributeError, TypeError) as error:
+            raise MdpStateError(
+                "MDP: dynamic producer supports runtime-owned one-shot identity."
+            ) from error
+        self._pre_authority_dynamic_producer = producer
+
+    def _validate_pre_authority_dynamic_producer(self, owner: Any, producer: Any) -> None:
+        """Require the one unconsumed producer registered by this runtime."""
+        self._validate_pre_authority_dynamic_producer_owner(owner, producer)
+        if getattr(producer, "_mdp_pre_authority_runtime", None) is not self:
+            raise MdpStateError("MDP: dynamic producer belongs to its exact runtime owner.")
+        if self._pre_authority_dynamic_producer is not producer:
+            raise MdpStateError("MDP: runtime has the exact registered producer handoff.")
+
+    def _consume_pre_authority_dynamic_producer(self, owner: Any, producer: Any) -> None:
+        """Consume one exact producer handoff after successful private binding."""
+        self._validate_pre_authority_dynamic_producer(owner, producer)
+        self._retire_pre_authority_dynamic_producer()
+
+    def _abort_pre_authority_dynamic_producer(self, owner: Any | None = None) -> None:
+        """Discard the active private producer handoff without communication."""
+        producer = self._pre_authority_dynamic_producer
+        if producer is None:
+            return
+        self._validate_pre_authority_dynamic_producer_owner(owner, producer)
+        self._retire_pre_authority_dynamic_producer()
+
+    def _validate_pre_authority_dynamic_producer_owner(self, owner: Any, producer: Any) -> None:
+        if owner is None or producer is None or getattr(producer, "owner", None) is not owner:
+            raise MdpStateError("MDP: dynamic producer has its exact producer owner.")
+        if getattr(owner, "_runtime", None) is not self:
+            raise MdpStateError("MDP: dynamic producer has its exact runtime owner.")
+
+    def _pre_authority_dynamic_producer_is_retired(self, producer: Any) -> bool:
+        reference = self._retired_pre_authority_dynamic_producers.get(id(producer))
+        if reference is None:
+            return False
+        retired = reference()
+        if retired is None:
+            del self._retired_pre_authority_dynamic_producers[id(producer)]
+            return False
+        return retired is producer
+
+    def _retire_pre_authority_dynamic_producer(self) -> None:
+        """Clear the active slot while preserving its one-shot identity tombstone."""
+        producer = self._pre_authority_dynamic_producer
+        if producer is None:
+            return
+        try:
+            producer_identity = id(producer)
+            tombstones = self._retired_pre_authority_dynamic_producers
+
+            def remove_tombstone(reference: weakref.ReferenceType[Any]) -> None:
+                if tombstones.get(producer_identity) is reference:
+                    del tombstones[producer_identity]
+
+            tombstones[producer_identity] = weakref.ref(producer, remove_tombstone)
+        except TypeError as error:
+            raise MdpStateError(
+                "MDP: dynamic producer supports runtime-owned one-shot identity."
+            ) from error
+        self._pre_authority_dynamic_producer = None
+
+    def _capture_pre_authority_dynamic_producer(
+        self,
+        *,
+        owner: Any,
+        rank_view: Any,
+        local_manifest: Any,
+        source_window: Any,
+        static_plan: Any,
+        item_outputs: Mapping,
+        sample_location_by_id: Mapping,
+        local_prepare_error: Exception | None,
+        forward_only: bool,
+    ) -> Any:
+        """Seal a local Dynamic-CP P0--P2 result and register it without a collective."""
+        from megatron.core.mdp.dynamic_cp_runtime import _PreAuthorityDynamicProducer
+
+        if owner is None or getattr(owner, "_runtime", None) is not self:
+            raise MdpStateError("MDP: dynamic producer capture has its exact runtime owner.")
+        if local_prepare_error is not None:
+            if not isinstance(local_prepare_error, Exception):
+                raise MdpConfigurationError(
+                    "MDP: dynamic producer local preparation error is an Exception or None."
+                )
+            self._abort_pre_authority_dynamic_producer(owner)
+            return _PreAuthorityDynamicProducer(
+                rank_view=None,
+                local_manifest=None,
+                source_window=None,
+                static_plan=None,
+                item_outputs=MappingProxyType({}),
+                sample_location_by_id=MappingProxyType({}),
+                owner=None,
+                local_prepare_error=local_prepare_error,
+                forward_only=forward_only,
+            )
+        if not isinstance(item_outputs, Mapping) or not isinstance(sample_location_by_id, Mapping):
+            raise MdpConfigurationError(
+                "MDP: dynamic producer capture outputs and sample locations are mappings."
+            )
+        producer = _PreAuthorityDynamicProducer(
+            rank_view=rank_view,
+            local_manifest=local_manifest,
+            source_window=source_window,
+            static_plan=static_plan,
+            item_outputs=MappingProxyType(dict(item_outputs)),
+            sample_location_by_id=MappingProxyType(dict(sample_location_by_id)),
+            owner=owner,
+            local_prepare_error=None,
+            forward_only=forward_only,
+        )
+        self._register_pre_authority_dynamic_producer(owner, producer)
+        return producer
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -785,6 +921,7 @@ class MdpRuntime:
         error is attached as a note instead of replacing the failure that made
         every planning rank enter this path.
         """
+        self._retire_pre_authority_dynamic_producer()
         handle = self._handle
         self._handle = None
         self._eval_outputs = ()
@@ -806,6 +943,7 @@ class MdpRuntime:
         self._reset_failed_iteration_state()
 
     def _reset_failed_iteration_state(self) -> None:
+        self._retire_pre_authority_dynamic_producer()
         self._window = None
         self._plan = None
         self._iter_specs = {}
