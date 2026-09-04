@@ -43,7 +43,11 @@ from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 from megatron.core.mdp.runtime import MdpRuntime
-from megatron.core.mdp.schedule import wrap_finalize_model_grads, wrap_forward_backward
+from megatron.core.mdp.schedule import (
+    _wrap_d3_forward_backward,
+    wrap_finalize_model_grads,
+    wrap_forward_backward,
+)
 from megatron.core.mdp.storage import MdpEmbeddingStorage
 
 logger = logging.getLogger(__name__)
@@ -54,6 +58,10 @@ _ADAPTER_BUILDER: Optional[Callable] = None
 #: The runtime for this process, once built. Module-level because the seams
 #: are far apart in the training loop.
 _RUNTIME: Optional[MdpRuntime] = None
+
+#: The one reusable training-only D3 facade, built lazily after model config
+#: and native Dynamic-CP groups are both available.
+_D3_FACADE = None
 
 _D3_STATUS_TIMEOUT_SECONDS = 30.0
 
@@ -277,7 +285,14 @@ def maybe_build_mdp_domain(
     return build_mdp_composite_optimizer(optimizer, encoder_domain.encoder_optimizer)
 
 
-def maybe_wrap_forward_backward(forward_backward_func: Callable, config=None) -> Callable:
+def d3_owns_data_schedule(config) -> bool:
+    """Whether D3, rather than native ``wrap_data_iterator``, owns this batch."""
+    return _RUNTIME is not None and getattr(config, "dynamic_context_parallel", None) is True
+
+
+def maybe_wrap_forward_backward(
+    forward_backward_func: Callable, config=None, *, training: bool = True
+) -> Callable:
     """Wrap the schedule with the MDP phases; no-op when MDP is off.
 
     Also installs the token capture on first use — this is the first point at
@@ -285,8 +300,15 @@ def maybe_wrap_forward_backward(forward_backward_func: Callable, config=None) ->
     """
     if _RUNTIME is None:
         return forward_backward_func
+    if type(training) is not bool:
+        raise MdpConfigurationError("MDP: schedule purpose must be an exact bool.")
     if config is not None:
         wrap_finalize_model_grads(config, _RUNTIME)
+    if d3_owns_data_schedule(config) and training:
+        global _D3_FACADE
+        if _D3_FACADE is None:
+            _D3_FACADE = _build_d3_facade_from_mcore(_RUNTIME, config)
+        return _wrap_d3_forward_backward(forward_backward_func, _D3_FACADE)
     return wrap_forward_backward(forward_backward_func, _RUNTIME)
 
 
@@ -333,6 +355,7 @@ def _build_d3_facade_from_mcore(runtime: MdpRuntime, config):
 
 def reset_for_testing() -> None:
     """Drop module state between tests."""
-    global _RUNTIME, _ADAPTER_BUILDER
+    global _RUNTIME, _ADAPTER_BUILDER, _D3_FACADE
     _RUNTIME = None
     _ADAPTER_BUILDER = None
+    _D3_FACADE = None

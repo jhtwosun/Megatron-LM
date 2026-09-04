@@ -2941,6 +2941,11 @@ def train_step(
     args = get_args()
     timers = get_timers()
     num_microbatches = get_num_microbatches()
+    mdp_d3_owns_data_schedule = False
+    if getattr(args, "mdp_enable", False):
+        from megatron.core.mdp import integration as mdp_integration
+
+        mdp_d3_owns_data_schedule = mdp_integration.d3_owns_data_schedule(config)
 
     offload_optimizer_states = getattr(args, 'offload_optimizer_states', False)
     if offload_optimizer_states:
@@ -3050,7 +3055,10 @@ def train_step(
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        if getattr(config, 'sequence_packing_scheduler', None) is not None:
+        if (
+            getattr(config, 'sequence_packing_scheduler', None) is not None
+            and not mdp_d3_owns_data_schedule
+        ):
             # Dynamic-CP / sequence packing must happen after the rerun state machine has
             # observed the original RerunDataIterator. The scheduler returns another
             # RerunDataIterator containing the packed microbatches for this step.
@@ -3066,8 +3074,12 @@ def train_step(
             forward_backward_data_iterator = packed_data_iterator
         else:
             num_microbatches = get_num_microbatches()
-            seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
-            seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
+            if mdp_d3_owns_data_schedule:
+                seqlen_sum_this_global_batch = None
+                seqlen_squared_sum_this_global_batch = None
+            else:
+                seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
+                seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
             forward_backward_data_iterator = data_iterator
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
@@ -4301,6 +4313,7 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    mdp_d3_owns_data_schedule = False
     if getattr(args, "mdp_enable", False):
         # MDP phase machine around the native schedule; no-op when MDP is off.
         from megatron.core.mdp import integration as mdp_integration
@@ -4308,6 +4321,7 @@ def train(
         forward_backward_func = mdp_integration.maybe_wrap_forward_backward(
             forward_backward_func, config
         )
+        mdp_d3_owns_data_schedule = mdp_integration.d3_owns_data_schedule(config)
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -4663,7 +4677,11 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        if getattr(config, 'sequence_packing_scheduler', None) is not None and not args.skip_train:
+        if (
+            getattr(config, 'sequence_packing_scheduler', None) is not None
+            and not mdp_d3_owns_data_schedule
+            and not args.skip_train
+        ):
             # The scheduler computed these from the real sequence lengths before
             # CP padding and rerouting, so use them directly for FLOPs accounting.
             assert seqlen_sum_this_global_batch is not None
@@ -4926,14 +4944,16 @@ def evaluate(
     eval_micro_batch_size = args.eval_micro_batch_size
     eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    mdp_owns_data_schedule = False
     if getattr(args, "mdp_enable", False):
         # MDP phase machine around the native schedule (evaluation builds its
         # own callable); no-op when MDP is off.
         from megatron.core.mdp import integration as mdp_integration
 
         forward_backward_func = mdp_integration.maybe_wrap_forward_backward(
-            forward_backward_func, config
+            forward_backward_func, config, training=False
         )
+        mdp_owns_data_schedule = True
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:
@@ -4977,7 +4997,10 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
-            if getattr(config, 'sequence_packing_scheduler', None) is not None:
+            if (
+                getattr(config, 'sequence_packing_scheduler', None) is not None
+                and not mdp_owns_data_schedule
+            ):
                 try:
                     (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
