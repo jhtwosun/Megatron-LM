@@ -69,7 +69,8 @@ class _ProducerOwner:
         self._runtime = _ProducerRuntime()
         self.aborts = 0
 
-    def prepare_dynamic_completion(self, gradients):
+    def prepare_dynamic_completion(self, gradients, *, transport_dtype=None):
+        self.transport_dtype = transport_dtype
         return gradients
 
     def abort(self):

@@ -620,6 +620,7 @@ def test_real_receipt_aggregates_endpoint_routes_and_remaps_native_ids_once():
             assert prepared.native_completion[item_id.local_item_id] is value
         assert prepared.lifecycle._state == "retired"
         assert receipt._consumed_lifecycle_identity == id(prepared.lifecycle)
+        assert producer.owner.transport_dtype is authority.bridge_dtype
 
         assert (
             _api()._validate_prepared_d3_encoder_completion(
