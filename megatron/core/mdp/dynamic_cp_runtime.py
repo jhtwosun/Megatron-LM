@@ -504,6 +504,7 @@ class _PreAuthorityDynamicProducer:
     source_window: Any
     static_plan: Any
     item_outputs: Mapping
+    sample_location_by_id: Mapping
     owner: Any
     local_prepare_error: Exception | None
     forward_only: bool
@@ -517,6 +518,13 @@ class _PreAuthorityDynamicProducer:
             raise MdpConfigurationError(
                 "MDP: pre-authority producer item_outputs is an immutable local mapping."
             )
+        if not isinstance(self.sample_location_by_id, _MAPPING_PROXY_TYPE):
+            raise MdpConfigurationError(
+                "MDP: pre-authority producer sample locations are an immutable local mapping."
+            )
+        object.__setattr__(
+            self, "sample_location_by_id", MappingProxyType(dict(self.sample_location_by_id))
+        )
         error = self.local_prepare_error
         if error is not None and not isinstance(error, Exception):
             raise MdpConfigurationError(
@@ -525,8 +533,10 @@ class _PreAuthorityDynamicProducer:
         local_values = (self.local_manifest, self.source_window, self.static_plan)
         if error is None:
             present = tuple(value is not None for value in local_values)
-            contributor = all(present)
-            noncontributor = not any(present) and not self.item_outputs
+            contributor = all(present) and bool(self.sample_location_by_id)
+            noncontributor = (
+                not any(present) and not self.item_outputs and not self.sample_location_by_id
+            )
             if self.owner is None or not (contributor or noncontributor):
                 raise MdpConfigurationError(
                     "MDP: successful pre-authority producer owns exact contributor P0-P2 "
@@ -536,10 +546,11 @@ class _PreAuthorityDynamicProducer:
             self.owner is not None
             or any(value is not None for value in local_values)
             or self.item_outputs
+            or self.sample_location_by_id
         ):
             raise MdpConfigurationError(
                 "MDP: failed pre-authority producer carries only its local error and "
-                "empty immutable item_outputs."
+                "empty immutable local mappings."
             )
 
 
