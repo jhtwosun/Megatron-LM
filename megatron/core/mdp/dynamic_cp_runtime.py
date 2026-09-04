@@ -26,7 +26,11 @@ from torch import Tensor
 
 from megatron.core.mdp.bridge import BridgePhase
 from megatron.core.mdp.dynamic_cp import GlobalVisionItemId
-from megatron.core.mdp.dynamic_cp_bridge import DynamicBridgeKey, DynamicBridgeLedger
+from megatron.core.mdp.dynamic_cp_bridge import (
+    DynamicBridgeKey,
+    DynamicBridgeLedger,
+    validate_dynamic_bridge_ledger_pair,
+)
 from megatron.core.mdp.dynamic_cp_bridge_transport import (
     PreparedDynamicBridgeExchange,
     _run_dynamic_bridge_gate,
@@ -44,7 +48,10 @@ from megatron.core.mdp.dynamic_cp_execution import (
     validate_decoder_global_manifest,
 )
 from megatron.core.mdp.dynamic_cp_plan import DecoderDynamicPlan, validate_decoder_dynamic_plan
-from megatron.core.mdp.dynamic_cp_routing import DecoderPayloadRouteLedger
+from megatron.core.mdp.dynamic_cp_routing import (
+    DecoderPayloadRouteLedger,
+    validate_decoder_payload_route_ledger,
+)
 from megatron.core.mdp.dynamic_cp_transport import (
     PreparedDecoderPayloadBundle,
     _run_decoder_payload_gate,
@@ -486,6 +493,190 @@ def _consensus_dynamic_execution_config(
         raise MdpStateError(
             "MDP: runtime config consensus succeeded despite a local error."
         ) from local_error
+
+
+@dataclass(frozen=True)
+class _PreAuthorityDynamicProducer:
+    """One local P0--P2 result captured before metadata authority exists."""
+
+    rank_view: Any
+    local_manifest: Any
+    source_window: Any
+    static_plan: Any
+    item_outputs: Mapping
+    owner: Any
+    local_prepare_error: Exception | None
+    forward_only: bool
+
+    def __post_init__(self) -> None:
+        if _require_exact_bool("pre-authority forward_only", self.forward_only):
+            raise MdpConfigurationError(
+                "MDP: dynamic producer contracts support training iterations only."
+            )
+        if not isinstance(self.item_outputs, _MAPPING_PROXY_TYPE):
+            raise MdpConfigurationError(
+                "MDP: pre-authority producer item_outputs is an immutable local mapping."
+            )
+        error = self.local_prepare_error
+        if error is not None and not isinstance(error, Exception):
+            raise MdpConfigurationError(
+                "MDP: pre-authority local_prepare_error is an Exception or None."
+            )
+        local_values = (self.local_manifest, self.source_window, self.static_plan)
+        if error is None:
+            present = tuple(value is not None for value in local_values)
+            contributor = all(present)
+            noncontributor = not any(present) and not self.item_outputs
+            if self.owner is None or not (contributor or noncontributor):
+                raise MdpConfigurationError(
+                    "MDP: successful pre-authority producer owns exact contributor P0-P2 "
+                    "state or empty noncontributor state."
+                )
+        elif (
+            self.owner is not None
+            or any(value is not None for value in local_values)
+            or self.item_outputs
+        ):
+            raise MdpConfigurationError(
+                "MDP: failed pre-authority producer carries only its local error and "
+                "empty immutable item_outputs."
+            )
+
+
+@dataclass(frozen=True)
+class _DynamicIterationAuthority:
+    """Global immutable D3 authority consumed by later runtime composition."""
+
+    global_manifest: Any
+    plan: Any
+    source_rank_by_lane: Mapping
+    producer_rank_by_item: Mapping
+    output_rows_by_item: Mapping
+    payload_ledger: Any
+    embedding_ledger: Any
+    gradient_ledger: Any
+    participant_ranks: tuple[int, ...]
+    bridge_width: int
+    bridge_dtype: torch.dtype
+
+    def __post_init__(self) -> None:
+        for name in ("source_rank_by_lane", "producer_rank_by_item", "output_rows_by_item"):
+            value = getattr(self, name)
+            if not isinstance(value, Mapping):
+                raise MdpConfigurationError(
+                    f"MDP: dynamic iteration authority {name} is a mapping."
+                )
+            object.__setattr__(self, name, MappingProxyType(dict(value)))
+        typed_fields = (
+            ("global_manifest", self.global_manifest, DecoderGlobalManifest),
+            ("plan", self.plan, DecoderDynamicPlan),
+            ("payload_ledger", self.payload_ledger, DecoderPayloadRouteLedger),
+            ("embedding_ledger", self.embedding_ledger, DynamicBridgeLedger),
+            ("gradient_ledger", self.gradient_ledger, DynamicBridgeLedger),
+        )
+        for name, value, expected_type in typed_fields:
+            if type(value) is not expected_type:
+                raise MdpConfigurationError(
+                    f"MDP: dynamic iteration authority {name} has its exact typed carrier."
+                )
+        if self.embedding_ledger.phase is not BridgePhase.EMBEDDING:
+            raise MdpConfigurationError(
+                "MDP: dynamic iteration authority embedding ledger has embedding phase."
+            )
+        if self.gradient_ledger.phase is not BridgePhase.GRADIENT:
+            raise MdpConfigurationError(
+                "MDP: dynamic iteration authority gradient ledger has gradient phase."
+            )
+        participants = _require_ranks(
+            "dynamic iteration authority participant ranks", self.participant_ranks
+        )
+        width = _require_positive_integer(
+            "dynamic iteration authority bridge width", self.bridge_width
+        )
+        if not isinstance(self.bridge_dtype, torch.dtype):
+            raise MdpConfigurationError(
+                "MDP: dynamic iteration authority bridge dtype is a torch dtype."
+            )
+        object.__setattr__(self, "participant_ranks", participants)
+        object.__setattr__(self, "bridge_width", width)
+        validate_decoder_global_manifest(self.global_manifest)
+        validate_decoder_dynamic_plan(self.plan)
+        validate_decoder_payload_route_ledger(
+            self.payload_ledger,
+            plan=self.plan,
+            global_manifest=self.global_manifest,
+            source_rank_by_lane=self.source_rank_by_lane,
+            participant_ranks=participants,
+        )
+        validate_dynamic_bridge_ledger_pair(
+            self.embedding_ledger,
+            self.gradient_ledger,
+            plan=self.plan,
+            global_manifest=self.global_manifest,
+            producer_rank_by_item=self.producer_rank_by_item,
+            output_rows_by_item=self.output_rows_by_item,
+            width=width,
+            dtype=self.bridge_dtype,
+            participant_ranks=participants,
+        )
+
+
+@dataclass(frozen=True)
+class _DynamicProducerCarrier:
+    """Caller-owned producer state bound to one typed global D3 authority.
+
+    This private handoff neither enters a collective nor invokes the callbacks;
+    later runtime composition owns both operations.
+    """
+
+    authority: _DynamicIterationAuthority
+    pre_authority: _PreAuthorityDynamicProducer
+    owner: Any
+    rank_view: Any
+    local_manifest: Any
+    source_window: Any
+    static_plan: Any
+    item_outputs: Mapping
+    payload_destination_views: Mapping
+    embedding_destination_views: Mapping
+    gradient_destination_views: Mapping
+    summed_gradient_destination_views: Mapping
+    backward: Callable
+    cleanup: Callable
+
+    def __post_init__(self) -> None:
+        if type(self.authority) is not _DynamicIterationAuthority:
+            raise MdpConfigurationError(
+                "MDP: dynamic producer carries its exact global iteration authority."
+            )
+        if type(self.pre_authority) is not _PreAuthorityDynamicProducer:
+            raise MdpConfigurationError(
+                "MDP: dynamic producer carries its exact pre-authority identity."
+            )
+        if self.owner is None or self.owner is not self.pre_authority.owner:
+            raise MdpConfigurationError(
+                "MDP: dynamic producer owner matches its pre-authority identity."
+            )
+        for name in ("rank_view", "local_manifest", "source_window", "static_plan", "item_outputs"):
+            if getattr(self, name) is not getattr(self.pre_authority, name):
+                raise MdpConfigurationError(
+                    f"MDP: dynamic producer {name} preserves its pre-authority identity."
+                )
+        for name in (
+            "item_outputs",
+            "payload_destination_views",
+            "embedding_destination_views",
+            "gradient_destination_views",
+            "summed_gradient_destination_views",
+        ):
+            if not isinstance(getattr(self, name), Mapping):
+                raise MdpConfigurationError(
+                    f"MDP: dynamic producer {name} is a caller-owned mapping."
+                )
+        if not callable(self.backward) or not callable(self.cleanup):
+            raise MdpConfigurationError(
+                "MDP: dynamic producer backward and cleanup callbacks are callable."
+            )
 
 
 def _require_digest(name: str, value: Any) -> bytes:
