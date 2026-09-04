@@ -1131,6 +1131,9 @@ def _validate_records_and_leaves(
             )
             for sample_id in assignment.assignment.sample_ids
         )
+        if cp_partition_mode == "contiguous":
+            cp_size = assignment.assignment.local_cp_size
+            expected_tokens = ((expected_tokens + cp_size - 1) // cp_size) * cp_size
         if (
             packed_values[0] != "thd"
             or type(packed_values[1]) is not int

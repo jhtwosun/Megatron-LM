@@ -621,6 +621,28 @@ class MultimodalDecoderPayloadCodec:
         if "attention_mask" in none_fields:
             rebuilt_payload["attention_mask"] = None
 
+        padded_lengths = [sample.padded_seqlen for sample in selected_samples]
+        total_padded = sum(padded_lengths)
+        if cp_partition_mode == "contiguous":
+            aligned_total = ((total_padded + actual_group_size - 1) // actual_group_size) * (
+                actual_group_size
+            )
+            tail_padding = aligned_total - total_padded
+            if tail_padding:
+                pad_values = {
+                    "input_ids": 0,
+                    "labels": -100,
+                    "loss_mask": 0,
+                    "padding_mask": True,
+                    "position_ids": 0,
+                }
+                for name, value in tuple(rebuilt_payload.items()):
+                    if value is not None and name in pad_values:
+                        rebuilt_payload[name] = torch.nn.functional.pad(
+                            value, (0, tail_padding), value=pad_values[name]
+                        )
+                padded_lengths[-1] += tail_padding
+
         item_by_id = {item.item_id: item for item in catalog_items}
         vision_records = []
         grids = []
@@ -661,12 +683,12 @@ class MultimodalDecoderPayloadCodec:
             tuple(sample.valid_seqlen for sample in selected_samples)
         )
         padded_cu_values = self._cumulative_lengths(
-            tuple(sample.padded_seqlen for sample in selected_samples)
+            padded_lengths
         )
         metadata_device = selected_packets[0].tensor_fields[tensor_names[0]].device
         valid_cu = torch.tensor(valid_cu_values, dtype=torch.int32, device=metadata_device)
         padded_cu = torch.tensor(padded_cu_values, dtype=torch.int32, device=metadata_device)
-        max_padded_seqlen = max(sample.padded_seqlen for sample in selected_samples)
+        max_padded_seqlen = max(padded_lengths)
         packed = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=valid_cu,

@@ -69,15 +69,41 @@ _NO_CP_GROUP = _NoCPGroup()
 # Gradients are correct; only the *logged* value drifts.
 
 
-def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+def _thd_cp_partition_index(
+    cu_seqlens_padded, total_tokens, cp_size, cp_rank, partition_mode="zigzag"
+):
     """Per-rank token index for THD + CP via TE's
     ``thd_get_partitioned_indices``.  Cast to int64 so the result can be
     used directly with ``index_select`` regardless of TE's return dtype.
     """
+    if partition_mode == "contiguous":
+        if total_tokens % cp_size != 0:
+            raise ValueError(
+                f"contiguous CP requires total_tokens={total_tokens} divisible by cp_size={cp_size}"
+            )
+        local_tokens = total_tokens // cp_size
+        start = cp_rank * local_tokens
+        return torch.arange(
+            start, start + local_tokens, dtype=torch.long, device=cu_seqlens_padded.device
+        )
+    if partition_mode != "zigzag":
+        raise ValueError(f"unsupported CP partition mode: {partition_mode}")
+
     from transformer_engine.pytorch import cpp_extensions as tex
 
     idx = tex.thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
     return idx.long()
+
+
+def _cp_size_rank(packed_seq_params):
+    """Resolve a per-microbatch Dynamic-CP group before the static CP group."""
+    cp_group = getattr(packed_seq_params, "cp_group", None)
+    if cp_group is not None:
+        return cp_group.size(), cp_group.rank()
+    return (
+        parallel_state.get_context_parallel_world_size(),
+        parallel_state.get_context_parallel_rank(),
+    )
 
 
 class MultimodalModel(MegatronModule):
@@ -383,13 +409,12 @@ class MultimodalModel(MegatronModule):
         ``_apply_rotary_pos_emb_thd`` does the per-sample CP zigzag
         itself via ``_get_thd_freqs_on_this_cp_rank``.
         """
-        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_size, cp_rank = _cp_size_rank(packed_seq_params)
         if cp_size <= 1:
             return (
                 decoder_input, input_ids, labels, loss_mask,
                 attention_mask, position_ids, padding_mask,
             )
-        cp_rank = parallel_state.get_context_parallel_rank()
         decoder_input_uses_sp = (
             decoder_input is not None
             and self.config.sequence_parallel
@@ -407,7 +432,11 @@ class MultimodalModel(MegatronModule):
                 decoder_input.shape[0] if decoder_input is not None else input_ids.shape[1]
             )
             idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded, total_tokens, cp_size, cp_rank
+                packed_seq_params.cu_seqlens_q_padded,
+                total_tokens,
+                cp_size,
+                cp_rank,
+                getattr(packed_seq_params, "cp_partition_mode", "zigzag"),
             )
             if decoder_input is not None:
                 decoder_input = decoder_input.index_select(0, idx)
@@ -452,13 +481,16 @@ class MultimodalModel(MegatronModule):
         with the model's CP-shard output. Returns ``loss_mask`` unchanged
         when ``CP <= 1``.
         """
-        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_size, cp_rank = _cp_size_rank(packed_seq_params)
         if cp_size <= 1 or loss_mask is None:
             return loss_mask
-        cp_rank = parallel_state.get_context_parallel_rank()
         if packed_seq_params is not None:
             idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded, loss_mask.shape[1], cp_size, cp_rank
+                packed_seq_params.cu_seqlens_q_padded,
+                loss_mask.shape[1],
+                cp_size,
+                cp_rank,
+                getattr(packed_seq_params, "cp_partition_mode", "zigzag"),
             )
             return loss_mask.index_select(1, idx)
         return _cp_split_tensor(loss_mask, seq_dim=1, cp_size=cp_size, cp_rank=cp_rank)

@@ -197,9 +197,10 @@ def test_sequence_parallel_decoder_cp_split_matches_full_token_order(monkeypatch
             cu_seqlens_q_padded=torch.tensor((0, 16, 32), dtype=torch.int32)
         )
 
-        def _partition_index(cu_seqlens, total_tokens, cp_size, cp_rank):
+        def _partition_index(cu_seqlens, total_tokens, cp_size, cp_rank, partition_mode):
             assert torch.equal(cu_seqlens, packed_seq_params.cu_seqlens_q_padded)
             assert (total_tokens, cp_size, cp_rank) == (32, 2, 1)
+            assert partition_mode == "zigzag"
             return cp_index
 
         monkeypatch.setattr(multimodal_base, "_thd_cp_partition_index", _partition_index)
@@ -245,6 +246,52 @@ def test_sequence_parallel_decoder_cp_split_matches_full_token_order(monkeypatch
     for full_index in cp_index[len(cp_index) // 2 :]:
         expected_grad[int(full_index) % len(local_decoder)] = 1
     assert torch.equal(local_decoder.grad, expected_grad)
+
+
+def test_dynamic_contiguous_cp_group_splits_model_inputs_and_loss_mask(monkeypatch):
+    from examples.multimodal_dev.models import base as multimodal_base
+
+    monkeypatch.setattr(
+        multimodal_base.parallel_state, "get_context_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(multimodal_base.parallel_state, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        multimodal_base.parallel_state, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    dynamic_group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)
+    packed_seq_params = SimpleNamespace(
+        cu_seqlens_q_padded=torch.tensor((0, 8, 16), dtype=torch.int32),
+        cp_group=dynamic_group,
+        cp_partition_mode="contiguous",
+    )
+    decoder_input = torch.arange(16, dtype=torch.float32).view(16, 1, 1)
+    input_ids = torch.arange(16, dtype=torch.long).view(1, 16)
+    labels = input_ids + 100
+    loss_mask = torch.arange(16, dtype=torch.float32).view(1, 16)
+    padding_mask = input_ids.remainder(3).eq(0)
+
+    outputs = multimodal_base.MultimodalModel._cp_split_for_forward(
+        SimpleNamespace(config=SimpleNamespace(sequence_parallel=False)),
+        decoder_input=decoder_input,
+        input_ids=input_ids,
+        labels=labels,
+        loss_mask=loss_mask,
+        attention_mask=None,
+        position_ids=input_ids + 200,
+        packed_seq_params=packed_seq_params,
+        padding_mask=padding_mask,
+    )
+
+    expected = torch.arange(8, 16)
+    assert torch.equal(outputs[0], decoder_input.index_select(0, expected))
+    assert torch.equal(outputs[1], input_ids.index_select(1, expected))
+    assert torch.equal(outputs[2], labels.index_select(1, expected))
+    assert torch.equal(outputs[3], loss_mask.index_select(1, expected))
+    assert torch.equal(outputs[6], padding_mask.index_select(1, expected))
+    assert torch.equal(
+        multimodal_base.MultimodalModel.cp_split_loss_mask(loss_mask, packed_seq_params),
+        loss_mask.index_select(1, expected),
+    )
 
 
 class _IdentityEncoder(torch.nn.Module):
