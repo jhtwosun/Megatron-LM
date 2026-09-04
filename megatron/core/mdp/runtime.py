@@ -169,6 +169,87 @@ class MdpRuntime:
         ``forward_only`` flag is recorded once here; ``end_iteration`` uses it
         so inconsistent values cannot be passed at two call sites.
         """
+        return self._begin_iteration(
+            data_iterators,
+            num_microbatches=num_microbatches,
+            forward_only=forward_only,
+        )
+
+    def _prepare_dynamic_encoder_producer(
+        self,
+        data_iterators: Union[Iterator, Sequence[Iterator]],
+        *,
+        num_microbatches: int,
+        forward_only: bool,
+        codec: Any,
+    ) -> Any:
+        """Run P0--P2 and return one local producer for D3 metadata rendezvous."""
+        from megatron.core.mdp.dynamic_cp_d3_producer_owner import (
+            _capture_d3_producer_owner,
+        )
+        from megatron.core.mdp.dynamic_cp_runtime import _PreAuthorityDynamicProducer
+
+        if type(forward_only) is not bool or forward_only:
+            raise MdpConfigurationError("MDP: D3 producer preparation supports training only.")
+        self._require_state(MdpRuntimeState.EMPTY, "_prepare_dynamic_encoder_producer")
+
+        def capture(window, plan, detached):
+            build_source = getattr(codec, "build_source_window_with_locations", None)
+            if not callable(build_source):
+                raise MdpConfigurationError(
+                    "MDP: D3 decoder codec provides build_source_window_with_locations."
+                )
+            source_window, sample_locations = build_source(
+                tuple(window.records()), source_dp_lane=self.rank_view.lane_id
+            )
+            item_outputs = {
+                item_id: detached[chunk_index][
+                    segment.output_row_start : segment.output_row_start + segment.output_rows
+                ]
+                for item_id, (chunk_index, segment) in self._chunk_of_item.items()
+            }
+            owner = _capture_d3_producer_owner(
+                runtime=self,
+                rank_view=self.rank_view,
+                local_manifest=source_window.metadata_manifest(),
+                source_window=source_window,
+                static_plan=plan,
+                item_outputs=item_outputs,
+                sample_location_by_id=sample_locations,
+                forward_only=False,
+            )
+            return owner.producer
+
+        try:
+            return self._begin_iteration(
+                data_iterators,
+                num_microbatches=num_microbatches,
+                forward_only=False,
+                p2_handoff=capture,
+            )
+        except Exception as error:
+            self._abort_failed_iteration(error)
+            return _PreAuthorityDynamicProducer(
+                rank_view=None,
+                local_manifest=None,
+                source_window=None,
+                static_plan=None,
+                item_outputs=MappingProxyType({}),
+                sample_location_by_id=MappingProxyType({}),
+                owner=None,
+                local_prepare_error=error,
+                forward_only=False,
+            )
+
+    def _begin_iteration(
+        self,
+        data_iterators: Union[Iterator, Sequence[Iterator]],
+        *,
+        num_microbatches: int,
+        forward_only: bool,
+        p2_handoff: Any = None,
+    ) -> Any:
+        """Execute the shared P0--P2 prefix and either hand off or enter P3."""
         self._require_state(MdpRuntimeState.EMPTY, "begin_iteration")
         self._forward_only = forward_only
 
@@ -387,6 +468,9 @@ class MdpRuntime:
             self._handle = None
             self._eval_outputs = tuple(chunk_outputs)
             detached = tuple(output.detach() for output in chunk_outputs)
+
+        if p2_handoff is not None:
+            return p2_handoff(window, plan, detached)
 
         # P3: bridge into TP0 endpoints, then replicate full leaves over the
         # already-created native decoder TP group on PP0.

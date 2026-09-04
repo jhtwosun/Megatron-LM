@@ -194,6 +194,30 @@ def test_factory_captures_and_registers_exact_contributor():
         )
 
 
+def test_factory_accepts_text_only_source_contributor():
+    api = _api()
+    runtime, outputs = _runtime(contributor=False)
+    rank_view = SimpleNamespace(global_rank=5, lane_id=0)
+    runtime.rank_view = rank_view
+    metadata = object()
+
+    owner = api._capture_d3_producer_owner(
+        runtime=runtime,
+        rank_view=rank_view,
+        local_manifest=metadata,
+        source_window=metadata,
+        static_plan=metadata,
+        item_outputs=outputs,
+        sample_location_by_id=MappingProxyType({GlobalSampleId(0, 0): (0, 0)}),
+        forward_only=False,
+    )
+
+    assert owner.producer.local_manifest is metadata
+    assert not owner.producer.item_outputs
+    owner.abort()
+    assert runtime.state is MdpRuntimeState.EMPTY
+
+
 def test_capture_requires_exact_rank_view_and_pre_routing_p2_state():
     api = _api()
     runtime, outputs = _runtime()

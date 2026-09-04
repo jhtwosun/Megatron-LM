@@ -370,6 +370,13 @@ class MultimodalDecoderPayloadCodec:
         self, records: Sequence[MdpMicrobatchRecord], *, source_dp_lane: int
     ) -> DecoderSourceWindow:
         """Catalog source-local THD views without copying decoder tensors."""
+        window, _ = self.build_source_window_with_locations(records, source_dp_lane=source_dp_lane)
+        return window
+
+    def build_source_window_with_locations(
+        self, records: Sequence[MdpMicrobatchRecord], *, source_dp_lane: int
+    ) -> tuple[DecoderSourceWindow, Mapping[GlobalSampleId, tuple[int, int]]]:
+        """Catalog a source window and its microbatch-local sample locations."""
         lane = self._require_nonnegative_integer("source_dp_lane", source_dp_lane)
         if (
             not isinstance(records, Sequence)
@@ -383,6 +390,7 @@ class MultimodalDecoderPayloadCodec:
         samples = []
         items = []
         packets = []
+        sample_locations = {}
         next_sample_order = 0
         next_item_id = 0
         for record in records:
@@ -413,6 +421,7 @@ class MultimodalDecoderPayloadCodec:
                 zip(valid_lengths, padded_lengths)
             ):
                 sample_id = GlobalSampleId(lane, next_sample_order + local_sample)
+                sample_locations[sample_id] = (record.microbatch_id, local_sample)
                 samples.append(
                     DecoderSampleMetadata(
                         sample_id=sample_id,
@@ -439,7 +448,7 @@ class MultimodalDecoderPayloadCodec:
         )
         validate_decoder_source_window(window)
         self._validate_packet_collection(window.packets)
-        return window
+        return window, MappingProxyType(sample_locations)
 
     def validate_packet(self, packet: DecoderPayloadPacket) -> None:
         """Validate one destination packet against the fixed Qwen decoder schema."""

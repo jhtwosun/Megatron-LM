@@ -181,6 +181,24 @@ def test_codec_builds_canonical_zero_copy_source_window(position_components):
         torch.testing.assert_close(view, source)
 
 
+def test_codec_builds_source_sample_locations_with_window():
+    records = _records()
+
+    window, locations = MultimodalDecoderPayloadCodec().build_source_window_with_locations(
+        records, source_dp_lane=7
+    )
+
+    assert isinstance(locations, type(MappingProxyType({})))
+    assert locations == {
+        GlobalSampleId(7, 0): (0, 0),
+        GlobalSampleId(7, 1): (0, 1),
+        GlobalSampleId(7, 2): (1, 0),
+    }
+    assert window.sample_ids == tuple(locations)
+    with pytest.raises(TypeError):
+        locations[GlobalSampleId(7, 3)] = (1, 1)
+
+
 @pytest.mark.parametrize(
     ("position_components", "attention_mask", "expected_none"),
     (
