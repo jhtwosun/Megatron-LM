@@ -21,6 +21,7 @@ from megatron.core.mdp.dynamic_cp_runtime import (
     _capture_decoder_gradient_receipt_authority,
     _capture_prepared_decoder_gradient_authority,
     _consume_decoder_gradient_receipt,
+    _dynamic_iteration_plan_digest,
     _DynamicIterationAuthority,
     _DynamicProducerCarrier,
     _retire_decoder_gradient_receipt_lifecycle,
@@ -162,6 +163,7 @@ def _validate_prepared_d3_encoder_completion(
         embedding_width=authority.bridge_width,
         embedding_dtype=authority.bridge_dtype,
         cp_partition_mode=cp_partition_mode,
+        plan_digest=_dynamic_iteration_plan_digest(authority),
     )
     receipt_authority = _capture_decoder_gradient_receipt_authority(prepared.receipt)
     prepared_authority = _capture_prepared_decoder_gradient_authority(gradient_prepared)
@@ -247,6 +249,7 @@ def _validate_receipt_workspace(
         embedding_dtype=authority.bridge_dtype,
         cp_partition_mode=cp_partition_mode,
         iteration_nonce=receipt.iteration_nonce,
+        plan_digest=_dynamic_iteration_plan_digest(authority),
     )
     buffers = workspace.gradient_transport_buffers
     exchange = receipt.prepared.exchange
@@ -334,6 +337,7 @@ class _D3EncoderCompletionPreparationBinding:
             embedding_dtype=authority.bridge_dtype,
             cp_partition_mode=self.cp_partition_mode,
             destination_tensors=destinations,
+            plan_digest=_dynamic_iteration_plan_digest(authority),
         )
         validation_error = None
         try:

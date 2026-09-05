@@ -32,6 +32,7 @@ from megatron.core.mdp.dynamic_cp_runtime import (
     DecoderReadyIteration,
     PreparedDecoderGradientExchange,
     _decoder_gradient_wave_authority_digest,
+    _dynamic_iteration_plan_digest,
     _DynamicIterationAuthority,
     _make_decoder_gradient_receipt,
     _validate_retained_decoder_ready_iteration,
@@ -264,6 +265,7 @@ class _D3GradientGateBinding:
                 embedding_width=authority.bridge_width,
                 embedding_dtype=authority.bridge_dtype,
                 cp_partition_mode=self._cp_partition_mode,
+                plan_digest=_dynamic_iteration_plan_digest(authority),
             )
             workspace = self._workspace_owner.require_workspace(authority)
             if (
@@ -349,6 +351,7 @@ class _D3GradientGateBinding:
             embedding_width=authority.bridge_width,
             embedding_dtype=authority.bridge_dtype,
             cp_partition_mode=self._cp_partition_mode,
+            plan_digest=_dynamic_iteration_plan_digest(authority),
         )
         if prepared.ready is not ready:
             raise MdpBridgeError(

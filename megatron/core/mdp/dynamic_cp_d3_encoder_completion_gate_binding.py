@@ -34,6 +34,7 @@ from megatron.core.mdp.dynamic_cp_runtime import (
     DecoderGradientReceipt,
     DecoderReadyIteration,
     _decoder_gradient_wave_authority_digest,
+    _dynamic_iteration_plan_digest,
     _DynamicIterationAuthority,
     _validate_retained_decoder_ready_iteration,
 )
@@ -278,6 +279,7 @@ class _D3EncoderCompletionGateBinding:
                 embedding_width=authority.bridge_width,
                 embedding_dtype=authority.bridge_dtype,
                 cp_partition_mode=self._cp_partition_mode,
+                plan_digest=_dynamic_iteration_plan_digest(authority),
             )
             workspace = self._workspace_owner.require_workspace(authority)
             if (
