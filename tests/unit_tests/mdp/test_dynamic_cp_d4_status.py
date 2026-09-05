@@ -9,7 +9,6 @@ import pytest
 import torch
 
 from megatron.core.mdp import dynamic_cp_d4_status as status_api
-from megatron.core.mdp.dynamic_cp_transport import make_precollective_status_gather
 from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError, MdpPlanError
 
 _MANIFEST_A = bytes.fromhex("00112233445566778899aabbccddeeff")
@@ -178,6 +177,110 @@ def test_does_not_seal_transport_failure():
     assert caught.value.__cause__ is primary
 
 
+def _binding(rank=3, *, gather=None, factory_calls=None):
+    def factory(**kwargs):
+        if factory_calls is not None:
+            factory_calls.append(kwargs)
+        return (lambda *_args, **_kwargs: _rows()) if gather is None else gather
+
+    return status_api._make_repeated_d4_world_pre_gate(
+        group="world",
+        world_ranks=tuple(range(8)),
+        global_rank=rank,
+        device=torch.device("cuda", 0),
+        timeout_seconds=1.0,
+        status_gather_factory=factory,
+    )
+
+
+def test_world_pre_gate_binds_exact_transport_and_submits_one_status():
+    factory_calls = []
+    gather_calls = []
+
+    def gather(value, **kwargs):
+        gather_calls.append((value, kwargs))
+        return _rows()
+
+    gate = _binding(gather=gather, factory_calls=factory_calls)
+
+    assert (
+        gate(global_manifest_digest=_MANIFEST_A, plan_digest=_PLAN_A, gate_id=2, local_error=None)
+        is None
+    )
+    assert factory_calls == [
+        {
+            "group": "world",
+            "group_ranks": tuple(range(8)),
+            "global_rank": 3,
+            "device": torch.device("cuda", 0),
+        }
+    ]
+    assert gather_calls == [(_status(3).to_wire_tuple(), {"timeout_seconds": 1.0})]
+
+
+def test_world_pre_gate_preserves_only_the_origin_local_error_as_cause():
+    primary = RuntimeError("rank 6 preparation")
+    rows = _rows(errors={6: 1})
+
+    with pytest.raises(MdpPlanError, match="rejected rank 6") as origin:
+        _binding(6, gather=lambda *_args, **_kwargs: rows)(
+            global_manifest_digest=_MANIFEST_B, plan_digest=_PLAN_B, gate_id=2, local_error=primary
+        )
+    with pytest.raises(MdpPlanError, match="rejected rank 6") as peer:
+        _binding(3, gather=lambda *_args, **_kwargs: rows)(
+            global_manifest_digest=_MANIFEST_A, plan_digest=_PLAN_A, gate_id=2, local_error=None
+        )
+
+    assert origin.value.__cause__ is primary
+    assert peer.value.__cause__ is None
+
+
+def test_world_pre_gate_does_not_convert_transport_failure_to_logical_completion():
+    primary = RuntimeError("transport")
+
+    def fail(*_args, **_kwargs):
+        raise primary
+
+    gate = _binding(gather=fail)
+
+    with pytest.raises(MdpBridgeError, match="failed before domain collective") as caught:
+        gate(global_manifest_digest=_MANIFEST_A, plan_digest=_PLAN_A, gate_id=2, local_error=None)
+    assert caught.value.__cause__ is primary
+
+
+def test_world_pre_gate_converges_rank_local_status_validation_through_gather():
+    gather_calls = []
+
+    def gather(value, **_kwargs):
+        gather_calls.append(value)
+        rows = list(_rows(gates={3: 0}))
+        rows[3] = value
+        return tuple(rows)
+
+    gate = _binding(gather=gather)
+
+    with pytest.raises(MdpPlanError, match="gate mismatch at rank 3") as caught:
+        gate(global_manifest_digest=b"invalid", plan_digest=_PLAN_A, gate_id=2, local_error=None)
+    assert len(gather_calls) == 1
+    assert caught.value.__cause__ is not None
+    assert "digest" in str(caught.value.__cause__)
+
+
+def test_world_pre_gate_rejects_geometry_before_constructing_transport():
+    factory_calls = []
+
+    with pytest.raises(MdpConfigurationError, match=r"ordered 2\^n"):
+        status_api._make_repeated_d4_world_pre_gate(
+            group="world",
+            world_ranks=tuple(range(4)),
+            global_rank=3,
+            device=torch.device("cuda", 0),
+            timeout_seconds=1.0,
+            status_gather_factory=lambda **kwargs: factory_calls.append(kwargs),
+        )
+    assert factory_calls == []
+
+
 _WORLD8 = int(os.environ.get("WORLD_SIZE", "1")) == 8
 
 if _WORLD8:
@@ -191,25 +294,50 @@ if _WORLD8:
 
 
 @pytest.mark.skipif(not _WORLD8, reason="needs torchrun world8")
-def test_world8_rank6_failure_and_same_group_retry(world_group):
+def test_world8_rank6_failure_retry_then_domain_collective(world_group):
     rank = torch.distributed.get_rank()
     ranks = tuple(range(torch.distributed.get_world_size()))
-    gather = make_precollective_status_gather(
+    gate = status_api._make_repeated_d4_world_pre_gate(
         group=world_group,
-        group_ranks=ranks,
+        world_ranks=ranks,
         global_rank=rank,
         device=torch.device("cuda", torch.cuda.current_device()),
-    )
-
-    failed = status_api._collect_repeated_d4_world_status(
-        _status(rank, error_code=int(rank == 6)),
-        world_ranks=ranks,
-        all_gather_status=gather,
         timeout_seconds=30.0,
     )
+    domain_groups = [
+        torch.distributed.new_group(ranks=(0, 1, 2, 3)),
+        torch.distributed.new_group(ranks=(4, 5, 6, 7)),
+    ]
 
-    assert str(failed.error) == "MDP: repeated-D4 WORLD rejected rank 6 with error code 1."
-    retry = status_api._collect_repeated_d4_world_status(
-        _status(rank, gate_id=3), world_ranks=ranks, all_gather_status=gather, timeout_seconds=30.0
+    primary = RuntimeError("rank 6 preparation") if rank == 6 else None
+    with pytest.raises(MdpPlanError, match="rejected rank 6") as failed:
+        gate(
+            global_manifest_digest=_MANIFEST_A if rank < 4 else _MANIFEST_B,
+            plan_digest=_PLAN_A if rank < 4 else _PLAN_B,
+            gate_id=2,
+            local_error=primary,
+        )
+
+    assert failed.value.__cause__ is primary
+    malformed_digest = b"invalid" if rank == 6 else (_MANIFEST_A if rank < 4 else _MANIFEST_B)
+    with pytest.raises(MdpPlanError, match="gate mismatch at rank 6") as malformed:
+        gate(
+            global_manifest_digest=malformed_digest,
+            plan_digest=_PLAN_A if rank < 4 else _PLAN_B,
+            gate_id=3,
+            local_error=None,
+        )
+    assert (malformed.value.__cause__ is not None) is (rank == 6)
+    assert (
+        gate(
+            global_manifest_digest=_MANIFEST_A if rank < 4 else _MANIFEST_B,
+            plan_digest=_PLAN_A if rank < 4 else _PLAN_B,
+            gate_id=4,
+            local_error=None,
+        )
+        is None
     )
-    assert retry.error is None
+    value = torch.tensor(rank, dtype=torch.int64, device="cuda")
+    torch.distributed.all_reduce(value, group=domain_groups[rank // 4])
+    assert value.item() == (6 if rank < 4 else 22)
+    torch.distributed.destroy_process_group(domain_groups[rank // 4])
