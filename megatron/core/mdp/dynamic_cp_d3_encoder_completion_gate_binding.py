@@ -50,6 +50,7 @@ __all__ = ()
 _INT64_MAX = 2**63 - 1
 _ZERO_DIGEST = bytes(16)
 _PENDING_OWNER_SEALS: dict[object, tuple[int, ...]] = {}
+_PENDING_ATTEMPT_SEALS: dict[object, tuple[int, ...]] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +64,44 @@ class _ArmedEncoderCompletion:
     native_completion: Any
     native_owner: Any
     gate_digest: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _D3EncoderCompletionGateAttempt:
+    """Opaque result of rank-local gate-4 validation awaiting consensus."""
+
+    _binding: Any
+    _status: _PrecollectiveStatus
+    _error: BaseException | None
+    _authority: _DynamicIterationAuthority | None
+    _ready: DecoderReadyIteration | None
+    _armed: _ArmedEncoderCompletion | None
+    _factory_seal: object
+
+    def __post_init__(self) -> None:
+        values = (
+            self._binding,
+            self._status,
+            self._error,
+            self._authority,
+            self._ready,
+            self._armed,
+        )
+        fingerprint = _PENDING_ATTEMPT_SEALS.pop(self._factory_seal, None)
+        if type(self) is not _D3EncoderCompletionGateAttempt or fingerprint != tuple(
+            id(value) for value in values
+        ):
+            raise MdpStateError("MDP: D3 encoder completion gate attempt is minted by its binding.")
+
+    @property
+    def status(self) -> _PrecollectiveStatus:
+        """Return the immutable status row for an external consensus."""
+        return self._status
+
+    @property
+    def error(self) -> BaseException | None:
+        """Return the local validation error represented by the status row."""
+        return self._error
 
 
 class _D3EncoderCompletionGateBinding:
@@ -81,6 +120,8 @@ class _D3EncoderCompletionGateBinding:
         "_group_ranks_getter",
         "_state",
         "_armed",
+        "_attempt",
+        "_attempt_fingerprint",
         "_tombstone",
     )
 
@@ -132,6 +173,8 @@ class _D3EncoderCompletionGateBinding:
         self._timeout_seconds = normalized_timeout
         self._state = "idle"
         self._armed: _ArmedEncoderCompletion | None = None
+        self._attempt: _D3EncoderCompletionGateAttempt | None = None
+        self._attempt_fingerprint: tuple[Any, ...] | None = None
         self._tombstone: tuple[weakref.ReferenceType[Any], ...] | None = None
 
     @property
@@ -334,20 +377,61 @@ class _D3EncoderCompletionGateBinding:
             weakref.ref(value) if value is not None else lambda: None for value in values
         )
 
-    def status_gate(
+    @staticmethod
+    def _fingerprint_attempt(attempt: _D3EncoderCompletionGateAttempt) -> tuple[Any, ...]:
+        return (
+            id(attempt._binding),
+            id(attempt._status),
+            attempt._status.to_wire_tuple(),
+            id(attempt._error),
+            id(attempt._authority),
+            id(attempt._ready),
+            id(attempt._armed),
+            id(attempt._factory_seal),
+        )
+
+    def _require_active_attempt(self, attempt: Any) -> _D3EncoderCompletionGateAttempt:
+        active = self._attempt
+        if (
+            self._state != "claimed"
+            or active is None
+            or attempt is not active
+            or type(attempt) is not _D3EncoderCompletionGateAttempt
+            or attempt._binding is not self
+        ):
+            raise MdpStateError(
+                "MDP: D3 encoder completion gate resolution requires its active attempt."
+            )
+        try:
+            fingerprint = self._fingerprint_attempt(attempt)
+        except BaseException:
+            fingerprint = None
+        if fingerprint != self._attempt_fingerprint:
+            self._clear_attempt()
+            self._state = "poisoned"
+            raise MdpTaskFatalError(
+                "MDP: D3 encoder completion gate attempt retains its sealed fields."
+            )
+        return attempt
+
+    def _clear_attempt(self) -> None:
+        self._attempt = None
+        self._attempt_fingerprint = None
+
+    def prepare_status_attempt(
         self, context: _D3GateStatusContext, local_error: BaseException | None, /
-    ) -> None:
-        """Authorize the exact local gate-4 completion through status consensus."""
+    ) -> _D3EncoderCompletionGateAttempt:
+        """Validate gate 4 locally for a caller-guarded external consensus.
+
+        State and replay failures deliberately raise before an attempt is
+        returned.  Callers must invoke this method inside their guarded local
+        preparation, raise an error-bearing attempt's ``error`` from that same
+        guarded scope, and resolve every returned attempt exactly once.
+        """
         if self._state == "poisoned":
             raise MdpTaskFatalError(
                 "MDP: poisoned D3 encoder completion gate binding cannot be reused."
             )
-        if type(context) is _D3GateStatusContext and context.gate_id != 4:
-            if self._state != "idle":
-                raise MdpStateError(
-                    "MDP: non-completion status requires an idle encoder completion binding."
-                )
-            return self._fallback_status_gate(context, local_error)
         if self._state == "armed":
             raise MdpStateError("MDP: D3 encoder completion gate binding is already armed.")
         if self._state != "idle":
@@ -368,39 +452,94 @@ class _D3EncoderCompletionGateBinding:
             error_code=int(error is not None),
             gate_id=4,
         )
+        values = (self, status, error, authority, ready, armed)
+        factory_seal = object()
+        _PENDING_ATTEMPT_SEALS[factory_seal] = tuple(id(value) for value in values)
+        try:
+            try:
+                attempt = _D3EncoderCompletionGateAttempt(*values, factory_seal)
+            finally:
+                _PENDING_ATTEMPT_SEALS.pop(factory_seal, None)
+            self._attempt = attempt
+            self._attempt_fingerprint = self._fingerprint_attempt(attempt)
+        except BaseException:
+            self._clear_attempt()
+            self._state = "poisoned"
+            raise
+        return attempt
+
+    def accept_status_attempt(self, attempt: _D3EncoderCompletionGateAttempt, /) -> None:
+        """Install one exact locally prepared attempt after external consensus."""
+        active = self._require_active_attempt(attempt)
+        try:
+            if active._error is not None:
+                raise MdpStateError(
+                    "MDP: D3 encoder completion gate status accepted a local error."
+                ) from active._error
+            if active._armed is None:
+                raise MdpTaskFatalError(
+                    "MDP: D3 encoder completion gate status accepted no prepared carrier."
+                )
+            self._armed = active._armed
+            self._clear_attempt()
+            self._state = "armed"
+        except BaseException:
+            self._clear_attempt()
+            self._state = "poisoned"
+            raise
+
+    def abort_status_attempt(
+        self, attempt: _D3EncoderCompletionGateAttempt, error: BaseException, /
+    ) -> None:
+        """Resolve one failed external consensus using its actual exception."""
+        active = self._require_active_attempt(attempt)
+        if not isinstance(error, BaseException):
+            raise MdpConfigurationError(
+                "MDP: D3 encoder completion gate abort requires the caught exception."
+            )
+        self._clear_attempt()
+        if isinstance(error, MdpPlanError):
+            self._retire_attempt(active._authority, active._ready, active._armed)
+            self._state = "idle"
+        else:
+            self._state = "poisoned"
+
+    def status_gate(
+        self, context: _D3GateStatusContext, local_error: BaseException | None, /
+    ) -> None:
+        """Authorize the exact local gate-4 completion through status consensus."""
+        if self._state == "poisoned":
+            raise MdpTaskFatalError(
+                "MDP: poisoned D3 encoder completion gate binding cannot be reused."
+            )
+        if type(context) is _D3GateStatusContext and context.gate_id != 4:
+            if self._state != "idle":
+                raise MdpStateError(
+                    "MDP: non-completion status requires an idle encoder completion binding."
+                )
+            return self._fallback_status_gate(context, local_error)
+        attempt = self.prepare_status_attempt(context, local_error)
         try:
             _run_precollective_consensus(
-                status,
+                attempt.status,
                 group_ranks=self._group_ranks,
                 all_gather_status=self._all_gather_status,
                 timeout_seconds=self._timeout_seconds,
             )
         except MdpBridgeError as caught:
-            self._state = "poisoned"
-            if error is not None and caught.__cause__ is None:
-                raise caught from error
+            self.abort_status_attempt(attempt, caught)
+            if attempt.error is not None and caught.__cause__ is None:
+                raise caught from attempt.error
             raise
         except MdpPlanError as caught:
-            self._retire_attempt(authority, ready, armed)
-            self._state = "idle"
-            if error is not None and caught.__cause__ is None:
-                raise caught from error
+            self.abort_status_attempt(attempt, caught)
+            if attempt.error is not None and caught.__cause__ is None:
+                raise caught from attempt.error
             raise
-        except BaseException:
-            self._state = "poisoned"
+        except BaseException as caught:
+            self.abort_status_attempt(attempt, caught)
             raise
-        if error is not None:
-            self._state = "poisoned"
-            raise MdpStateError(
-                "MDP: D3 encoder completion gate status accepted a local error."
-            ) from error
-        if armed is None:
-            self._state = "poisoned"
-            raise MdpTaskFatalError(
-                "MDP: D3 encoder completion gate status accepted no prepared carrier."
-            )
-        self._armed = armed
-        self._state = "armed"
+        self.accept_status_attempt(attempt)
 
     def claim_for_backward(self, prepared: _PreparedD3EncoderCompletion, /) -> Any:
         """Consume one authorized carrier and return its opaque native preparation."""
