@@ -13,6 +13,7 @@ from typing import Optional, Sequence
 import torch
 import torch.distributed as dist
 
+from megatron.core.mdp.dynamic_cp import DynamicCpGroupMembership, nested_dynamic_cp_group_specs
 from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError
 from megatron.core.mdp.protocols import VisionDescriptor
 from megatron.core.mdp.rank_mapping import MdpRankMap
@@ -24,7 +25,10 @@ DESCRIPTOR_SLOTS = 12
 
 @dataclass(frozen=True)
 class MdpProcessGroups:
-    """The process groups one rank participates in."""
+    """The process groups one rank participates in.
+
+    ``encoder_cp_groups`` is empty on the unchanged static path.
+    """
 
     planning_group: dist.ProcessGroup
     encoder_cp_group: dist.ProcessGroup
@@ -34,6 +38,7 @@ class MdpProcessGroups:
     encoder_reduction_group: dist.ProcessGroup
     world_group: dist.ProcessGroup
     decoder_tp_group: Optional[dist.ProcessGroup] = None
+    encoder_cp_groups: tuple[DynamicCpGroupMembership, ...] = ()
 
 
 class MdpGroupRegistry:
@@ -74,7 +79,13 @@ class MdpGroupRegistry:
     def assert_no_leak(self) -> None:
         """Every created key must be a planning group or a registered alias."""
         for key in self._groups:
-            if key[0] not in ("planning", "encoder_cp", "singleton", "world_alias"):
+            if key[0] not in (
+                "planning",
+                "encoder_cp",
+                "encoder_cp_dynamic",
+                "singleton",
+                "world_alias",
+            ):
                 raise MdpConfigurationError(
                     f"MDP: group registry violates: no unexpected groups (found {key})."
                 )
@@ -85,6 +96,8 @@ def install_mdp_process_groups(
     *,
     group_registry: MdpGroupRegistry,
     decoder_pg_collection=None,
+    dynamic_encoder_cp: bool = False,
+    min_dynamic_encoder_cp_size: int = 1,
 ) -> MdpProcessGroups:
     """Install MDP process groups; every rank creates groups in the same order.
 
@@ -93,6 +106,34 @@ def install_mdp_process_groups(
     Encoder-CP size one aliases the corresponding singleton. Encoder gradient
     reduction and optimizer sharding continue to alias WORLD.
     """
+    if type(dynamic_encoder_cp) is not bool:
+        raise MdpConfigurationError("MDP: dynamic encoder CP enablement is an exact bool.")
+    dynamic_specs_by_worker = ()
+    if dynamic_encoder_cp:
+        if type(min_dynamic_encoder_cp_size) is not int:
+            raise MdpConfigurationError("MDP: dynamic encoder CP minimum size is an exact integer.")
+        dynamic_specs_by_worker = tuple(
+            (
+                outer_dp_rank,
+                worker_id,
+                ranks,
+                nested_dynamic_cp_group_specs(ranks, minimum_size=min_dynamic_encoder_cp_size),
+            )
+            for outer_dp_rank, _ in enumerate(rank_map.planning_groups())
+            for worker_id in range(rank_map.num_workers_per_group)
+            for ranks in (rank_map.worker_ranks(outer_dp_rank, worker_id),)
+        )
+        if any(
+            len(ranks) != rank_map.spec.encoder_cp
+            or not specs
+            or specs[-1].group_size != rank_map.spec.encoder_cp
+            or specs[-1].ranks != ranks
+            for _, _, ranks, specs in dynamic_specs_by_worker
+        ):
+            raise MdpConfigurationError(
+                "MDP: dynamic encoder CP minimum/maximum sizes match each exact worker pool."
+            )
+
     world = dist.group.WORLD
     my_rank = dist.get_rank()
     decoder_tp_group = (
@@ -129,6 +170,7 @@ def install_mdp_process_groups(
     my_encoder_cp_group = None
     my_encoder_cp_group_ranks = None
     my_encoder_cp_leader_rank = None
+    encoder_cp_groups = {}
     for outer_dp_rank, _ in enumerate(rank_map.planning_groups()):
         for worker_id in range(rank_map.num_workers_per_group):
             ranks = rank_map.worker_ranks(outer_dp_rank, worker_id)
@@ -139,10 +181,46 @@ def install_mdp_process_groups(
                 group_registry.register_alias(key, ranks, group)
             else:
                 group = group_registry.get_or_create(key, ranks)
+            encoder_cp_groups[(outer_dp_rank, worker_id)] = group
             if my_rank in ranks:
                 my_encoder_cp_group = group
                 my_encoder_cp_group_ranks = ranks
                 my_encoder_cp_leader_rank = leader_rank
+
+    dynamic_groups = {}
+    for outer_dp_rank, worker_id, ranks, specs in dynamic_specs_by_worker:
+        for spec in specs:
+            if spec.group_size in (1, len(ranks)):
+                continue
+            key = (
+                "encoder_cp_dynamic",
+                outer_dp_rank,
+                worker_id,
+                spec.group_size,
+                spec.group_index,
+            )
+            dynamic_groups[(outer_dp_rank, worker_id, spec.group_size, spec.group_index)] = (
+                group_registry.get_or_create(key, spec.ranks)
+            )
+
+    my_dynamic_memberships = []
+    for outer_dp_rank, worker_id, ranks, specs in dynamic_specs_by_worker:
+        if my_rank not in ranks:
+            continue
+        for spec in specs:
+            if my_rank not in spec.ranks:
+                continue
+            if spec.group_size == 1:
+                group = singleton_groups[my_rank]
+            elif spec.group_size == len(ranks):
+                group = encoder_cp_groups[(outer_dp_rank, worker_id)]
+            else:
+                group = dynamic_groups[
+                    (outer_dp_rank, worker_id, spec.group_size, spec.group_index)
+                ]
+            my_dynamic_memberships.append(
+                DynamicCpGroupMembership(spec.group_size, spec.ranks, group)
+            )
 
     group_registry.register_alias(
         ("world_alias",), tuple(range(rank_map.spec.world_size)), world
@@ -153,6 +231,7 @@ def install_mdp_process_groups(
         or my_encoder_cp_group is None
         or my_encoder_cp_group_ranks is None
         or my_encoder_cp_leader_rank is None
+        or (dynamic_encoder_cp and not my_dynamic_memberships)
     ):
         raise MdpConfigurationError(
             f"MDP: rank {my_rank} violates: every rank belongs to one singleton, "
@@ -167,6 +246,7 @@ def install_mdp_process_groups(
         encoder_reduction_group=world,
         world_group=world,
         decoder_tp_group=decoder_tp_group,
+        encoder_cp_groups=tuple(my_dynamic_memberships),
     )
 
 
