@@ -302,6 +302,182 @@ def test_private_factory_signatures_state_and_fallback(gate_api):
         api._make_d3_encoder_completion_gate_binding(**{**kwargs, "timeout_seconds": 10**1000})
 
 
+def test_external_attempt_prepares_without_collective_and_blocks_claim_or_reentry(gate_api):
+    api = gate_api
+    parts = _parts()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("external preparation must not gather")
+
+    binding = _binding(api, parts[2], gather=forbidden)
+    attempt = binding.prepare_status_attempt(_context(parts), None)
+
+    assert type(attempt) is api._D3EncoderCompletionGateAttempt
+    assert attempt.status.error_code == 0 and attempt.error is None
+    assert binding.state == "claimed" and not binding.is_armed
+    with pytest.raises(MdpStateError, match="requires one armed"):
+        binding.claim_for_backward(parts[5])
+    with pytest.raises(MdpStateError, match="already claimed"):
+        binding.prepare_status_attempt(_context(parts), None)
+    with pytest.raises(MdpStateError, match="minted by its binding"):
+        api._D3EncoderCompletionGateAttempt(None, None, None, None, None, None, None)
+    with pytest.raises(MdpStateError, match="minted by its binding"):
+        api._D3EncoderCompletionGateAttempt(
+            attempt._binding,
+            attempt._status,
+            attempt._error,
+            attempt._authority,
+            attempt._ready,
+            attempt._armed,
+            attempt._factory_seal,
+        )
+
+
+def test_external_attempt_accepts_exact_token_and_rejects_foreign_or_double_resolution(
+    gate_api, monkeypatch
+):
+    api = gate_api
+    first = _parts()
+    second = _parts(nonce=b"s" * 16)
+    first_binding = _binding(api, first[2])
+    second_binding = _binding(api, second[2])
+    first_attempt = first_binding.prepare_status_attempt(_context(first), None)
+    second_attempt = second_binding.prepare_status_attempt(_context(second), None)
+
+    with pytest.raises(MdpStateError, match="active attempt"):
+        first_binding.accept_status_attempt(second_attempt)
+    assert first_binding.state == "claimed"
+
+    monkeypatch.setattr(
+        api._D3EncoderCompletionGateBinding,
+        "_validate_gate4",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("accept must not repeat validation")
+        ),
+    )
+    first_binding.accept_status_attempt(first_attempt)
+    assert first_binding.is_armed
+    assert first_binding.claim_for_backward(first[5]) is first[6]
+    with pytest.raises(MdpStateError, match="active attempt"):
+        first_binding.accept_status_attempt(first_attempt)
+
+    second_binding.abort_status_attempt(second_attempt, MdpPlanError("peer rejection"))
+    assert second_binding.is_idle
+    with pytest.raises(MdpStateError, match="active attempt"):
+        second_binding.abort_status_attempt(second_attempt, MdpPlanError("again"))
+
+
+def test_external_attempt_mutation_is_rejected_without_installing_authority(gate_api):
+    api = gate_api
+    parts = _parts()
+    binding = _binding(api, parts[2])
+    attempt = binding.prepare_status_attempt(_context(parts), None)
+    object.__setattr__(
+        attempt,
+        "_status",
+        api._PrecollectiveStatus(
+            global_rank=7,
+            global_manifest_digest=b"x" * 16,
+            plan_digest=attempt.status.plan_digest,
+            error_code=0,
+            gate_id=4,
+        ),
+    )
+
+    with pytest.raises(MdpTaskFatalError, match="sealed fields"):
+        binding.accept_status_attempt(attempt)
+    assert binding.is_poisoned and not binding.is_armed
+
+    parts = _parts()
+    binding = _binding(api, parts[2])
+    attempt = binding.prepare_status_attempt(_context(parts), None)
+    object.__setattr__(attempt, "_authority", object())
+    with pytest.raises(MdpTaskFatalError, match="sealed fields"):
+        binding.abort_status_attempt(attempt, MdpPlanError("must not retire forged identity"))
+    assert binding.is_poisoned and binding._tombstone is None
+
+
+def test_external_attempt_error_is_raised_by_guarded_caller_then_aborted(gate_api):
+    api = gate_api
+    parts = _parts()
+    binding = _binding(api, parts[2])
+    local_error = RuntimeError("local gate4 preparation")
+    attempt = binding.prepare_status_attempt(_context(parts, value=False), local_error)
+
+    assert attempt.error is local_error and attempt.status.error_code == 1
+    assert binding.state == "claimed"
+    with pytest.raises(RuntimeError, match="local gate4 preparation"):
+        raise attempt.error
+    binding.abort_status_attempt(attempt, MdpPlanError("WORLD rejected local error"))
+    assert binding.is_idle
+
+
+def test_external_attempt_mint_failure_poison_does_not_strand_claimed(gate_api, monkeypatch):
+    api = gate_api
+    parts = _parts()
+    binding = _binding(api, parts[2])
+    monkeypatch.setattr(
+        api._D3EncoderCompletionGateBinding,
+        "_fingerprint_attempt",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("fingerprint")),
+    )
+
+    with pytest.raises(RuntimeError, match="fingerprint"):
+        binding.prepare_status_attempt(_context(parts), None)
+    assert binding.is_poisoned and binding._attempt is None
+
+
+@pytest.mark.parametrize("failure", (MdpBridgeError("transport"), RuntimeError("unknown")))
+def test_external_attempt_abort_classifies_logical_and_fatal_failures(gate_api, failure):
+    api = gate_api
+    parts = _parts()
+    binding = _binding(api, parts[2])
+    attempt = binding.prepare_status_attempt(_context(parts), None)
+    binding.abort_status_attempt(attempt, failure)
+    assert binding.is_poisoned
+
+    retired = _parts()
+    binding = _binding(api, retired[2])
+    attempt = binding.prepare_status_attempt(_context(retired), None)
+    binding.abort_status_attempt(attempt, MdpPlanError("coordinated rejection"))
+    assert binding.is_idle
+    with pytest.raises(MdpTaskFatalError, match="cannot be replayed"):
+        binding.prepare_status_attempt(_context(retired), None)
+    assert binding.is_poisoned
+
+
+def test_status_gate_resolves_through_external_attempt_seam(gate_api, monkeypatch):
+    api = gate_api
+    parts = _parts()
+    binding = _binding(api, parts[2])
+    events = []
+    prepare = api._D3EncoderCompletionGateBinding.prepare_status_attempt
+    accept = api._D3EncoderCompletionGateBinding.accept_status_attempt
+
+    def tracked_prepare(self, context, local_error, /):
+        events.append("prepare")
+        return prepare(self, context, local_error)
+
+    def tracked_accept(self, attempt, /):
+        events.append("accept")
+        return accept(self, attempt)
+
+    monkeypatch.setattr(
+        api._D3EncoderCompletionGateBinding, "prepare_status_attempt", tracked_prepare
+    )
+    monkeypatch.setattr(
+        api._D3EncoderCompletionGateBinding, "accept_status_attempt", tracked_accept
+    )
+    monkeypatch.setattr(
+        api, "_run_precollective_consensus", lambda *_args, **_kwargs: events.append("gather")
+    )
+
+    binding.status_gate(_context(parts), None)
+
+    assert events == ["prepare", "gather", "accept"]
+    assert binding.claim_for_backward(parts[5]) is parts[6]
+
+
 @pytest.mark.parametrize("mode", ("contiguous", "zigzag"))
 def test_valid_digest_arms_and_exact_claim_only_unwraps(gate_api, mode):
     api = gate_api
