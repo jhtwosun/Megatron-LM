@@ -22,7 +22,11 @@ from megatron.core.mdp.dynamic_cp_d4_authority_collective import (
 )
 from megatron.core.mdp.dynamic_cp_d4_group_binding import _RepeatedD4GroupBinding
 from megatron.core.mdp.dynamic_cp_execution import _require_digest
-from megatron.core.mdp.dynamic_cp_runtime import _DynamicIterationAuthority, _DynamicProducerCarrier
+from megatron.core.mdp.dynamic_cp_runtime import (
+    _dynamic_iteration_plan_digest,
+    _DynamicIterationAuthority,
+    _DynamicProducerCarrier,
+)
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError, MdpTaskFatalError
 
 __all__ = ()
@@ -66,7 +70,7 @@ def _candidate_terminal_digest(binding: Any, authority: Any, commit_ready: Any) 
     try:
         return _terminal_commit_digest(
             global_manifest_digest=authority.global_manifest.digest,
-            plan_digest=authority.plan.digest,
+            plan_digest=_dynamic_iteration_plan_digest(authority),
             iteration=commit_ready.iteration,
             world_ranks=binding.world_ranks,
         )
@@ -160,7 +164,7 @@ def run_repeated_d4_iteration_commit(
             raise MdpStateError("MDP: repeated-D4 Gate 7 retains its exact commit capability.")
         expected_digest = _terminal_commit_digest(
             global_manifest_digest=snapshot.global_manifest.digest,
-            plan_digest=snapshot.plan.digest,
+            plan_digest=_dynamic_iteration_plan_digest(snapshot),
             iteration=ready.iteration,
             world_ranks=binding.world_ranks,
         )

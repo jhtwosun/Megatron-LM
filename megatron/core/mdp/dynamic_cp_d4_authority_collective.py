@@ -9,7 +9,10 @@ from megatron.core.mdp.dynamic_cp_d4_group_binding import (
     _RepeatedD4GroupBinding,
     _validate_repeated_d4_group_binding,
 )
-from megatron.core.mdp.dynamic_cp_runtime import _DynamicIterationAuthority
+from megatron.core.mdp.dynamic_cp_runtime import (
+    _dynamic_iteration_plan_digest,
+    _DynamicIterationAuthority,
+)
 from megatron.core.mdp.errors import MdpStateError
 
 __all__ = ()
@@ -55,6 +58,14 @@ def _candidate_digest(authority: Any, field: str) -> Any:
         return None
 
 
+def _candidate_iteration_plan_digest(authority: Any) -> bytes | None:
+    """Read validated decoder-only plan authority without skipping WORLD."""
+    try:
+        return _dynamic_iteration_plan_digest(authority)
+    except BaseException:
+        return None
+
+
 def run_repeated_d4_authority_collective(
     binding: _RepeatedD4GroupBinding,
     authority: _DynamicIterationAuthority,
@@ -81,7 +92,7 @@ def run_repeated_d4_authority_collective(
 
     return runner.run(
         global_manifest_digest=_candidate_digest(authority, "global_manifest"),
-        plan_digest=_candidate_digest(authority, "plan"),
+        plan_digest=_candidate_iteration_plan_digest(authority),
         gate_id=gate_id,
         prepare=prepare_bound_value,
         domain_collective=domain_collective,

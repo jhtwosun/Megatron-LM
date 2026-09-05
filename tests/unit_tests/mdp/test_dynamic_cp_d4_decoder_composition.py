@@ -129,6 +129,11 @@ def _typed_dependencies(monkeypatch, request):
     monkeypatch.setattr(coordinator_module, "DecoderReadyIteration", _Ready)
     monkeypatch.setattr(coordinator_module, "DecoderGradientReceipt", _Receipt)
     monkeypatch.setattr(
+        coordinator_module,
+        "_dynamic_iteration_plan_digest",
+        lambda authority: authority.plan.digest,
+    )
+    monkeypatch.setattr(
         coordinator_module, "validate_decoder_ready_iteration", lambda ready, **_kwargs: ready
     )
     monkeypatch.setattr(
