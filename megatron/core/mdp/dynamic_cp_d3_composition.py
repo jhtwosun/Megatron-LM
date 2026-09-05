@@ -49,6 +49,7 @@ from megatron.core.mdp.dynamic_cp_routing import attach_local_decoder_payload_te
 from megatron.core.mdp.dynamic_cp_runtime import (
     DYNAMIC_RUNTIME_SCHEMA_VERSION,
     _consensus_dynamic_execution_config,
+    _dynamic_iteration_plan_digest,
     _DynamicExecutionConfig,
     _DynamicProducerCarrier,
 )
@@ -87,7 +88,7 @@ def _run_status(
     status = _PrecollectiveStatus(
         global_rank=global_rank,
         global_manifest_digest=context.authority.global_manifest.digest,
-        plan_digest=context.authority.plan.digest,
+        plan_digest=_dynamic_iteration_plan_digest(context.authority),
         error_code=int(local_error is not None),
         gate_id=context.gate_id,
     )
@@ -255,7 +256,9 @@ def _build_d3_runtime_facade(
         def authority_status_gate(local_error):
             authority = authority_slot["value"]
             digest = bytes(16) if authority is None else authority.global_manifest.digest
-            plan_digest = bytes(16) if authority is None else authority.plan.digest
+            plan_digest = (
+                bytes(16) if authority is None else _dynamic_iteration_plan_digest(authority)
+            )
             status = _PrecollectiveStatus(
                 global_rank, digest, plan_digest, int(local_error is not None), 0
             )

@@ -4,7 +4,7 @@
 
 import os
 from importlib import import_module
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 import torch
@@ -206,6 +206,13 @@ def test_authority_collective_binds_exact_digests_and_callbacks(monkeypatch):
     api = import_module("megatron.core.mdp.dynamic_cp_d4_authority_collective")
     binding, authority = _iteration_authority()
     events = []
+    digest_authorities = []
+
+    def plan_digest(actual):
+        digest_authorities.append(actual)
+        return actual.plan.digest
+
+    monkeypatch.setattr(api, "_dynamic_iteration_plan_digest", plan_digest)
 
     class _Runner:
         def run(self, **kwargs):
@@ -236,10 +243,129 @@ def test_authority_collective_binds_exact_digests_and_callbacks(monkeypatch):
     call = events[1][1]
     assert call["global_manifest_digest"] == authority.global_manifest.digest
     assert call["plan_digest"] == authority.plan.digest
+    assert digest_authorities == [authority]
     assert call["gate_id"] == 2
     assert call["prepare"] is not prepare and callable(call["prepare"])
     assert call["domain_collective"] is collective
     assert events[2:] == [("prepare",), ("collective", "prepared")]
+
+
+def test_malformed_plan_digest_helper_still_enters_gate0_world(monkeypatch):
+    api = import_module("megatron.core.mdp.dynamic_cp_d4_authority_collective")
+    order = import_module("megatron.core.mdp.dynamic_cp_d4_collective_order")
+    binding, authority = _iteration_authority()
+    world_calls = []
+    runner = order._make_repeated_d4_collective_runner(
+        attempt_nonce=b"n" * 16,
+        world_pre_gate=lambda **kwargs: world_calls.append(kwargs),
+        domain_status_collector=lambda **_kwargs: pytest.fail("domain ran after malformed Gate 0"),
+    )
+    monkeypatch.setattr(type(binding), "begin_attempt", lambda *_args, **_kwargs: runner)
+    monkeypatch.setattr(
+        api,
+        "_dynamic_iteration_plan_digest",
+        lambda _authority: (_ for _ in ()).throw(KeyboardInterrupt("bad plan digest")),
+    )
+
+    with pytest.raises(MdpStateError, match="accepted a local error"):
+        api.run_repeated_d4_authority_collective(
+            binding,
+            authority,
+            gate_id=0,
+            prepare=lambda: pytest.fail("prepare ran after malformed plan digest"),
+            domain_collective=lambda _value: pytest.fail("collective ran"),
+        )
+
+    assert len(world_calls) == 1
+    assert world_calls[0]["gate_id"] == 0
+    assert isinstance(world_calls[0]["local_error"], MdpPlanError)
+
+
+def test_nested_d3_authority_status_uses_exact_legacy_iteration_plan_digest(monkeypatch):
+    composition = import_module("megatron.core.mdp.dynamic_cp_d3_composition")
+    group = SimpleNamespace(ranks=(0, 1), size=lambda: 2, rank=lambda: 0)
+    runtime = SimpleNamespace(
+        rank_map=SimpleNamespace(spec=SimpleNamespace(tp=1, ep=1, pp=1, cp=1, encoder_cp=1)),
+        num_vpp_chunks=1,
+        config=SimpleNamespace(dynamic_encoder_cp=False, overlap_window_capture=False),
+        device=torch.device("cuda", 0),
+        params_dtype=torch.bfloat16,
+        hidden_size=8,
+        allocator=object(),
+        storage=object(),
+        _prepare_dynamic_encoder_producer=lambda *_args, **_kwargs: None,
+    )
+    codec = SimpleNamespace(rebuild_microbatch=lambda *_args, **_kwargs: None)
+    statuses = []
+    digest_authorities = []
+
+    def plan_digest(actual):
+        digest_authorities.append(actual)
+        return actual.plan.digest
+
+    monkeypatch.setattr(composition, "_dynamic_iteration_plan_digest", plan_digest)
+    monkeypatch.setattr(
+        composition,
+        "_run_precollective_consensus",
+        lambda status, **_kwargs: statuses.append(status),
+    )
+    facade = composition._build_d3_runtime_facade(
+        producer_runtime=runtime,
+        codec=codec,
+        group=group,
+        participant_ranks=(0, 1),
+        global_rank=0,
+        device=runtime.device,
+        expected_source_lanes=(0,),
+        decoder_solver=_FullGroupSolver(),
+        max_seqlen_per_rank=8,
+        minimum_cp_size=1,
+        decoder_group_getter=lambda _size: group,
+        decoder_group_ranks_getter=lambda _group: (0, 1),
+        timeout_seconds=5.0,
+        group_ranks_getter=lambda _group: (0, 1),
+        all_to_all_single=lambda *_args, **_kwargs: None,
+    )
+    config = facade._config_factory(None, num_microbatches=1, forward_only=False)
+    coordinator = facade._coordinator_factory(None, num_microbatches=1, forward_only=False)
+    authority = coordinator._bindings.build_authority(_metadata(0, 0), object(), config)
+    coordinator._bindings.authority_status_gate(None)
+
+    assert digest_authorities == [authority]
+    assert statuses[0].plan_digest == authority.plan.digest
+
+
+def test_d3_gate2_status_uses_exact_legacy_iteration_plan_digest(monkeypatch):
+    composition = import_module("megatron.core.mdp.dynamic_cp_d3_composition")
+    coordinator = import_module("megatron.core.mdp.dynamic_cp_d3_coordinator")
+    binding, authority = _iteration_authority()
+    statuses = []
+    digest_authorities = []
+
+    def plan_digest(actual):
+        digest_authorities.append(actual)
+        return actual.plan.digest
+
+    monkeypatch.setattr(composition, "_dynamic_iteration_plan_digest", plan_digest)
+    monkeypatch.setattr(
+        composition,
+        "_run_precollective_consensus",
+        lambda status, **_kwargs: statuses.append(status),
+    )
+    composition._run_status(
+        coordinator._make_d3_gate_status_context(
+            gate_id=2, authority=authority, phase_value=None, ready=None
+        ),
+        None,
+        global_rank=binding.global_rank,
+        group_ranks=binding.domain_ranks,
+        all_gather_status=lambda _status: None,
+        timeout_seconds=5.0,
+    )
+
+    assert digest_authorities == [authority]
+    assert statuses[0].plan_digest == authority.plan.digest
+    assert statuses[0].gate_id == 2
 
 
 def test_authority_collective_rejects_foreign_domain_inside_preparation(monkeypatch):

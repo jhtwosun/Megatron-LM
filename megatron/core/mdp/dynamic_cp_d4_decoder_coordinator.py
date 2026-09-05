@@ -11,6 +11,7 @@ from megatron.core.mdp.dynamic_cp_bridge_transport import PreparedDynamicBridgeE
 from megatron.core.mdp.dynamic_cp_runtime import (
     DecoderGradientReceipt,
     DecoderReadyIteration,
+    _dynamic_iteration_plan_digest,
     _DynamicIterationAuthority,
     _validate_decoder_gradient_receipt,
     validate_decoder_ready_iteration,
@@ -119,7 +120,7 @@ class _D4DecoderCoordinator:
         assert payload is not None and embedding is not None
         if (
             ready.global_manifest_digest != authority.global_manifest.digest
-            or ready.decoder_plan_digest != authority.plan.digest
+            or ready.decoder_plan_digest != _dynamic_iteration_plan_digest(authority)
             or ready.payload_bundle_authority_digest != payload.bundle_authority_digest
             or ready.embedding_route_authority_digest != embedding.route_authority_digest
             or ready.participant_ranks != authority.participant_ranks
@@ -140,6 +141,7 @@ class _D4DecoderCoordinator:
             embedding_width=authority.bridge_width,
             embedding_dtype=authority.bridge_dtype,
             cp_partition_mode=ready.cp_partition_mode,
+            plan_digest=_dynamic_iteration_plan_digest(authority),
         )
         if validated is not ready:
             raise MdpStateError(
@@ -176,6 +178,7 @@ class _D4DecoderCoordinator:
             embedding_dtype=authority.bridge_dtype,
             cp_partition_mode=ready.cp_partition_mode,
             iteration_nonce=receipt.iteration_nonce,
+            plan_digest=_dynamic_iteration_plan_digest(authority),
         )
         if validated is not receipt:
             raise MdpStateError(

@@ -229,12 +229,18 @@ def test_composes_qwen_vision_and_text_ready_handoff_with_one_canonical_assignme
     api = _api()
     materialize = api._materialize_d3_decoder_ready_artifacts
     captured = {}
+    digest_authorities = []
+
+    def plan_digest(actual):
+        digest_authorities.append(actual)
+        return actual.plan.digest
 
     def capture_materialization(**kwargs):
         captured["assignments"] = kwargs["assignments"]
         return materialize(**kwargs)
 
     monkeypatch.setattr(api, "_materialize_d3_decoder_ready_artifacts", capture_materialization)
+    monkeypatch.setattr(api, "_dynamic_iteration_plan_digest", plan_digest)
     try:
         ready = _compose(context)
         runtime = import_module("megatron.core.mdp.dynamic_cp_runtime")
@@ -244,6 +250,7 @@ def test_composes_qwen_vision_and_text_ready_handoff_with_one_canonical_assignme
         assert tuple(ready.embedding_leaves) == (ready.assignments[0].key,)
         assert ready.assignments[0].key is next(iter(ready.embedding_leaves))
         assert captured["assignments"] is ready.assignments
+        assert ready.decoder_plan_digest == authority.plan.digest
         runtime.validate_decoder_ready_iteration(
             ready,
             global_manifest=authority.global_manifest,
@@ -257,7 +264,9 @@ def test_composes_qwen_vision_and_text_ready_handoff_with_one_canonical_assignme
             embedding_width=authority.bridge_width,
             embedding_dtype=authority.bridge_dtype,
             cp_partition_mode="contiguous",
+            plan_digest=authority.plan.digest,
         )
+        assert digest_authorities == [authority, authority, authority]
         with pytest.raises(MdpStateError, match="fresh"):
             _compose(context)
     finally:

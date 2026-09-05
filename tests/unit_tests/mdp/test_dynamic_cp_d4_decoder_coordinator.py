@@ -67,6 +67,11 @@ class _Receipt:
 @pytest.fixture(autouse=True)
 def _typed_carriers(monkeypatch):
     monkeypatch.setattr(coordinator_module, "_DynamicIterationAuthority", _Authority)
+    monkeypatch.setattr(
+        coordinator_module,
+        "_dynamic_iteration_plan_digest",
+        lambda authority: authority.plan.digest,
+    )
     monkeypatch.setattr(coordinator_module, "PreparedDecoderPayloadBundle", _Payload)
     monkeypatch.setattr(coordinator_module, "PreparedDynamicBridgeExchange", _Embedding)
     monkeypatch.setattr(coordinator_module, "DecoderReadyIteration", _Ready)
@@ -263,6 +268,11 @@ def test_runs_exact_prefix_then_one_gradient_without_false_retirement(monkeypatc
     coordinator = _make_d4_decoder_coordinator(bindings=bindings)
     authority = _Authority()
     validations = []
+    digest_authorities = []
+
+    def plan_digest(actual):
+        digest_authorities.append(actual)
+        return actual.plan.digest
 
     def validate_ready(actual, **kwargs):
         validations.append(("ready", actual, kwargs))
@@ -274,6 +284,7 @@ def test_runs_exact_prefix_then_one_gradient_without_false_retirement(monkeypatc
 
     monkeypatch.setattr(coordinator_module, "validate_decoder_ready_iteration", validate_ready)
     monkeypatch.setattr(coordinator_module, "_validate_decoder_gradient_receipt", validate_receipt)
+    monkeypatch.setattr(coordinator_module, "_dynamic_iteration_plan_digest", plan_digest)
 
     ready = coordinator.begin_iteration(authority)
     with pytest.raises(MdpStateError, match="idle"):
@@ -306,9 +317,12 @@ def test_runs_exact_prefix_then_one_gradient_without_false_retirement(monkeypatc
     assert ready_validation[2]["embedding_exchange"] is embedding
     assert ready_validation[2]["embedding_tensors"] is embedding.received_tensors
     assert ready_validation[2]["expected_assignments"] is ready.assignments
+    assert ready_validation[2]["plan_digest"] == authority.plan.digest
     assert gradient_validation[1] is receipt
     assert gradient_validation[2]["iteration_nonce"] is receipt.iteration_nonce
     assert gradient_validation[2]["global_rank"] == ready.global_rank
+    assert gradient_validation[2]["plan_digest"] == authority.plan.digest
+    assert digest_authorities == [authority, authority, authority]
 
 
 def test_callback_failure_allows_fresh_retry_on_same_coordinator():

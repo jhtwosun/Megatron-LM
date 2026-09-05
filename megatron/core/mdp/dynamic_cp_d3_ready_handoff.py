@@ -25,6 +25,7 @@ from megatron.core.mdp.dynamic_cp_runtime import (
     DecoderReadyIteration,
     _build_decoder_ready_iteration,
     _decoder_ready_authority_digest,
+    _dynamic_iteration_plan_digest,
     _DynamicIterationAuthority,
     _DynamicProducerCarrier,
     _expected_local_assignments,
@@ -136,7 +137,7 @@ def _compose_d3_decoder_ready_handoff(
         artifacts = _LocalDecoderReadyArtifacts((), MappingProxyType({}))
     digest = _decoder_ready_authority_digest(
         global_manifest_digest=authority.global_manifest.digest,
-        decoder_plan_digest=authority.plan.digest,
+        decoder_plan_digest=_dynamic_iteration_plan_digest(authority),
         payload_bundle_authority_digest=bundle.bundle_authority_digest,
         embedding_route_authority_digest=exchange.route_authority_digest,
         participant_ranks=authority.participant_ranks,
@@ -156,6 +157,7 @@ def _compose_d3_decoder_ready_handoff(
         embedding_tensors=embedding_result,
         assignments=assignments,
         artifacts=artifacts,
+        plan_digest=_dynamic_iteration_plan_digest(authority),
     )
     return validate_decoder_ready_iteration(
         ready,
@@ -170,4 +172,5 @@ def _compose_d3_decoder_ready_handoff(
         embedding_width=authority.bridge_width,
         embedding_dtype=authority.bridge_dtype,
         cp_partition_mode=cp_partition_mode,
+        plan_digest=_dynamic_iteration_plan_digest(authority),
     )

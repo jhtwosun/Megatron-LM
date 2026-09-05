@@ -175,6 +175,7 @@ def _values(
     monkeypatch.setattr(api, "_DynamicIterationWorkspace", _Workspace)
     monkeypatch.setattr(api, "_DynamicProducerCarrier", _Producer)
     monkeypatch.setattr(api, "_D3IterationCommitReady", _Commit)
+    monkeypatch.setattr(api, "_dynamic_iteration_plan_digest", lambda _authority: _PLAN)
     monkeypatch.setattr(
         api,
         "_snapshot_local_authority",
@@ -236,6 +237,13 @@ def test_gate7_begins_before_candidates_cleans_through_owner_and_commits_last(mo
     api = _api()
     values = _values(api, monkeypatch)
     generator = lambda size: _NONCE if size == 16 else bytes(size)
+    digest_authorities = []
+
+    def plan_digest(actual):
+        digest_authorities.append(actual)
+        return actual.plan.digest
+
+    monkeypatch.setattr(api, "_dynamic_iteration_plan_digest", plan_digest)
 
     assert _run(api, values, byte_generator=generator) is None
 
@@ -257,6 +265,7 @@ def test_gate7_begins_before_candidates_cleans_through_owner_and_commits_last(mo
     assert values.callback_calls == []
     assert values.owner.cleanup_calls == 1
     assert values.owner.is_idle
+    assert digest_authorities == [values.authority, values.authority]
     assert all(event[1]["gate_id"] == 7 for event in values.events if event[0] == "world")
     assert next(event[1] for event in values.events if event[0] == "domain")["gate_id"] == 7
 
