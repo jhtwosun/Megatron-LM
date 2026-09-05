@@ -1187,3 +1187,64 @@ def test_encoder_cp2_decoder_cp2_composes_leader_transport_and_backward(monkeypa
     assert runtime.state is MdpRuntimeState.EMPTY
     runtime.storage.assert_empty()
     runtime.bridge.assert_idle()
+
+
+class _HostileCleanupPrimary(BaseException):
+    def __init__(self, message="primary"):
+        super().__init__(message)
+        self.add_note_calls = 0
+
+    def add_note(self, _note):
+        self.add_note_calls += 1
+        raise BaseException("hostile add_note")
+
+
+def test_failed_iteration_hostile_note_attempts_all_cleanup_resets_and_reuses_runtime():
+    runtime, _ = _build_runtime(decoder_pp=1)
+    primary = _HostileCleanupPrimary()
+    cleanup_calls = []
+
+    def fail_cleanup(name):
+        cleanup_calls.append(name)
+        raise RuntimeError(f"injected {name} cleanup failure")
+
+    runtime._state = MdpRuntimeState.DECODER_READY
+    runtime._abort_failed_iteration(
+        primary,
+        cleanup_actions=(
+            ("first", lambda: fail_cleanup("first")),
+            ("second", lambda: fail_cleanup("second")),
+        ),
+    )
+
+    assert cleanup_calls == ["first", "second"]
+    assert primary.add_note_calls == 2
+    assert runtime.state is MdpRuntimeState.EMPTY
+    assert runtime._handle is None
+    assert not runtime._chunk_payload_bases
+
+    recovered = runtime._prepare_dynamic_encoder_producer(
+        iter(range(10)), num_microbatches=2, forward_only=False, codec=_DynamicSourceCodec()
+    )
+    assert recovered.local_prepare_error is None
+    recovered.owner.abort()
+    assert runtime.state is MdpRuntimeState.EMPTY
+
+
+def test_cleanup_without_primary_raises_exact_first_hostile_error_after_all_actions():
+    primary = _HostileCleanupPrimary("first cleanup failure")
+    cleanup_calls = []
+
+    def fail(error):
+        cleanup_calls.append(error)
+        raise error
+
+    secondary = RuntimeError("second cleanup failure")
+    with pytest.raises(_HostileCleanupPrimary) as caught:
+        MdpRuntime._attempt_cleanup(
+            (("first", lambda: fail(primary)), ("second", lambda: fail(secondary)))
+        )
+
+    assert caught.value is primary
+    assert cleanup_calls == [primary, secondary]
+    assert primary.add_note_calls == 1
