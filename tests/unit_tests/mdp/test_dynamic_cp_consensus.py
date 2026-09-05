@@ -59,6 +59,15 @@ def _run(local_status=None, **overrides):
     return getattr(execution, "_run_precollective_consensus")(local_status, **values)
 
 
+def _collect(local_status=None, **overrides):
+    local_status = _status() if local_status is None else local_status
+    values = dict(
+        group_ranks=_RANKS, all_gather_status=lambda *_args, **_kwargs: _rows(), timeout_seconds=1.0
+    )
+    values.update(overrides)
+    return getattr(execution, "_collect_precollective_consensus")(local_status, **values)
+
+
 def test_precollective_status_wire_roundtrips_high_digest_bits_little_endian():
     status = _status(error_code=2**63 - 1, gate_id=6)
 
@@ -140,6 +149,52 @@ def test_consensus_calls_injected_gather_once_with_exact_wire_and_timeout():
 
     assert result is None
     assert calls == [(status.to_wire_tuple(), {"timeout_seconds": 0.001})]
+
+
+def test_completed_consensus_returns_an_exact_sealed_success_outcome():
+    outcome = _collect()
+
+    assert type(outcome) is getattr(execution, "_CompletedPrecollectiveConsensus")
+    assert outcome.error is None
+
+
+def test_completed_consensus_rejects_direct_construction_without_private_seal():
+    outcome_type = getattr(execution, "_CompletedPrecollectiveConsensus")
+
+    with pytest.raises(MdpConfigurationError, match="minted after one returned gather"):
+        outcome_type(error=None, _seal=object())
+
+
+def test_completed_consensus_seals_post_gather_logical_rejection():
+    local = _status(error_code=7)
+    gathered = _rows(error_codes={8: 5, 3: 7, 11: 1})
+
+    outcome = _collect(local, all_gather_status=lambda *_args, **_kwargs: gathered)
+
+    assert type(outcome) is getattr(execution, "_CompletedPrecollectiveConsensus")
+    assert type(outcome.error) is MdpPlanError
+    assert str(outcome.error) == "MDP: precollective consensus rejected rank 8 with error code 5."
+
+
+def test_completed_consensus_seals_post_gather_malformed_output():
+    gathered = (list(_rows()[0]), _rows()[1], _rows()[2])
+
+    outcome = _collect(all_gather_status=lambda *_args, **_kwargs: gathered)
+
+    assert type(outcome) is getattr(execution, "_CompletedPrecollectiveConsensus")
+    assert type(outcome.error) is MdpPlanError
+    assert "malformed status for rank 8" in str(outcome.error)
+
+
+def test_completed_consensus_does_not_normalize_or_seal_gather_failure():
+    primary = RuntimeError("gather")
+
+    def fail(*_args, **_kwargs):
+        raise primary
+
+    with pytest.raises(MdpBridgeError, match="consensus failed") as caught:
+        _collect(all_gather_status=fail)
+    assert caught.value.__cause__ is primary
 
 
 @pytest.mark.parametrize(
@@ -330,3 +385,26 @@ def test_world4_nccl_one_rank_gate_mismatch_completes_and_rejects_deterministica
     completed = torch.ones((), dtype=torch.int64, device=torch.cuda.current_device())
     torch.distributed.all_reduce(completed, group=consensus_world)
     assert completed.item() == 4
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world4")
+def test_world4_completed_consensus_seals_rank2_failure_and_allows_retry(consensus_world):
+    rank = torch.distributed.get_rank()
+    ranks = tuple(range(torch.distributed.get_world_size()))
+    gather = _world4_gather(consensus_world, rank, ranks)
+    failed = _status(global_rank=rank, error_code=int(rank == 2), gate_id=1)
+
+    outcome = _collect(failed, group_ranks=ranks, all_gather_status=gather, timeout_seconds=30.0)
+
+    assert type(outcome) is getattr(execution, "_CompletedPrecollectiveConsensus")
+    assert type(outcome.error) is MdpPlanError
+    assert str(outcome.error) == "MDP: precollective consensus rejected rank 2 with error code 1."
+    assert (
+        _run(
+            _status(global_rank=rank, gate_id=2),
+            group_ranks=ranks,
+            all_gather_status=gather,
+            timeout_seconds=30.0,
+        )
+        is None
+    )
