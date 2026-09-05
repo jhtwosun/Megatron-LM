@@ -46,7 +46,7 @@ class _FullGroupSolver:
         return ([lengths] * total_gpus, [], None, [sample_ids] * total_gpus)
 
 
-def _source_manifest(lane):
+def _source_window(lane, *, device="cpu"):
     sample_id = GlobalSampleId(lane, 0)
     item_id = GlobalVisionItemId(lane, 0)
     sample = DecoderSampleMetadata(
@@ -64,8 +64,8 @@ def _source_manifest(lane):
         decoder_offsets=(1,),
     )
     tensors = {
-        "input_ids": torch.arange(4, dtype=torch.int64).view(1, 4),
-        "position_ids": torch.arange(4, dtype=torch.int64).view(1, 4),
+        "input_ids": (lane * 100 + torch.arange(4, dtype=torch.int64, device=device)).view(1, 4),
+        "position_ids": torch.arange(4, dtype=torch.int64, device=device).view(1, 4),
     }
     fields = tuple(
         DecoderTensorFieldSpec(name, tensor.dtype, tuple(tensor.shape), tensor.device.type)
@@ -92,7 +92,11 @@ def _source_manifest(lane):
     )
     return finalize_decoder_source_window(
         source_dp_lane=lane, samples=(sample,), items=(item,), packets=(packet,)
-    ).metadata_manifest()
+    )
+
+
+def _source_manifest(lane):
+    return _source_window(lane).metadata_manifest()
 
 
 def _binding(rank=2, ep=1):
@@ -258,6 +262,60 @@ def test_authority_collective_rejects_foreign_domain_inside_preparation(monkeypa
     assert events == ["runner"]
 
 
+def test_payload_transport_prepares_everything_before_domain_collective(monkeypatch):
+    api = import_module("megatron.core.mdp.dynamic_cp_d4_payload_transport")
+    binding, authority = _iteration_authority(rank=0)
+    source_window = _source_window(0)
+    buffers = {torch.int64: (object(), object())}
+    prepared = object()
+    received = object()
+    events = []
+
+    def run(binding_arg, authority_arg, **kwargs):
+        assert binding_arg is binding
+        assert authority_arg is authority
+        assert kwargs["gate_id"] == 0
+        events.append("run")
+        value = kwargs["prepare"]()
+        events.append("prepared")
+        return kwargs["domain_collective"](value)
+
+    def attach(ledger, **kwargs):
+        assert ledger is authority.payload_ledger
+        assert kwargs["source_window"] is source_window
+        events.append("attach")
+        return {"local": "tensors"}
+
+    def prepare(ledger, **kwargs):
+        assert ledger is authority.payload_ledger
+        assert kwargs["local_tensors"] == {"local": "tensors"}
+        assert kwargs["buffers_by_dtype"] is buffers
+        events.append("bundle")
+        return prepared
+
+    def execute(value, **kwargs):
+        assert value is prepared
+        assert kwargs["group"] is binding.domain_group
+        events.append("collective")
+        return received
+
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", run)
+    monkeypatch.setattr(api, "attach_local_decoder_payload_tensors", attach)
+    monkeypatch.setattr(api, "prepare_decoder_payload_bundle", prepare)
+    monkeypatch.setattr(api, "_execute_validated_decoder_payload_bundle", execute)
+
+    result = api.run_repeated_d4_decoder_payload(
+        binding,
+        authority,
+        source_window=source_window,
+        buffers_by_dtype=buffers,
+        all_to_all_single=lambda *_args, **_kwargs: None,
+    )
+
+    assert result is prepared
+    assert events == ["run", "attach", "bundle", "prepared", "collective"]
+
+
 if _WORLD8:
 
     @pytest.fixture(scope="module")
@@ -390,3 +448,97 @@ def test_world8_authority_collective_converges_rank6_failure_and_retries(groups)
         binding, authority, gate_id=2, prepare=prepare, domain_collective=collect
     )
     assert result == (6 if lane == 0 else 22)
+
+
+@pytest.mark.skipif(not _WORLD8, reason="needs torchrun world8")
+def test_world8_payload_rejects_rank6_then_retries_without_cross_domain_routes(groups):
+    api = import_module("megatron.core.mdp.dynamic_cp_d4_payload_transport")
+    routing = import_module("megatron.core.mdp.dynamic_cp_routing")
+    world, domain_group = groups
+    rank = torch.distributed.get_rank()
+    lane = rank // 4
+    domain_ranks = tuple(range(lane * 4, lane * 4 + 4))
+    device = torch.device("cuda", torch.cuda.current_device())
+    binding = binding_api._make_repeated_d4_group_binding(
+        world_group=world,
+        domain_group=domain_group,
+        expert_group=None,
+        global_rank=rank,
+        expert_parallel_size=1,
+        device=device,
+        timeout_seconds=30.0,
+    )
+    source_window = _source_window(lane, device=device)
+    metadata = gather_decoder_source_manifests(
+        source_window.metadata_manifest() if rank == domain_ranks[0] else None,
+        expected_source_lanes=(lane,),
+        group=domain_group,
+        group_ranks=domain_ranks,
+        global_rank=rank,
+        device=device,
+        timeout_seconds=30.0,
+    )
+    authority = _authority_api().build_repeated_d4_iteration_authority(
+        binding,
+        metadata,
+        max_seqlen_per_rank=8,
+        minimum_cp_size=1,
+        solver=_FullGroupSolver(),
+        bridge_width=16,
+        bridge_dtype=torch.bfloat16,
+    )
+    dtypes = tuple(
+        dict.fromkeys(
+            spec.dtype
+            for payload in authority.global_manifest.payloads
+            for spec in payload.field_specs
+        )
+    )
+    buffers = {}
+    for dtype in dtypes:
+        inputs, outputs = routing.decoder_payload_split_sizes(
+            authority.payload_ledger,
+            plan=authority.plan,
+            global_manifest=authority.global_manifest,
+            source_rank_by_lane=authority.source_rank_by_lane,
+            participant_ranks=authority.participant_ranks,
+            dtype=dtype,
+            global_rank=rank,
+        )
+        buffers[dtype] = (
+            torch.empty(sum(inputs), dtype=dtype, device=device),
+            torch.empty(sum(outputs), dtype=dtype, device=device),
+        )
+
+    collective_calls = 0
+
+    def tracked_all_to_all(*args, **kwargs):
+        nonlocal collective_calls
+        collective_calls += 1
+        return torch.distributed.all_to_all_single(*args, **kwargs)
+
+    with pytest.raises(MdpPlanError, match="rejected rank 6"):
+        api.run_repeated_d4_decoder_payload(
+            binding,
+            authority,
+            source_window=source_window if rank in (domain_ranks[0], 6) else None,
+            buffers_by_dtype=buffers,
+            all_to_all_single=tracked_all_to_all,
+        )
+    assert collective_calls == 0
+
+    prepared = api.run_repeated_d4_decoder_payload(
+        binding,
+        authority,
+        source_window=source_window if rank == domain_ranks[0] else None,
+        buffers_by_dtype=buffers,
+        all_to_all_single=tracked_all_to_all,
+    )
+    received = prepared.received_tensors
+
+    assert collective_calls == len(dtypes)
+    expected_packet = source_window.packets[0]
+    assert received
+    assert all(key.sample_id.source_dp_lane == lane for key in received)
+    for key, tensor in received.items():
+        torch.testing.assert_close(tensor, expected_packet.tensor_fields[key.field_name])
