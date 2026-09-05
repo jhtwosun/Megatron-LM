@@ -56,7 +56,7 @@ class _Ready:
     pass
 
 
-def _values(api, monkeypatch):
+def _values(api, monkeypatch, *, joint=False):
     events = []
 
     def world_gate(**kwargs):
@@ -75,7 +75,16 @@ def _values(api, monkeypatch):
         domain_status_collector=domain_status,
     )
     binding = _Binding(runner, events)
-    authority = SimpleNamespace(global_manifest=SimpleNamespace(digest=_MANIFEST))
+    if joint:
+        from tests.unit_tests.mdp.test_dynamic_cp_d4_authority_construction import (
+            _iteration_authority,
+        )
+        from tests.unit_tests.mdp.test_dynamic_cp_runtime import _joint_authority
+
+        _, authority = _iteration_authority()
+        authority = _joint_authority(authority)
+    else:
+        authority = SimpleNamespace(global_manifest=SimpleNamespace(digest=_MANIFEST))
     prepared = SimpleNamespace(authority=authority, receipt=object())
     gate = _Gate()
     claim = _Claim()
@@ -93,7 +102,9 @@ def _values(api, monkeypatch):
             ("snapshot", actual_binding, actual_authority)
         ),
     )
-    monkeypatch.setattr(api, "_candidate_digest", lambda *_args: _MANIFEST)
+    monkeypatch.setattr(api, "_candidate_digest", lambda *_args: authority.global_manifest.digest)
+    if not joint:
+        monkeypatch.setattr(api, "_candidate_joint_gate_digest", lambda _a, digest, _g: digest)
     monkeypatch.setattr(
         api,
         "_candidate_completion_gate_digest",
@@ -146,6 +157,24 @@ def test_gate5_begins_attempt_before_candidate_and_guards_exact_inputs(monkeypat
         "domain",
         "world",
         "execute",
+    ]
+
+
+def test_gate5_runner_receives_exact_joint_plan_digest(monkeypatch):
+    api = _api()
+    values = _values(api, monkeypatch, joint=True)
+
+    assert _run(api, values) is values.ready
+    calls = [event[1] for event in values.events if event[0] in ("world", "domain")]
+    base_digest = import_module(
+        "megatron.core.mdp.dynamic_cp_d4_authority_collective"
+    )._candidate_joint_gate_digest(values.authority, _GATE, 5)
+    order = import_module("megatron.core.mdp.dynamic_cp_d4_collective_order")
+    assert [call["plan_digest"] for call in calls] == [
+        order._stage_plan_digest(
+            plan_digest=base_digest, attempt_nonce=_RUNNER_NONCE, gate_id=5, stage=stage
+        )
+        for stage in range(3)
     ]
     assert values.events[4][1]["gate_id"] == 5
 
@@ -259,6 +288,7 @@ def test_gate5_rejection_aborts_exact_retained_claim_once(monkeypatch, failure_s
     monkeypatch.setattr(api, "_D3EncoderFinalizeReady", _Ready)
     monkeypatch.setattr(api, "_snapshot_local_authority", lambda *_args: None)
     monkeypatch.setattr(api, "_candidate_digest", lambda *_args: _MANIFEST)
+    monkeypatch.setattr(api, "_candidate_joint_gate_digest", lambda _a, digest, _g: digest)
     monkeypatch.setattr(api, "_candidate_completion_gate_digest", lambda *_args: _GATE)
     monkeypatch.setattr(api, "_prepare_d3_encoder_backward_claim", lambda *_args: claim)
     monkeypatch.setattr(

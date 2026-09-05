@@ -53,6 +53,8 @@ class _DynamicIterationWorkspace:
             participant_ranks=authority.participant_ranks,
             bridge_width=authority.bridge_width,
             bridge_dtype=authority.bridge_dtype,
+            encoder_plan=authority.encoder_plan,
+            joint_plan_digest=authority.joint_plan_digest,
         )
         if type(rank) is not int or rank not in validated_authority.participant_ranks:
             raise MdpConfigurationError("MDP: D3 workspace rank is an authority participant.")

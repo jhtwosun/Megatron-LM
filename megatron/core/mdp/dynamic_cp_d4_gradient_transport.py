@@ -19,6 +19,7 @@ from megatron.core.mdp.dynamic_cp_d3_gradient_preparation_binding import (
 from megatron.core.mdp.dynamic_cp_d3_workspace_binding import _D3WorkspaceBindingOwner
 from megatron.core.mdp.dynamic_cp_d4_authority_collective import (
     _candidate_digest,
+    _candidate_joint_gate_digest,
     _snapshot_local_authority,
 )
 from megatron.core.mdp.dynamic_cp_d4_group_binding import _RepeatedD4GroupBinding
@@ -78,6 +79,7 @@ def run_repeated_d4_decoder_gradient(
     route_digest, gate_digest = _candidate_gradient_gate_digest(
         authority, ready, runner.attempt_nonce
     )
+    status_digest = _candidate_joint_gate_digest(authority, gate_digest, 3)
 
     def prepare():
         _snapshot_local_authority(binding, authority)
@@ -103,7 +105,7 @@ def run_repeated_d4_decoder_gradient(
 
     return runner.run(
         global_manifest_digest=_candidate_digest(authority, "global_manifest"),
-        plan_digest=gate_digest,
+        plan_digest=status_digest,
         gate_id=3,
         prepare=prepare,
         domain_collective=execute,

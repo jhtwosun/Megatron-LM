@@ -4,6 +4,7 @@
 
 import os
 from dataclasses import replace
+from importlib import import_module
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
@@ -38,8 +39,10 @@ from megatron.core.mdp.storage import MdpEmbeddingStorage
 from tests.unit_tests.mdp.test_dynamic_cp_d4_authority_construction import (
     _authority_api,
     _FullGroupSolver,
+    _iteration_authority,
     _source_window,
 )
+from tests.unit_tests.mdp.test_dynamic_cp_runtime import _joint_authority
 
 _WORLD8 = int(os.environ.get("WORLD_SIZE", "1")) == 8
 
@@ -162,6 +165,75 @@ def _dependencies(events):
 
 def _factory(values):
     return _make_d4_decoder_composition(bindings=_D4DecoderCompositionBindings(**vars(values)))
+
+
+def test_real_gate0_to_gate2_adapters_bind_exact_joint_plan_digest(monkeypatch):
+    payload_api = import_module("megatron.core.mdp.dynamic_cp_d4_payload_transport")
+    embedding_api = import_module("megatron.core.mdp.dynamic_cp_d4_embedding_transport")
+    ready_api = import_module("megatron.core.mdp.dynamic_cp_d4_ready_handoff")
+    binding, authority = _iteration_authority()
+    authority = _joint_authority(authority)
+    calls = []
+
+    class _Runner:
+        attempt_nonce = b"n" * 16
+
+        def run(self, **kwargs):
+            calls.append((kwargs["gate_id"], kwargs["plan_digest"]))
+            return kwargs["domain_collective"](kwargs["prepare"]())
+
+    monkeypatch.setattr(type(binding), "begin_attempt", lambda *_args, **_kwargs: _Runner())
+    payload = SimpleNamespace(received_tensors=object())
+    embedding = SimpleNamespace(received_tensors=object())
+    ready = object()
+    item_outputs = {
+        item_id: torch.empty(authority.output_rows_by_item[item_id], authority.bridge_width)
+        for item_id, producer_rank in authority.producer_rank_by_item.items()
+        if producer_rank == binding.global_rank
+    }
+    monkeypatch.setattr(payload_api, "prepare_decoder_payload_bundle", lambda *_a, **_k: payload)
+    monkeypatch.setattr(payload_api, "_execute_validated_decoder_payload_bundle", lambda *_a, **_k: None)
+    monkeypatch.setattr(embedding_api, "prepare_dynamic_bridge_exchange", lambda *_a, **_k: embedding)
+    monkeypatch.setattr(embedding_api, "_execute_validated_dynamic_bridge_exchange", lambda *_a, **_k: None)
+    monkeypatch.setattr(ready_api, "_compose_d3_decoder_ready_handoff", lambda **_kwargs: ready)
+
+    assert (
+        payload_api.run_repeated_d4_decoder_payload(
+            binding,
+            authority,
+            source_window=None,
+            buffers_by_dtype={},
+            all_to_all_single=lambda *_a, **_k: None,
+        )
+        is payload
+    )
+    assert (
+        embedding_api.run_repeated_d4_embedding(
+            binding,
+            authority,
+            item_outputs=item_outputs,
+            send_buffer=torch.empty(0),
+            receive_buffer=torch.empty(0),
+            all_to_all_single=lambda *_a, **_k: None,
+        )
+        is embedding
+    )
+    assert (
+        ready_api.run_repeated_d4_decoder_ready(
+            binding,
+            authority,
+            workspace_owner=object(),
+            producer=object(),
+            payload_bundle=payload,
+            embedding_exchange=embedding,
+            cp_partition_mode="contiguous",
+            decoder_group_getter=lambda *_a: None,
+            decoder_group_ranks_getter=lambda *_a: (),
+            rebuild_microbatch=lambda *_a: None,
+        )
+        is ready
+    )
+    assert calls == [(gate_id, authority.joint_plan_digest) for gate_id in range(3)]
 
 
 def test_factory_delegates_exact_carriers_arguments_and_order(monkeypatch):

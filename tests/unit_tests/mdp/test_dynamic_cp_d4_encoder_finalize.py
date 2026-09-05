@@ -97,6 +97,7 @@ def _values(
     domain_error=None,
     accept_error=None,
     finalize_error=None,
+    joint=False,
 ):
     events = []
 
@@ -116,17 +117,32 @@ def _values(
         domain_status_collector=domain_status,
     )
     binding = _Binding(runner, events)
-    authority = SimpleNamespace(global_manifest=SimpleNamespace(digest=_D4_MANIFEST))
+    if joint:
+        from tests.unit_tests.mdp.test_dynamic_cp_d4_authority_construction import (
+            _iteration_authority,
+        )
+        from tests.unit_tests.mdp.test_dynamic_cp_runtime import _joint_authority
+
+        _, authority = _iteration_authority()
+        authority = _joint_authority(authority)
+    else:
+        authority = SimpleNamespace(global_manifest=SimpleNamespace(digest=_D4_MANIFEST))
     ready = _Ready()
     ready.owner = SimpleNamespace(_iteration=7)
     decoder_ready = object()
     ready.prepared = SimpleNamespace(
         authority=authority, receipt=SimpleNamespace(prepared=SimpleNamespace(ready=decoder_ready))
     )
+    status_digest = (
+        import_module("megatron.core.mdp.dynamic_cp_d4_authority_collective")
+        ._candidate_joint_gate_digest(authority, _GATE, 6)
+        if joint
+        else _GATE
+    )
     status = _PrecollectiveStatus(
         global_rank=0,
         global_manifest_digest=_D3_TOPOLOGY if attempt_error is None else bytes(16),
-        plan_digest=_GATE if attempt_error is None else bytes(16),
+        plan_digest=status_digest if attempt_error is None else bytes(16),
         error_code=int(attempt_error is not None),
         gate_id=5,
     )
@@ -141,7 +157,8 @@ def _values(
     monkeypatch.setattr(api, "_D3EncoderFinalizeAttempt", _Attempt)
     monkeypatch.setattr(api, "_D3EncoderFinalizeReady", _Ready)
     monkeypatch.setattr(api, "_D3IterationCommitReady", _Commit)
-    monkeypatch.setattr(api, "_DynamicIterationAuthority", SimpleNamespace)
+    if not joint:
+        monkeypatch.setattr(api, "_DynamicIterationAuthority", SimpleNamespace)
     monkeypatch.setattr(
         api,
         "_snapshot_local_authority",
@@ -152,7 +169,8 @@ def _values(
     monkeypatch.setattr(
         api,
         "_candidate_digest",
-        lambda actual, field: events.append(("candidate-manifest", actual, field)) or _D4_MANIFEST,
+        lambda actual, field: events.append(("candidate-manifest", actual, field))
+        or authority.global_manifest.digest,
     )
     monkeypatch.setattr(
         api,
@@ -162,6 +180,8 @@ def _values(
         )
         or _GATE,
     )
+    if not joint:
+        monkeypatch.setattr(api, "_candidate_joint_gate_digest", lambda _a, digest, _g: digest)
     monkeypatch.setattr(
         api,
         "_digest",
@@ -222,6 +242,24 @@ def test_gate6_begins_before_candidate_and_finalizes_only_after_final_world(monk
     assert domain["global_manifest_digest"] == _D4_MANIFEST
     assert domain["gate_id"] == 6 and type(domain["plan_digest"]) is bytes
     assert values.attempt.status.global_manifest_digest == _D3_TOPOLOGY
+
+
+def test_gate6_runner_receives_exact_joint_plan_digest(monkeypatch):
+    api = _api()
+    values = _values(api, monkeypatch, joint=True)
+
+    assert _run(api, values) is values.commit
+    calls = [event[1] for event in values.events if event[0] in ("world", "domain")]
+    base_digest = import_module(
+        "megatron.core.mdp.dynamic_cp_d4_authority_collective"
+    )._candidate_joint_gate_digest(values.authority, _GATE, 6)
+    order = import_module("megatron.core.mdp.dynamic_cp_d4_collective_order")
+    assert [call["plan_digest"] for call in calls] == [
+        order._stage_plan_digest(
+            plan_digest=base_digest, attempt_nonce=_RUNNER_NONCE, gate_id=6, stage=stage
+        )
+        for stage in range(3)
+    ]
     assert _D4_MANIFEST != _D3_TOPOLOGY
     assert values.events[-2:] == [("accept", values.attempt), ("finalize", values.ready)]
 
@@ -550,6 +588,7 @@ def test_gate6_real_d3_finalize_contributor_follower_and_empty(monkeypatch, cont
     monkeypatch.setattr(api, "_DynamicIterationAuthority", type(authority))
     monkeypatch.setattr(api, "_snapshot_local_authority", lambda *_args: None)
     monkeypatch.setattr(api, "_candidate_digest", lambda *_args: _D4_MANIFEST)
+    monkeypatch.setattr(api, "_candidate_joint_gate_digest", lambda _a, digest, _g: digest)
     monkeypatch.setattr(
         api,
         "_make_d3_gate_status_context",

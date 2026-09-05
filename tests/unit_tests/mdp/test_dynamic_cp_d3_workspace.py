@@ -9,8 +9,14 @@ import pytest
 import torch
 
 from megatron.core.mdp.allocator import DirectBufferAllocator
+from megatron.core.mdp.dynamic_cp import nested_dynamic_cp_group_specs
 from megatron.core.mdp.dynamic_cp_bridge_transport import prepare_dynamic_bridge_exchange
 from megatron.core.mdp.dynamic_cp_execution import DecoderGlobalManifest
+from megatron.core.mdp.dynamic_cp_plan import (
+    EncoderWorkEstimate,
+    EncoderWorkUnit,
+    build_encoder_dynamic_plan,
+)
 from megatron.core.mdp.dynamic_cp_routing import build_decoder_payload_route_ledger
 from megatron.core.mdp.dynamic_cp_transport import prepare_decoder_payload_bundle
 from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError
@@ -547,6 +553,38 @@ def test_allocates_all_zero_transport_pairs_and_rejects_non_cuda_payload_before_
             storage=MdpEmbeddingStorage(allocator),
         )
     assert not allocator.acquire_calls
+
+
+def test_workspace_validation_snapshot_preserves_joint_encoder_plan_authority():
+    runtime = import_module("megatron.core.mdp.dynamic_cp_runtime")
+    authority = _authority(participant_ranks=(7, 3, 5, 9))
+    item_ids = tuple(
+        item.item_id for sample in authority.plan.samples for item in sample.vision_items
+    )
+    encoder_plan = build_encoder_dynamic_plan(
+        authority.plan.samples,
+        tuple(EncoderWorkUnit((item_id,)) for item_id in item_ids),
+        group_specs=nested_dynamic_cp_group_specs(authority.participant_ranks, minimum_size=1),
+        max_seqlen_per_rank=8,
+        workload_query=lambda _items, _size: EncoderWorkEstimate(1, 1),
+    )
+    joint_digest = runtime._joint_dynamic_plan_digest(authority.plan, encoder_plan)
+    authority = replace(authority, encoder_plan=encoder_plan, joint_plan_digest=joint_digest)
+    allocator = _RecordingAllocator()
+    workspace = _workspace_api()._DynamicIterationWorkspace(
+        authority=authority,
+        rank=3,
+        device=torch.device("cuda", 0),
+        allocator=allocator,
+        storage=MdpEmbeddingStorage(allocator),
+    )
+    try:
+        assert workspace.authority is authority
+        assert workspace._validated_authority.encoder_plan is encoder_plan
+        assert workspace._validated_authority.joint_plan_digest == joint_digest
+        assert runtime._dynamic_iteration_plan_digest(workspace._validated_authority) == joint_digest
+    finally:
+        workspace.release()
 
 
 def test_transport_cleanup_drops_staging_references_and_allows_retry_after_failure():

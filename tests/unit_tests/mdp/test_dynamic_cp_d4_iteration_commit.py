@@ -15,6 +15,8 @@ from megatron.core.mdp.dynamic_cp_execution import (
     _CompletedPrecollectiveConsensus,
 )
 from megatron.core.mdp.errors import MdpPlanError, MdpStateError, MdpTaskFatalError
+from tests.unit_tests.mdp.test_dynamic_cp_d4_authority_construction import _iteration_authority
+from tests.unit_tests.mdp.test_dynamic_cp_runtime import _joint_authority
 
 _MANIFEST = bytes.fromhex("00112233445566778899aabbccddeeff")
 _PLAN = bytes.fromhex("ffeeddccbbaa99887766554433221100")
@@ -268,6 +270,44 @@ def test_gate7_begins_before_candidates_cleans_through_owner_and_commits_last(mo
     assert digest_authorities == [values.authority, values.authority]
     assert all(event[1]["gate_id"] == 7 for event in values.events if event[0] == "world")
     assert next(event[1] for event in values.events if event[0] == "domain")["gate_id"] == 7
+
+
+def test_gate7_runner_receives_exact_joint_terminal_plan_digest():
+    api = _api()
+    _, authority = _iteration_authority()
+    authority = _joint_authority(authority)
+    calls = []
+    primary = RuntimeError("runner stop")
+
+    class _Runner:
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            raise primary
+
+    binding = SimpleNamespace(
+        world_ranks=_WORLD,
+        begin_attempt=lambda **_kwargs: _Runner(),
+    )
+    commit_ready = SimpleNamespace(iteration=19)
+
+    with pytest.raises(RuntimeError) as caught:
+        api.run_repeated_d4_iteration_commit(
+            binding,
+            authority,
+            workspace_owner=object(),
+            producer=object(),
+            commit_ready=commit_ready,
+        )
+
+    assert caught.value is primary
+    assert calls[0]["gate_id"] == 7
+    expected = api._terminal_commit_digest(
+        global_manifest_digest=authority.global_manifest.digest,
+        plan_digest=authority.joint_plan_digest,
+        iteration=commit_ready.iteration,
+        world_ranks=_WORLD,
+    )
+    assert calls[0]["plan_digest"] == expected
 
 
 def test_terminal_digest_is_deterministic_binds_all_fields_and_differs_from_gate6():

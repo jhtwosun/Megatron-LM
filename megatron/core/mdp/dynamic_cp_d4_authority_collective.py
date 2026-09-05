@@ -2,6 +2,8 @@
 
 """Private repeated-D4 data-collective binding for one iteration authority."""
 
+import hashlib
+import struct
 from collections.abc import Callable
 from typing import Any
 
@@ -38,6 +40,8 @@ def _snapshot_local_authority(
         participant_ranks=authority.participant_ranks,
         bridge_width=authority.bridge_width,
         bridge_dtype=authority.bridge_dtype,
+        encoder_plan=authority.encoder_plan,
+        joint_plan_digest=authority.joint_plan_digest,
     )
     domain_ranks = group_authority.domain_ranks
     source_lane = group_authority.world_ranks.index(domain_ranks[0]) // _DOMAIN_WIDTH
@@ -59,9 +63,28 @@ def _candidate_digest(authority: Any, field: str) -> Any:
 
 
 def _candidate_iteration_plan_digest(authority: Any) -> bytes | None:
-    """Read validated decoder-only plan authority without skipping WORLD."""
+    """Read validated decoder-only or joint plan authority without skipping WORLD."""
     try:
         return _dynamic_iteration_plan_digest(authority)
+    except BaseException:
+        return None
+
+
+def _candidate_joint_gate_digest(authority: Any, phase_digest: Any, gate_id: int) -> bytes | None:
+    """Bind a phase digest to joint plan authority while preserving legacy bytes."""
+    try:
+        plan_digest = _dynamic_iteration_plan_digest(authority)
+        if authority.encoder_plan is None:
+            return phase_digest
+        if type(phase_digest) is not bytes or len(phase_digest) != 16:
+            return None
+        digest = hashlib.blake2b(digest_size=16)
+        domain = b"megatron.mdp.dynamic-cp.joint-gate"
+        digest.update(struct.pack("<3q", len(domain), 1, gate_id))
+        digest.update(domain)
+        digest.update(plan_digest)
+        digest.update(phase_digest)
+        return digest.digest()
     except BaseException:
         return None
 

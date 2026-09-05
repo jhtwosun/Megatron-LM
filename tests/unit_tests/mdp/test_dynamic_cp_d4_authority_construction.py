@@ -26,6 +26,7 @@ from megatron.core.mdp.dynamic_cp_execution import (
 )
 from megatron.core.mdp.dynamic_cp_plan import DecoderSampleMetadata, EncoderVisionItemMetadata
 from megatron.core.mdp.errors import MdpPlanError, MdpStateError
+from tests.unit_tests.mdp.test_dynamic_cp_runtime import _joint_authority
 
 _WORLD8 = int(os.environ.get("WORLD_SIZE", "1")) == 8
 
@@ -248,6 +249,32 @@ def test_authority_collective_binds_exact_digests_and_callbacks(monkeypatch):
     assert call["prepare"] is not prepare and callable(call["prepare"])
     assert call["domain_collective"] is collective
     assert events[2:] == [("prepare",), ("collective", "prepared")]
+
+
+@pytest.mark.parametrize("gate_id", (0, 1, 2))
+def test_joint_authority_binds_exact_plan_digest_to_each_prefix_runner(monkeypatch, gate_id):
+    api = import_module("megatron.core.mdp.dynamic_cp_d4_authority_collective")
+    binding, authority = _iteration_authority()
+    authority = _joint_authority(authority)
+    calls = []
+
+    class _Runner:
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            return kwargs["domain_collective"](kwargs["prepare"]())
+
+    monkeypatch.setattr(type(binding), "begin_attempt", lambda *_args, **_kwargs: _Runner())
+    result = api.run_repeated_d4_authority_collective(
+        binding,
+        authority,
+        gate_id=gate_id,
+        prepare=lambda: "prepared",
+        domain_collective=lambda value: value,
+    )
+
+    assert result == "prepared"
+    assert calls[0]["gate_id"] == gate_id
+    assert calls[0]["plan_digest"] == authority.joint_plan_digest
 
 
 def test_malformed_plan_digest_helper_still_enters_gate0_world(monkeypatch):

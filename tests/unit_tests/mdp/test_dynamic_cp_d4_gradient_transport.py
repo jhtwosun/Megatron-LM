@@ -8,9 +8,11 @@ from types import SimpleNamespace
 import torch
 
 from tests.unit_tests.mdp.test_dynamic_cp_d3_ready_handoff import _context, _Group
+from tests.unit_tests.mdp.test_dynamic_cp_d4_authority_construction import _iteration_authority
+from tests.unit_tests.mdp.test_dynamic_cp_runtime import _joint_authority
 
 
-def test_gradient_transport_binds_ready_nonce_and_seals_exact_receipt(monkeypatch):
+def test_gate3_runner_binds_exact_joint_digest_ready_nonce_and_receipt(monkeypatch):
     api = import_module("megatron.core.mdp.dynamic_cp_d4_gradient_transport")
     nonce = bytes.fromhex("102132435465768798a9bacbdcedfe0f")
     route_digest = b"r" * 16
@@ -22,17 +24,11 @@ def test_gradient_transport_binds_ready_nonce_and_seals_exact_receipt(monkeypatc
     ready = object()
     producer = object()
     owner = object()
-    authority = SimpleNamespace(
-        global_manifest=SimpleNamespace(digest=b"m" * 16),
-        plan=object(),
-        embedding_ledger=object(),
-        gradient_ledger=object(),
-        producer_rank_by_item=object(),
-        output_rows_by_item=object(),
-        bridge_width=16,
-        bridge_dtype=torch.bfloat16,
-        participant_ranks=(0, 1, 2, 3),
-    )
+    _, authority = _iteration_authority()
+    authority = _joint_authority(authority)
+    status_digest = import_module(
+        "megatron.core.mdp.dynamic_cp_d4_authority_collective"
+    )._candidate_joint_gate_digest(authority, gate_digest, 3)
     events = []
 
     class _Runner:
@@ -104,7 +100,7 @@ def test_gradient_transport_binds_ready_nonce_and_seals_exact_receipt(monkeypatc
 
     assert result is receipt
     assert events == [
-        ("run", gate_digest, 3),
+        ("run", status_digest, 3),
         ("snapshot", binding, authority),
         ("prepare", authority, producer, ready),
         ("status-complete", prepared),

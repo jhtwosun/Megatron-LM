@@ -48,7 +48,11 @@ class _Embedding:
 class _Ready:
     def __init__(self, authority, payload, embedding):
         self.global_manifest_digest = authority.global_manifest.digest
-        self.decoder_plan_digest = authority.plan.digest
+        self.decoder_plan_digest = (
+            authority.joint_plan_digest
+            if getattr(authority, "joint_plan_digest", None) is not None
+            else authority.plan.digest
+        )
         self.payload_bundle_authority_digest = payload.bundle_authority_digest
         self.embedding_route_authority_digest = embedding.route_authority_digest
         self.participant_ranks = authority.participant_ranks
@@ -323,6 +327,45 @@ def test_runs_exact_prefix_then_one_gradient_without_false_retirement(monkeypatc
     assert gradient_validation[2]["global_rank"] == ready.global_rank
     assert gradient_validation[2]["plan_digest"] == authority.plan.digest
     assert digest_authorities == [authority, authority, authority]
+
+
+def test_joint_ready_and_receipt_validation_use_exact_iteration_plan_digest(monkeypatch):
+    runtime = import_module("megatron.core.mdp.dynamic_cp_runtime")
+    from tests.unit_tests.mdp.test_dynamic_cp_d4_authority_construction import (
+        _iteration_authority,
+    )
+    from tests.unit_tests.mdp.test_dynamic_cp_runtime import _joint_authority
+
+    _, authority = _iteration_authority()
+    authority = _joint_authority(authority)
+    events = []
+    bindings, _ = _bindings(events)
+    validations = []
+    monkeypatch.setattr(coordinator_module, "_DynamicIterationAuthority", type(authority))
+    monkeypatch.setattr(
+        coordinator_module, "_dynamic_iteration_plan_digest", runtime._dynamic_iteration_plan_digest
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "validate_decoder_ready_iteration",
+        lambda value, **kwargs: validations.append(("ready", kwargs["plan_digest"])) or value,
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "_validate_decoder_gradient_receipt",
+        lambda value, **kwargs: validations.append(("receipt", kwargs["plan_digest"])) or value,
+    )
+
+    coordinator = _make_d4_decoder_coordinator(bindings=bindings)
+    ready = coordinator.begin_iteration(authority)
+    coordinator.mark_decoder_complete(ready)
+    coordinator.end_decoder_phase(ready)
+
+    assert ready.decoder_plan_digest == authority.joint_plan_digest
+    assert validations == [
+        ("ready", authority.joint_plan_digest),
+        ("receipt", authority.joint_plan_digest),
+    ]
 
 
 def test_callback_failure_allows_fresh_retry_on_same_coordinator():

@@ -15,6 +15,7 @@ from megatron.core.mdp.dynamic_cp_d3_encoder_finalize import (
 from megatron.core.mdp.dynamic_cp_d3_iteration_commit import _D3IterationCommitReady
 from megatron.core.mdp.dynamic_cp_d4_authority_collective import (
     _candidate_digest,
+    _candidate_joint_gate_digest,
     _snapshot_local_authority,
 )
 from megatron.core.mdp.dynamic_cp_d4_group_binding import _RepeatedD4GroupBinding
@@ -62,6 +63,7 @@ def run_repeated_d4_encoder_finalize(
     runner = binding.begin_attempt(**kwargs)
     manifest_digest = _candidate_digest(authority, "global_manifest")
     gate_digest = _candidate_gate6_digest(finalize_binding, ready)
+    status_digest = _candidate_joint_gate_digest(authority, gate_digest, 6)
     retained_attempt: _D3EncoderFinalizeAttempt | None = None
     retained_commit: _D3IterationCommitReady | None = None
     prepare_started = False
@@ -115,7 +117,7 @@ def run_repeated_d4_encoder_finalize(
         status = attempt.status
         error = attempt.error
         expected_manifest_digest = bytes(16) if error is not None else topology_digest
-        expected_gate_digest = bytes(16) if error is not None else gate_digest
+        expected_gate_digest = bytes(16) if error is not None else status_digest
         if (
             type(status) is not _PrecollectiveStatus
             or status.global_rank != binding.global_rank
@@ -163,7 +165,7 @@ def run_repeated_d4_encoder_finalize(
     try:
         result = runner.run(
             global_manifest_digest=manifest_digest,
-            plan_digest=gate_digest,
+            plan_digest=status_digest,
             gate_id=6,
             prepare=prepare,
             domain_collective=finalize_retained,

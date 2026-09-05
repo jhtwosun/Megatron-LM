@@ -20,6 +20,7 @@ from megatron.core.mdp.dynamic_cp_d3_encoder_completion_preparation import (
 )
 from megatron.core.mdp.dynamic_cp_d4_authority_collective import (
     _candidate_digest,
+    _candidate_joint_gate_digest,
     _snapshot_local_authority,
 )
 from megatron.core.mdp.dynamic_cp_d4_encoder_completion import _candidate_completion_gate_digest
@@ -53,6 +54,7 @@ def run_repeated_d4_encoder_backward(
     runner = binding.begin_attempt(**kwargs)
     manifest_digest = _candidate_digest(authority, "global_manifest")
     gate_digest = _candidate_gate5_digest(authority, prepared)
+    status_digest = _candidate_joint_gate_digest(authority, gate_digest, 5)
     retained_claim: _D3EncoderBackwardClaim | None = None
     retained_ready: _D3EncoderFinalizeReady | None = None
 
@@ -110,7 +112,7 @@ def run_repeated_d4_encoder_backward(
     try:
         result = runner.run(
             global_manifest_digest=manifest_digest,
-            plan_digest=gate_digest,
+            plan_digest=status_digest,
             gate_id=5,
             prepare=prepare,
             domain_collective=execute_retained,

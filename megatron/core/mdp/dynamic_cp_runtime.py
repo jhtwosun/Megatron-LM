@@ -48,7 +48,13 @@ from megatron.core.mdp.dynamic_cp_execution import (
     bind_local_decoder_assignment,
     validate_decoder_global_manifest,
 )
-from megatron.core.mdp.dynamic_cp_plan import DecoderDynamicPlan, validate_decoder_dynamic_plan
+from megatron.core.mdp.dynamic_cp_plan import (
+    DecoderDynamicPlan,
+    EncoderDynamicPlan,
+    validate_decoder_dynamic_plan,
+    validate_dynamic_plan_catalog,
+    validate_encoder_dynamic_plan,
+)
 from megatron.core.mdp.dynamic_cp_routing import (
     DecoderPayloadRouteLedger,
     validate_decoder_payload_route_ledger,
@@ -76,6 +82,8 @@ _DECODER_ROLES = ("decoder", "non-decoder")
 DYNAMIC_RUNTIME_SCHEMA_VERSION = 5
 DYNAMIC_EXECUTION_CONFIG_WIRE_WIDTH = 20
 _DYNAMIC_EXECUTION_CONFIG_DOMAIN = b"megatron.mdp.dynamic-cp.runtime-config-v2"
+_JOINT_PLAN_DIGEST_DOMAIN = b"megatron.mdp.dynamic-cp.joint-plan"
+_JOINT_PLAN_DIGEST_SCHEMA_VERSION = 1
 _PARTITION_MODE_IDS = {"contiguous": 1, "zigzag": 2}
 _EMBEDDING_DTYPE_IDS = frozenset((2, 3))
 
@@ -115,7 +123,9 @@ class _DecoderReadyCarrierAuthority:
 class DecoderReadyIteration:
     """One immutable, role-aware handoff accepted by decoder-ready gate 2.
 
-    Tensor contents are caller-owned and are not hashed. The private seal binds
+    Tensor contents are caller-owned and are not hashed. Under joint repeated-D4,
+    ``decoder_plan_digest`` carries the validated iteration-plan authority digest.
+    The private seal binds
     the exact transport carriers, returned mappings, record objects, and leaf
     views that were validated before gate 2.
     """
@@ -555,6 +565,27 @@ class _PreAuthorityDynamicProducer:
             )
 
 
+def _joint_dynamic_plan_digest(
+    decoder_plan: DecoderDynamicPlan, encoder_plan: EncoderDynamicPlan
+) -> bytes:
+    """Bind exact decoder and encoder plan digests into one D4 authority digest."""
+    if type(decoder_plan) is not DecoderDynamicPlan or type(encoder_plan) is not EncoderDynamicPlan:
+        raise MdpConfigurationError(
+            "MDP: joint dynamic plan digest uses exact decoder/encoder plan carriers."
+        )
+    validate_decoder_dynamic_plan(decoder_plan)
+    validate_encoder_dynamic_plan(encoder_plan)
+    validate_dynamic_plan_catalog(decoder_plan, encoder_plan)
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(
+        struct.pack("<2q", len(_JOINT_PLAN_DIGEST_DOMAIN), _JOINT_PLAN_DIGEST_SCHEMA_VERSION)
+    )
+    digest.update(_JOINT_PLAN_DIGEST_DOMAIN)
+    digest.update(decoder_plan.digest)
+    digest.update(encoder_plan.digest)
+    return digest.digest()
+
+
 @dataclass(frozen=True)
 class _DynamicIterationAuthority:
     """Global immutable D3 authority consumed by later runtime composition."""
@@ -570,6 +601,8 @@ class _DynamicIterationAuthority:
     participant_ranks: tuple[int, ...]
     bridge_width: int
     bridge_dtype: torch.dtype
+    encoder_plan: EncoderDynamicPlan | None = None
+    joint_plan_digest: bytes | None = None
 
     def __post_init__(self) -> None:
         for name in ("source_rank_by_lane", "producer_rank_by_item", "output_rows_by_item"):
@@ -613,6 +646,28 @@ class _DynamicIterationAuthority:
         object.__setattr__(self, "bridge_width", width)
         validate_decoder_global_manifest(self.global_manifest)
         validate_decoder_dynamic_plan(self.plan)
+        encoder_plan = self.encoder_plan
+        joint_plan_digest = self.joint_plan_digest
+        if (encoder_plan is None) != (joint_plan_digest is None):
+            raise MdpConfigurationError(
+                "MDP: dynamic iteration authority carries encoder plan and joint digest together."
+            )
+        if encoder_plan is not None:
+            if type(encoder_plan) is not EncoderDynamicPlan:
+                raise MdpConfigurationError(
+                    "MDP: dynamic iteration authority encoder plan has its exact typed carrier."
+                )
+            expected_joint_digest = _joint_dynamic_plan_digest(self.plan, encoder_plan)
+            if encoder_plan.pool_ranks != participants:
+                raise MdpPlanError(
+                    "MDP: dynamic iteration encoder plan pool matches exact participant ranks."
+                )
+            if type(joint_plan_digest) is not bytes or len(joint_plan_digest) != 16:
+                raise MdpPlanError("MDP: dynamic iteration joint plan digest is exactly 16 bytes.")
+            if joint_plan_digest != expected_joint_digest:
+                raise MdpPlanError(
+                    "MDP: dynamic iteration joint plan digest matches exact decoder/encoder plans."
+                )
         validate_decoder_payload_route_ledger(
             self.payload_ledger,
             plan=self.plan,
@@ -634,10 +689,19 @@ class _DynamicIterationAuthority:
 
 
 def _dynamic_iteration_plan_digest(authority: Any) -> bytes:
-    """Return the exact decoder-plan digest for a legacy iteration authority."""
+    """Return the validated decoder-only or joint iteration plan authority."""
     if type(authority) is not _DynamicIterationAuthority:
         raise MdpConfigurationError("MDP: plan digest requires exact iteration authority.")
-    return authority.plan.digest
+    encoder_plan = authority.encoder_plan
+    joint_plan_digest = authority.joint_plan_digest
+    if encoder_plan is None and joint_plan_digest is None:
+        return authority.plan.digest
+    if encoder_plan is None or joint_plan_digest is None:
+        raise MdpStateError("MDP: iteration authority retains paired encoder plan authority.")
+    expected = _joint_dynamic_plan_digest(authority.plan, encoder_plan)
+    if encoder_plan.pool_ranks != authority.participant_ranks or joint_plan_digest != expected:
+        raise MdpStateError("MDP: iteration authority retains exact joint plan authority.")
+    return joint_plan_digest
 
 
 @dataclass(frozen=True)

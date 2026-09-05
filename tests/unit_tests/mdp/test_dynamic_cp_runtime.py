@@ -17,7 +17,11 @@ import megatron.core.mdp.dynamic_cp_execution as execution
 import megatron.core.mdp.dynamic_cp_routing as routing
 import megatron.core.mdp.dynamic_cp_transport as payload_transport
 from megatron.core.mdp.bridge import BridgePhase
-from megatron.core.mdp.dynamic_cp import GlobalSampleId, GlobalVisionItemId
+from megatron.core.mdp.dynamic_cp import (
+    GlobalSampleId,
+    GlobalVisionItemId,
+    nested_dynamic_cp_group_specs,
+)
 from megatron.core.mdp.dynamic_cp_execution import (
     DECODER_EXECUTION_SCHEMA_VERSION,
     DecoderPayloadHeaderV1,
@@ -30,7 +34,10 @@ from megatron.core.mdp.dynamic_cp_execution import (
 from megatron.core.mdp.dynamic_cp_plan import (
     DecoderSampleMetadata,
     EncoderVisionItemMetadata,
+    EncoderWorkEstimate,
+    EncoderWorkUnit,
     build_decoder_dynamic_plan,
+    build_encoder_dynamic_plan,
 )
 from megatron.core.mdp.errors import (
     MdpBridgeError,
@@ -539,9 +546,18 @@ def test_dynamic_producer_carrier_requires_mapping_views_and_callbacks():
         )
 
 
-def test_dynamic_iteration_authority_requires_mapping_fields():
+def test_dynamic_iteration_authority_requires_mapping_fields(monkeypatch):
     runtime = _runtime()
     authority = _dynamic_authority(runtime)
+    assert authority.encoder_plan is None
+    assert authority.joint_plan_digest is None
+    with monkeypatch.context() as digest_lookup:
+        digest_lookup.setattr(
+            runtime,
+            "validate_decoder_dynamic_plan",
+            lambda _plan: pytest.fail("legacy digest lookup revalidated the decoder plan"),
+        )
+        assert runtime._dynamic_iteration_plan_digest(authority) is authority.plan.digest
     assert authority.plan.digest == _state().plan.digest
 
     mutable_source_ranks = dict(authority.source_rank_by_lane)
@@ -553,6 +569,75 @@ def test_dynamic_iteration_authority_requires_mapping_fields():
         replace(authority, source_rank_by_lane=())
     with pytest.raises(MdpConfigurationError, match="exact typed carrier"):
         replace(authority, global_manifest="manifest")
+
+
+def test_dynamic_iteration_authority_binds_exact_encoder_plan_and_joint_digest():
+    runtime = _runtime()
+    state = _state()
+    authority = _dynamic_authority(runtime)
+    encoder_plan = _encoder_plan(state)
+    joint_digest = runtime._joint_dynamic_plan_digest(state.plan, encoder_plan)
+
+    joint = replace(authority, encoder_plan=encoder_plan, joint_plan_digest=joint_digest)
+    duplicate = replace(authority, encoder_plan=encoder_plan, joint_plan_digest=joint_digest)
+    different_encoder = _encoder_plan(state, capacity=8)
+    different_joint = replace(
+        authority,
+        encoder_plan=different_encoder,
+        joint_plan_digest=runtime._joint_dynamic_plan_digest(state.plan, different_encoder),
+    )
+
+    assert joint.encoder_plan is encoder_plan
+    assert type(joint.joint_plan_digest) is bytes and len(joint.joint_plan_digest) == 16
+    assert joint.joint_plan_digest == duplicate.joint_plan_digest
+    assert joint.joint_plan_digest not in (authority.plan.digest, encoder_plan.digest)
+    assert different_joint.joint_plan_digest != joint.joint_plan_digest
+
+    object.__setattr__(joint, "joint_plan_digest", b"m" * 16)
+    with pytest.raises(MdpStateError, match="retains exact joint plan authority"):
+        runtime._dynamic_iteration_plan_digest(joint)
+
+
+def test_dynamic_iteration_authority_rejects_encoder_catalog_and_digest_mutation():
+    runtime = _runtime()
+    state = _state()
+    authority = _dynamic_authority(runtime)
+    encoder_plan = _encoder_plan(state)
+    joint_digest = runtime._joint_dynamic_plan_digest(state.plan, encoder_plan)
+    joint = replace(authority, encoder_plan=encoder_plan, joint_plan_digest=joint_digest)
+
+    first = state.plan.samples[0]
+    changed_samples = (
+        replace(first, valid_seqlen=first.valid_seqlen + 1, padded_seqlen=first.padded_seqlen + 1),
+        *state.plan.samples[1:],
+    )
+    mismatched_catalog = _encoder_plan(state, source_samples=changed_samples)
+    with pytest.raises(MdpPlanError, match="exact same canonical source"):
+        replace(authority, encoder_plan=mismatched_catalog, joint_plan_digest=b"j" * 16)
+    with pytest.raises(MdpPlanError, match="encoder dynamic plan digest matches"):
+        replace(
+            authority,
+            encoder_plan=replace(encoder_plan, digest=b"x" * 16),
+            joint_plan_digest=b"j" * 16,
+        )
+    with pytest.raises(MdpPlanError, match="joint plan digest matches"):
+        replace(joint, joint_plan_digest=b"j" * 16)
+    with pytest.raises(MdpPlanError, match="exactly 16 bytes"):
+        replace(joint, joint_plan_digest=b"short")
+    with pytest.raises(MdpConfigurationError, match="encoder plan has its exact typed carrier"):
+        replace(authority, encoder_plan=object(), joint_plan_digest=joint_digest)
+    with pytest.raises(MdpConfigurationError, match="encoder plan and joint digest together"):
+        replace(authority, encoder_plan=encoder_plan)
+    with pytest.raises(MdpConfigurationError, match="encoder plan and joint digest together"):
+        replace(authority, joint_plan_digest=joint_digest)
+    for pool_ranks in ((4, 5, 6, 7), (1, 0, 2, 3)):
+        foreign_pool = _encoder_plan(state, pool_ranks=pool_ranks)
+        with pytest.raises(MdpPlanError, match="pool matches exact participant ranks"):
+            replace(
+                authority,
+                encoder_plan=foreign_pool,
+                joint_plan_digest=runtime._joint_dynamic_plan_digest(state.plan, foreign_pool),
+            )
 
 
 def test_bind_pre_authority_producer_preserves_identity_and_globalizes_outputs(monkeypatch):
@@ -832,6 +917,37 @@ def _dynamic_authority(runtime):
         participant_ranks=_PARTICIPANTS,
         bridge_width=_WIDTH,
         bridge_dtype=torch.float32,
+    )
+
+
+def _encoder_plan(state, *, source_samples=None, capacity=4, pool_ranks=_PARTICIPANTS):
+    samples = state.plan.samples if source_samples is None else source_samples
+    item_ids = tuple(item.item_id for sample in samples for item in sample.vision_items)
+    return build_encoder_dynamic_plan(
+        samples,
+        tuple(EncoderWorkUnit((item_id,)) for item_id in item_ids),
+        group_specs=nested_dynamic_cp_group_specs(pool_ranks, minimum_size=1),
+        max_seqlen_per_rank=capacity,
+        workload_query=lambda _item_ids, _group_size: EncoderWorkEstimate(1, 1),
+    )
+
+
+def _joint_authority(authority):
+    runtime = _runtime()
+    item_ids = tuple(
+        item.item_id for sample in authority.plan.samples for item in sample.vision_items
+    )
+    encoder_plan = build_encoder_dynamic_plan(
+        authority.plan.samples,
+        tuple(EncoderWorkUnit((item_id,)) for item_id in item_ids),
+        group_specs=nested_dynamic_cp_group_specs(authority.participant_ranks, minimum_size=1),
+        max_seqlen_per_rank=8,
+        workload_query=lambda _item_ids, _group_size: EncoderWorkEstimate(1, 1),
+    )
+    return replace(
+        authority,
+        encoder_plan=encoder_plan,
+        joint_plan_digest=runtime._joint_dynamic_plan_digest(authority.plan, encoder_plan),
     )
 
 

@@ -68,19 +68,36 @@ class _Gate:
             raise self.abort_error
 
 
-def _dependencies(api, monkeypatch, *, world_error=None, domain_error=None, attempt_error=None):
+def _dependencies(
+    api, monkeypatch, *, world_error=None, domain_error=None, attempt_error=None, joint=False
+):
     events = []
-    authority = SimpleNamespace(global_manifest=SimpleNamespace(digest=_MANIFEST))
+    if joint:
+        from tests.unit_tests.mdp.test_dynamic_cp_d4_authority_construction import (
+            _iteration_authority,
+        )
+        from tests.unit_tests.mdp.test_dynamic_cp_runtime import _joint_authority
+
+        _, authority = _iteration_authority()
+        authority = _joint_authority(authority)
+    else:
+        authority = SimpleNamespace(global_manifest=SimpleNamespace(digest=_MANIFEST))
     ready = object()
     receipt = SimpleNamespace(prepared=SimpleNamespace(ready=ready), iteration_nonce=_RECEIPT_NONCE)
     producer = object()
     workspace_owner = object()
     prepared = SimpleNamespace(receipt=receipt)
+    status_digest = (
+        import_module("megatron.core.mdp.dynamic_cp_d4_authority_collective")
+        ._candidate_joint_gate_digest(authority, _GATE, 4)
+        if joint
+        else _GATE
+    )
     attempt = SimpleNamespace(
         status=_PrecollectiveStatus(
             global_rank=0,
-            global_manifest_digest=_MANIFEST,
-            plan_digest=_GATE if attempt_error is None else bytes(16),
+            global_manifest_digest=authority.global_manifest.digest,
+            plan_digest=status_digest if attempt_error is None else bytes(16),
             error_code=int(attempt_error is not None),
             gate_id=4,
         ),
@@ -122,7 +139,9 @@ def _dependencies(api, monkeypatch, *, world_error=None, domain_error=None, atte
         return b"route".ljust(16, b"0"), _GATE
 
     monkeypatch.setattr(api, "_candidate_gradient_gate_digest", candidate)
-    monkeypatch.setattr(api, "_candidate_digest", lambda *_args: _MANIFEST)
+    monkeypatch.setattr(api, "_candidate_digest", lambda *_args: authority.global_manifest.digest)
+    if not joint:
+        monkeypatch.setattr(api, "_candidate_joint_gate_digest", lambda _a, digest, _g: digest)
     monkeypatch.setattr(
         api, "_make_d3_gate_status_context", lambda **kwargs: SimpleNamespace(**kwargs)
     )
@@ -186,6 +205,24 @@ def test_gate4_uses_receipt_nonce_and_arms_only_after_world_domain_world(monkeyp
     assert values.events[-1] == ("accept", values.attempt)
     assert not hasattr(api, "_execute_d3_encoder_backward")
     assert not hasattr(api, "_run_precollective_consensus")
+
+
+def test_gate4_runner_receives_exact_joint_plan_digest(monkeypatch):
+    api = import_module("megatron.core.mdp.dynamic_cp_d4_encoder_completion")
+    values = _dependencies(api, monkeypatch, joint=True)
+
+    assert _run(api, values) is values.prepared
+    calls = [event[1] for event in values.events if event[0] in ("world", "domain")]
+    base_digest = import_module(
+        "megatron.core.mdp.dynamic_cp_d4_authority_collective"
+    )._candidate_joint_gate_digest(values.authority, _GATE, 4)
+    order = import_module("megatron.core.mdp.dynamic_cp_d4_collective_order")
+    assert [call["plan_digest"] for call in calls] == [
+        order._stage_plan_digest(
+            plan_digest=base_digest, attempt_nonce=_RUNNER_NONCE, gate_id=4, stage=stage
+        )
+        for stage in range(3)
+    ]
 
 
 def test_gate4_malformed_receipt_candidate_still_enters_world(monkeypatch):
