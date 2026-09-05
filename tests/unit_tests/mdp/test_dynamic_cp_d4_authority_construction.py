@@ -3,6 +3,7 @@
 """Domain-local iteration-authority contracts for repeated D4."""
 
 import os
+from dataclasses import replace
 from importlib import import_module
 from types import MappingProxyType, SimpleNamespace
 
@@ -24,7 +25,11 @@ from megatron.core.mdp.dynamic_cp_execution import (
     build_decoder_global_manifest,
     finalize_decoder_source_window,
 )
-from megatron.core.mdp.dynamic_cp_plan import DecoderSampleMetadata, EncoderVisionItemMetadata
+from megatron.core.mdp.dynamic_cp_plan import (
+    DecoderSampleMetadata,
+    EncoderVisionItemMetadata,
+    EncoderWorkEstimate,
+)
 from megatron.core.mdp.errors import MdpPlanError, MdpStateError
 from tests.unit_tests.mdp.test_dynamic_cp_runtime import _joint_authority
 
@@ -137,6 +142,137 @@ def _iteration_authority(rank=2, ep=1):
         bridge_dtype=torch.bfloat16,
     )
     return binding, authority
+
+
+@pytest.mark.parametrize(
+    ("rank", "rows_by_size", "expected_size"),
+    (
+        (2, {1: 4, 2: 2, 4: 1}, 1),
+        (2, {1: 9, 2: 5, 4: 3}, 2),
+        (6, {1: 17, 2: 9, 4: 5}, 4),
+    ),
+)
+def test_joint_authority_selects_first_fitting_encoder_group_from_exact_catalog(
+    rank, rows_by_size, expected_size
+):
+    api = _authority_api()
+    binding = _binding(rank)
+    lane = rank // 4
+    metadata = _metadata(lane, binding.domain_ranks[0])
+    calls = []
+
+    def workload(items, *, group_size):
+        calls.append((items, group_size))
+        assert len(items) == len(metadata.global_manifest.items)
+        assert all(
+            actual is expected
+            for actual, expected in zip(items, metadata.global_manifest.items, strict=True)
+        )
+        return EncoderWorkEstimate(rows_by_size[group_size], 17)
+
+    kwargs = dict(
+        decoder_max_seqlen_per_rank=8,
+        decoder_minimum_cp_size=1,
+        decoder_solver=_FullGroupSolver(),
+        encoder_max_seqlen_per_rank=8,
+        encoder_minimum_cp_size=1,
+        encoder_workload_query=workload,
+        bridge_width=16,
+        bridge_dtype=torch.bfloat16,
+    )
+    first = api.build_repeated_d4_joint_iteration_authority(binding, metadata, **kwargs)
+    second = api.build_repeated_d4_joint_iteration_authority(binding, metadata, **kwargs)
+
+    assert first.encoder_plan.source_samples == first.plan.samples
+    assert first.encoder_plan.pool_ranks == binding.domain_ranks
+    execution = first.encoder_plan.waves[0].executions[0]
+    assert execution.group_size == expected_size
+    assert execution.item_ids == tuple(item.item_id for item in metadata.global_manifest.items)
+    assert first.joint_plan_digest == second.joint_plan_digest
+    assert first.joint_plan_digest not in (first.plan.digest, first.encoder_plan.digest)
+    queried_sizes = tuple(size for size in (1, 2, 4) if size <= expected_size)
+    assert calls == [(metadata.global_manifest.items, size) for size in queried_sizes * 2]
+
+
+def test_joint_authority_rejects_invalid_workload_without_changing_decoder_only_builder():
+    api = _authority_api()
+    binding = _binding(2)
+    metadata = _metadata(0, 0)
+    legacy = api.build_repeated_d4_iteration_authority(
+        binding,
+        metadata,
+        max_seqlen_per_rank=8,
+        minimum_cp_size=1,
+        solver=_FullGroupSolver(),
+        bridge_width=16,
+        bridge_dtype=torch.bfloat16,
+    )
+    assert legacy.encoder_plan is None
+    assert legacy.joint_plan_digest is None
+
+    with pytest.raises(MdpPlanError, match="workload query failed"):
+        api.build_repeated_d4_joint_iteration_authority(
+            binding,
+            metadata,
+            decoder_max_seqlen_per_rank=8,
+            decoder_minimum_cp_size=1,
+            decoder_solver=_FullGroupSolver(),
+            encoder_max_seqlen_per_rank=8,
+            encoder_minimum_cp_size=1,
+            encoder_workload_query=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("bad metadata")
+            ),
+            bridge_width=16,
+            bridge_dtype=torch.bfloat16,
+        )
+
+
+def test_joint_authority_builds_empty_encoder_plan_for_text_only_catalog():
+    api = _authority_api()
+    binding = _binding(2)
+    window = _source_window(0)
+    text_window = finalize_decoder_source_window(
+        source_dp_lane=0,
+        samples=(replace(window.samples[0], vision_items=()),),
+        items=(),
+        packets=window.packets,
+    )
+    metadata = DecoderMetadataGatherResult(
+        global_manifest=build_decoder_global_manifest((text_window.metadata_manifest(),)),
+        source_rank_by_lane={0: 0},
+    )
+    kwargs = dict(
+        decoder_max_seqlen_per_rank=8,
+        decoder_minimum_cp_size=1,
+        decoder_solver=_FullGroupSolver(),
+        encoder_max_seqlen_per_rank=8,
+        encoder_minimum_cp_size=1,
+        encoder_workload_query=lambda *_args, **_kwargs: pytest.fail(
+            "text-only catalog queried encoder workload"
+        ),
+        bridge_width=16,
+        bridge_dtype=torch.bfloat16,
+    )
+
+    first = api.build_repeated_d4_joint_iteration_authority(binding, metadata, **kwargs)
+    second = api.build_repeated_d4_joint_iteration_authority(binding, metadata, **kwargs)
+    legacy = api.build_repeated_d4_iteration_authority(
+        binding,
+        metadata,
+        max_seqlen_per_rank=8,
+        minimum_cp_size=1,
+        solver=_FullGroupSolver(),
+        bridge_width=16,
+        bridge_dtype=torch.bfloat16,
+    )
+
+    assert first.encoder_plan.source_samples == first.plan.samples
+    assert first.encoder_plan.pool_ranks == binding.domain_ranks
+    assert first.encoder_plan.waves == ()
+    assert first.joint_plan_digest == second.joint_plan_digest
+    assert first.joint_plan_digest not in (first.plan.digest, first.encoder_plan.digest)
+    assert legacy.encoder_plan is None
+    assert legacy.joint_plan_digest is None
 
 
 @pytest.mark.parametrize(("rank", "ep"), ((2, 1), (6, 4)))
