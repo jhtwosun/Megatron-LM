@@ -1096,6 +1096,14 @@ class MdpRuntime:
         )
 
     @staticmethod
+    def _add_cleanup_note(primary_error: BaseException, note: str) -> None:
+        """Attach cleanup diagnostics without allowing an exception to replace the primary."""
+        try:
+            primary_error.add_note(note)
+        except BaseException:
+            pass
+
+    @staticmethod
     def _attempt_cleanup(actions, *, primary_error=None) -> None:
         cleanup_errors = []
         for description, action in actions:
@@ -1108,14 +1116,14 @@ class MdpRuntime:
             return
         if primary_error is not None:
             for description, error in cleanup_errors:
-                primary_error.add_note(
-                    f"suppressed cleanup error while {description}: {error!r}"
+                MdpRuntime._add_cleanup_note(
+                    primary_error, f"suppressed cleanup error while {description}: {error!r}"
                 )
             return
         _, first_error = cleanup_errors[0]
         for description, error in cleanup_errors[1:]:
-            first_error.add_note(
-                f"another cleanup error while {description}: {error!r}"
+            MdpRuntime._add_cleanup_note(
+                first_error, f"another cleanup error while {description}: {error!r}"
             )
         raise first_error
 
