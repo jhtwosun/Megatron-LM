@@ -633,6 +633,13 @@ class _DynamicIterationAuthority:
         )
 
 
+def _dynamic_iteration_plan_digest(authority: Any) -> bytes:
+    """Return the exact decoder-plan digest for a legacy iteration authority."""
+    if type(authority) is not _DynamicIterationAuthority:
+        raise MdpConfigurationError("MDP: plan digest requires exact iteration authority.")
+    return authority.plan.digest
+
+
 @dataclass(frozen=True)
 class _DynamicProducerCarrier:
     """Caller-owned producer state bound to one typed global D3 authority.
@@ -1197,6 +1204,7 @@ def validate_decoder_ready_iteration(
     embedding_width: int,
     embedding_dtype: torch.dtype,
     cp_partition_mode: str,
+    plan_digest: bytes | None = None,
 ) -> DecoderReadyIteration:
     """Validate one sealed handoff against exact phase-local authority."""
     if type(ready) is not DecoderReadyIteration:
@@ -1205,6 +1213,11 @@ def validate_decoder_ready_iteration(
         raise MdpBridgeError("MDP: decoder-ready handoff has a private authority seal.")
     validate_decoder_global_manifest(global_manifest)
     validate_decoder_dynamic_plan(plan)
+    expected_plan_digest = (
+        plan.digest
+        if plan_digest is None
+        else _require_digest("decoder-ready plan authority digest", plan_digest)
+    )
     bundle = validate_prepared_decoder_payload_bundle(payload_bundle)
     exchange = validate_prepared_dynamic_bridge_exchange(embedding_exchange)
     participants = _require_ranks("decoder-ready participant ranks", ready.participant_ranks)
@@ -1218,7 +1231,7 @@ def validate_decoder_ready_iteration(
     scalar_fields = (
         (ready.authority_digest, expected_digest),
         (ready.global_manifest_digest, global_manifest.digest),
-        (ready.decoder_plan_digest, plan.digest),
+        (ready.decoder_plan_digest, expected_plan_digest),
         (ready.payload_bundle_authority_digest, bundle.bundle_authority_digest),
         (ready.embedding_route_authority_digest, exchange.route_authority_digest),
         (ready.cp_partition_mode, cp_partition_mode),
@@ -1298,6 +1311,7 @@ def _validate_retained_decoder_ready_iteration(
     embedding_width: int,
     embedding_dtype: torch.dtype,
     cp_partition_mode: str,
+    plan_digest: bytes | None = None,
 ) -> DecoderReadyIteration:
     """Validate a gate-2 carrier after its gate-0 and gate-1 inputs retired."""
     if type(ready) is not DecoderReadyIteration:
@@ -1306,6 +1320,11 @@ def _validate_retained_decoder_ready_iteration(
         raise MdpBridgeError("MDP: retained decoder-ready handoff has a private authority seal.")
     validate_decoder_global_manifest(global_manifest)
     validate_decoder_dynamic_plan(plan)
+    expected_plan_digest = (
+        plan.digest
+        if plan_digest is None
+        else _require_digest("retained decoder-ready plan authority digest", plan_digest)
+    )
     rank = _require_integer("retained decoder-ready global rank", global_rank)
     participants = _require_ranks("retained decoder-ready participant ranks", participant_ranks)
     ready_participants = _require_ranks(
@@ -1342,7 +1361,7 @@ def _validate_retained_decoder_ready_iteration(
         ready.global_rank != rank
         or ready_participants != participants
         or ready_manifest_digest != global_manifest.digest
-        or ready_plan_digest != plan.digest
+        or ready_plan_digest != expected_plan_digest
         or ready.cp_partition_mode != cp_partition_mode
     ):
         raise MdpBridgeError("MDP: retained decoder-ready scalar authority matches this phase.")
@@ -1351,7 +1370,7 @@ def _validate_retained_decoder_ready_iteration(
         raise MdpConfigurationError("MDP: retained decoder-ready role matches plan authority.")
     expected_digest = _decoder_ready_authority_digest(
         global_manifest_digest=global_manifest.digest,
-        decoder_plan_digest=plan.digest,
+        decoder_plan_digest=expected_plan_digest,
         payload_bundle_authority_digest=ready_payload_digest,
         embedding_route_authority_digest=ready_embedding_digest,
         participant_ranks=participants,
@@ -1512,6 +1531,7 @@ def validate_prepared_decoder_gradient_exchange(
     embedding_width: int,
     embedding_dtype: torch.dtype,
     cp_partition_mode: str,
+    plan_digest: bytes | None = None,
 ) -> PreparedDecoderGradientExchange:
     """Validate one sealed local gradient preparation without entering gate 3."""
     if type(prepared) is not PreparedDecoderGradientExchange:
@@ -1527,6 +1547,7 @@ def validate_prepared_decoder_gradient_exchange(
         embedding_width=embedding_width,
         embedding_dtype=embedding_dtype,
         cp_partition_mode=cp_partition_mode,
+        plan_digest=plan_digest,
     )
     exchange = validate_prepared_dynamic_bridge_exchange(prepared.exchange)
     if (
@@ -1580,6 +1601,7 @@ def _validate_decoder_gradient_receipt(
     embedding_dtype: torch.dtype,
     cp_partition_mode: str,
     iteration_nonce: bytes,
+    plan_digest: bytes | None = None,
 ) -> DecoderGradientReceipt:
     """Validate one sealed gate-3 result before local producer aggregation."""
     if type(receipt) is not DecoderGradientReceipt:
@@ -1596,6 +1618,7 @@ def _validate_decoder_gradient_receipt(
         embedding_width=embedding_width,
         embedding_dtype=embedding_dtype,
         cp_partition_mode=cp_partition_mode,
+        plan_digest=plan_digest,
     )
     if receipt.received_tensors is not prepared.exchange.received_tensors:
         raise MdpBridgeError("MDP: decoder gradient receipt retains the exact gate-3 mapping.")
@@ -1674,6 +1697,7 @@ def _assemble_decoder_gradient_receipt(
     embedding_dtype: torch.dtype,
     cp_partition_mode: str,
     destination_tensors: Mapping[GlobalVisionItemId, Tensor],
+    plan_digest: bytes | None = None,
 ) -> Mapping[GlobalVisionItemId, Tensor]:
     """Sum endpoint gradients into exact caller-owned producer item buffers.
 
@@ -1695,6 +1719,7 @@ def _assemble_decoder_gradient_receipt(
         embedding_dtype=embedding_dtype,
         cp_partition_mode=cp_partition_mode,
         iteration_nonce=lifecycle.iteration_nonce,
+        plan_digest=plan_digest,
     )
     if not isinstance(destination_tensors, Mapping):
         raise MdpConfigurationError("MDP: decoder gradient destinations are an item mapping.")
@@ -1912,6 +1937,7 @@ def _prepare_decoder_gradient_exchange(
     participant_ranks: tuple[int, ...],
     send_buffer: Tensor,
     receive_buffer: Tensor,
+    plan_digest: bytes | None = None,
 ) -> PreparedDecoderGradientExchange:
     """Freeze one caller-buffer reverse-gradient exchange without collective work."""
     ready = _validate_retained_decoder_ready_iteration(
@@ -1923,6 +1949,7 @@ def _prepare_decoder_gradient_exchange(
         embedding_width=embedding_width,
         embedding_dtype=embedding_dtype,
         cp_partition_mode=cp_partition_mode,
+        plan_digest=plan_digest,
     )
     route_authority_digest = build_dynamic_bridge_route_authority_digest(
         embedding_ledger,
@@ -1972,6 +1999,7 @@ def _prepare_decoder_gradient_exchange(
         embedding_width=embedding_width,
         embedding_dtype=embedding_dtype,
         cp_partition_mode=cp_partition_mode,
+        plan_digest=plan_digest,
     )
 
 
@@ -2112,12 +2140,18 @@ def _build_decoder_ready_iteration(
     embedding_tensors: Mapping[Any, Tensor],
     assignments: tuple[LocalDecoderAssignment, ...],
     artifacts: _LocalDecoderReadyArtifacts,
+    plan_digest: bytes | None = None,
 ) -> DecoderReadyIteration:
+    effective_plan_digest = (
+        plan.digest
+        if plan_digest is None
+        else _require_digest("decoder-ready plan authority digest", plan_digest)
+    )
     ready = DecoderReadyIteration(
         role=role,
         authority_digest=authority_digest,
         global_manifest_digest=global_manifest.digest,
-        decoder_plan_digest=plan.digest,
+        decoder_plan_digest=effective_plan_digest,
         payload_bundle_authority_digest=payload_bundle.bundle_authority_digest,
         embedding_route_authority_digest=embedding_exchange.route_authority_digest,
         global_rank=global_rank,

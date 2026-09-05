@@ -2719,3 +2719,144 @@ def test_world4_nccl_decoder_gradient_completion_converges_prepare_failure_befor
         **_world4_gradient_phase_kwargs(state, rank, decoder_ready_groups, events=retry_events),
     )
     assert retry_events == ["status-3", "a2a-torch.float32"]
+
+
+def _rebuild_ready_with_plan_digest(state, legacy, captured, plan_digest):
+    runtime = _runtime()
+    authority_digest = runtime._decoder_ready_authority_digest(
+        global_manifest_digest=state.manifest.digest,
+        decoder_plan_digest=plan_digest,
+        payload_bundle_authority_digest=captured["payload_bundle"].bundle_authority_digest,
+        embedding_route_authority_digest=captured["embedding_exchange"].route_authority_digest,
+        participant_ranks=_PARTICIPANTS,
+        cp_partition_mode="contiguous",
+    )
+    return runtime._build_decoder_ready_iteration(
+        role=legacy.role,
+        authority_digest=authority_digest,
+        global_manifest=state.manifest,
+        plan=state.plan,
+        global_rank=legacy.global_rank,
+        participant_ranks=_PARTICIPANTS,
+        cp_partition_mode="contiguous",
+        payload_bundle=captured["payload_bundle"],
+        payload_tensors=captured["payload_tensors"],
+        embedding_exchange=captured["embedding_exchange"],
+        embedding_tensors=captured["embedding_tensors"],
+        assignments=legacy.assignments,
+        artifacts=runtime._LocalDecoderReadyArtifacts(
+            legacy.records, legacy.embedding_leaves
+        ),
+        plan_digest=plan_digest,
+    )
+
+
+def test_plan_digest_plumbing_preserves_legacy_bytes_and_threads_explicit_override():
+    runtime = _runtime()
+    state = _state()
+    captured = {}
+    legacy = _run(state, 1, captured=captured)
+    rebuilt_legacy = _rebuild_ready_with_plan_digest(
+        state, legacy, captured, state.plan.digest
+    )
+    assert rebuilt_legacy.decoder_plan_digest == legacy.decoder_plan_digest
+    assert rebuilt_legacy.authority_digest == legacy.authority_digest
+    assert (
+        runtime.validate_decoder_ready_iteration(
+            legacy,
+            global_manifest=state.manifest,
+            plan=state.plan,
+            payload_bundle=captured["payload_bundle"],
+            payload_tensors=captured["payload_tensors"],
+            embedding_exchange=captured["embedding_exchange"],
+            embedding_tensors=captured["embedding_tensors"],
+            expected_assignments=legacy.assignments,
+            authority_digest=legacy.authority_digest,
+            embedding_width=_WIDTH,
+            embedding_dtype=torch.float32,
+            cp_partition_mode="contiguous",
+        )
+        is legacy
+    )
+
+    plan_digest = b"j" * 16
+    ready = _rebuild_ready_with_plan_digest(state, legacy, captured, plan_digest)
+    ready_kwargs = dict(
+        global_manifest=state.manifest,
+        plan=state.plan,
+        global_rank=1,
+        participant_ranks=_PARTICIPANTS,
+        embedding_width=_WIDTH,
+        embedding_dtype=torch.float32,
+        cp_partition_mode="contiguous",
+        plan_digest=plan_digest,
+    )
+    assert ready.decoder_plan_digest == plan_digest
+    assert (
+        runtime.validate_decoder_ready_iteration(
+            ready,
+            global_manifest=state.manifest,
+            plan=state.plan,
+            payload_bundle=captured["payload_bundle"],
+            payload_tensors=captured["payload_tensors"],
+            embedding_exchange=captured["embedding_exchange"],
+            embedding_tensors=captured["embedding_tensors"],
+            expected_assignments=ready.assignments,
+            authority_digest=ready.authority_digest,
+            embedding_width=_WIDTH,
+            embedding_dtype=torch.float32,
+            cp_partition_mode="contiguous",
+            plan_digest=plan_digest,
+        )
+        is ready
+    )
+    assert runtime._validate_retained_decoder_ready_iteration(ready, **ready_kwargs) is ready
+
+    _set_leaf_grads(ready)
+    prepared = _prepare_gradient(state, ready, 1, plan_digest=plan_digest)
+    assert (
+        runtime.validate_prepared_decoder_gradient_exchange(prepared, **ready_kwargs)
+        is prepared
+    )
+    nonce = b"n" * 16
+    receipt = runtime._make_decoder_gradient_receipt(
+        prepared, prepared.exchange.received_tensors, iteration_nonce=nonce
+    )
+    receipt_kwargs = dict(
+        **ready_kwargs,
+        embedding_ledger=state.embedding,
+        gradient_ledger=state.gradient,
+        producer_rank_by_item=state.bridge_authority["producer_rank_by_item"],
+        output_rows_by_item=state.bridge_authority["output_rows_by_item"],
+        iteration_nonce=nonce,
+    )
+    assert runtime._validate_decoder_gradient_receipt(receipt, **receipt_kwargs) is receipt
+    destinations = _gradient_destinations(state, 1)
+    assembled = runtime._assemble_decoder_gradient_receipt(
+        _gradient_lifecycle(nonce),
+        receipt,
+        destination_tensors=destinations,
+        **{key: value for key, value in receipt_kwargs.items() if key != "iteration_nonce"},
+    )
+    assert tuple(assembled) == tuple(destinations)
+
+
+def test_plan_digest_plumbing_rejects_malformed_override():
+    state = _state()
+    captured = {}
+    ready = _run(state, 1, captured=captured)
+    with pytest.raises(MdpPlanError, match="exact 16-byte digest"):
+        _rebuild_ready_with_plan_digest(state, ready, captured, b"short")
+
+
+def test_dynamic_iteration_plan_digest_is_exact_type_and_legacy_fast_path(monkeypatch):
+    runtime = _runtime()
+    authority = _dynamic_authority(runtime)
+    monkeypatch.setattr(
+        runtime,
+        "validate_decoder_dynamic_plan",
+        lambda _plan: pytest.fail("legacy digest lookup revalidated the decoder plan"),
+    )
+    assert runtime._dynamic_iteration_plan_digest(authority) is authority.plan.digest
+    with pytest.raises(MdpConfigurationError, match="exact iteration authority"):
+        runtime._dynamic_iteration_plan_digest(object())
