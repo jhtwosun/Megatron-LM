@@ -119,6 +119,21 @@ def _metadata(lane, producer_rank):
     )
 
 
+def _iteration_authority(rank=2, ep=1):
+    binding = _binding(rank, ep)
+    lane = rank // 4
+    authority = _authority_api().build_repeated_d4_iteration_authority(
+        binding,
+        _metadata(lane, binding.domain_ranks[0]),
+        max_seqlen_per_rank=8,
+        minimum_cp_size=1,
+        solver=_FullGroupSolver(),
+        bridge_width=16,
+        bridge_dtype=torch.bfloat16,
+    )
+    return binding, authority
+
+
 @pytest.mark.parametrize(("rank", "ep"), ((2, 1), (6, 4)))
 def test_builds_authority_only_within_the_bound_local_domain(rank, ep):
     api = _authority_api()
@@ -181,6 +196,66 @@ def test_revalidates_group_binding_before_planning():
             bridge_width=16,
             bridge_dtype=torch.bfloat16,
         )
+
+
+def test_authority_collective_binds_exact_digests_and_callbacks(monkeypatch):
+    api = import_module("megatron.core.mdp.dynamic_cp_d4_authority_collective")
+    binding, authority = _iteration_authority()
+    events = []
+
+    class _Runner:
+        def run(self, **kwargs):
+            events.append(("run", kwargs))
+            return kwargs["domain_collective"](kwargs["prepare"]())
+
+    def begin_attempt(self, *, byte_generator=None):
+        assert self is binding
+        events.append(("begin", byte_generator))
+        return _Runner()
+
+    monkeypatch.setattr(type(binding), "begin_attempt", begin_attempt)
+    prepare = lambda: events.append(("prepare",)) or "prepared"
+    collective = lambda value: events.append(("collective", value)) or "result"
+
+    result = api.run_repeated_d4_authority_collective(
+        binding,
+        authority,
+        gate_id=2,
+        prepare=prepare,
+        domain_collective=collective,
+        byte_generator=bytes,
+    )
+
+    assert result == "result"
+    assert events[0] == ("begin", bytes)
+    assert events[1][0] == "run"
+    call = events[1][1]
+    assert call["global_manifest_digest"] == authority.global_manifest.digest
+    assert call["plan_digest"] == authority.plan.digest
+    assert call["gate_id"] == 2
+    assert call["prepare"] is not prepare and callable(call["prepare"])
+    assert call["domain_collective"] is collective
+    assert events[2:] == [("prepare",), ("collective", "prepared")]
+
+
+def test_authority_collective_rejects_foreign_domain_inside_preparation(monkeypatch):
+    api = import_module("megatron.core.mdp.dynamic_cp_d4_authority_collective")
+    binding, _ = _iteration_authority(rank=2)
+    _, foreign = _iteration_authority(rank=6)
+    events = []
+
+    class _Runner:
+        def run(self, **kwargs):
+            events.append("runner")
+            return kwargs["prepare"]()
+
+    monkeypatch.setattr(type(binding), "begin_attempt", lambda *_args, **_kwargs: _Runner())
+
+    with pytest.raises(MdpStateError, match="matches its local domain"):
+        api.run_repeated_d4_authority_collective(
+            binding, foreign, gate_id=2, prepare=lambda: None, domain_collective=lambda _value: None
+        )
+    assert events == ["runner"]
 
 
 if _WORLD8:
@@ -246,3 +321,72 @@ def test_world8_gathers_and_builds_two_independent_domain_authorities(groups):
     )
     assert edges
     assert all(src in domain_ranks and dst in domain_ranks for src, dst in edges)
+
+
+@pytest.mark.skipif(not _WORLD8, reason="needs torchrun world8")
+def test_world8_authority_collective_converges_rank6_failure_and_retries(groups):
+    api = import_module("megatron.core.mdp.dynamic_cp_d4_authority_collective")
+    world, domain_group = groups
+    rank = torch.distributed.get_rank()
+    lane = rank // 4
+    domain_ranks = tuple(range(lane * 4, lane * 4 + 4))
+    device = torch.device("cuda", torch.cuda.current_device())
+    binding = binding_api._make_repeated_d4_group_binding(
+        world_group=world,
+        domain_group=domain_group,
+        expert_group=None,
+        global_rank=rank,
+        expert_parallel_size=1,
+        device=device,
+        timeout_seconds=30.0,
+    )
+    metadata = gather_decoder_source_manifests(
+        _source_manifest(lane) if rank == domain_ranks[0] else None,
+        expected_source_lanes=(lane,),
+        group=domain_group,
+        group_ranks=domain_ranks,
+        global_rank=rank,
+        device=device,
+        timeout_seconds=30.0,
+    )
+    authority = _authority_api().build_repeated_d4_iteration_authority(
+        binding,
+        metadata,
+        max_seqlen_per_rank=8,
+        minimum_cp_size=1,
+        solver=_FullGroupSolver(),
+        bridge_width=16,
+        bridge_dtype=torch.bfloat16,
+    )
+
+    def prepare(*, fail=False):
+        if fail:
+            raise RuntimeError("rank 6 preparation")
+        return torch.tensor(rank, dtype=torch.int64, device=device)
+
+    with pytest.raises(MdpPlanError, match="gate mismatch at rank 6"):
+        api.run_repeated_d4_authority_collective(
+            binding,
+            object() if rank == 6 else authority,
+            gate_id=2,
+            prepare=prepare,
+            domain_collective=lambda _value: pytest.fail("data entered after rejection"),
+        )
+
+    with pytest.raises(MdpPlanError, match="rejected rank 6"):
+        api.run_repeated_d4_authority_collective(
+            binding,
+            authority,
+            gate_id=2,
+            prepare=lambda: prepare(fail=rank == 6),
+            domain_collective=lambda _value: pytest.fail("data entered after rejection"),
+        )
+
+    def collect(value):
+        torch.distributed.all_reduce(value, group=domain_group)
+        return value.item()
+
+    result = api.run_repeated_d4_authority_collective(
+        binding, authority, gate_id=2, prepare=prepare, domain_collective=collect
+    )
+    assert result == (6 if lane == 0 else 22)
