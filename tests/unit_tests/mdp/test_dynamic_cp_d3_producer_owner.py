@@ -60,6 +60,16 @@ class _EncoderDomain:
         self.encoder_ddp = ddp
 
 
+class _HostilePrimary(BaseException):
+    def __init__(self, message="primary"):
+        super().__init__(message)
+        self.add_note_calls = 0
+
+    def add_note(self, _note):
+        self.add_note_calls += 1
+        raise BaseException("hostile add_note")
+
+
 def _segment(item_id, rows, output_start):
     return EncoderThdSegment(
         global_item_id=item_id,
@@ -878,6 +888,99 @@ def test_abort_preserves_primary_and_attaches_cleanup_note(monkeypatch):
     assert str(primary) == "primary"
     assert any("cleanup" in note for note in getattr(primary, "__notes__", ()))
     assert calls == 3
+
+
+def test_abort_hostile_note_preserves_cleanup_and_exact_runtime_reset(monkeypatch):
+    api = _api()
+    runtime, outputs = _runtime()
+    owner = _capture(api, runtime, outputs)
+    completion = owner.prepare_dynamic_completion(_gradients(outputs))
+    owned_handle = runtime._handle
+    owned_pixels = runtime._chunk_payload_bases
+    runtime._handle = object()
+    runtime._chunk_payload_bases = (torch.empty_like(owned_pixels[0]),)
+    original_abort = runtime._abort_failed_iteration
+    reset_calls = []
+
+    def abort_then_fail(primary, *, cleanup_actions=()):
+        reset_calls.append(primary)
+        original_abort(primary, cleanup_actions=cleanup_actions)
+        raise BaseException("injected post-reset failure")
+
+    monkeypatch.setattr(runtime, "_abort_failed_iteration", abort_then_fail)
+    primary = _HostilePrimary()
+    owner.abort(primary)
+
+    assert reset_calls == [primary]
+    assert primary.add_note_calls == 3
+    assert runtime.state is MdpRuntimeState.EMPTY
+    assert runtime._handle is None
+    assert not runtime._chunk_payload_bases
+    assert owner._runtime is None
+    assert completion.handle is None
+    assert owned_handle._released is True
+
+    registry_identity = id(runtime._retired_pre_authority_dynamic_producers)
+    allocator_identity = id(runtime.allocator)
+    fresh_runtime, fresh_outputs = _runtime()
+    runtime._handle = fresh_runtime._handle
+    runtime._chunk_layouts = fresh_runtime._chunk_layouts
+    runtime._chunk_of_item = fresh_runtime._chunk_of_item
+    runtime._chunk_payload_bases = fresh_runtime._chunk_payload_bases
+    runtime._state = fresh_runtime._state
+    monkeypatch.setattr(runtime, "_abort_failed_iteration", original_abort)
+    fresh = _capture(api, runtime, fresh_outputs, bind=False)
+    assert fresh._runtime is runtime
+    assert runtime._pre_authority_dynamic_producer is fresh.producer
+    assert id(runtime._retired_pre_authority_dynamic_producers) == registry_identity
+    assert id(runtime.allocator) == allocator_identity
+    fresh.abort()
+    assert runtime.state is MdpRuntimeState.EMPTY
+    assert runtime._pre_authority_dynamic_producer is None
+
+
+def test_finalization_hostile_primary_attempts_all_release_and_reset(monkeypatch):
+    api = _api()
+    runtime, outputs = _runtime()
+    owner = _capture(api, runtime, outputs)
+    completion = owner.prepare_dynamic_completion(_gradients(outputs))
+    owner._enter_native_encoder_backward(completion)
+    completion.handle.backward(completion.gradient_views)
+    owner._complete_native_encoder_backward(completion)
+    primary = _HostilePrimary("injected handle release failure")
+    bases = completion.allocation_bases
+    pixels = runtime._chunk_payload_bases
+    release_calls = []
+    original_abort = runtime._abort_failed_iteration
+    reset_calls = []
+
+    def fail_handle_release():
+        raise primary
+
+    def fail_release(tensor):
+        release_calls.append(tensor)
+        raise RuntimeError("injected buffer release failure")
+
+    def abort_then_fail(error, *, cleanup_actions=()):
+        reset_calls.append(error)
+        original_abort(error, cleanup_actions=cleanup_actions)
+        raise BaseException("injected finalization reset failure")
+
+    monkeypatch.setattr(completion.handle, "release", fail_handle_release)
+    monkeypatch.setattr(runtime.allocator, "release", fail_release)
+    monkeypatch.setattr(runtime, "_abort_failed_iteration", abort_then_fail)
+
+    with pytest.raises(_HostilePrimary) as caught:
+        owner._prepare_native_encoder_finalization(completion)
+
+    assert caught.value is primary
+    assert len(release_calls) == len(bases) + len(pixels)
+    assert reset_calls == [primary]
+    assert primary.add_note_calls >= 2
+    assert runtime.state is MdpRuntimeState.EMPTY
+    assert runtime._handle is None
+    assert not runtime._chunk_payload_bases
+    assert owner._runtime is None
 
 
 def test_payload_substitution_is_rejected_and_only_owned_payload_is_released():

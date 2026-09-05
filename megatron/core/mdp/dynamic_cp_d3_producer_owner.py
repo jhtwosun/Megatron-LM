@@ -22,6 +22,14 @@ _PENDING_OWNER_SEALS: dict[object, tuple[int, ...]] = {}
 _INT64_MAX = 2**63 - 1
 
 
+def _add_cleanup_note(primary: BaseException, note: str) -> None:
+    """Attach cleanup diagnostics without allowing an exception to replace the primary."""
+    try:
+        primary.add_note(note)
+    except BaseException:
+        pass
+
+
 def _descriptor(tensor: torch.Tensor) -> tuple:
     return (
         id(tensor),
@@ -180,7 +188,7 @@ class _D3ProducerOwner:
         self._rank_view, self._handle = rank_view, handle
         self._outputs = () if handle is None else tuple(handle.chunk_outputs)
         self._output_descriptors = tuple(_descriptor(value) for value in self._outputs)
-        self._layouts, self._geometry, self._item_outputs = layouts, geometry, item_outputs
+        self._layouts, self._geometry, self._item_outputs = (layouts, geometry, item_outputs)
         self._item_descriptors = tuple(
             (key, _descriptor(value)) for key, value in item_outputs.items()
         )
@@ -360,11 +368,15 @@ class _D3ProducerOwner:
             self._state = "retired"
             primary = errors[0][1]
             for description, error in errors[1:]:
-                primary.add_note(f"another cleanup error while releasing {description}: {error!r}")
+                _add_cleanup_note(
+                    primary, f"another cleanup error while releasing {description}: {error!r}"
+                )
             try:
                 runtime._abort_failed_iteration(primary)
             except BaseException as cleanup_error:
-                primary.add_note(f"suppressed D3 finalization reset error: {cleanup_error!r}")
+                _add_cleanup_note(
+                    primary, f"suppressed D3 finalization reset error: {cleanup_error!r}"
+                )
             self._scrub_owner(finalized=False)
             raise primary
         self._state = "finalization-prepared"
@@ -510,14 +522,16 @@ class _D3ProducerOwner:
         self._state = "retired"
         try:
             if runtime._handle is not self._handle:
-                error.add_note("D3 cleanup ignored a substituted runtime forward handle.")
+                _add_cleanup_note(error, "D3 cleanup ignored a substituted runtime forward handle.")
             if (
                 type(runtime._chunk_payload_bases) is not tuple
                 or len(runtime._chunk_payload_bases) != len(self._pixel_bases)
                 or any(a is not b for a, b in zip(runtime._chunk_payload_bases, self._pixel_bases))
             ):
-                error.add_note("D3 cleanup ignored substituted runtime packed-pixel bases.")
-            runtime._handle, runtime._chunk_payload_bases = self._handle, self._pixel_bases
+                _add_cleanup_note(
+                    error, "D3 cleanup ignored substituted runtime packed-pixel bases."
+                )
+            runtime._handle, runtime._chunk_payload_bases = (self._handle, self._pixel_bases)
             try:
                 runtime._abort_failed_iteration(
                     error,
@@ -530,7 +544,7 @@ class _D3ProducerOwner:
                     ),
                 )
             except BaseException as cleanup_error:
-                error.add_note(f"suppressed D3 owner cleanup error: {cleanup_error!r}")
+                _add_cleanup_note(error, f"suppressed D3 owner cleanup error: {cleanup_error!r}")
         finally:
             if completion is not None:
                 object.__setattr__(completion, "handle", None)
