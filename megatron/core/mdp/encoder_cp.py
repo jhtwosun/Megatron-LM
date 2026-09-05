@@ -174,19 +174,22 @@ def partition_encoder_cp_inputs(
     if rotary.dim() == 0 or rotary.size(0) != plan.total_rows:
         rows = rotary.size(0) if rotary.dim() else 0
         raise ValueError(f"rotary rows {rows} != {plan.total_rows}")
+    return partition_encoder_cp_tensor(hidden, plan), partition_encoder_cp_tensor(rotary, plan)
+
+
+def partition_encoder_cp_tensor(tensor: Tensor, plan: EncoderCpPlan) -> Tensor:
+    """Pad and select this encoder-CP rank's native THD rows."""
+    if tensor.dim() == 0 or tensor.size(0) != plan.total_rows:
+        rows = tensor.size(0) if tensor.dim() else 0
+        raise ValueError(f"tensor rows {rows} != {plan.total_rows}")
     if plan.cp_size == 1 or plan.total_rows == 0:
-        return hidden, rotary
+        return tensor
     local_indices = plan.local_indices
     assert plan.valid_padded_indices is not None and local_indices is not None
-    padded_hidden = hidden.new_zeros((plan.total_padded_rows, *hidden.shape[1:])).index_copy(
-        0, plan.valid_padded_indices, hidden
+    padded = tensor.new_zeros((plan.total_padded_rows, *tensor.shape[1:])).index_copy(
+        0, plan.valid_padded_indices, tensor
     )
-    padded_rotary = rotary.new_zeros((plan.total_padded_rows, *rotary.shape[1:])).index_copy(
-        0, plan.valid_padded_indices, rotary
-    )
-    return padded_hidden.index_select(0, local_indices), padded_rotary.index_select(
-        0, local_indices
-    )
+    return padded.index_select(0, local_indices)
 
 
 def restore_encoder_cp_output(

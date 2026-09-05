@@ -81,8 +81,9 @@ def validate_nemotron_omni_support(args, language_config, vision_config) -> None
         raise ValueError("Nemotron Omni M3 does not support a custom pipeline layout.")
     if getattr(args, "mtp_num_layers", None) or getattr(language_config, "mtp_num_layers", None):
         raise ValueError("Nemotron Omni M3 does not support MTP.")
-    if int(getattr(args, "mdp_encoder_cp", 1)) != 1:
-        raise ValueError("Nemotron Omni M3 requires encoder_cp=1; encoder CP is unsupported.")
+    encoder_cp = getattr(args, "mdp_encoder_cp", 1)
+    if type(encoder_cp) is not int or encoder_cp not in (1, 2, 4):
+        raise ValueError("Nemotron Omni M3 encoder CP must be exactly 1, 2, or 4.")
     if getattr(language_config, "recompute_granularity", None) is not None:
         raise ValueError("Nemotron Omni M3 does not support language recompute.")
     if (

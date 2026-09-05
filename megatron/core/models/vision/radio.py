@@ -310,6 +310,17 @@ class RADIOViTModel(VisionModule):
         """Sets input tensor to the model."""
         self.decoder.set_input_tensor(input_tensor)
 
+    def _forward_transformer(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> torch.Tensor:
+        """Run the ViT blocks while preserving RADIO's public BSH layout."""
+        x = x.permute(1, 0, 2).contiguous()
+        x = self.decoder(x, attention_mask=attention_mask, packed_seq_params=packed_seq_params)
+        return x.permute(1, 0, 2).contiguous()
+
     def forward(
         self,
         x: torch.Tensor,
@@ -430,13 +441,7 @@ class RADIOViTModel(VisionModule):
         if self.ln_pre:
             x = self.ln_pre(x)
 
-        x = x.permute(1, 0, 2)  # [b, s, h] -> [s, b, h]
-        x = x.contiguous()
-
-        x = self.decoder(x, attention_mask=attention_mask, packed_seq_params=packed_seq_params)
-
-        x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
-        x = x.contiguous()
+        x = self._forward_transformer(x, attention_mask, packed_seq_params)
 
         if self.ln_post:
             x = self.ln_post(x)

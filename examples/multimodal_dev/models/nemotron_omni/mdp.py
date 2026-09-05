@@ -6,8 +6,9 @@ from collections.abc import Mapping
 
 import torch
 
-from examples.multimodal_dev.mdp_adapter import Qwen35VLMdpAdapter
+from examples.multimodal_dev.mdp_adapter import Qwen35VLMdpAdapter, _bind_dynamic_encoder_cp
 from examples.multimodal_dev.models.nemotron_omni.configuration import (
+    CLASS_TOKEN_LEN,
     IMAGE_TOKEN_ID,
     PIXEL_PAYLOAD_WIDTH,
     SPATIAL_MERGE_SIZE,
@@ -19,8 +20,12 @@ from examples.multimodal_dev.models.nemotron_omni.factory import (
 )
 from examples.multimodal_dev.models.nemotron_omni.vision_encoder import (
     NemotronOmniVisionEncoder,
+    _NemotronEncoderCpRADIOViTModel,
     encode_nemotron_omni_images,
 )
+from megatron.core.mdp.dynamic_cp_execution import DecoderVisionItemMetadata
+from megatron.core.mdp.dynamic_cp_plan import EncoderWorkEstimate
+from megatron.core.mdp.errors import MdpConfigurationError
 
 
 def validate_nemotron_omni_raw_batch(raw_batch) -> None:
@@ -54,6 +59,90 @@ class NemotronOmniMdpAdapter(Qwen35VLMdpAdapter):
         )
         self.payload_width = PIXEL_PAYLOAD_WIDTH
         self._language_config = language_config
+
+    def estimate_dynamic_encoder_workload(
+        self, items: tuple[DecoderVisionItemMetadata, ...], *, group_size: int
+    ) -> EncoderWorkEstimate:
+        """Estimate RADIO transformer rows, including per-image class tokens."""
+        if type(self) is not NemotronOmniMdpAdapter:
+            raise MdpConfigurationError(
+                "MDP: dynamic encoder workload requires the exact Nemotron Omni adapter."
+            )
+        if not isinstance(items, tuple) or not items:
+            raise MdpConfigurationError(
+                "MDP: Nemotron Omni dynamic encoder items are an immutable non-empty tuple."
+            )
+        if type(group_size) is not int or group_size not in (1, 2, 4):
+            raise MdpConfigurationError(
+                "MDP: Nemotron Omni dynamic encoder group_size is E1, E2, or E4."
+            )
+
+        seen = set()
+        effective_rows = 0
+        cost_units = 0
+        alignment = 2 * group_size
+        for item in items:
+            if not isinstance(item, DecoderVisionItemMetadata):
+                raise MdpConfigurationError(
+                    "MDP: Nemotron Omni dynamic encoder items use typed decoder metadata."
+                )
+            if item.item_id in seen:
+                raise MdpConfigurationError(
+                    "MDP: Nemotron Omni dynamic encoder items have unique item identities."
+                )
+            seen.add(item.item_id)
+            grid = item.grid_thw
+            if (
+                not isinstance(grid, tuple)
+                or len(grid) != 3
+                or any(type(value) is not int or value <= 0 for value in grid)
+            ):
+                raise MdpConfigurationError(
+                    "MDP: Nemotron Omni dynamic encoder grid_thw has three positive integers."
+                )
+            temporal, height, width = grid
+            if temporal != 1:
+                raise MdpConfigurationError(
+                    "MDP: Nemotron Omni dynamic encoder grid_thw is image-only with t=1."
+                )
+            if height % 2 or width % 2:
+                raise MdpConfigurationError(
+                    "MDP: Nemotron Omni dynamic encoder grid_thw is 2x2 shuffle aligned."
+                )
+            output_rows = height * width // 4
+            if type(item.output_rows) is not int or item.output_rows != output_rows:
+                raise MdpConfigurationError(
+                    "MDP: Nemotron Omni dynamic encoder output_rows matches RADIO projection."
+                )
+            radio_rows = height * width + CLASS_TOKEN_LEN
+            padded_rows = ((radio_rows + alignment - 1) // alignment) * alignment
+            effective_rows += padded_rows // group_size
+            cost_units += radio_rows
+        return EncoderWorkEstimate(effective_rows, cost_units)
+
+    def bind_dynamic_encoder_cp(self, encoder, *, membership, global_rank):
+        """Temporarily bind the exact Nemotron RADIO transformer to one subgroup."""
+        if type(self) is not NemotronOmniMdpAdapter:
+            raise MdpConfigurationError(
+                "MDP: dynamic encoder CP binding requires the exact Nemotron Omni adapter."
+            )
+        if type(encoder) is not NemotronOmniVisionEncoder:
+            raise MdpConfigurationError(
+                "MDP: Nemotron dynamic encoder CP requires its exact outer vision encoder."
+            )
+        radio = encoder.vision_model
+        if type(radio) is not _NemotronEncoderCpRADIOViTModel:
+            raise MdpConfigurationError(
+                "MDP: Nemotron dynamic encoder CP requires its exact inner RADIO encoder."
+            )
+        return _bind_dynamic_encoder_cp(
+            encoder,
+            radio,
+            membership=membership,
+            global_rank=global_rank,
+            group_attribute="encoder_cp_group",
+            size_attribute=None,
+        )
 
     def get_batch(self, data_iterator):
         """Validate the one raw batch, then reuse native packed sidecar capture."""
@@ -116,6 +205,16 @@ class NemotronOmniMdpAdapter(Qwen35VLMdpAdapter):
     def build_encoder(self, model_config, *, pg_collection):
         if self._language_config is None:
             raise RuntimeError("Nemotron Omni encoder construction requires the language config.")
+        encoder_cp_group = getattr(pg_collection, "cp", None)
+        if encoder_cp_group is None:
+            raise ValueError("Nemotron Omni encoder construction requires an encoder CP group.")
+        encoder_cp_size = int(encoder_cp_group.size())
+        configured_cp_size = int(model_config.context_parallel_size)
+        if encoder_cp_size != configured_cp_size:
+            raise ValueError(
+                "Nemotron Omni encoder CP group size must match context_parallel_size: "
+                f"group size {encoder_cp_size}, context_parallel_size {configured_cp_size}."
+            )
         pattern = getattr(self._language_config, "hybrid_layer_pattern", None)
         _language_spec, vision_spec, projection_submodules = get_nemotron_omni_specs(pattern)
         projection_config, _submodules, _input_size = get_nemotron_omni_projector_config(
@@ -127,6 +226,7 @@ class NemotronOmniMdpAdapter(Qwen35VLMdpAdapter):
             projection_config=projection_config,
             projection_submodules=projection_submodules,
             pg_collection=pg_collection,
+            encoder_cp_group=encoder_cp_group,
         )
 
     def encode(self, encoder, payload, layout):

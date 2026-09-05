@@ -12,6 +12,11 @@ from examples.multimodal_dev.models.nemotron_omni.configuration import (
     PATCH_SIZE,
     PIXEL_PAYLOAD_WIDTH,
 )
+from megatron.core.mdp.encoder_cp import (
+    build_encoder_cp_plan,
+    partition_encoder_cp_tensor,
+    restore_encoder_cp_output,
+)
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -159,6 +164,88 @@ def _encode_radio_modules(
     return vision_projection(merged.unsqueeze(1)).squeeze(1).contiguous()
 
 
+class _NemotronEncoderCpRADIOViTModel(RADIOViTModel):
+    """Shard only RADIO transformer rows across one explicit encoder-CP group."""
+
+    def __init__(self, *args, encoder_cp_group=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.encoder_cp_group = encoder_cp_group
+
+    def _forward_transformer(self, x, attention_mask, packed_seq_params):
+        group = self.encoder_cp_group
+        configured_size = int(self.config.context_parallel_size)
+        if group is None:
+            if configured_size != 1:
+                raise ValueError("Nemotron RADIO encoder CP requires an explicit process group.")
+            return super()._forward_transformer(x, attention_mask, packed_seq_params)
+
+        group_size = int(group.size())
+        if group_size != configured_size:
+            raise ValueError(
+                "Nemotron RADIO encoder CP group size must match context_parallel_size: "
+                f"group size {group_size}, context_parallel_size {configured_size}."
+            )
+        if group_size == 1:
+            return super()._forward_transformer(x, attention_mask, packed_seq_params)
+        if x.ndim != 3 or x.shape[0] != 1:
+            raise ValueError(
+                "Nemotron RADIO encoder CP requires BSH input with batch size one; "
+                f"got {tuple(x.shape)}."
+            )
+        if attention_mask is not None:
+            raise ValueError("Nemotron RADIO encoder CP does not accept an attention mask.")
+        if not isinstance(packed_seq_params, PackedSeqParams):
+            raise ValueError("Nemotron RADIO encoder CP requires packed THD metadata.")
+        if packed_seq_params.qkv_format != "thd":
+            raise ValueError("Nemotron RADIO encoder CP requires qkv_format='thd'.")
+        cu_q = packed_seq_params.cu_seqlens_q
+        cu_kv = packed_seq_params.cu_seqlens_kv
+        if not isinstance(cu_q, Tensor) or not isinstance(cu_kv, Tensor):
+            raise ValueError("Nemotron RADIO encoder CP requires Q/KV cumulative lengths.")
+        if cu_q.device != x.device or cu_kv.device != x.device:
+            raise ValueError(
+                "Nemotron RADIO encoder CP cumulative lengths and hidden states share a device."
+            )
+        if not torch.equal(cu_q, cu_kv):
+            raise ValueError("Nemotron RADIO encoder CP requires identical Q/KV lengths.")
+        if cu_q.ndim != 1 or cu_q.numel() == 0:
+            raise ValueError("Nemotron RADIO encoder CP cumulative lengths are one-dimensional.")
+        if int(cu_q[-1].item()) != x.shape[1]:
+            raise ValueError(
+                "Nemotron RADIO encoder CP cumulative lengths end at the BSH row count."
+            )
+        if x.shape[1] == 0:
+            if cu_q.numel() != 1 or int(cu_q[0].item()) != 0:
+                raise ValueError("Empty Nemotron RADIO encoder CP input requires lengths [0].")
+            return x
+        lengths = cu_q[1:] - cu_q[:-1]
+        if lengths.numel() == 0 or bool(torch.any(lengths <= self.class_token_len).item()):
+            raise ValueError(
+                "Nemotron RADIO encoder CP sequences require class tokens and patch rows."
+            )
+
+        plan = build_encoder_cp_plan(cu_q, group)
+        local_x = partition_encoder_cp_tensor(x.squeeze(0), plan).unsqueeze(0)
+        local_packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=plan.cu_seqlens,
+            cu_seqlens_kv=plan.cu_seqlens,
+            cu_seqlens_q_padded=plan.cu_seqlens_padded,
+            cu_seqlens_kv_padded=plan.cu_seqlens_padded,
+            max_seqlen_q=plan.max_seqlen,
+            max_seqlen_kv=plan.max_seqlen,
+            pad_between_seqs=plan.total_rows != plan.total_padded_rows,
+        )
+        local_output = super()._forward_transformer(local_x, None, local_packed)
+        if local_output.ndim != 3 or local_output.shape[:2] != local_x.shape[:2]:
+            raise ValueError(
+                "Nemotron RADIO transformer output preserves local BSH geometry; "
+                f"input {tuple(local_x.shape)}, output {tuple(local_output.shape)}."
+            )
+        restored = restore_encoder_cp_output(local_output.squeeze(0), plan, group)
+        return restored.unsqueeze(0)
+
+
 class NemotronOmniVisionEncoder(torch.nn.Module):
     """RADIO plus the canonical squared-ReLU language-width projector."""
 
@@ -170,9 +257,10 @@ class NemotronOmniVisionEncoder(torch.nn.Module):
         projection_config,
         projection_submodules,
         pg_collection=None,
+        encoder_cp_group=None,
     ):
         super().__init__()
-        self.vision_model = RADIOViTModel(
+        self.vision_model = _NemotronEncoderCpRADIOViTModel(
             vision_config,
             vision_spec,
             img_h=512,
@@ -191,6 +279,7 @@ class NemotronOmniVisionEncoder(torch.nn.Module):
             cpe_aspect_ratio_select=False,
             has_cpe=True,
             pg_collection=pg_collection,
+            encoder_cp_group=encoder_cp_group,
         )
         self.vision_projection = MultimodalProjector(
             projection_config,

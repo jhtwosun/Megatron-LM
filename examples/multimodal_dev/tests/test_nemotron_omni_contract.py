@@ -260,7 +260,7 @@ def test_native_and_mdp_radio_constructors_pin_expanded_eval_controls(monkeypatc
     monkeypatch.setattr(model_module, "HybridModel", LightweightHybrid)
     monkeypatch.setattr(model_module, "RADIOViTModel", CapturingRadio)
     monkeypatch.setattr(model_module, "MultimodalProjector", LightweightProjector)
-    monkeypatch.setattr(vision_module, "RADIOViTModel", CapturingRadio)
+    monkeypatch.setattr(vision_module, "_NemotronEncoderCpRADIOViTModel", CapturingRadio)
     monkeypatch.setattr(vision_module, "MultimodalProjector", LightweightProjector)
 
     language_config = _minimal_transformer_config()
@@ -675,7 +675,6 @@ def test_raw_sound_or_video_fails_before_generic_packing_or_planning(monkeypatch
         ("vpp", "virtual pipeline"),
         ("layout", "pipeline layout"),
         ("mtp", "MTP"),
-        ("encoder-cp", "encoder.?CP|encoder_cp"),
         ("language-recompute", "language.*recompute|recompute.*language"),
         ("vision-recompute", "recompute"),
     ],
@@ -710,7 +709,25 @@ def test_invalid_configuration_is_rejected_by_the_model_support_matrix(failure, 
         virtual_pipeline_model_parallel_size=(2 if failure == "vpp" else None),
         pipeline_model_parallel_layout=(object() if failure == "layout" else None),
         mtp_num_layers=1 if failure == "mtp" else None,
-        mdp_encoder_cp=2 if failure == "encoder-cp" else 1,
+        mdp_encoder_cp=1,
     )
     with pytest.raises(ValueError, match=match):
         factory.validate_nemotron_omni_support(args, language_config, vision_config)
+
+
+@pytest.mark.parametrize("encoder_cp", (0, -1, 3, 8, True, "2", 2.0))
+def test_invalid_encoder_cp_is_rejected_by_the_model_support_matrix(encoder_cp):
+    factory = _load("factory")
+    language_config = _minimal_transformer_config()
+    args = SimpleNamespace(
+        nemotron_omni_input_contract="expanded_sequence_v1",
+        nemotron_omni_enable_sound=False,
+        hybrid_layer_pattern=language_config.hybrid_layer_pattern,
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        mdp_encoder_cp=encoder_cp,
+    )
+
+    with pytest.raises(ValueError, match="encoder CP must be exactly 1, 2, or 4"):
+        factory.validate_nemotron_omni_support(args, language_config, None)
