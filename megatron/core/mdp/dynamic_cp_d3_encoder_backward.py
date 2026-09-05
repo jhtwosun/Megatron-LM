@@ -18,6 +18,7 @@ from megatron.core.mdp.dynamic_cp_d3_producer_owner import (
     _D3ProducerOwner,
     _PreparedNativeEncoderCompletion,
     _validate_completed_native_encoder_completion,
+    _validate_prepared_native_encoder_completion,
 )
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError, MdpTaskFatalError
 from megatron.core.mdp.runtime import MdpRuntime
@@ -25,6 +26,8 @@ from megatron.core.mdp.runtime import MdpRuntime
 __all__ = ()
 
 _PENDING_READY_SEALS: dict[object, tuple[int, ...]] = {}
+_PENDING_CLAIM_SEALS: dict[object, tuple[int, ...]] = {}
+_ACTIVE_CLAIMS: dict[int, tuple["_D3EncoderBackwardClaim", _D3ProducerOwner, tuple, Any]] = {}
 
 
 def _outer_authority(prepared: _PreparedD3EncoderCompletion):
@@ -32,6 +35,109 @@ def _outer_authority(prepared: _PreparedD3EncoderCompletion):
     if prepared._authority != authority:
         raise MdpStateError("MDP: encoder backward requires the sealed outer preparation.")
     return authority
+
+
+@dataclass(frozen=True, slots=True)
+class _D3EncoderBackwardClaim:
+    """Sealed single-use proof of an exact successful Gate-4 claim."""
+
+    gate_binding: _D3EncoderCompletionGateBinding = field(compare=False, repr=False)
+    prepared: _PreparedD3EncoderCompletion = field(compare=False, repr=False)
+    native_completion: _PreparedNativeEncoderCompletion = field(compare=False, repr=False)
+    owner: _D3ProducerOwner = field(compare=False, repr=False)
+    outer_authority: Any = field(compare=False, repr=False)
+    authority: Any = field(compare=False, repr=False)
+    receipt: Any = field(compare=False, repr=False)
+    ready: Any = field(compare=False, repr=False)
+    gate_tombstone: tuple = field(compare=False, repr=False)
+    _authority: tuple | None = field(default=None, init=False, compare=False, repr=False)
+    _state: str = field(default="fresh", init=False, compare=False, repr=False)
+    _factory_seal: object | None = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        values = (
+            self.gate_binding,
+            self.prepared,
+            self.native_completion,
+            self.owner,
+            self.outer_authority,
+            self.authority,
+            self.receipt,
+            self.ready,
+            self.gate_tombstone,
+        )
+        fingerprint = _PENDING_CLAIM_SEALS.pop(self._factory_seal, None)
+        if type(self) is not _D3EncoderBackwardClaim or fingerprint != tuple(
+            id(value) for value in values
+        ):
+            raise MdpStateError("MDP: D3 encoder backward claim is factory-minted.")
+
+
+def _claim_authority(claim: _D3EncoderBackwardClaim) -> tuple:
+    return (
+        id(claim),
+        id(claim.gate_binding),
+        id(claim.prepared),
+        id(claim.outer_authority),
+        claim.outer_authority,
+        _outer_authority(claim.prepared),
+        id(claim.native_completion),
+        claim.native_completion._authority,
+        _completion_authority(claim.native_completion),
+        id(claim.owner),
+        id(claim.authority),
+        id(claim.receipt),
+        id(claim.ready),
+        id(claim.gate_tombstone),
+        tuple(reference() for reference in claim.gate_tombstone),
+        claim._state,
+    )
+
+
+def _validate_d3_encoder_backward_claim(claim: Any) -> _D3EncoderBackwardClaim:
+    """Validate an exact unconsumed Gate-4 claim without entering backward."""
+    if type(claim) is not _D3EncoderBackwardClaim:
+        raise MdpConfigurationError("MDP: encoder backward claim has its exact private type.")
+    try:
+        active = _ACTIVE_CLAIMS.get(id(claim))
+        valid = (
+            active is not None
+            and active[0] is claim
+            and active[1] is claim.owner
+            and active[2] == claim._authority
+            and active[3] is claim.outer_authority
+            and claim._state == "fresh"
+            and claim._authority == _claim_authority(claim)
+        )
+    except BaseException as error:
+        raise MdpStateError("MDP: encoder backward claim retains valid resources.") from error
+    if not valid:
+        raise MdpStateError("MDP: encoder backward claim retains its exact unconsumed fresh seal.")
+    _validate_prepared_native_encoder_completion(claim.native_completion, owner=claim.owner)
+    _require_consumed_gate4(
+        claim.gate_binding,
+        authority=claim.authority,
+        ready=claim.ready,
+        receipt=claim.receipt,
+        expected_tombstone=claim.gate_tombstone,
+    )
+    return claim
+
+
+def _mint_backward_claim(*values: Any) -> _D3EncoderBackwardClaim:
+    token = object()
+    _PENDING_CLAIM_SEALS[token] = tuple(id(value) for value in values)
+    try:
+        claim = _D3EncoderBackwardClaim(*values, _factory_seal=token)
+    except BaseException:
+        _PENDING_CLAIM_SEALS.pop(token, None)
+        raise
+    authority = _claim_authority(claim)
+    object.__setattr__(claim, "_authority", authority)
+    if id(claim) in _ACTIVE_CLAIMS:
+        raise MdpStateError("MDP: D3 encoder backward claim identity is already active.")
+    _ACTIVE_CLAIMS[id(claim)] = (claim, claim.owner, authority, claim.outer_authority)
+    return claim
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,38 +344,139 @@ def _require_consumed_gate4(gate_binding, *, authority, ready, receipt, expected
     return tombstone
 
 
-def _execute_d3_encoder_backward(
+def _prepare_d3_encoder_backward_claim(
     gate_binding: _D3EncoderCompletionGateBinding, prepared: _PreparedD3EncoderCompletion, /
-) -> _D3EncoderFinalizeReady:
-    """Consume exact Gate 4, run local encoder backward, and retain all resources."""
+) -> _D3EncoderBackwardClaim:
+    """Consume Gate 4; the caller must resolve the retained claim once by execute or abort."""
     if (
         type(gate_binding) is not _D3EncoderCompletionGateBinding
         or type(prepared) is not _PreparedD3EncoderCompletion
     ):
         raise MdpConfigurationError("MDP: encoder backward requires exact Gate-4 inputs.")
-    completion = gate_binding.claim_for_backward(prepared)
-    cleanup_owner = getattr(completion, "owner", None)
+    expected_completion = prepared.native_completion
+    cleanup_owner = prepared.producer.owner
+    _validate_prepared_native_encoder_completion(expected_completion, owner=cleanup_owner)
+    claim = None
+    claimed = False
     try:
-        expected_completion = prepared.native_completion
+        completion = gate_binding.claim_for_backward(prepared)
+        claimed = True
         claimed_outer_authority = _outer_authority(prepared)
         claimed_authority = prepared.authority
         claimed_receipt = prepared.receipt
-        claimed_ready = prepared.receipt.prepared.ready
+        claimed_ready = claimed_receipt.prepared.ready
         gate_tombstone = _require_consumed_gate4(
             gate_binding, authority=claimed_authority, ready=claimed_ready, receipt=claimed_receipt
         )
-        expected_owner = cleanup_owner
         if (
             completion is not expected_completion
             or prepared.native_completion is not expected_completion
-            or type(expected_owner) is not _D3ProducerOwner
-            or completion.owner is not expected_owner
-            or prepared.producer.owner is not expected_owner
+            or type(cleanup_owner) is not _D3ProducerOwner
+            or completion.owner is not cleanup_owner
+            or prepared.producer.owner is not cleanup_owner
         ):
             raise MdpTaskFatalError(
                 "MDP: encoder backward requires the exact claimed native completion."
             )
-        expected_owner._enter_native_encoder_backward(completion)
+        _validate_prepared_native_encoder_completion(completion, owner=cleanup_owner)
+        claim = _mint_backward_claim(
+            gate_binding,
+            prepared,
+            completion,
+            cleanup_owner,
+            claimed_outer_authority,
+            claimed_authority,
+            claimed_receipt,
+            claimed_ready,
+            gate_tombstone,
+        )
+        return _validate_d3_encoder_backward_claim(claim)
+    except BaseException as error:
+        if not claimed:
+            raise
+        if claim is not None and _ACTIVE_CLAIMS.get(id(claim), (None,))[0] is claim:
+            _scrub_backward_claim(claim, "failed")
+        _abort_after_claim(cleanup_owner, error)
+        raise MdpTaskFatalError(
+            "MDP: post-claim encoder backward failure is task-fatal."
+        ) from error
+
+
+def _scrub_backward_claim(claim: _D3EncoderBackwardClaim, state: str) -> None:
+    _ACTIVE_CLAIMS.pop(id(claim), None)
+    for name in (
+        "gate_binding",
+        "prepared",
+        "native_completion",
+        "owner",
+        "outer_authority",
+        "authority",
+        "receipt",
+        "ready",
+        "gate_tombstone",
+        "_authority",
+    ):
+        object.__setattr__(claim, name, None)
+    object.__setattr__(claim, "_state", state)
+
+
+def _abort_d3_encoder_backward_claim(
+    claim: _D3EncoderBackwardClaim, primary_error: BaseException, /
+) -> None:
+    """Abort one valid prepared claim while preserving its caller's error."""
+    if not isinstance(primary_error, BaseException):
+        raise MdpConfigurationError("MDP: encoder backward claim abort uses an exception.")
+    active = _ACTIVE_CLAIMS.get(id(claim)) if type(claim) is _D3EncoderBackwardClaim else None
+    if active is None or active[0] is not claim:
+        _validate_d3_encoder_backward_claim(claim)
+    owner = active[1]
+    try:
+        _validate_d3_encoder_backward_claim(claim)
+    except BaseException as validation_error:
+        try:
+            primary_error.add_note(
+                f"suppressed D3 prepared-claim validation error: {validation_error!r}"
+            )
+        except BaseException:
+            pass
+    finally:
+        _scrub_backward_claim(claim, "aborted")
+        _abort_after_claim(owner, primary_error)
+
+
+def _execute_d3_encoder_backward_claim(
+    claim: _D3EncoderBackwardClaim, /
+) -> _D3EncoderFinalizeReady:
+    """Execute physical encoder backward from one exact unconsumed claim."""
+    active = _ACTIVE_CLAIMS.get(id(claim)) if type(claim) is _D3EncoderBackwardClaim else None
+    if active is None or active[0] is not claim:
+        return _validate_d3_encoder_backward_claim(claim)
+    trusted_owner = active[1]
+    try:
+        claim = _validate_d3_encoder_backward_claim(claim)
+    except BaseException as error:
+        _scrub_backward_claim(claim, "failed")
+        _abort_after_claim(trusted_owner, error)
+        raise MdpTaskFatalError(
+            "MDP: post-claim encoder backward failure is task-fatal."
+        ) from error
+    gate_binding, prepared, completion, owner = (
+        claim.gate_binding,
+        claim.prepared,
+        claim.native_completion,
+        claim.owner,
+    )
+    claimed_outer_authority, authority, receipt, ready, tombstone = (
+        claim.outer_authority,
+        claim.authority,
+        claim.receipt,
+        claim.ready,
+        claim.gate_tombstone,
+    )
+    _ACTIVE_CLAIMS.pop(id(claim), None)
+    object.__setattr__(claim, "_state", "executing")
+    try:
+        owner._enter_native_encoder_backward(completion)
         handle = completion.handle
         if handle is not None:
             if type(handle) is not EncoderForwardHandle:
@@ -277,24 +484,34 @@ def _execute_d3_encoder_backward(
             EncoderForwardHandle.backward(handle, completion.gradient_views)
         _require_consumed_gate4(
             gate_binding,
-            authority=claimed_authority,
-            ready=claimed_ready,
-            receipt=claimed_receipt,
-            expected_tombstone=gate_tombstone,
+            authority=authority,
+            ready=ready,
+            receipt=receipt,
+            expected_tombstone=tombstone,
         )
-        expected_owner._complete_native_encoder_backward(completion)
-        ready = _mint_finalize_ready(prepared, completion, expected_owner, claimed_outer_authority)
-        ready = _validate_d3_encoder_finalize_ready(ready)
+        owner._complete_native_encoder_backward(completion)
+        finalize_ready = _mint_finalize_ready(prepared, completion, owner, claimed_outer_authority)
+        finalize_ready = _validate_d3_encoder_finalize_ready(finalize_ready)
         _require_consumed_gate4(
             gate_binding,
-            authority=claimed_authority,
-            ready=claimed_ready,
-            receipt=claimed_receipt,
-            expected_tombstone=gate_tombstone,
+            authority=authority,
+            ready=ready,
+            receipt=receipt,
+            expected_tombstone=tombstone,
         )
-        return ready
     except BaseException as error:
-        _abort_after_claim(cleanup_owner, error)
+        _scrub_backward_claim(claim, "failed")
+        _abort_after_claim(owner, error)
         raise MdpTaskFatalError(
             "MDP: post-claim encoder backward failure is task-fatal."
         ) from error
+    _scrub_backward_claim(claim, "consumed")
+    return finalize_ready
+
+
+def _execute_d3_encoder_backward(
+    gate_binding: _D3EncoderCompletionGateBinding, prepared: _PreparedD3EncoderCompletion, /
+) -> _D3EncoderFinalizeReady:
+    """Consume exact Gate 4, run local encoder backward, and retain all resources."""
+    claim = _prepare_d3_encoder_backward_claim(gate_binding, prepared)
+    return _execute_d3_encoder_backward_claim(claim)
