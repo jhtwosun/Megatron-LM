@@ -546,9 +546,14 @@ def gather_decoder_source_manifests(
         configuration,
     )
     statuses = status_gather(status, timeout_seconds=_STATUS_RENDEZVOUS_SECONDS)
-    parsed = _validate_statuses(
-        statuses, ranks=ranks, lanes=lanes, maximum=maximum, configuration=configuration
-    )
+    try:
+        parsed = _validate_statuses(
+            statuses, ranks=ranks, lanes=lanes, maximum=maximum, configuration=configuration
+        )
+    except MdpPlanError as error:
+        if local_error is not None:
+            raise error from local_error
+        raise
     lengths = tuple(row[4] for row in parsed)
     if lengths[ranks.index(global_rank)] != len(body):
         raise MdpPlanError("MDP: local metadata status length matches its encoded body.")
