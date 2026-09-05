@@ -296,6 +296,37 @@ def test_metadata_status_rejects_unknown_error_before_body(monkeypatch):
     assert not body_called
 
 
+def test_local_prepare_error_is_the_source_rank_status_rejection_cause(monkeypatch):
+    api = _transport_api()
+    original = RuntimeError("rank-local prepare failure")
+    body_called = False
+
+    def status_gather(value, *, timeout_seconds):
+        return (value,)
+
+    def body(*args, **kwargs):
+        nonlocal body_called
+        body_called = True
+        raise AssertionError("must not gather a body after rejected status")
+
+    monkeypatch.setattr(api, "make_precollective_status_gather", lambda **_: status_gather)
+    monkeypatch.setattr(api, "_gather_body", body)
+    with pytest.raises(MdpPlanError, match="preparation failed before body") as caught:
+        api.gather_decoder_source_manifests(
+            _source_manifest(),
+            expected_source_lanes=(0,),
+            group=object(),
+            group_ranks=(0,),
+            global_rank=0,
+            device=torch.device("cuda", 0),
+            timeout_seconds=0.001,
+            local_prepare_error=original,
+        )
+
+    assert caught.value.__cause__ is original
+    assert not body_called
+
+
 def test_metadata_transport_rejects_cpu_before_status_factory(monkeypatch):
     api = _transport_api()
     factory_called = False
@@ -406,15 +437,17 @@ def test_world4_nccl_metadata_gather_rejects_before_body_and_retries(monkeypatch
 
         with monkeypatch.context() as patched:
             patched.setattr(api, "_gather_body", count_body)
-            with pytest.raises(MdpPlanError):
+            local_prepare_error = RuntimeError("rank-local prepare failure") if rank == 2 else None
+            with pytest.raises(MdpPlanError) as caught:
                 api.gather_decoder_source_manifests(
-                    _source_manifest(rank),
-                    local_prepare_error=(
-                        RuntimeError("rank-local prepare failure") if rank == 2 else None
-                    ),
-                    **common,
+                    _source_manifest(rank), local_prepare_error=local_prepare_error, **common
                 )
             assert body_calls == 0
+            if rank == 2:
+                assert caught.value.__cause__ is local_prepare_error
+                assert str(caught.value.__cause__) == "rank-local prepare failure"
+            else:
+                assert caught.value.__cause__ is None
         torch.distributed.barrier()
 
         body_calls = 0
