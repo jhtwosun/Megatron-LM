@@ -129,6 +129,7 @@ def _typed(monkeypatch):
     monkeypatch.setattr(api, "_D3WorkspaceBindingOwner", _Owner)
     monkeypatch.setattr(api, "_DynamicIterationAuthority", _Authority)
     monkeypatch.setattr(api, "_DynamicProducerCarrier", _Producer)
+    monkeypatch.setattr(api, "_dynamic_iteration_plan_digest", lambda _authority: b"p" * 16)
     monkeypatch.setattr(api, "DecoderGradientReceipt", _Receipt)
     monkeypatch.setattr(api, "DecoderGradientReceiptLifecycle", _Lifecycle)
     monkeypatch.setattr(api, "_capture_decoder_gradient_receipt_authority", _fake_receipt_authority)
@@ -270,6 +271,7 @@ def test_consumes_retires_then_prepares_exact_opaque_completion(monkeypatch, _ty
         "embedding_dtype": authority.bridge_dtype,
         "cp_partition_mode": mode,
         "destination_tensors": workspace.summed_gradient_views,
+        "plan_digest": b"p" * 16,
     }
     assert events[-1][1] is workspace.summed_gradient_views
     assert prepared.authority is authority

@@ -7,6 +7,7 @@ from typing import Any
 
 from megatron.core.mdp.dynamic_cp_d3_workspace_binding import _D3WorkspaceBindingOwner
 from megatron.core.mdp.dynamic_cp_runtime import (
+    _dynamic_iteration_plan_digest,
     _DynamicIterationAuthority,
     _DynamicProducerCarrier,
     _prepare_decoder_gradient_exchange,
@@ -77,6 +78,7 @@ class _D3GradientPreparationBinding:
             participant_ranks=authority.participant_ranks,
             send_buffer=buffers[0],
             receive_buffer=buffers[1],
+            plan_digest=_dynamic_iteration_plan_digest(authority),
         )
 
 

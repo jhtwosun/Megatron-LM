@@ -137,6 +137,7 @@ def gate_api(monkeypatch):
     monkeypatch.setattr(api, "PreparedDecoderGradientExchange", _Prepared)
     monkeypatch.setattr(api, "DecoderGradientReceipt", _Receipt)
     monkeypatch.setattr(api, "_D3GateStatusContext", _Context)
+    monkeypatch.setattr(api, "_dynamic_iteration_plan_digest", lambda _authority: b"p" * 16)
     monkeypatch.setattr(
         api, "_validate_retained_decoder_ready_iteration", lambda value, **_kw: value
     )
@@ -800,6 +801,20 @@ def test_world4_nccl_common_nonce_one_status_one_reverse_a2a_and_error_convergen
         bridge_width=runtime_test._WIDTH,
         bridge_dtype=torch.float32,
     )
+    validate_ready = api._validate_retained_decoder_ready_iteration
+    validate_prepared = api.validate_prepared_decoder_gradient_exchange
+    plan_digests = []
+
+    def tracked_validate_ready(value, **kwargs):
+        plan_digests.append(("ready", kwargs["plan_digest"]))
+        return validate_ready(value, **kwargs)
+
+    def tracked_validate_prepared(value, **kwargs):
+        plan_digests.append(("prepared", kwargs["plan_digest"]))
+        return validate_prepared(value, **kwargs)
+
+    monkeypatch.setattr(api, "_validate_retained_decoder_ready_iteration", tracked_validate_ready)
+    monkeypatch.setattr(api, "validate_prepared_decoder_gradient_exchange", tracked_validate_prepared)
 
     class WorldWorkspace:
         def __init__(self):
@@ -876,6 +891,11 @@ def test_world4_nccl_common_nonce_one_status_one_reverse_a2a_and_error_convergen
     )
     binding.status_gate(context, None)
     receipt = binding.execute_gradient(prepared)
+    assert plan_digests == [
+        ("ready", authority.plan.digest),
+        ("ready", authority.plan.digest),
+        ("prepared", authority.plan.digest),
+    ]
     assert events == ["nonce", "status", "a2a"]
     assert receipt.received_tensors is prepared.exchange.received_tensors
     assert tuple(receipt.received_tensors) == tuple(owner.workspace.gradient_views)

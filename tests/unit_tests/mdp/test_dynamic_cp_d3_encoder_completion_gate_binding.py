@@ -158,6 +158,7 @@ def gate_api(monkeypatch):
     monkeypatch.setattr(api, "DecoderGradientReceipt", _Receipt)
     monkeypatch.setattr(api, "_PreparedD3EncoderCompletion", _Prepared)
     monkeypatch.setattr(api, "_D3GateStatusContext", _Context)
+    monkeypatch.setattr(api, "_dynamic_iteration_plan_digest", lambda _authority: b"p" * 16)
     monkeypatch.setattr(
         api, "_validate_retained_decoder_ready_iteration", lambda value, **_kwargs: value
     )
@@ -909,6 +910,40 @@ def test_real_pr71_completion_passes_real_preparation_and_gate4_without_executio
     )
 
     authority, owner, workspace, producer, receipt = _real_receipt_inputs()
+    validate_receipt = preparation_api._validate_decoder_gradient_receipt
+    validate_prepared = preparation_api.validate_prepared_decoder_gradient_exchange
+    consume_receipt = preparation_api._consume_decoder_gradient_receipt
+    preparation_plan_digests = []
+    gate_plan_digests = []
+
+    def tracked_validate_receipt(*args, **kwargs):
+        preparation_plan_digests.append(("receipt", kwargs["plan_digest"]))
+        return validate_receipt(*args, **kwargs)
+
+    def tracked_validate_prepared(*args, **kwargs):
+        preparation_plan_digests.append(("prepared", kwargs["plan_digest"]))
+        return validate_prepared(*args, **kwargs)
+
+    def tracked_consume_receipt(*args, **kwargs):
+        preparation_plan_digests.append(("consume", kwargs["plan_digest"]))
+        return consume_receipt(*args, **kwargs)
+
+    validate_ready = api._validate_retained_decoder_ready_iteration
+
+    def tracked_validate_ready(value, **kwargs):
+        gate_plan_digests.append(kwargs["plan_digest"])
+        return validate_ready(value, **kwargs)
+
+    monkeypatch.setattr(
+        preparation_api, "_validate_decoder_gradient_receipt", tracked_validate_receipt
+    )
+    monkeypatch.setattr(
+        preparation_api, "validate_prepared_decoder_gradient_exchange", tracked_validate_prepared
+    )
+    monkeypatch.setattr(
+        preparation_api, "_consume_decoder_gradient_receipt", tracked_consume_receipt
+    )
+    monkeypatch.setattr(api, "_validate_retained_decoder_ready_iteration", tracked_validate_ready)
     native_owner = None
     bound_producer = None
     try:
@@ -950,6 +985,12 @@ def test_real_pr71_completion_passes_real_preparation_and_gate4_without_executio
         monkeypatch.setattr(api, "_D3GateStatusContext", _Context)
 
         binding.status_gate(context, None)
+        assert preparation_plan_digests == [
+            ("receipt", authority.plan.digest),
+            ("consume", authority.plan.digest),
+            ("prepared", authority.plan.digest),
+        ]
+        assert gate_plan_digests == [authority.plan.digest]
         assert binding.claim_for_backward(prepared) is native_completion
         assert native_completion.handle is None
     finally:

@@ -75,6 +75,7 @@ def _typed_dependencies(monkeypatch):
     monkeypatch.setattr(api, "_D3WorkspaceBindingOwner", _Owner)
     monkeypatch.setattr(api, "_DynamicIterationAuthority", _Authority)
     monkeypatch.setattr(api, "_DynamicProducerCarrier", _Producer)
+    monkeypatch.setattr(api, "_dynamic_iteration_plan_digest", lambda _authority: b"p" * 16)
     return api
 
 
@@ -164,6 +165,7 @@ def test_forwards_exact_authority_workspace_buffers_and_result_identity(
         "participant_ranks": authority.participant_ranks,
         "send_buffer": workspace.gradient_transport_buffers[0],
         "receive_buffer": workspace.gradient_transport_buffers[1],
+        "plan_digest": b"p" * 16,
     }
     assert workspace.gradient_transport_buffers == (kwargs["send_buffer"], kwargs["receive_buffer"])
 
@@ -275,10 +277,21 @@ def test_propagates_prepare_base_exception_without_cleanup_or_retention(
     assert owner.workspace is workspace and not workspace._released
 
 
-def test_prepares_real_ready_leaf_gradients_without_consuming_workspace_or_retaining_stale_state():
+def test_prepares_real_ready_leaf_gradients_without_consuming_workspace_or_retaining_stale_state(
+    monkeypatch,
+):
     context = _context()
     _, authority, owner, _, bound, _, _ = context
-    binding = _api()._make_d3_gradient_preparation_binding(
+    api = _api()
+    prepare = api._prepare_decoder_gradient_exchange
+    plan_digests = []
+
+    def tracked_prepare(*args, **kwargs):
+        plan_digests.append(kwargs["plan_digest"])
+        return prepare(*args, **kwargs)
+
+    monkeypatch.setattr(api, "_prepare_decoder_gradient_exchange", tracked_prepare)
+    binding = api._make_d3_gradient_preparation_binding(
         workspace_owner=owner, cp_partition_mode="contiguous"
     )
     workspace = owner.require_workspace(authority)
@@ -289,6 +302,7 @@ def test_prepares_real_ready_leaf_gradients_without_consuming_workspace_or_retai
         original_gradients = {key: leaf.grad for key, leaf in ready.embedding_leaves.items()}
 
         prepared = binding(authority, bound, ready)
+        assert plan_digests == [authority.plan.digest]
         assert prepared.ready is ready
         assert prepared.exchange.phase.value == "gradient"
         assert prepared.exchange.send_buffer is workspace.gradient_transport_buffers[0]
