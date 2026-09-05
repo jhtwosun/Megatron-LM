@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from examples.multimodal_dev.models.base import split_multimodal_inputs_for_context_parallel
 from examples.multimodal_dev.models.nemotron_omni.configuration import (
     CLASS_TOKEN_LEN,
     IMAGE_TOKEN_ID,
@@ -191,6 +192,26 @@ class NemotronOmniModel(MegatronModule):
                 text_embeddings, input_ids, vision_embeddings, image_token_id=self.image_token_id
             )
             language_input_ids = None
+
+        (
+            decoder_input,
+            language_input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
+        ) = split_multimodal_inputs_for_context_parallel(
+            decoder_input=decoder_input,
+            input_ids=language_input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            sequence_parallel=self.config.sequence_parallel,
+            padding_mask=padding_mask,
+        )
 
         return self.language_model(
             input_ids=language_input_ids,

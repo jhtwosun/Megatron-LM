@@ -332,6 +332,144 @@ def test_expanded_placeholders_are_exact_and_merge_is_out_of_place():
         )
 
 
+@pytest.mark.parametrize("with_image", (False, True), ids=("text-only", "vision"))
+def test_expanded_decoder_input_uses_dynamic_cp_group_after_vision_merge(with_image):
+    model_module = _load("model")
+    image_id = _load("configuration").IMAGE_TOKEN_ID
+
+    class CapturingHybrid(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.text_embeddings = None
+            self.forward_kwargs = None
+
+        def embedding(self, *, input_ids, position_ids):
+            del position_ids
+            hidden = 4
+            self.text_embeddings = torch.arange(
+                input_ids.numel() * hidden, dtype=torch.float32
+            ).view(input_ids.shape[1], input_ids.shape[0], hidden)
+            return self.text_embeddings
+
+        def forward(self, **kwargs):
+            self.forward_kwargs = kwargs
+            return kwargs["decoder_input"]
+
+    model = model_module.NemotronOmniModel.__new__(model_module.NemotronOmniModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(sequence_parallel=False)
+    model.pre_process = True
+    model.image_token_id = image_id
+    model.language_model = CapturingHybrid()
+    model.vision_model = None
+    model.vision_projection = None
+
+    input_ids = (
+        torch.tensor([[image_id, 1, 2, 3, 4, 5, image_id, 7]])
+        if with_image
+        else torch.arange(8).view(1, 8)
+    )
+    labels = input_ids + 100
+    loss_mask = torch.arange(8, dtype=torch.float32).view(1, 8)
+    padding_mask = input_ids.eq(7)
+    position_ids = torch.arange(8).view(1, 8)
+    attention_mask = torch.ones(1, 8, dtype=torch.bool)
+    vision_embeddings = (
+        torch.tensor([[101.0, 102.0, 103.0, 104.0], [201.0, 202.0, 203.0, 204.0]])
+        if with_image
+        else torch.empty(0, 4)
+    )
+    cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)
+    packed = SimpleNamespace(
+        cu_seqlens_q_padded=torch.tensor([0, 8], dtype=torch.int32),
+        cp_group=cp_group,
+        cp_partition_mode="contiguous",
+    )
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        loss_mask=loss_mask,
+        padding_mask=padding_mask,
+        packed_seq_params=packed,
+        vision_embeddings=vision_embeddings,
+    )
+
+    expected_global = model.language_model.text_embeddings.transpose(0, 1).clone()
+    expected_global[input_ids == image_id] = vision_embeddings
+    expected_local = expected_global.transpose(0, 1)[4:8].contiguous()
+    kwargs = model.language_model.forward_kwargs
+    assert torch.equal(output, expected_local)
+    assert torch.equal(kwargs["decoder_input"], expected_local)
+    assert kwargs["input_ids"] is None
+    assert torch.equal(kwargs["labels"], labels[:, 4:8])
+    assert torch.equal(kwargs["loss_mask"], loss_mask[:, 4:8])
+    assert torch.equal(kwargs["padding_mask"], padding_mask[:, 4:8])
+    assert kwargs["position_ids"] is position_ids
+    assert kwargs["attention_mask"] is attention_mask
+    assert kwargs["packed_seq_params"] is packed
+
+
+def test_non_first_pipeline_stage_splits_decoder_side_inputs_without_embedding():
+    model_module = _load("model")
+
+    class CapturingHybrid(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.forward_kwargs = None
+
+        def embedding(self, **_kwargs):
+            raise AssertionError("a non-first pipeline stage must not embed input IDs")
+
+        def forward(self, **kwargs):
+            self.forward_kwargs = kwargs
+            return kwargs["labels"]
+
+    model = model_module.NemotronOmniModel.__new__(model_module.NemotronOmniModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(sequence_parallel=False)
+    model.pre_process = False
+    model.image_token_id = _load("configuration").IMAGE_TOKEN_ID
+    model.language_model = CapturingHybrid()
+    model.vision_model = None
+    model.vision_projection = None
+
+    input_ids = torch.arange(8).view(1, 8)
+    labels = input_ids + 100
+    loss_mask = torch.arange(8, dtype=torch.float32).view(1, 8)
+    padding_mask = input_ids.eq(7)
+    position_ids = torch.arange(8).view(1, 8)
+    attention_mask = torch.ones(1, 8, dtype=torch.bool)
+    packed = SimpleNamespace(
+        cu_seqlens_q_padded=torch.tensor([0, 8], dtype=torch.int32),
+        cp_group=SimpleNamespace(size=lambda: 2, rank=lambda: 1),
+        cp_partition_mode="contiguous",
+    )
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        loss_mask=loss_mask,
+        padding_mask=padding_mask,
+        packed_seq_params=packed,
+        vision_embeddings=torch.randn(2, 4),
+    )
+
+    kwargs = model.language_model.forward_kwargs
+    assert torch.equal(output, labels[:, 4:8])
+    assert kwargs["decoder_input"] is None
+    assert torch.equal(kwargs["input_ids"], input_ids[:, 4:8])
+    assert torch.equal(kwargs["loss_mask"], loss_mask[:, 4:8])
+    assert torch.equal(kwargs["padding_mask"], padding_mask[:, 4:8])
+    assert kwargs["position_ids"] is position_ids
+    assert kwargs["attention_mask"] is attention_mask
+    assert kwargs["packed_seq_params"] is packed
+
+
 def test_native_and_mdp_import_the_same_encoder_helper_and_adapter_keeps_one_plane():
     model_module = _load("model")
     mdp_module = _load("mdp")
