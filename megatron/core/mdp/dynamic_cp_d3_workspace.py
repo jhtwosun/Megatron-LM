@@ -18,6 +18,14 @@ from megatron.core.mdp.storage import MdpEmbeddingStorage
 __all__ = ("_DynamicIterationWorkspace",)
 
 
+def _add_cleanup_note(primary: BaseException, note: str) -> None:
+    """Attach cleanup diagnostics without allowing an exception to replace the primary."""
+    try:
+        primary.add_note(note)
+    except BaseException:
+        pass
+
+
 class _DynamicIterationWorkspace:
     """Own one local iteration's authority-derived destination buffers."""
 
@@ -114,7 +122,9 @@ class _DynamicIterationWorkspace:
             try:
                 self.release()
             except BaseException as cleanup_error:
-                error.add_note(f"suppressed D3 workspace cleanup error: {cleanup_error!r}")
+                _add_cleanup_note(
+                    error, f"suppressed D3 workspace cleanup error: {cleanup_error!r}"
+                )
             raise
 
     def _require_active(self) -> None:
@@ -153,7 +163,9 @@ class _DynamicIterationWorkspace:
                 try:
                     self.allocator.release(base)
                 except BaseException as cleanup_error:
-                    error.add_note(f"suppressed D3 workspace cleanup error: {cleanup_error!r}")
+                    _add_cleanup_note(
+                        error, f"suppressed D3 workspace cleanup error: {cleanup_error!r}"
+                    )
             raise
         self._bases.append(base)
         return base
@@ -338,8 +350,8 @@ class _DynamicIterationWorkspace:
                 self._storage_owned_base_ids.add(id(leaf))
         except BaseException as error:
             for cleanup_error in self._release_embedding_leaves():
-                error.add_note(
-                    f"suppressed D3 embedding activation cleanup error: {cleanup_error!r}"
+                _add_cleanup_note(
+                    error, f"suppressed D3 embedding activation cleanup error: {cleanup_error!r}"
                 )
             raise
 
@@ -381,7 +393,7 @@ class _DynamicIterationWorkspace:
     def _raise_cleanup_errors(errors: list[BaseException]) -> None:
         primary = errors[0]
         for error in errors[1:]:
-            primary.add_note(f"suppressed D3 workspace cleanup error: {error!r}")
+            _add_cleanup_note(primary, f"suppressed D3 workspace cleanup error: {error!r}")
         raise primary
 
     def release_embedding_leaves(self) -> None:
