@@ -106,6 +106,87 @@ def _cp_size_rank(packed_seq_params):
     )
 
 
+def split_multimodal_inputs_for_context_parallel(
+    *,
+    decoder_input,
+    input_ids,
+    labels,
+    loss_mask,
+    attention_mask,
+    position_ids,
+    packed_seq_params,
+    sequence_parallel,
+    padding_mask=None,
+):
+    """Apply the existing multimodal CP layout to decoder inputs.
+
+    BSHD zigzag-splits every sequence-shaped input except ``position_ids``.
+    THD partitions decoder/input IDs, labels, loss and padding masks using the
+    padded segment boundaries, while leaving ``position_ids`` and
+    ``attention_mask`` global for their existing RoPE/attention-side split.
+    """
+    cp_size, cp_rank = _cp_size_rank(packed_seq_params)
+    if cp_size <= 1:
+        return (
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
+        )
+    decoder_input_uses_sp = (
+        decoder_input is not None
+        and sequence_parallel
+        and parallel_state.get_tensor_model_parallel_world_size() > 1
+    )
+    if decoder_input_uses_sp:
+        decoder_input = tensor_parallel.gather_from_sequence_parallel_region(
+            decoder_input, tensor_parallel_output_grad=False
+        )
+
+    if packed_seq_params is not None:
+        total_tokens = decoder_input.shape[0] if decoder_input is not None else input_ids.shape[1]
+        idx = _thd_cp_partition_index(
+            packed_seq_params.cu_seqlens_q_padded,
+            total_tokens,
+            cp_size,
+            cp_rank,
+            getattr(packed_seq_params, "cp_partition_mode", "zigzag"),
+        )
+        if decoder_input is not None:
+            decoder_input = decoder_input.index_select(0, idx)
+        if input_ids is not None:
+            input_ids = input_ids.index_select(1, idx)
+        if labels is not None:
+            labels = labels.index_select(1, idx)
+        if loss_mask is not None:
+            loss_mask = loss_mask.index_select(1, idx)
+        if padding_mask is not None:
+            padding_mask = padding_mask.index_select(1, idx)
+    else:
+
+        def _split(tensor, seq_dim):
+            return (
+                None
+                if tensor is None
+                else _cp_split_tensor(tensor, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank)
+            )
+
+        decoder_input = _split(decoder_input, 0)
+        input_ids = _split(input_ids, 1)
+        labels = _split(labels, 1)
+        loss_mask = _split(loss_mask, 1)
+        attention_mask = _split(attention_mask, 1)
+        padding_mask = _split(padding_mask, 1)
+
+    if decoder_input_uses_sp:
+        decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(decoder_input)
+
+    return (decoder_input, input_ids, labels, loss_mask, attention_mask, position_ids, padding_mask)
+
+
 class MultimodalModel(MegatronModule):
     """Base class for multimodal vision-language models.
 
@@ -409,67 +490,16 @@ class MultimodalModel(MegatronModule):
         ``_apply_rotary_pos_emb_thd`` does the per-sample CP zigzag
         itself via ``_get_thd_freqs_on_this_cp_rank``.
         """
-        cp_size, cp_rank = _cp_size_rank(packed_seq_params)
-        if cp_size <= 1:
-            return (
-                decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids, padding_mask,
-            )
-        decoder_input_uses_sp = (
-            decoder_input is not None
-            and self.config.sequence_parallel
-            and parallel_state.get_tensor_model_parallel_world_size() > 1
-        )
-        if decoder_input_uses_sp:
-            # Reconstruct the global sequence before applying the native CP
-            # partition, then restore SP ownership within the CP-local shard.
-            decoder_input = tensor_parallel.gather_from_sequence_parallel_region(
-                decoder_input, tensor_parallel_output_grad=False
-            )
-
-        if packed_seq_params is not None:
-            total_tokens = (
-                decoder_input.shape[0] if decoder_input is not None else input_ids.shape[1]
-            )
-            idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded,
-                total_tokens,
-                cp_size,
-                cp_rank,
-                getattr(packed_seq_params, "cp_partition_mode", "zigzag"),
-            )
-            if decoder_input is not None:
-                decoder_input = decoder_input.index_select(0, idx)
-            if input_ids is not None:
-                input_ids = input_ids.index_select(1, idx)
-            if labels is not None:
-                labels = labels.index_select(1, idx)
-            if loss_mask is not None:
-                loss_mask = loss_mask.index_select(1, idx)
-            if padding_mask is not None:
-                padding_mask = padding_mask.index_select(1, idx)
-        else:
-
-            def _split(t, seq_dim):
-                return (
-                    None
-                    if t is None
-                    else _cp_split_tensor(t, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank)
-                )
-
-            decoder_input = _split(decoder_input, 0)
-            input_ids = _split(input_ids, 1)
-            labels = _split(labels, 1)
-            loss_mask = _split(loss_mask, 1)
-            attention_mask = _split(attention_mask, 1)
-            padding_mask = _split(padding_mask, 1)
-
-        if decoder_input_uses_sp:
-            decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(decoder_input)
-
-        return (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+        return split_multimodal_inputs_for_context_parallel(
+            decoder_input=decoder_input,
+            input_ids=input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            sequence_parallel=self.config.sequence_parallel,
+            padding_mask=padding_mask,
         )
 
     @staticmethod

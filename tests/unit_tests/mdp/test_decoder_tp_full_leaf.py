@@ -152,6 +152,56 @@ def test_integration_threads_language_tp_group_into_groups_and_runtime(monkeypat
     mdp_integration.reset_for_testing()
 
 
+def test_multimodal_model_delegates_cp_split_to_shared_helper(monkeypatch):
+    from examples.multimodal_dev.models import base as multimodal_base
+
+    sentinel = object()
+    observed = {}
+
+    def _split(**kwargs):
+        observed.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(multimodal_base, "split_multimodal_inputs_for_context_parallel", _split)
+    model = SimpleNamespace(config=SimpleNamespace(sequence_parallel=True))
+    inputs = {
+        "decoder_input": object(),
+        "input_ids": object(),
+        "labels": object(),
+        "loss_mask": object(),
+        "attention_mask": object(),
+        "position_ids": object(),
+        "packed_seq_params": object(),
+        "padding_mask": object(),
+    }
+
+    assert multimodal_base.MultimodalModel._cp_split_for_forward(model, **inputs) is sentinel
+    assert observed == {**inputs, "sequence_parallel": True}
+
+
+def test_shared_cp_split_is_identity_at_cp1(monkeypatch):
+    from examples.multimodal_dev.models import base as multimodal_base
+
+    monkeypatch.setattr(
+        multimodal_base.parallel_state, "get_context_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(multimodal_base.parallel_state, "get_context_parallel_rank", lambda: 0)
+    inputs = tuple(object() for _ in range(7))
+    actual = multimodal_base.split_multimodal_inputs_for_context_parallel(
+        decoder_input=inputs[0],
+        input_ids=inputs[1],
+        labels=inputs[2],
+        loss_mask=inputs[3],
+        attention_mask=inputs[4],
+        position_ids=inputs[5],
+        packed_seq_params=None,
+        sequence_parallel=True,
+        padding_mask=inputs[6],
+    )
+
+    assert all(value is expected for value, expected in zip(actual, inputs))
+
+
 @pytest.mark.parametrize("packed", (False, True), ids=("bshd", "thd"))
 def test_sequence_parallel_decoder_cp_split_matches_full_token_order(monkeypatch, packed):
     from examples.multimodal_dev.models import base as multimodal_base
@@ -164,6 +214,7 @@ def test_sequence_parallel_decoder_cp_split_matches_full_token_order(monkeypatch
     loss_mask = torch.arange(32, dtype=torch.float32).view(1, 32)
     padding_mask = (input_ids % 3) == 0
     position_ids = input_ids + 200
+    attention_mask = input_ids + 300
     calls = []
 
     monkeypatch.setattr(
@@ -223,7 +274,7 @@ def test_sequence_parallel_decoder_cp_split_matches_full_token_order(monkeypatch
         input_ids=input_ids,
         labels=labels,
         loss_mask=loss_mask,
-        attention_mask=None,
+        attention_mask=attention_mask,
         position_ids=position_ids,
         packed_seq_params=packed_seq_params,
         padding_mask=padding_mask,
@@ -238,7 +289,10 @@ def test_sequence_parallel_decoder_cp_split_matches_full_token_order(monkeypatch
     assert torch.equal(actual_labels, labels.index_select(1, cp_index))
     assert torch.equal(actual_loss_mask, loss_mask.index_select(1, cp_index))
     assert torch.equal(actual_padding_mask, padding_mask.index_select(1, cp_index))
-    assert actual_attention_mask is None
+    if packed:
+        assert actual_attention_mask is attention_mask
+    else:
+        assert torch.equal(actual_attention_mask, attention_mask.index_select(1, cp_index))
     assert actual_position_ids is position_ids
 
     actual_decoder.sum().backward()
