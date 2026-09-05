@@ -90,6 +90,42 @@ def test_success_order_is_world_domain_world_then_data():
     assert events[3][1]["local_error"] is None
 
 
+def test_runner_accepts_terminal_gate7():
+    events = []
+    runner = _runner(events=events)
+
+    result = runner.run(
+        global_manifest_digest=_MANIFEST,
+        plan_digest=_PLAN,
+        gate_id=7,
+        prepare=lambda: "prepared",
+        domain_collective=lambda value: value,
+    )
+
+    assert result == "prepared"
+    assert [event[1]["gate_id"] for event in events] == [7, 7, 7]
+
+
+def test_runner_rejects_gate8_with_eight_gate_diagnostic():
+    events = []
+    runner = _runner(events=events)
+
+    with pytest.raises(MdpPlanError, match="WORLD rejected") as caught:
+        runner.run(
+            global_manifest_digest=_MANIFEST,
+            plan_digest=_PLAN,
+            gate_id=8,
+            prepare=lambda: "prepared",
+            domain_collective=lambda value: value,
+        )
+
+    assert type(caught.value.__cause__) is MdpPlanError
+    assert str(caught.value.__cause__) == (
+        "MDP: repeated-D4 gate is one of the eight Dynamic-CP gates."
+    )
+    assert [event[0] for event in events] == ["world"]
+
+
 def test_runner_exposes_exact_read_only_attempt_nonce():
     runner = _runner(events=[])
 

@@ -21,6 +21,7 @@ _GATES = (
     "encoder-backward-ready",
     "encoder-finalize-ready",
     "encoder-complete",
+    "iteration-cleanup-complete",
 )
 _RANKS = (8, 3, 11)
 _MANIFEST_DIGEST = bytes.fromhex("ff80aa55000102030405060708090a0b")
@@ -69,7 +70,7 @@ def _collect(local_status=None, **overrides):
 
 
 def test_precollective_status_wire_roundtrips_high_digest_bits_little_endian():
-    status = _status(error_code=2**63 - 1, gate_id=6)
+    status = _status(error_code=2**63 - 1, gate_id=7)
 
     wire = status.to_wire_tuple()
 
@@ -78,7 +79,7 @@ def test_precollective_status_wire_roundtrips_high_digest_bits_little_endian():
         *struct.unpack("<qq", _MANIFEST_DIGEST),
         *struct.unpack("<qq", _PLAN_DIGEST),
         2**63 - 1,
-        6,
+        7,
     )
     assert type(wire) is tuple
     assert all(type(component) is int for component in wire)
@@ -87,7 +88,7 @@ def test_precollective_status_wire_roundtrips_high_digest_bits_little_endian():
 
 
 @pytest.mark.parametrize(("gate_id", "gate_name"), tuple(enumerate(_GATES)))
-def test_precollective_gate_names_and_all_seven_ids_are_fixed(gate_id, gate_name):
+def test_precollective_gate_names_and_all_eight_ids_are_fixed(gate_id, gate_name):
     assert getattr(execution, "DYNAMIC_PRECOLLECTIVE_GATES") == _GATES
     assert _GATES[gate_id] == gate_name
     status = _status(gate_id=gate_id)
@@ -110,7 +111,7 @@ def test_precollective_gate_names_and_all_seven_ids_are_fixed(gate_id, gate_name
         ({"error_code": 2**63}, MdpConfigurationError, "error_code"),
         ({"gate_id": True}, MdpConfigurationError, "gate_id"),
         ({"gate_id": -1}, MdpConfigurationError, "gate_id"),
-        ({"gate_id": 7}, MdpPlanError, "seven"),
+        ({"gate_id": 8}, MdpPlanError, "eight"),
     ),
 )
 def test_precollective_status_rejects_malformed_fields(overrides, error_type, message):
@@ -129,7 +130,7 @@ def test_precollective_status_rejects_malformed_fields(overrides, error_type, me
         ((0, -(2**63) - 1, 0, 0, 0, 0, 0), MdpConfigurationError, "signed-int64"),
         ((0, 0, 0, 2**63, 0, 0, 0), MdpConfigurationError, "signed-int64"),
         ((0, 0, 0, 0, 0, -1, 0), MdpConfigurationError, "error_code"),
-        ((0, 0, 0, 0, 0, 0, 7), MdpPlanError, "seven"),
+        ((0, 0, 0, 0, 0, 0, 8), MdpPlanError, "eight"),
     ),
 )
 def test_precollective_status_wire_rejects_noncanonical_values(wire, error_type, message):
