@@ -31,14 +31,14 @@ def _authority_api():
     return import_module("megatron.core.mdp.dynamic_cp_d3_authority_construction")
 
 
-def _source_manifest(lane):
+def _source_manifest(lane, *, with_vision=True):
     sample_id = GlobalSampleId(lane, 0)
     item_id = GlobalVisionItemId(lane, 0)
     sample = DecoderSampleMetadata(
         sample_id=sample_id,
         valid_seqlen=4,
         padded_seqlen=4,
-        vision_items=(EncoderVisionItemMetadata(item_id, sample_id, 0),),
+        vision_items=(EncoderVisionItemMetadata(item_id, sample_id, 0),) if with_vision else (),
     )
     item = DecoderVisionItemMetadata(
         item_id=item_id,
@@ -76,7 +76,10 @@ def _source_manifest(lane):
         none_fields=("attention_mask",),
     )
     return finalize_decoder_source_window(
-        source_dp_lane=lane, samples=(sample,), items=(item,), packets=(packet,)
+        source_dp_lane=lane,
+        samples=(sample,),
+        items=(item,) if with_vision else (),
+        packets=(packet,),
     ).metadata_manifest()
 
 
@@ -84,6 +87,13 @@ def _metadata():
     manifests = (_source_manifest(0), _source_manifest(1))
     return DecoderMetadataGatherResult(
         global_manifest=build_decoder_global_manifest(manifests), source_rank_by_lane={0: 3, 1: 5}
+    )
+
+
+def _text_only_metadata():
+    manifest = _source_manifest(0, with_vision=False)
+    return DecoderMetadataGatherResult(
+        global_manifest=build_decoder_global_manifest((manifest,)), source_rank_by_lane={0: 3}
     )
 
 
@@ -102,6 +112,45 @@ def test_derives_immutable_producer_and_output_authority_in_manifest_item_order(
     assert dict(authority.output_rows_by_item) == {item_ids[0]: 1, item_ids[1]: 2}
     with pytest.raises(TypeError):
         authority.producer_rank_by_item[item_ids[0]] = 99
+
+
+def test_derives_exact_empty_item_authority_for_real_text_only_manifest():
+    api = _authority_api()
+    metadata = _text_only_metadata()
+
+    authority = api.derive_decoder_item_authority(
+        metadata, participant_ranks=(3, 5, 7), decoder_ranks=(5, 7)
+    )
+
+    assert authority.global_manifest is metadata.global_manifest
+    assert dict(authority.source_rank_by_lane) == {0: 3}
+    assert authority.participant_ranks == (3, 5, 7)
+    assert authority.decoder_ranks == (5, 7)
+    assert type(authority.producer_rank_by_item) is type(MappingProxyType({}))
+    assert type(authority.output_rows_by_item) is type(MappingProxyType({}))
+    assert dict(authority.producer_rank_by_item) == {}
+    assert dict(authority.output_rows_by_item) == {}
+
+
+@pytest.mark.parametrize("field", ("producer_rank_by_item", "output_rows_by_item"))
+def test_text_only_authority_rejects_nonempty_foreign_item_maps(field):
+    api = _authority_api()
+    valid = api.derive_decoder_item_authority(
+        _text_only_metadata(), participant_ranks=(3, 5, 7), decoder_ranks=(5, 7)
+    )
+    foreign = GlobalVisionItemId(0, 0)
+    kwargs = {
+        "global_manifest": valid.global_manifest,
+        "source_rank_by_lane": valid.source_rank_by_lane,
+        "producer_rank_by_item": {},
+        "output_rows_by_item": {},
+        "participant_ranks": valid.participant_ranks,
+        "decoder_ranks": valid.decoder_ranks,
+    }
+    kwargs[field] = {foreign: 3 if field == "producer_rank_by_item" else 1}
+
+    with pytest.raises(MdpPlanError, match="exact manifest item order"):
+        api.DecoderItemAuthority(**kwargs)
 
 
 def test_preserves_authoritative_nonnumeric_rank_order():
@@ -218,6 +267,31 @@ def _item_authority(api):
     return api.derive_decoder_item_authority(
         _metadata(), participant_ranks=(3, 5, 7), decoder_ranks=(5, 7)
     )
+
+
+def test_builds_text_only_authority_with_payload_routes_and_empty_bridge_ledgers():
+    api = _authority_api()
+    item_authority = api.derive_decoder_item_authority(
+        _text_only_metadata(), participant_ranks=(3, 5, 7), decoder_ranks=(5, 7)
+    )
+
+    result = api.build_d3_iteration_authority(
+        item_authority,
+        max_seqlen_per_rank=8,
+        minimum_cp_size=1,
+        solver=_FullGroupSolver(),
+        bridge_width=16,
+        bridge_dtype=torch.bfloat16,
+    )
+
+    assert result.global_manifest is item_authority.global_manifest
+    assert dict(result.source_rank_by_lane) == {0: 3}
+    assert result.participant_ranks == (3, 5, 7)
+    assert result.payload_ledger.entries
+    assert result.producer_rank_by_item == {}
+    assert result.output_rows_by_item == {}
+    assert result.embedding_ledger.entries == ()
+    assert result.gradient_ledger.entries == ()
 
 
 def test_builds_exact_typed_iteration_authority_deterministically():

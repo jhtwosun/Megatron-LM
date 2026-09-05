@@ -79,7 +79,7 @@ class DecoderItemAuthority:
         if len(set(source_authority.values())) != len(source_authority):
             raise MdpPlanError("MDP: metadata source lanes have unique producer ranks.")
         item_ids = tuple(item.item_id for item in self.global_manifest.items)
-        if not item_ids or len(set(item_ids)) != len(item_ids):
+        if len(set(item_ids)) != len(item_ids):
             raise MdpPlanError("MDP: global manifest has unique vision items for D3 authority.")
         maps = (self.producer_rank_by_item, self.output_rows_by_item)
         if any(not isinstance(mapping, Mapping) for mapping in maps):
