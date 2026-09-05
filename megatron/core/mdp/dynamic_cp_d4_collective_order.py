@@ -79,6 +79,11 @@ class _RepeatedD4CollectiveRunner:
         self._world_gate = world_pre_gate
         self._domain_status = domain_status_collector
 
+    @property
+    def attempt_nonce(self) -> bytes:
+        """Return the immutable WORLD-common nonce bound to this attempt."""
+        return self._attempt_nonce
+
     def _digest(self, plan_digest: bytes, gate_id: int, stage: int) -> bytes:
         return _stage_plan_digest(
             plan_digest=plan_digest, attempt_nonce=self._attempt_nonce, gate_id=gate_id, stage=stage

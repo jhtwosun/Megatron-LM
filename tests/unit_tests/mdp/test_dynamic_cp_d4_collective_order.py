@@ -90,6 +90,14 @@ def test_success_order_is_world_domain_world_then_data():
     assert events[3][1]["local_error"] is None
 
 
+def test_runner_exposes_exact_read_only_attempt_nonce():
+    runner = _runner(events=[])
+
+    assert runner.attempt_nonce == _NONCE
+    with pytest.raises(AttributeError):
+        runner.attempt_nonce = bytes(reversed(_NONCE))
+
+
 def test_prepare_failure_stops_at_first_world_gate():
     events = []
     primary = RuntimeError("prepare")
