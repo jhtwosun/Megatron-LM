@@ -41,7 +41,7 @@ def _stage_plan_digest(
     if nonce == b"\0" * _NONCE_BYTES:
         raise MdpConfigurationError("MDP: repeated-D4 attempt nonce is nonzero.")
     if type(gate_id) is not int or not 0 <= gate_id < len(DYNAMIC_PRECOLLECTIVE_GATES):
-        raise MdpPlanError("MDP: repeated-D4 gate is one of the seven Dynamic-CP gates.")
+        raise MdpPlanError("MDP: repeated-D4 gate is one of the eight Dynamic-CP gates.")
     if type(stage) is not int or not 0 <= stage < _STAGE_COUNT:
         raise MdpConfigurationError("MDP: repeated-D4 collective order has three stages.")
     digest = hashlib.blake2b(digest_size=_DIGEST_BYTES, person=_ORDER_PERSON)

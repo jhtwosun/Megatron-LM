@@ -57,6 +57,7 @@ DYNAMIC_PRECOLLECTIVE_GATES = (
     "encoder-backward-ready",
     "encoder-finalize-ready",
     "encoder-complete",
+    "iteration-cleanup-complete",
 )
 
 _SOURCE_MANIFEST_DOMAIN = b"megatron.mdp.dynamic-cp.decoder-source"
@@ -1378,7 +1379,7 @@ class _PrecollectiveStatus:
         gate = _require_integer("precollective status gate_id", self.gate_id)
         if gate >= len(DYNAMIC_PRECOLLECTIVE_GATES):
             raise MdpPlanError(
-                "MDP: precollective status gate_id is one of the seven Dynamic-CP gates."
+                "MDP: precollective status gate_id is one of the eight Dynamic-CP gates."
             )
 
     def to_wire_tuple(self) -> tuple[int, ...]:

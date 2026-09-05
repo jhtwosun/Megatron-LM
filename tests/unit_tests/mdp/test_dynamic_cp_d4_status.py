@@ -48,7 +48,7 @@ def _collect(local=None, *, gather=None):
 
 
 def test_status_wire_is_versioned_fixed_width_and_roundtrips():
-    local = _status(6, error_code=7, gate_id=5)
+    local = _status(6, error_code=7, gate_id=7)
 
     wire = local.to_wire_tuple()
 
@@ -57,7 +57,7 @@ def test_status_wire_is_versioned_fixed_width_and_roundtrips():
         *struct.unpack("<qq", _MANIFEST_B),
         *struct.unpack("<qq", _PLAN_B),
         7,
-        (1 << 16) | (4 << 8) | 5,
+        (1 << 16) | (4 << 8) | 7,
     )
     assert len(wire) == 7
     assert status_api._RepeatedD4WorldStatus.from_wire_tuple(wire) == local
@@ -114,9 +114,18 @@ def test_local_echo_precedes_error_and_digest_validation():
     assert str(outcome.error) == "MDP: repeated-D4 WORLD local status matches its submitted row."
 
 
-@pytest.mark.parametrize("gate_id", (-1, 7, 256))
-def test_local_status_rejects_gate_outside_existing_seven_gate_contract(gate_id):
-    with pytest.raises((MdpConfigurationError, MdpPlanError), match="gate_id"):
+@pytest.mark.parametrize(
+    ("gate_id", "error_type", "message"),
+    (
+        (-1, MdpConfigurationError, "gate_id"),
+        (8, MdpPlanError, "one of the eight Dynamic-CP gates"),
+        (256, MdpPlanError, "one of the eight Dynamic-CP gates"),
+    ),
+)
+def test_local_status_rejects_gate_outside_existing_eight_gate_contract(
+    gate_id, error_type, message
+):
+    with pytest.raises(error_type, match=message):
         _status(3, gate_id=gate_id)
 
 
