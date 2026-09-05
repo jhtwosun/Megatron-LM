@@ -505,6 +505,46 @@ def test_d3_coordinator_preserves_primary_error_when_cleanup_raises_base_excepti
     assert coordinator.is_idle
 
 
+def test_d3_coordinator_cleanup_note_failure_never_replaces_primary():
+    class Primary(BaseException):
+        def __init__(self):
+            super().__init__("primary")
+            self.add_note_calls = 0
+
+        def add_note(self, _note):
+            self.add_note_calls += 1
+            raise NoteSignal("note")
+
+    class NoteSignal(BaseException):
+        pass
+
+    class CleanupSignal(BaseException):
+        pass
+
+    events = []
+    bindings = _bindings(events)
+    primary = Primary()
+
+    def fail_config(_config):
+        events.append("config")
+        raise primary
+
+    def fail_cleanup(_producer):
+        events.append("cleanup")
+        raise CleanupSignal("cleanup")
+
+    coordinator = _D3Coordinator(
+        bindings=replace(bindings, execution_config_consensus=fail_config, cleanup=fail_cleanup)
+    )
+    with pytest.raises(Primary) as error:
+        _begin(coordinator)
+
+    assert error.value is primary
+    assert primary.add_note_calls == 1
+    assert events == ["config", "cleanup"]
+    assert coordinator.is_idle
+
+
 def test_d3_coordinator_never_advances_after_an_entered_collective_fails():
     events = []
     contexts = []

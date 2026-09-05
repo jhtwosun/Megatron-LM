@@ -199,7 +199,7 @@ class _D3Coordinator:
         if cleanup_error is not None:
             try:
                 error.add_note(f"suppressed D3 coordinator cleanup error: {cleanup_error!r}")
-            except Exception:
+            except BaseException:
                 pass
         raise error
 
