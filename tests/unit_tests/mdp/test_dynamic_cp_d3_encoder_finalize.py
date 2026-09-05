@@ -54,6 +54,16 @@ class _Context:
         self.ready = ready
 
 
+class _HostileFinalizePrimary(BaseException):
+    def __init__(self, message="primary"):
+        super().__init__(message)
+        self.add_note_calls = 0
+
+    def add_note(self, _note):
+        self.add_note_calls += 1
+        raise BaseException("hostile add_note")
+
+
 def _ready(monkeypatch, *, contributor=False, follower=False):
     monkeypatch.setattr(_api(), "_DynamicProducerCarrier", SimpleNamespace)
     backward_api = import_module("megatron.core.mdp.dynamic_cp_d3_encoder_backward")
@@ -289,7 +299,7 @@ def test_foreign_finalize_binding_rejects_active_attempt(monkeypatch):
 def test_prepare_failure_never_cleans_owner_substituted_by_release_callback(monkeypatch):
     api = _api()
     runtime, _outputs, owner, native, ready, context, group = _ready(monkeypatch, contributor=True)
-    foreign_runtime, _outputs, foreign_owner, _native, _ready_value, _context, _group = _ready(
+    (foreign_runtime, _outputs, foreign_owner, _native, _ready_value, _context, _group) = _ready(
         monkeypatch
     )
     binding = _binding(monkeypatch, runtime, group)
@@ -725,6 +735,56 @@ def test_local_error_with_valid_ready_cleans_exact_owner_once(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA retained state")
+def test_hostile_supplied_local_error_survives_secondary_preparation_failure(monkeypatch):
+    runtime, _outputs, owner, _native, _ready_value, context, group = _ready(monkeypatch)
+    binding = _binding(monkeypatch, runtime, group)
+    primary = _HostileFinalizePrimary("hostile supplied local error")
+
+    attempt = binding.prepare_status_attempt(context, primary)
+
+    assert attempt.error is primary
+    assert primary.add_note_calls == 1
+    assert owner._runtime is None
+    binding.abort_status_attempt(attempt, MdpPlanError("peer rejection"))
+    assert binding.is_idle
+
+    fresh_error = RuntimeError("fresh local failure")
+    fresh = binding.prepare_status_attempt(_Context(5, object(), None, object()), fresh_error)
+    assert fresh.error is fresh_error
+    binding.abort_status_attempt(fresh, MdpPlanError("fresh peer rejection"))
+    assert binding.is_idle
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA retained state")
+def test_hostile_preparation_error_survives_owner_cleanup_failure(monkeypatch):
+    api = _api()
+    runtime, _outputs, owner, _native, _ready_value, context, group = _ready(monkeypatch)
+    binding = _binding(monkeypatch, runtime, group)
+    primary = _HostileFinalizePrimary("hostile preparation failure")
+    owner_type = type(owner)
+    real_abort = owner_type.abort
+    abort_calls = []
+
+    def abort_then_fail(candidate, error=None):
+        abort_calls.append((candidate, error))
+        real_abort(candidate, error)
+        raise RuntimeError("injected owner cleanup failure")
+
+    monkeypatch.setattr(
+        api, "_validate_native_group_context", lambda *_args: (_ for _ in ()).throw(primary)
+    )
+    monkeypatch.setattr(owner_type, "abort", abort_then_fail)
+    attempt = binding.prepare_status_attempt(context, None)
+
+    assert attempt.error is primary
+    assert primary.add_note_calls == 1
+    assert abort_calls == [(owner, primary)]
+    assert owner._runtime is None
+    binding.abort_status_attempt(attempt, MdpPlanError("peer rejection"))
+    assert binding.is_idle
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA retained state")
 def test_local_error_never_cleans_substituted_ready_owner(monkeypatch):
     runtime, _outputs, owner, _native, ready, context, group = _ready(monkeypatch)
     (
@@ -772,8 +832,8 @@ def test_group_validation_failure_uses_precaptured_exact_owner(monkeypatch, subs
     runtime, _outputs, owner, _native, ready, context, group = _ready(monkeypatch)
     foreign_runtime = foreign_owner = None
     if substituted:
-        foreign_runtime, _outputs, foreign_owner, _native, _ready_value, _context, _group = _ready(
-            monkeypatch
+        (foreign_runtime, _outputs, foreign_owner, _native, _ready_value, _context, _group) = (
+            _ready(monkeypatch)
         )
         object.__setattr__(ready, "owner", foreign_owner)
     binding = _binding(monkeypatch, runtime, group)
@@ -810,7 +870,7 @@ def test_wrong_gate_context_with_ready_cleans_precaptured_exact_owner(monkeypatc
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA retained state")
 def test_raising_nested_owner_accessor_is_never_invoked_or_trusted(monkeypatch, nested):
     runtime, _outputs, owner, _native, ready, context, group = _ready(monkeypatch)
-    foreign_runtime, _outputs, foreign_owner, _native, _ready_value, _context, _group = _ready(
+    (foreign_runtime, _outputs, foreign_owner, _native, _ready_value, _context, _group) = _ready(
         monkeypatch
     )
     binding = _binding(monkeypatch, runtime, group)
@@ -843,7 +903,7 @@ def test_joint_foreign_owner_authority_and_raising_nested_carrier_cannot_redirec
     monkeypatch,
 ):
     runtime, _outputs, owner, _native, ready, context, group = _ready(monkeypatch)
-    foreign_runtime, _outputs, foreign_owner, _native, _ready_value, _context, _group = _ready(
+    (foreign_runtime, _outputs, foreign_owner, _native, _ready_value, _context, _group) = _ready(
         monkeypatch
     )
     binding = _binding(monkeypatch, runtime, group)
@@ -1261,6 +1321,42 @@ def test_finalizer_failure_is_task_fatal_and_never_consumes_token(monkeypatch):
     assert caught.value.__cause__ is primary
     assert runtime._token_consumed is False
     assert binding.is_poisoned and owner._runtime is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA retained state")
+def test_hostile_finalizer_primary_survives_post_cleanup_failure_and_retires_owner(monkeypatch):
+    runtime, _outputs, owner, _native, ready, context, group = _ready(monkeypatch)
+    binding = _binding(monkeypatch, runtime, group)
+    binding.status_gate(context, None)
+    primary = _HostileFinalizePrimary("hostile WORLD finalizer failure")
+    finalize_calls = []
+    owner_type = type(owner)
+    real_abort = owner_type.abort
+    abort_calls = []
+
+    def fail_finalize(*_args, **_kwargs):
+        finalize_calls.append(primary)
+        raise primary
+
+    def abort_then_fail(candidate, error=None):
+        abort_calls.append((candidate, error))
+        real_abort(candidate, error)
+        raise RuntimeError("injected post-finalize cleanup failure")
+
+    monkeypatch.setattr(
+        import_module("megatron.core.mdp.encoder"), "finalize_encoder_grads", fail_finalize
+    )
+    monkeypatch.setattr(owner_type, "abort", abort_then_fail)
+    with pytest.raises(MdpTaskFatalError, match="post-Gate-5") as caught:
+        binding.finalize(ready)
+
+    assert caught.value.__cause__ is primary
+    assert finalize_calls == [primary]
+    assert abort_calls == [(owner, primary)]
+    assert primary.add_note_calls == 1
+    assert owner._runtime is None
+    assert runtime._token_consumed is False
+    assert binding.is_poisoned
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA retained state")
