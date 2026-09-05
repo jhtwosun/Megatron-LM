@@ -1410,6 +1410,30 @@ class _PrecollectiveStatus:
         )
 
 
+_COMPLETED_PRECOLLECTIVE_CONSENSUS_SEAL = object()
+
+
+@dataclass(frozen=True)
+class _CompletedPrecollectiveConsensus:
+    """Internal sealed marker minted after one injected status gather returned."""
+
+    error: MdpPlanError | None
+    _seal: object = field(compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not _CompletedPrecollectiveConsensus
+            or self._seal is not _COMPLETED_PRECOLLECTIVE_CONSENSUS_SEAL
+        ):
+            raise MdpConfigurationError(
+                "MDP: completed precollective consensus is minted after one returned gather."
+            )
+        if self.error is not None and type(self.error) is not MdpPlanError:
+            raise MdpConfigurationError(
+                "MDP: completed precollective consensus carries a logical plan error or None."
+            )
+
+
 def _validate_precollective_timeout(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise MdpConfigurationError(
@@ -1436,14 +1460,14 @@ def _validate_precollective_timeout(value: Any) -> float:
     return seconds
 
 
-def _run_precollective_consensus(
+def _collect_precollective_consensus(
     local_status: _PrecollectiveStatus,
     *,
     group_ranks: tuple[int, ...],
     all_gather_status: Any,
     timeout_seconds: float,
-) -> None:
-    """Run one injected status gather and require rank-ordered phase agreement."""
+) -> _CompletedPrecollectiveConsensus:
+    """Return a sealed logical outcome only after one status gather returns."""
     if type(local_status) is not _PrecollectiveStatus:
         raise MdpPlanError("MDP: precollective consensus has a typed local status.")
     ranks = _require_ordered_ranks("precollective group ranks", group_ranks, immutable=True)
@@ -1461,48 +1485,73 @@ def _run_precollective_consensus(
         raise MdpBridgeError(
             "MDP: precollective status consensus failed before payload exchange."
         ) from error
-    if type(gathered) is not tuple or len(gathered) != len(ranks):
-        raise MdpPlanError(
-            "MDP: precollective consensus returns one ordered status per group rank."
-        )
-
-    parsed = []
-    for expected_rank, wire in zip(ranks, gathered):
-        try:
-            status = _PrecollectiveStatus.from_wire_tuple(wire)
-        except (MdpConfigurationError, MdpPlanError) as error:
+    try:
+        if type(gathered) is not tuple or len(gathered) != len(ranks):
             raise MdpPlanError(
-                f"MDP: precollective consensus received malformed status for rank "
-                f"{expected_rank}."
-            ) from error
-        if status.global_rank != expected_rank:
-            raise MdpPlanError(
-                f"MDP: precollective consensus rank order expected rank {expected_rank}, "
-                f"received rank {status.global_rank}."
+                "MDP: precollective consensus returns one ordered status per group rank."
             )
-        parsed.append(status)
-
-    reference = parsed[0]
-    shared_fields = (
-        ("manifest digest", "global_manifest_digest"),
-        ("plan digest", "plan_digest"),
-        ("gate", "gate_id"),
-    )
-    for status in parsed[1:]:
-        for label, field_name in shared_fields:
-            if getattr(status, field_name) != getattr(reference, field_name):
+        parsed = []
+        for expected_rank, wire in zip(ranks, gathered):
+            try:
+                status = _PrecollectiveStatus.from_wire_tuple(wire)
+            except (MdpConfigurationError, MdpPlanError) as error:
                 raise MdpPlanError(
-                    f"MDP: precollective consensus {label} mismatch at rank "
-                    f"{status.global_rank}."
+                    f"MDP: precollective consensus received malformed status for rank "
+                    f"{expected_rank}."
+                ) from error
+            if status.global_rank != expected_rank:
+                raise MdpPlanError(
+                    f"MDP: precollective consensus rank order expected rank {expected_rank}, "
+                    f"received rank {status.global_rank}."
                 )
-    local_index = ranks.index(local_status.global_rank)
-    if parsed[local_index] != local_status:
-        raise MdpPlanError(
-            "MDP: precollective consensus gathered local status matches its submitted status."
+            parsed.append(status)
+
+        reference = parsed[0]
+        shared_fields = (
+            ("manifest digest", "global_manifest_digest"),
+            ("plan digest", "plan_digest"),
+            ("gate", "gate_id"),
         )
-    for status in parsed:
-        if status.error_code:
+        for status in parsed[1:]:
+            for label, field_name in shared_fields:
+                if getattr(status, field_name) != getattr(reference, field_name):
+                    raise MdpPlanError(
+                        f"MDP: precollective consensus {label} mismatch at rank "
+                        f"{status.global_rank}."
+                    )
+        local_index = ranks.index(local_status.global_rank)
+        if parsed[local_index] != local_status:
             raise MdpPlanError(
-                f"MDP: precollective consensus rejected rank {status.global_rank} with "
-                f"error code {status.error_code}."
+                "MDP: precollective consensus gathered local status matches its submitted status."
             )
+        for status in parsed:
+            if status.error_code:
+                raise MdpPlanError(
+                    f"MDP: precollective consensus rejected rank {status.global_rank} with "
+                    f"error code {status.error_code}."
+                )
+    except MdpPlanError as error:
+        return _CompletedPrecollectiveConsensus(
+            error=error, _seal=_COMPLETED_PRECOLLECTIVE_CONSENSUS_SEAL
+        )
+    return _CompletedPrecollectiveConsensus(
+        error=None, _seal=_COMPLETED_PRECOLLECTIVE_CONSENSUS_SEAL
+    )
+
+
+def _run_precollective_consensus(
+    local_status: _PrecollectiveStatus,
+    *,
+    group_ranks: tuple[int, ...],
+    all_gather_status: Any,
+    timeout_seconds: float,
+) -> None:
+    """Run one injected status gather and require rank-ordered phase agreement."""
+    outcome = _collect_precollective_consensus(
+        local_status,
+        group_ranks=group_ranks,
+        all_gather_status=all_gather_status,
+        timeout_seconds=timeout_seconds,
+    )
+    if outcome.error is not None:
+        raise outcome.error
