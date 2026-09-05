@@ -1799,25 +1799,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # Save TE's current CP group before potential DCP switch (for restore at end).
         _te_orig_cp_group = self.cp_group
         _te_orig_cp_global_ranks = self.cp_global_ranks
+        _te_orig_cp_stream = getattr(self, "cp_stream", None)
+        _use_dynamic_cp_group = (
+            packed_seq_params is not None and packed_seq_params.local_cp_size is not None
+        )
 
         if packed_seq_params is not None:
-            # If Dynamic CP group is provided, update TE DPA CP group
-            if packed_seq_params.local_cp_size is not None:
-                if packed_seq_params.local_cp_size == 1:
-                    super().set_context_parallel_group(None, None, None, self.cp_comm_type)
-                else:
-                    assert (
-                        packed_seq_params.cp_group is not None
-                    ), "cp_group is not set in packed_seq_params for dynamic CP"
-                    self.cp_group = packed_seq_params.cp_group
-                    if TEDotProductAttention.cp_stream is None:
-                        TEDotProductAttention.cp_stream = torch.cuda.Stream()
-                    super().set_context_parallel_group(
-                        self.cp_group,
-                        torch.distributed.get_process_group_ranks(self.cp_group),
-                        TEDotProductAttention.cp_stream,
-                        self.cp_comm_type,
-                    )
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
 
@@ -1865,66 +1852,81 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ):
                 #  need to change mask type for SWA inference decode stage.
                 attn_mask_type = AttnMaskType.causal_bottom_right
-        if self.te_forward_mask_type:
-            if qkv_format == "thd" and is_te_min_version("1.7.0"):
-                # thd format uses flash attention with cuDNN kernel which requires is_padding=True,
-                # so the only acceptable mask types are `padding_causal` and `padding`. These do not
-                # necessarily indicate there are padded tokens in the sequence.
-                if attn_mask_type == AttnMaskType.causal:
-                    attn_mask_type = AttnMaskType.padding_causal
-                elif attn_mask_type == AttnMaskType.no_mask:
-                    attn_mask_type = AttnMaskType.padding
-            _fa_kwargs = dict(
-                attn_mask_type=attn_mask_type.name, **attention_bias_kwargs, **packed_seq_kwargs
-            )
-            if num_splits is not None:
-                _fa_kwargs["num_splits"] = num_splits
 
-            core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
-
-            if self.config.qk_clip or self.config.log_max_attention_logit:
-                # qk-clip is only supported in TE 2.9.0 and later
-                assert is_te_min_version("2.9.0"), "qk-clip is only supported in TE 2.9.0 and later"
-
-                # Update Q K outside of TE Attention API
-                core_attn_out, batch_max_attention_logits = core_attn_out
-
-                # The max attention logit is only used as a statistic for qk-clip
-                # and logging, so it never needs gradients. Detach it from the
-                # autograd graph, otherwise accumulating it into
-                # current_max_attn_logits keeps every batch's attention forward
-                # graph alive and leaks memory (most visibly when only
-                # log_max_attention_logit is set and clip_qk() never resets it).
-                batch_max_attention_logits = batch_max_attention_logits.detach()
-
-                # Update QK_Clip balancing eta
-                if self.current_max_attn_logits is None:
-                    self.current_max_attn_logits = batch_max_attention_logits
+        try:
+            if _use_dynamic_cp_group:
+                if packed_seq_params.local_cp_size == 1:
+                    super().set_context_parallel_group(None, None, None, self.cp_comm_type)
                 else:
-                    self.current_max_attn_logits = torch.max(
-                        self.current_max_attn_logits, batch_max_attention_logits
+                    assert (
+                        packed_seq_params.cp_group is not None
+                    ), "cp_group is not set in packed_seq_params for dynamic CP"
+                    if TEDotProductAttention.cp_stream is None:
+                        TEDotProductAttention.cp_stream = torch.cuda.Stream()
+                    super().set_context_parallel_group(
+                        packed_seq_params.cp_group,
+                        torch.distributed.get_process_group_ranks(packed_seq_params.cp_group),
+                        TEDotProductAttention.cp_stream,
+                        self.cp_comm_type,
                     )
 
-        else:
-            _fa_kwargs = dict(**attention_bias_kwargs, **packed_seq_kwargs)
-            if num_splits is not None:
-                _fa_kwargs["num_splits"] = num_splits
-            core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
+            if self.te_forward_mask_type:
+                if qkv_format == "thd" and is_te_min_version("1.7.0"):
+                    # thd format uses flash attention with cuDNN kernel which requires
+                    # is_padding=True, so the only acceptable mask types are
+                    # `padding_causal` and `padding`. These do not necessarily indicate
+                    # there are padded tokens in the sequence.
+                    if attn_mask_type == AttnMaskType.causal:
+                        attn_mask_type = AttnMaskType.padding_causal
+                    elif attn_mask_type == AttnMaskType.no_mask:
+                        attn_mask_type = AttnMaskType.padding
+                _fa_kwargs = dict(
+                    attn_mask_type=attn_mask_type.name, **attention_bias_kwargs, **packed_seq_kwargs
+                )
+                if num_splits is not None:
+                    _fa_kwargs["num_splits"] = num_splits
 
-        # Restore TE's CP group after dynamic CP forward.
-        if (
-            packed_seq_params is not None
-            and packed_seq_params.local_cp_size is not None
-            and self.config.context_parallel_size > 1
-        ):
-            super().set_context_parallel_group(
-                _te_orig_cp_group,
-                _te_orig_cp_global_ranks,
-                TEDotProductAttention.cp_stream,
-                self.cp_comm_type,
-            )
+                core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
-        return core_attn_out
+                if self.config.qk_clip or self.config.log_max_attention_logit:
+                    # qk-clip is only supported in TE 2.9.0 and later
+                    assert is_te_min_version(
+                        "2.9.0"
+                    ), "qk-clip is only supported in TE 2.9.0 and later"
+
+                    # Update Q K outside of TE Attention API
+                    core_attn_out, batch_max_attention_logits = core_attn_out
+
+                    # The max attention logit is only used as a statistic for qk-clip
+                    # and logging, so it never needs gradients. Detach it from the
+                    # autograd graph, otherwise accumulating it into
+                    # current_max_attn_logits keeps every batch's attention forward
+                    # graph alive and leaks memory (most visibly when only
+                    # log_max_attention_logit is set and clip_qk() never resets it).
+                    batch_max_attention_logits = batch_max_attention_logits.detach()
+
+                    # Update QK_Clip balancing eta
+                    if self.current_max_attn_logits is None:
+                        self.current_max_attn_logits = batch_max_attention_logits
+                    else:
+                        self.current_max_attn_logits = torch.max(
+                            self.current_max_attn_logits, batch_max_attention_logits
+                        )
+
+            else:
+                _fa_kwargs = dict(**attention_bias_kwargs, **packed_seq_kwargs)
+                if num_splits is not None:
+                    _fa_kwargs["num_splits"] = num_splits
+                core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
+            return core_attn_out
+        finally:
+            if _use_dynamic_cp_group:
+                super().set_context_parallel_group(
+                    _te_orig_cp_group,
+                    _te_orig_cp_global_ranks,
+                    _te_orig_cp_stream,
+                    self.cp_comm_type,
+                )
 
     def sharded_state_dict(
         self,
