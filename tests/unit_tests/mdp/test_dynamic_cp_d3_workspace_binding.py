@@ -2,7 +2,7 @@
 
 """Private D3 workspace/producer binding contracts."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import import_module
 from types import MappingProxyType
 
@@ -104,6 +104,7 @@ def test_binds_one_exact_workspace_and_requires_exact_active_authority(monkeypat
     carrier = owner.bind(authority=authority, producer=producer)
     workspace = owner.require_workspace(authority)
 
+    assert owner.require_bound_producer(authority, carrier) is carrier
     assert workspace.authority is authority
     assert carrier.authority is authority
     assert carrier.pre_authority is producer
@@ -129,6 +130,122 @@ def test_binds_one_exact_workspace_and_requires_exact_active_authority(monkeypat
     with pytest.raises(MdpStateError, match="exact active"):
         owner.require_workspace(_Authority("foreign"))
     carrier.cleanup()
+
+
+@pytest.mark.parametrize("same_cleanup", (False, True))
+def test_owner_cleanup_rejects_replacement_clone_without_invoking_it(monkeypatch, same_cleanup):
+    events = []
+    monkeypatch.setattr(binding_module, "_bind_pre_authority_dynamic_producer", _binder(events))
+    owner = _owner()
+    authority = _Authority("first")
+    carrier = owner.bind(authority=authority, producer=_Producer("first"))
+    replacement_calls = []
+    clone = replace(
+        carrier,
+        cleanup=carrier.cleanup if same_cleanup else lambda: replacement_calls.append("clone"),
+    )
+
+    with pytest.raises(MdpStateError, match="exact bound producer"):
+        owner.cleanup_bound_producer(authority, clone)
+
+    assert replacement_calls == []
+    assert owner.require_bound_producer(authority, carrier) is carrier
+    owner.cleanup_bound_producer(authority, carrier)
+    assert owner.is_idle
+
+
+def test_owner_cleanup_rejects_foreign_authority_without_consuming_escrow(monkeypatch):
+    events = []
+    monkeypatch.setattr(binding_module, "_bind_pre_authority_dynamic_producer", _binder(events))
+    owner = _owner()
+    authority = _Authority("first")
+    carrier = owner.bind(authority=authority, producer=_Producer("first"))
+
+    with pytest.raises(MdpStateError, match="exact bound producer"):
+        owner.cleanup_bound_producer(_Authority("foreign"), carrier)
+
+    assert owner.require_bound_producer(authority, carrier) is carrier
+    owner.cleanup_bound_producer(authority, carrier)
+
+
+@pytest.mark.parametrize("target", ("carrier", "workspace"))
+def test_owner_cleanup_uses_bind_time_authority_after_exact_live_mutation(monkeypatch, target):
+    events = []
+    monkeypatch.setattr(binding_module, "_bind_pre_authority_dynamic_producer", _binder(events))
+    owner = _owner()
+    authority = _Authority("first")
+    carrier = owner.bind(authority=authority, producer=_Producer("first"))
+    workspace = owner.require_workspace(authority)
+    if target == "carrier":
+        object.__setattr__(carrier, "authority", _Authority("mutated"))
+    else:
+        workspace.authority = _Authority("mutated")
+
+    with pytest.raises(MdpStateError, match="exact bound producer"):
+        owner.require_bound_producer(authority, carrier)
+    owner.cleanup_bound_producer(authority, carrier)
+
+    assert owner.is_idle
+    with pytest.raises(MdpStateError, match="exact bound producer"):
+        owner.cleanup_bound_producer(authority, carrier)
+    retry_authority = _Authority("retry")
+    retry = owner.bind(authority=retry_authority, producer=_Producer("retry"))
+    owner.cleanup_bound_producer(retry_authority, retry)
+
+
+def test_owner_cleanup_clears_escrow_before_fallible_release_and_reentry(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        binding_module,
+        "_bind_pre_authority_dynamic_producer",
+        _binder(events, cleanup=lambda: events.append("producer-cleanup")),
+    )
+    owner = _owner()
+    authority = _Authority("first")
+    carrier = owner.bind(authority=authority, producer=_Producer("first"))
+    workspace = owner.require_workspace(authority)
+    original_release = workspace.release
+
+    def release():
+        assert owner.is_idle
+        with pytest.raises(MdpStateError, match="exact bound producer"):
+            owner.cleanup_bound_producer(authority, carrier)
+        events.append("workspace-release")
+        original_release()
+
+    workspace.release = release
+    owner.cleanup_bound_producer(authority, carrier)
+
+    assert events[-2:] == ["workspace-release", "producer-cleanup"]
+    with pytest.raises(MdpStateError, match="exact bound producer"):
+        owner.require_bound_producer(authority, carrier)
+    with pytest.raises(MdpStateError, match="exact bound producer"):
+        owner.cleanup_bound_producer(authority, carrier)
+
+
+def test_owner_cleanup_failure_drains_escrow_and_allows_rebind(monkeypatch):
+    primary = _BaseFailure("producer")
+    events = []
+    monkeypatch.setattr(
+        binding_module,
+        "_bind_pre_authority_dynamic_producer",
+        _binder(events, cleanup=lambda: (_ for _ in ()).throw(primary)),
+    )
+    owner = _owner()
+    authority = _Authority("first")
+    carrier = owner.bind(authority=authority, producer=_Producer("first"))
+
+    with pytest.raises(_BaseFailure) as caught:
+        owner.cleanup_bound_producer(authority, carrier)
+
+    assert caught.value is primary
+    assert owner.is_idle
+    with pytest.raises(MdpStateError, match="exact bound producer"):
+        owner.cleanup_bound_producer(authority, carrier)
+    monkeypatch.setattr(binding_module, "_bind_pre_authority_dynamic_producer", _binder(events))
+    retry_authority = _Authority("retry")
+    retry = owner.bind(authority=retry_authority, producer=_Producer("retry"))
+    owner.cleanup_bound_producer(retry_authority, retry)
 
 
 def test_bind_failure_clears_workspace_and_allows_retry(monkeypatch):
