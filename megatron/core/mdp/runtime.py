@@ -227,8 +227,15 @@ class MdpRuntime:
                 forward_only=False,
                 p2_handoff=capture,
             )
-        except Exception as error:
-            self._abort_failed_iteration(error)
+        except BaseException as error:
+            local_prepare_error = error
+            if not isinstance(error, Exception):
+                local_prepare_error = MdpStateError(
+                    "MDP: local dynamic producer preparation raised a non-Exception "
+                    "BaseException."
+                )
+                local_prepare_error.__cause__ = error
+            self._abort_failed_iteration(local_prepare_error)
             return _PreAuthorityDynamicProducer(
                 rank_view=None,
                 local_manifest=None,
@@ -237,7 +244,7 @@ class MdpRuntime:
                 item_outputs=MappingProxyType({}),
                 sample_location_by_id=MappingProxyType({}),
                 owner=None,
-                local_prepare_error=error,
+                local_prepare_error=local_prepare_error,
                 forward_only=False,
             )
 
