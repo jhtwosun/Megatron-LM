@@ -488,6 +488,21 @@ class _DynamicSourceCodec:
         return source, locations
 
 
+class _LocalPreparationBaseException(BaseException):
+    pass
+
+
+class _HostileLocalPreparationBaseException(BaseException):
+    def __init__(self, message):
+        super().__init__(message)
+        self.add_note_calls = 0
+
+    def add_note(self, note):
+        del note
+        self.add_note_calls += 1
+        raise AssertionError("untrusted BaseException.add_note was invoked")
+
+
 def test_dynamic_producer_preparation_stops_after_p2_and_owns_exact_state():
     runtime, view = _build_runtime(decoder_pp=1)
     codec = _DynamicSourceCodec()
@@ -525,6 +540,68 @@ def test_dynamic_producer_codec_failure_returns_clean_rendezvous_carrier():
     assert runtime.state is MdpRuntimeState.EMPTY
     assert runtime._handle is None
     assert not runtime._chunk_payload_bases
+    assert runtime._pre_authority_dynamic_producer is None
+
+
+@pytest.mark.parametrize("failure_stage", ("capture", "codec"))
+def test_dynamic_producer_normalizes_local_baseexception_and_allows_fresh_retry(
+    monkeypatch, failure_stage
+):
+    runtime, _ = _build_runtime(decoder_pp=1)
+    original = _LocalPreparationBaseException(f"injected {failure_stage} failure")
+    codec = _DynamicSourceCodec(original if failure_stage == "codec" else None)
+    if failure_stage == "capture":
+        capture = runtime._capture_window
+        calls = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise original
+            return capture(*args, **kwargs)
+
+        monkeypatch.setattr(runtime, "_capture_window", fail_once)
+
+    failed = runtime._prepare_dynamic_encoder_producer(
+        iter(range(10)), num_microbatches=2, forward_only=False, codec=codec
+    )
+
+    assert type(failed.local_prepare_error) is MdpStateError
+    assert failed.local_prepare_error.__cause__ is original
+    assert failed.owner is None
+    assert runtime.state is MdpRuntimeState.EMPTY
+    assert runtime._handle is None
+    assert not runtime._chunk_payload_bases
+    assert runtime._pre_authority_dynamic_producer is None
+
+    recovered = runtime._prepare_dynamic_encoder_producer(
+        iter(range(10)), num_microbatches=2, forward_only=False, codec=_DynamicSourceCodec()
+    )
+    assert recovered.local_prepare_error is None
+    recovered.owner.abort()
+    assert runtime.state is MdpRuntimeState.EMPTY
+
+
+def test_dynamic_producer_cleanup_notes_only_the_typed_baseexception_wrapper(monkeypatch):
+    runtime, _ = _build_runtime(decoder_pp=1)
+    original = _HostileLocalPreparationBaseException("injected hostile codec failure")
+    cleanup_error = RuntimeError("injected packed-pixel cleanup failure")
+
+    def fail_cleanup():
+        raise cleanup_error
+
+    monkeypatch.setattr(runtime, "_release_chunk_payload_bases", fail_cleanup)
+    failed = runtime._prepare_dynamic_encoder_producer(
+        iter(range(10)), num_microbatches=2, forward_only=False, codec=_DynamicSourceCodec(original)
+    )
+
+    error = failed.local_prepare_error
+    assert type(error) is MdpStateError
+    assert error.__cause__ is original
+    assert original.add_note_calls == 0
+    assert any("packed-pixel buffers" in note for note in error.__notes__)
+    assert runtime.state is MdpRuntimeState.EMPTY
     assert runtime._pre_authority_dynamic_producer is None
 
 
