@@ -21,7 +21,12 @@ from examples.multimodal_dev.models.qwen35_vl.specs import (
     get_qwen35_vl_vision_spec,
 )
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
-from megatron.core.mdp.dynamic_cp import GlobalSampleId, GlobalVisionItemId
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.mdp.dynamic_cp import (
+    DynamicCpGroupMembership,
+    GlobalSampleId,
+    GlobalVisionItemId,
+)
 from megatron.core.mdp.dynamic_cp_execution import (
     DECODER_EXECUTION_SCHEMA_VERSION,
     DecoderGlobalManifest,
@@ -40,9 +45,14 @@ from megatron.core.mdp.dynamic_cp_plan import (
     DecoderCpAssignment,
     DecoderSampleMetadata,
     EncoderVisionItemMetadata,
+    EncoderWorkEstimate,
 )
-from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError
-from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
+from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError, MdpStateError
+from megatron.core.mdp.protocols import (
+    CapturedMicrobatch,
+    CapturedVisionItem,
+    DynamicEncoderCpBinding,
+)
 from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
 from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -52,6 +62,156 @@ _DECODER_ALLOWED_PAYLOAD_FIELDS = frozenset(
     (*_DECODER_ROUTED_FIELD_ORDER, "attention_mask", "image_grid_thw")
 )
 _INTEGER_DTYPES = frozenset((torch.int32, torch.int64))
+_DYNAMIC_ENCODER_CP_BINDING_SLOT = "_mdp_dynamic_encoder_cp_binding"
+
+
+def _add_restore_note(primary_error: BaseException, restore_error: BaseException) -> None:
+    try:
+        primary_error.add_note(
+            f"Suppressed dynamic encoder CP restoration failure: {restore_error!r}"
+        )
+    except BaseException:
+        pass
+
+
+def _bind_dynamic_encoder_cp(
+    encoder, model, *, membership, global_rank, group_attribute, size_attribute
+):
+    """Install a validated subgroup and return its one-shot restoration owner."""
+    if type(membership) is not DynamicCpGroupMembership:
+        raise MdpConfigurationError("MDP: dynamic encoder CP membership is typed.")
+    if membership.group_size not in (1, 2, 4):
+        raise MdpConfigurationError("MDP: dynamic encoder CP membership is E1, E2, or E4.")
+    if type(global_rank) is not int or global_rank not in membership.ranks:
+        raise MdpConfigurationError("MDP: dynamic encoder CP rank belongs to its membership.")
+    group = membership.group
+    size = getattr(group, "size", None)
+    rank = getattr(group, "rank", None)
+    if not callable(size) or not callable(rank):
+        raise MdpConfigurationError("MDP: dynamic encoder CP group exposes size and local rank.")
+    actual_size = size()
+    actual_rank = rank()
+    if type(actual_size) is not int or actual_size != membership.group_size:
+        raise MdpConfigurationError("MDP: dynamic encoder CP group size matches membership.")
+    if type(actual_rank) is not int or actual_rank != membership.ranks.index(global_rank):
+        raise MdpConfigurationError("MDP: dynamic encoder CP local rank matches global rank.")
+    if getattr(encoder, _DYNAMIC_ENCODER_CP_BINDING_SLOT, None) is not None:
+        raise MdpStateError("MDP: encoder already has an active dynamic encoder CP binding.")
+    if not hasattr(model, "config") or not hasattr(model.config, "context_parallel_size"):
+        raise MdpConfigurationError("MDP: dynamic encoder CP model has configured CP authority.")
+    if not hasattr(model, group_attribute):
+        raise MdpConfigurationError("MDP: dynamic encoder CP model has a CP group authority.")
+    if size_attribute is not None and not hasattr(model, size_attribute):
+        raise MdpConfigurationError("MDP: dynamic encoder CP model has a CP size authority.")
+
+    attentions = tuple(
+        module for module in model.modules() if isinstance(module, TEDotProductAttention)
+    )
+    if not attentions:
+        raise MdpConfigurationError("MDP: dynamic encoder CP model has TE attention modules.")
+    for attention in attentions:
+        if not callable(getattr(attention, "set_context_parallel_group", None)):
+            raise MdpConfigurationError("MDP: TE attention exposes context parallel binding.")
+        if not hasattr(attention, "config") or not hasattr(
+            attention.config, "context_parallel_size"
+        ):
+            raise MdpConfigurationError("MDP: TE attention has configured CP authority.")
+
+    model_cp_size = model.config.context_parallel_size
+    model_group = getattr(model, group_attribute)
+    model_size = None if size_attribute is None else getattr(model, size_attribute)
+    attention_state = tuple(
+        (
+            attention,
+            attention.cp_group,
+            attention.cp_global_ranks,
+            attention.config.context_parallel_size,
+            attention.cp_stream,
+            attention.cp_comm_type,
+        )
+        for attention in attentions
+    )
+    target_group = None if membership.group_size == 1 else group
+    target_ranks = None if membership.group_size == 1 else membership.ranks
+    binding = None
+
+    def is_current():
+        return getattr(encoder, _DYNAMIC_ENCODER_CP_BINDING_SLOT, None) is binding
+
+    def restore(primary_error):
+        restore_primary = primary_error
+
+        def attempt(action):
+            nonlocal restore_primary
+            try:
+                action()
+            except BaseException as restore_error:
+                if restore_primary is None:
+                    restore_primary = restore_error
+                else:
+                    _add_restore_note(restore_primary, restore_error)
+
+        for attention, old_group, old_ranks, old_size, stream, comm_type in reversed(
+            attention_state
+        ):
+            attempt(
+                lambda attention=attention, old_group=old_group, old_ranks=old_ranks, stream=stream, comm_type=comm_type: attention.set_context_parallel_group(
+                    old_group, old_ranks, None if old_group is None else stream, comm_type
+                )
+            )
+            attempt(
+                lambda attention=attention, old_size=old_size: setattr(
+                    attention.config, "context_parallel_size", old_size
+                )
+            )
+            attempt(
+                lambda attention=attention, old_group=old_group: setattr(
+                    attention, "cp_group", old_group
+                )
+            )
+            attempt(
+                lambda attention=attention, old_ranks=old_ranks: setattr(
+                    attention, "cp_global_ranks", old_ranks
+                )
+            )
+            attempt(
+                lambda attention=attention, stream=stream: setattr(attention, "cp_stream", stream)
+            )
+            attempt(
+                lambda attention=attention, comm_type=comm_type: setattr(
+                    attention, "cp_comm_type", comm_type
+                )
+            )
+        attempt(lambda: setattr(model.config, "context_parallel_size", model_cp_size))
+        attempt(lambda: setattr(model, group_attribute, model_group))
+        if size_attribute is not None:
+            attempt(lambda: setattr(model, size_attribute, model_size))
+        try:
+            setattr(encoder, _DYNAMIC_ENCODER_CP_BINDING_SLOT, None)
+        except BaseException as restore_error:
+            if restore_primary is None:
+                restore_primary = restore_error
+            else:
+                _add_restore_note(restore_primary, restore_error)
+        if primary_error is None and restore_primary is not None:
+            raise restore_primary
+
+    binding = DynamicEncoderCpBinding(membership, is_current=is_current, restore=restore)
+    setattr(encoder, _DYNAMIC_ENCODER_CP_BINDING_SLOT, binding)
+    try:
+        model.config.context_parallel_size = membership.group_size
+        setattr(model, group_attribute, target_group)
+        if size_attribute is not None:
+            setattr(model, size_attribute, membership.group_size)
+        for attention, _group, _ranks, _size, stream, comm_type in attention_state:
+            attention.config.context_parallel_size = membership.group_size
+            attention.set_context_parallel_group(
+                target_group, target_ranks, None if target_group is None else stream, comm_type
+            )
+    except BaseException as primary_error:
+        binding.restore(primary_error)
+        raise
+    return binding
 
 
 class MultimodalDecoderPayloadCodec:
@@ -809,6 +969,67 @@ class Qwen35VLMdpAdapter:
         """Patch rows as the LPT ordering cost; never sizes any buffer."""
         return item.payload_rows
 
+    def estimate_dynamic_encoder_workload(
+        self, items: tuple[DecoderVisionItemMetadata, ...], *, group_size: int
+    ) -> EncoderWorkEstimate:
+        """Estimate native per-rank Qwen THD rows using metadata only."""
+        if type(self) is not Qwen35VLMdpAdapter:
+            raise MdpConfigurationError(
+                "MDP: dynamic encoder workload requires the exact Qwen3.5-VL adapter."
+            )
+        if not isinstance(items, tuple) or not items:
+            raise MdpConfigurationError(
+                "MDP: Qwen dynamic encoder items are an immutable non-empty tuple."
+            )
+        if type(group_size) is not int or group_size not in (1, 2, 4):
+            raise MdpConfigurationError("MDP: Qwen dynamic encoder group_size is E1, E2, or E4.")
+
+        merge = self.spatial_merge_size
+        seen = set()
+        effective_rows = 0
+        cost_units = 0
+        alignment = 2 * group_size
+        for item in items:
+            if not isinstance(item, DecoderVisionItemMetadata):
+                raise MdpConfigurationError(
+                    "MDP: Qwen dynamic encoder items use typed decoder metadata."
+                )
+            if item.item_id in seen:
+                raise MdpConfigurationError(
+                    "MDP: Qwen dynamic encoder items have unique item identities."
+                )
+            seen.add(item.item_id)
+            grid = item.grid_thw
+            if (
+                not isinstance(grid, tuple)
+                or len(grid) != 3
+                or any(type(value) is not int or value <= 0 for value in grid)
+            ):
+                raise MdpConfigurationError(
+                    "MDP: Qwen dynamic encoder grid_thw has three positive integers."
+                )
+            temporal, height, width = grid
+            if height % merge or width % merge:
+                raise MdpConfigurationError(
+                    "MDP: Qwen dynamic encoder grid_thw is spatial-merge aligned."
+                )
+            if type(item.output_rows) is not int or item.output_rows != temporal * (
+                height // merge
+            ) * (width // merge):
+                raise MdpConfigurationError(
+                    "MDP: Qwen dynamic encoder output_rows matches grid_thw."
+                )
+            frame_rows = height * width
+            valid_rows = temporal * frame_rows
+            padded_frame_rows = (
+                frame_rows
+                if group_size == 1
+                else ((frame_rows + alignment - 1) // alignment) * alignment
+            )
+            effective_rows += temporal * padded_frame_rows // group_size
+            cost_units += valid_rows
+        return EncoderWorkEstimate(effective_rows, cost_units)
+
     # ------------------------------------------------------------------
     # Encoder factory and forward
     # ------------------------------------------------------------------
@@ -832,6 +1053,25 @@ class Qwen35VLMdpAdapter:
             spatial_merge_size=kwargs["spatial_merge_size"],
             out_hidden_size=kwargs["out_hidden_size"],
             max_num_positions=kwargs["max_num_positions"],
+        )
+
+    def bind_dynamic_encoder_cp(self, encoder, *, membership, global_rank):
+        """Temporarily bind Qwen vision attention to one encoder subgroup."""
+        if type(self) is not Qwen35VLMdpAdapter:
+            raise MdpConfigurationError(
+                "MDP: dynamic encoder CP binding requires the exact Qwen3.5-VL adapter."
+            )
+        if not isinstance(encoder, Qwen35VLVisionEncoder):
+            raise MdpConfigurationError(
+                "MDP: Qwen dynamic encoder CP requires its typed vision encoder."
+            )
+        return _bind_dynamic_encoder_cp(
+            encoder,
+            encoder,
+            membership=membership,
+            global_rank=global_rank,
+            group_attribute="_encoder_cp_group",
+            size_attribute="_encoder_cp_size",
         )
 
     def encode(self, encoder: torch.nn.Module, payload: torch.Tensor, layout) -> torch.Tensor:
