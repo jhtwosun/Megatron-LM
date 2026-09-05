@@ -15,14 +15,21 @@ from megatron.core.mdp.dynamic_cp_d3_encoder_backward import (
     _ready_authority,
     _validate_d3_encoder_finalize_ready,
 )
+from megatron.core.mdp.dynamic_cp_d3_encoder_completion_preparation import (
+    _PreparedD3EncoderCompletion,
+)
 from megatron.core.mdp.dynamic_cp_d3_gradient_gate_binding import _validate_native_group_context
 from megatron.core.mdp.dynamic_cp_d3_iteration_commit import _mint_d3_iteration_commit_ready
-from megatron.core.mdp.dynamic_cp_d3_producer_owner import _D3ProducerOwner
+from megatron.core.mdp.dynamic_cp_d3_producer_owner import (
+    _D3ProducerOwner,
+    _PreparedNativeEncoderCompletion,
+)
 from megatron.core.mdp.dynamic_cp_execution import (
     _PrecollectiveStatus,
     _run_precollective_consensus,
     _validate_precollective_timeout,
 )
+from megatron.core.mdp.dynamic_cp_runtime import _DynamicProducerCarrier
 from megatron.core.mdp.errors import (
     MdpBridgeError,
     MdpConfigurationError,
@@ -38,6 +45,8 @@ _ZERO_DIGEST = bytes(16)
 _INT64_MAX = 2**63 - 1
 _PENDING_SEALS: dict[object, tuple[int, ...]] = {}
 _PENDING_BINDING_SEALS: dict[object, tuple[int, ...]] = {}
+_PENDING_ATTEMPT_SEALS: dict[object, tuple[int, ...]] = {}
+_ACTIVE_ATTEMPT_ACCESS: dict[int, tuple[Any, Any, tuple[int, ...], Any]] = {}
 
 
 def _digest(label: bytes, iteration: int, ranks: tuple[int, ...]) -> bytes:
@@ -189,6 +198,37 @@ class _ArmedFinalization:
     digest: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class _D3EncoderFinalizeAttempt:
+    """Opaque rank-local Gate-5 preparation awaiting external consensus."""
+
+    _binding: Any
+    _status: _PrecollectiveStatus
+    _error: BaseException | None
+    _ready: _D3EncoderFinalizeReady | None
+    _prepared: _PreparedD3EncoderFinalization | None
+    _factory_seal: object
+
+    def __post_init__(self) -> None:
+        values = (self._binding, self._status, self._error, self._ready, self._prepared)
+        fingerprint = _PENDING_ATTEMPT_SEALS.pop(self._factory_seal, None)
+        if type(self) is not _D3EncoderFinalizeAttempt or fingerprint != tuple(
+            id(value) for value in values
+        ):
+            raise MdpStateError("MDP: D3 encoder finalize attempt is minted by its binding.")
+
+    @property
+    def status(self) -> _PrecollectiveStatus:
+        """Return the immutable status row for external consensus."""
+        entry = _require_attempt_access(self)
+        return _PrecollectiveStatus.from_wire_tuple(entry[2])
+
+    @property
+    def error(self) -> BaseException | None:
+        """Return the rank-local error represented by the status row."""
+        return _require_attempt_access(self)[3]
+
+
 class _D3EncoderFinalizeBinding:
     """Own one reusable physical Gate-5 status and exact finalizer claim."""
 
@@ -203,6 +243,13 @@ class _D3EncoderFinalizeBinding:
         "_group_ranks_getter",
         "_state",
         "_armed",
+        "_attempt",
+        "_attempt_trusted",
+        "_attempt_trusted_fields",
+        "_attempt_fingerprint",
+        "_attempt_resources",
+        "_attempt_resources_fingerprint",
+        "_attempt_trusted_resources",
         "_tombstone",
     )
 
@@ -248,6 +295,13 @@ class _D3EncoderFinalizeBinding:
         self._fallback_status_gate = fallback_status_gate
         self._all_gather_status, self._group_ranks_getter = all_gather_status, group_ranks_getter
         self._state, self._armed, self._tombstone = "idle", None, None
+        self._attempt = None
+        self._attempt_trusted = None
+        self._attempt_trusted_fields = None
+        self._attempt_fingerprint = None
+        self._attempt_resources = None
+        self._attempt_resources_fingerprint = None
+        self._attempt_trusted_resources = None
 
     @property
     def is_idle(self):
@@ -261,13 +315,116 @@ class _D3EncoderFinalizeBinding:
     def is_poisoned(self):
         return self._state == "poisoned"
 
-    def status_gate(self, context: _D3GateStatusContext, local_error: BaseException | None, /):
-        if type(context) is _D3GateStatusContext and context.gate_id != 5:
-            if self._state != "idle":
-                raise MdpStateError("MDP: non-Gate-5 status requires an idle binding.")
-            return self._fallback_status_gate(context, local_error)
+    @staticmethod
+    def _fingerprint_attempt(attempt: _D3EncoderFinalizeAttempt) -> tuple:
+        prepared = attempt._prepared
+        prepared_authority = None if prepared is None else prepared._authority
+        return (
+            id(attempt._binding),
+            id(attempt._status),
+            attempt._status.to_wire_tuple(),
+            id(attempt._error),
+            id(attempt._ready),
+            id(prepared),
+            prepared_authority,
+            id(attempt._factory_seal),
+        )
+
+    @staticmethod
+    def _fingerprint_resources(resources: Any) -> tuple | None:
+        if resources is None:
+            return None
+        prepared, owner = resources
+        return (
+            id(prepared),
+            prepared._authority,
+            _prepared_authority(prepared),
+            id(owner),
+            prepared.owner is owner,
+        )
+
+    def _clear_attempt(self) -> None:
+        trusted = self._attempt_trusted
+        if trusted is not None:
+            entry = _ACTIVE_ATTEMPT_ACCESS.get(id(trusted))
+            if entry is not None and entry[0] is trusted and entry[1] is self:
+                del _ACTIVE_ATTEMPT_ACCESS[id(trusted)]
+        self._attempt = None
+        self._attempt_trusted = None
+        self._attempt_trusted_fields = None
+        self._attempt_fingerprint = None
+        self._attempt_resources = None
+        self._attempt_resources_fingerprint = None
+        self._attempt_trusted_resources = None
+
+    def _require_active_attempt(
+        self, attempt: Any, *, cleanup_error: BaseException | None = None
+    ) -> _D3EncoderFinalizeAttempt:
+        active = self._attempt
+        trusted_fields = self._attempt_trusted_fields
+        exact_type = type(attempt) is _D3EncoderFinalizeAttempt
+        exact_original = self._attempt_trusted is attempt and exact_type
+        fields_match = (
+            exact_original
+            and type(trusted_fields) is tuple
+            and len(trusted_fields) == 6
+            and attempt._binding is trusted_fields[0]
+            and attempt._status is trusted_fields[1]
+            and type(attempt._status) is _PrecollectiveStatus
+            and attempt._error is trusted_fields[2]
+            and attempt._ready is trusted_fields[3]
+            and attempt._prepared is trusted_fields[4]
+            and attempt._factory_seal is trusted_fields[5]
+        )
+        resources_match = self._attempt_resources is self._attempt_trusted_resources
+        if (
+            not exact_original
+            or self._state != "claimed"
+            or active is None
+            or attempt is not active
+            or not fields_match
+            or not resources_match
+        ):
+            if exact_original:
+                resources = self._attempt_trusted_resources
+                fatal = MdpTaskFatalError(
+                    "MDP: D3 encoder finalize attempt retains its sealed fields."
+                )
+                self._clear_attempt()
+                self._state = "poisoned"
+                if resources is not None:
+                    cleanup_primary = fatal if cleanup_error is None else cleanup_error
+                    self._abort(resources[0], cleanup_primary, resources[1])
+                raise fatal
+            raise MdpStateError("MDP: encoder finalization requires its active attempt.")
+        try:
+            fingerprint = self._fingerprint_attempt(attempt)
+            resources_fingerprint = self._fingerprint_resources(self._attempt_trusted_resources)
+        except BaseException:
+            fingerprint = None
+            resources_fingerprint = None
+        if (
+            fingerprint != self._attempt_fingerprint
+            or resources_fingerprint != self._attempt_resources_fingerprint
+        ):
+            resources = self._attempt_trusted_resources
+            fatal = MdpTaskFatalError("MDP: D3 encoder finalize attempt retains its sealed fields.")
+            self._clear_attempt()
+            self._state = "poisoned"
+            if resources is not None:
+                cleanup_primary = fatal if cleanup_error is None else cleanup_error
+                self._abort(resources[0], cleanup_primary, resources[1])
+            raise fatal
+        return attempt
+
+    def prepare_status_attempt(
+        self, context: _D3GateStatusContext, local_error: BaseException | None, /
+    ) -> _D3EncoderFinalizeAttempt:
+        """Build one rank-local Gate-5 status without entering consensus or finalization."""
+        if self._state == "poisoned":
+            raise MdpTaskFatalError("MDP: poisoned encoder finalization binding cannot be reused.")
         if self._state != "idle":
-            raise MdpStateError("MDP: encoder finalization status requires an idle binding.")
+            raise MdpStateError("MDP: encoder finalization binding is already claimed or armed.")
         ready = context.phase_value if type(context) is _D3GateStatusContext else None
         if self._tombstone is not None and self._tombstone is ready:
             self._state = "poisoned"
@@ -276,85 +433,227 @@ class _D3EncoderFinalizeBinding:
         prepared = None
         error = local_error
         iteration = None
+        resources = None
+        trusted_owner = None
         try:
-            if error is not None and not isinstance(error, BaseException):
-                raise MdpConfigurationError("MDP: Gate-5 local error is an exception or None.")
-            _validate_native_group_context(
-                self._group, self._group_ranks, self._global_rank, self._group_ranks_getter
+            try:
+                if type(ready) is _D3EncoderFinalizeReady:
+                    nested_types_valid = (
+                        type(ready.native_completion) is _PreparedNativeEncoderCompletion
+                        and type(ready.prepared) is _PreparedD3EncoderCompletion
+                        and type(ready.prepared.producer) is _DynamicProducerCarrier
+                    )
+                    if nested_types_valid:
+                        candidate_owner = ready.owner
+                        ready_authority = ready._authority
+                        if (
+                            type(candidate_owner) is _D3ProducerOwner
+                            and type(ready_authority) is tuple
+                            and len(ready_authority) > 5
+                            and ready_authority[0] == id(ready)
+                            and ready_authority[5] == id(candidate_owner)
+                            and ready.native_completion.owner is candidate_owner
+                            and ready.prepared.producer.owner is candidate_owner
+                        ):
+                            trusted_owner = candidate_owner
+                    else:
+                        raise MdpConfigurationError(
+                            "MDP: encoder finalize-ready cleanup carriers have exact private types."
+                        )
+                if error is not None and not isinstance(error, BaseException):
+                    raise MdpConfigurationError("MDP: Gate-5 local error is an exception or None.")
+                _validate_native_group_context(
+                    self._group, self._group_ranks, self._global_rank, self._group_ranks_getter
+                )
+                if type(context) is not _D3GateStatusContext or context.gate_id != 5:
+                    raise MdpConfigurationError(
+                        "MDP: encoder finalization requires exact Gate-5 context."
+                    )
+                if error is not None:
+                    if ready is not None:
+                        raise MdpStateError(
+                            "MDP: failed Gate-5 preparation carries no phase value."
+                        )
+                elif type(ready) is _D3EncoderFinalizeReady:
+                    ready = _validate_d3_encoder_finalize_ready(ready)
+                    if type(trusted_owner) is not _D3ProducerOwner:
+                        raise MdpConfigurationError(
+                            "MDP: encoder finalization requires its exact producer owner."
+                        )
+                    candidate_iteration = trusted_owner._iteration
+                    if (
+                        type(candidate_iteration) is not int
+                        or not 0 <= candidate_iteration <= _INT64_MAX
+                    ):
+                        raise MdpStateError(
+                            "MDP: Gate-5 iteration is a nonnegative signed-int64 integer."
+                        )
+                    iteration = candidate_iteration
+                    prepared = _prepare(
+                        context, self._group, self._group_ranks, self._global_rank, self._device
+                    )
+                    resources = (prepared, trusted_owner)
+                    if prepared.owner is not trusted_owner:
+                        raise MdpStateError(
+                            "MDP: local Gate-5 preparation retains its validated owner."
+                        )
+                else:
+                    raise MdpConfigurationError("MDP: Gate 5 requires exact finalize-ready input.")
+            except BaseException as caught:
+                if prepared is not None:
+                    raise
+                if trusted_owner is not None and trusted_owner._runtime is not None:
+                    try:
+                        trusted_owner.abort(caught)
+                    except BaseException as cleanup_error:
+                        caught.add_note(
+                            f"suppressed Gate-5 preparation cleanup error: {cleanup_error!r}"
+                        )
+                _scrub_ready(ready)
+                if not isinstance(error, BaseException):
+                    error = caught
+                elif caught is not error:
+                    error.add_note(f"suppressed Gate-5 local preparation error: {caught!r}")
+                prepared = None
+                resources = None
+                iteration = None
+            manifest = (
+                _ZERO_DIGEST
+                if iteration is None
+                else _digest(b"topology", iteration, self._group_ranks)
             )
-            if type(context) is not _D3GateStatusContext or context.gate_id != 5:
-                raise MdpConfigurationError(
-                    "MDP: encoder finalization requires exact Gate-5 context."
-                )
-            if error is not None:
-                if ready is not None:
-                    raise MdpStateError("MDP: failed Gate-5 preparation carries no phase value.")
-            elif type(ready) is _D3EncoderFinalizeReady:
-                candidate_iteration = ready.owner._iteration
-                if (
-                    type(candidate_iteration) is not int
-                    or not 0 <= candidate_iteration <= _INT64_MAX
-                ):
-                    raise MdpStateError(
-                        "MDP: Gate-5 iteration is a nonnegative signed-int64 integer."
-                    )
-                iteration = candidate_iteration
-                prepared = _prepare(
-                    context, self._group, self._group_ranks, self._global_rank, self._device
-                )
-            else:
-                raise MdpConfigurationError("MDP: Gate 5 requires exact finalize-ready input.")
+            gate = (
+                _ZERO_DIGEST
+                if prepared is None
+                else _digest(b"gate-5", iteration, self._group_ranks)
+            )
+            status = _PrecollectiveStatus(
+                self._global_rank, manifest, gate, int(error is not None), 5
+            )
+            values = (self, status, error, ready, prepared)
+            factory_seal = object()
+            _PENDING_ATTEMPT_SEALS[factory_seal] = tuple(id(value) for value in values)
+            try:
+                attempt = _D3EncoderFinalizeAttempt(*values, factory_seal)
+            finally:
+                _PENDING_ATTEMPT_SEALS.pop(factory_seal, None)
+            self._attempt = attempt
+            # These snapshots are binding-private cleanup escrow, not caller authority.
+            self._attempt_trusted = attempt
+            self._attempt_trusted_fields = (*values, factory_seal)
+            self._attempt_resources = resources
+            self._attempt_trusted_resources = resources
+            self._attempt_fingerprint = self._fingerprint_attempt(attempt)
+            self._attempt_resources_fingerprint = self._fingerprint_resources(resources)
+            access_key = id(attempt)
+            if access_key in _ACTIVE_ATTEMPT_ACCESS:
+                raise MdpStateError("MDP: encoder finalize attempt access identity collided.")
+            _ACTIVE_ATTEMPT_ACCESS[access_key] = (attempt, self, status.to_wire_tuple(), error)
         except BaseException as caught:
-            candidate_owner = getattr(ready, "owner", None)
-            if type(candidate_owner) is _D3ProducerOwner and candidate_owner._runtime is not None:
-                try:
-                    candidate_owner.abort(caught)
-                except BaseException as cleanup_error:
-                    caught.add_note(
-                        f"suppressed Gate-5 preparation cleanup error: {cleanup_error!r}"
-                    )
-            _scrub_ready(ready)
-            if error is None:
-                error = caught
-            elif caught is not error:
-                error.add_note(f"suppressed Gate-5 local preparation error: {caught!r}")
-        manifest = (
-            _ZERO_DIGEST
-            if iteration is None
-            else _digest(b"topology", iteration, self._group_ranks)
+            self._clear_attempt()
+            self._state = "poisoned"
+            if resources is not None:
+                self._abort(resources[0], caught, resources[1])
+            raise
+        return attempt
+
+    def accept_status_attempt(self, attempt: _D3EncoderFinalizeAttempt, /) -> None:
+        """Install one exact locally prepared Gate-5 attempt after external consensus."""
+        active = self._require_active_attempt(attempt)
+        resources = self._attempt_trusted_resources
+        try:
+            if active._error is not None:
+                raise MdpStateError(
+                    "MDP: encoder finalization status accepted a local error."
+                ) from active._error
+            if resources is None:
+                raise MdpTaskFatalError(
+                    "MDP: encoder finalization status accepted no prepared resources."
+                )
+            prepared, owner = resources
+            if (
+                active._prepared is not prepared
+                or active._ready is None
+                or prepared.owner is not owner
+            ):
+                raise MdpTaskFatalError(
+                    "MDP: encoder finalization status retains exact prepared resources."
+                )
+            armed = _ArmedFinalization(active._ready, prepared, owner, active._status.plan_digest)
+        except BaseException as caught:
+            self._clear_attempt()
+            self._state = "poisoned"
+            if resources is not None:
+                self._abort(resources[0], caught, resources[1])
+            raise
+        self._armed = armed
+        self._clear_attempt()
+        self._state = "armed"
+
+    def abort_status_attempt(
+        self, attempt: _D3EncoderFinalizeAttempt, primary_error: BaseException, /
+    ) -> None:
+        """Retire one failed external Gate-5 consensus and clean its exact owner."""
+        if not isinstance(primary_error, BaseException):
+            raise MdpConfigurationError(
+                "MDP: encoder finalization attempt abort requires the caller error."
+            )
+        exact_active = (
+            self._attempt_trusted is attempt and type(attempt) is _D3EncoderFinalizeAttempt
         )
-        gate = (
-            _ZERO_DIGEST if prepared is None else _digest(b"gate-5", iteration, self._group_ranks)
-        )
-        status = _PrecollectiveStatus(self._global_rank, manifest, gate, int(error is not None), 5)
+        try:
+            active = self._require_active_attempt(attempt, cleanup_error=primary_error)
+        except BaseException as validation_error:
+            if not exact_active:
+                raise
+            try:
+                primary_error.add_note(
+                    f"suppressed Gate-5 attempt validation error: {validation_error!r}"
+                )
+            except BaseException:
+                pass
+            return
+        resources = self._attempt_trusted_resources
+        ready = active._ready
+        self._clear_attempt()
+        if isinstance(primary_error, MdpPlanError):
+            self._state = "idle"
+            self._tombstone = ready if type(ready) is _D3EncoderFinalizeReady else None
+        else:
+            self._state = "poisoned"
+        if resources is not None:
+            self._abort(resources[0], primary_error, resources[1])
+
+    def status_gate(self, context: _D3GateStatusContext, local_error: BaseException | None, /):
+        if type(context) is _D3GateStatusContext and context.gate_id != 5:
+            if self._state != "idle":
+                raise MdpStateError("MDP: non-Gate-5 status requires an idle binding.")
+            return self._fallback_status_gate(context, local_error)
+        attempt = self.prepare_status_attempt(context, local_error)
+        attempt_error = attempt.error
         try:
             _run_precollective_consensus(
-                status,
+                attempt.status,
                 group_ranks=self._group_ranks,
                 all_gather_status=self._all_gather_status,
                 timeout_seconds=self._timeout_seconds,
             )
-        except MdpBridgeError:
-            self._state = "poisoned"
-            self._abort(prepared)
+        except MdpBridgeError as caught:
+            self.abort_status_attempt(attempt, caught)
             raise
         except MdpPlanError as caught:
-            self._state = "idle"
-            self._tombstone = ready if type(ready) is _D3EncoderFinalizeReady else None
-            self._abort(prepared, caught)
-            if error is not None and caught.__cause__ is None:
-                raise caught from error
+            self.abort_status_attempt(attempt, caught)
+            if attempt_error is not None and caught.__cause__ is None:
+                raise caught from attempt_error
             raise
-        except BaseException:
-            self._state = "poisoned"
-            self._abort(prepared)
+        except BaseException as caught:
+            self.abort_status_attempt(attempt, caught)
             raise
-        if error is not None or prepared is None:
-            self._state = "poisoned"
-            self._abort(prepared, error)
-            raise MdpTaskFatalError("MDP: Gate-5 accepted an invalid local preparation.") from error
-        self._armed = _ArmedFinalization(ready, prepared, prepared.owner, gate)
-        self._state = "armed"
+        if attempt_error is not None or attempt._prepared is None:
+            fatal = MdpTaskFatalError("MDP: Gate-5 accepted an invalid local preparation.")
+            self.abort_status_attempt(attempt, fatal)
+            raise fatal from attempt_error
+        self.accept_status_attempt(attempt)
 
     @staticmethod
     def _abort(prepared, error=None, owner=None):
@@ -429,6 +728,20 @@ class _D3EncoderFinalizeBinding:
         _scrub_ready(ready)
         self._state = "idle"
         return commit_ready
+
+
+def _require_attempt_access(attempt: Any) -> tuple[Any, Any, tuple[int, ...], Any]:
+    """Return mint escrow only for one still-active exact attempt."""
+    entry = _ACTIVE_ATTEMPT_ACCESS.get(id(attempt))
+    if (
+        entry is None
+        or entry[0] is not attempt
+        or type(attempt) is not _D3EncoderFinalizeAttempt
+        or type(entry[1]) is not _D3EncoderFinalizeBinding
+    ):
+        raise MdpStateError("MDP: encoder finalize attempt access requires an active mint.")
+    entry[1]._require_active_attempt(attempt)
+    return entry
 
 
 def _validate_dependencies(ranks, global_rank, device, timeout, *callbacks):
