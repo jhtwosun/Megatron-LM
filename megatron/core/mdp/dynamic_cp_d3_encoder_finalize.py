@@ -49,6 +49,14 @@ _PENDING_ATTEMPT_SEALS: dict[object, tuple[int, ...]] = {}
 _ACTIVE_ATTEMPT_ACCESS: dict[int, tuple[Any, Any, tuple[int, ...], Any]] = {}
 
 
+def _add_cleanup_note(primary: BaseException, note: str) -> None:
+    """Attach cleanup diagnostics without allowing an exception to replace the primary."""
+    try:
+        primary.add_note(note)
+    except BaseException:
+        pass
+
+
 def _digest(label: bytes, iteration: int, ranks: tuple[int, ...]) -> bytes:
     value = hashlib.blake2b(digest_size=16)
     value.update(_SCHEMA)
@@ -293,7 +301,7 @@ class _D3EncoderFinalizeBinding:
         self._global_rank, self._device = global_rank, device
         self._timeout_seconds = _validate_precollective_timeout(timeout_seconds)
         self._fallback_status_gate = fallback_status_gate
-        self._all_gather_status, self._group_ranks_getter = all_gather_status, group_ranks_getter
+        self._all_gather_status, self._group_ranks_getter = (all_gather_status, group_ranks_getter)
         self._state, self._armed, self._tombstone = "idle", None, None
         self._attempt = None
         self._attempt_trusted = None
@@ -506,14 +514,17 @@ class _D3EncoderFinalizeBinding:
                     try:
                         trusted_owner.abort(caught)
                     except BaseException as cleanup_error:
-                        caught.add_note(
-                            f"suppressed Gate-5 preparation cleanup error: {cleanup_error!r}"
+                        _add_cleanup_note(
+                            caught,
+                            f"suppressed Gate-5 preparation cleanup error: {cleanup_error!r}",
                         )
                 _scrub_ready(ready)
                 if not isinstance(error, BaseException):
                     error = caught
                 elif caught is not error:
-                    error.add_note(f"suppressed Gate-5 local preparation error: {caught!r}")
+                    _add_cleanup_note(
+                        error, f"suppressed Gate-5 local preparation error: {caught!r}"
+                    )
                 prepared = None
                 resources = None
                 iteration = None
@@ -665,7 +676,9 @@ class _D3EncoderFinalizeBinding:
                 candidate.abort(error)
             except BaseException as cleanup_error:
                 if error is not None:
-                    error.add_note(f"suppressed Gate-5 owner cleanup error: {cleanup_error!r}")
+                    _add_cleanup_note(
+                        error, f"suppressed Gate-5 owner cleanup error: {cleanup_error!r}"
+                    )
 
     def finalize(self, ready: _D3EncoderFinalizeReady, /):
         if self._state == "finalizing":
