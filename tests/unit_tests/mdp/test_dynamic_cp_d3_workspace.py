@@ -166,6 +166,16 @@ class _BasePutFailure(BaseException):
     pass
 
 
+class _HostileWorkspaceFailure(BaseException):
+    def __init__(self, message):
+        super().__init__(message)
+        self.add_note_calls = 0
+
+    def add_note(self, _note):
+        self.add_note_calls += 1
+        raise BaseException("hostile add_note")
+
+
 class _SecondPutFailsStorage(MdpEmbeddingStorage):
     def __init__(self, allocator, error):
         super().__init__(allocator)
@@ -788,6 +798,37 @@ def test_base_exception_put_failure_rolls_back_and_preserves_primary():
     assert len(allocator.releases) == len(set(allocator.releases))
 
 
+def test_hostile_activation_primary_preserves_rollback_and_released_workspace(monkeypatch):
+    api = _workspace_api()
+    primary = _HostileWorkspaceFailure("hostile put failure")
+    allocator = _RecordingAllocator()
+    storage = _SecondPutFailsStorage(allocator, primary)
+    workspace = api._DynamicIterationWorkspace(
+        authority=_authority(solver=_OneSampleSolver()),
+        rank=5,
+        device=torch.device("cuda", 0),
+        allocator=allocator,
+        storage=storage,
+    )
+    first_key = next(iter(workspace._embedding_bases))
+    original_release = storage.release
+
+    def release_then_fail(microbatch_id):
+        original_release(microbatch_id)
+        raise _ReleaseFailure("injected leaf cleanup failure")
+
+    monkeypatch.setattr(storage, "release", release_then_fail)
+    with pytest.raises(_HostileWorkspaceFailure) as caught:
+        workspace.activate_embedding_leaves()
+
+    assert caught.value is primary
+    assert primary.add_note_calls == 1
+    assert storage.get_leaf(first_key) is None
+    workspace.release()
+    assert workspace._released is True
+    assert not workspace._bases
+
+
 def test_release_attempts_every_cleanup_and_preserves_the_first_error():
     api = _workspace_api()
     allocator = _RecordingAllocator(fail_releases=True, release_error=_ReleaseFailure("release 1"))
@@ -843,6 +884,87 @@ def test_base_exception_allocation_failure_unwinds_in_reverse_and_preserves_prim
     assert allocator.releases == [id(allocator.acquired[1]), id(allocator.acquired[0])]
 
 
+def test_hostile_allocation_primary_preserves_full_unwind_and_allocator_retry():
+    api = _workspace_api()
+    primary = _HostileWorkspaceFailure("hostile allocation failure")
+    allocator = _RecordingAllocator(
+        fail_acquire_at=3,
+        fail_releases=True,
+        acquire_error=primary,
+        release_error=_ReleaseFailure("injected release failure"),
+    )
+
+    with pytest.raises(_HostileWorkspaceFailure) as caught:
+        api._DynamicIterationWorkspace(
+            authority=_authority(),
+            rank=5,
+            device=torch.device("cuda", 0),
+            allocator=allocator,
+            storage=MdpEmbeddingStorage(allocator),
+        )
+
+    assert caught.value is primary
+    assert primary.add_note_calls == 1
+    assert allocator.releases == [id(allocator.acquired[1]), id(allocator.acquired[0])]
+
+    allocator.fail_acquire_at = None
+    allocator.fail_releases = False
+    retry = api._DynamicIterationWorkspace(
+        authority=_authority(),
+        rank=5,
+        device=torch.device("cuda", 0),
+        allocator=allocator,
+        storage=MdpEmbeddingStorage(allocator),
+    )
+    retry.release()
+    assert retry._released is True
+
+
+def test_hostile_post_acquire_validation_releases_base_and_allows_retry(monkeypatch):
+    api = _workspace_api()
+    primary = _HostileWorkspaceFailure("hostile tensor validation failure")
+    allocator = _RecordingAllocator(
+        fail_releases=True, release_error=_ReleaseFailure("injected release failure")
+    )
+    original_acquire = allocator.acquire
+    acquire_calls = 0
+
+    class HostileTensor(torch.Tensor):
+        def numel(self):
+            raise primary
+
+    def acquire_once_hostile(**kwargs):
+        nonlocal acquire_calls
+        acquire_calls += 1
+        tensor = original_acquire(**kwargs)
+        return tensor.as_subclass(HostileTensor) if acquire_calls == 1 else tensor
+
+    monkeypatch.setattr(allocator, "acquire", acquire_once_hostile)
+    with pytest.raises(_HostileWorkspaceFailure) as caught:
+        api._DynamicIterationWorkspace(
+            authority=_authority(),
+            rank=5,
+            device=torch.device("cuda", 0),
+            allocator=allocator,
+            storage=MdpEmbeddingStorage(allocator),
+        )
+
+    assert caught.value is primary
+    assert primary.add_note_calls == 1
+    assert len(allocator.releases) == 1
+
+    allocator.fail_releases = False
+    retry = api._DynamicIterationWorkspace(
+        authority=_authority(),
+        rank=5,
+        device=torch.device("cuda", 0),
+        allocator=allocator,
+        storage=MdpEmbeddingStorage(allocator),
+    )
+    retry.release()
+    assert retry._released is True
+
+
 def test_base_exception_release_attempts_every_buffer_and_preserves_primary():
     api = _workspace_api()
     primary = _BaseReleaseFailure("base release failure")
@@ -860,6 +982,31 @@ def test_base_exception_release_attempts_every_buffer_and_preserves_primary():
         workspace.release()
 
     assert raised.value is primary
+    assert len(allocator.releases) == expected_cleanup_calls
+
+
+def test_hostile_first_release_error_attempts_every_buffer_and_retires_workspace():
+    api = _workspace_api()
+    primary = _HostileWorkspaceFailure("hostile release failure")
+    allocator = _RecordingAllocator(fail_releases=True, release_error=primary)
+    workspace = api._DynamicIterationWorkspace(
+        authority=_authority(),
+        rank=5,
+        device=torch.device("cuda", 0),
+        allocator=allocator,
+        storage=MdpEmbeddingStorage(allocator),
+    )
+    expected_cleanup_calls = len(workspace._bases)
+
+    with pytest.raises(_HostileWorkspaceFailure) as caught:
+        workspace.release()
+
+    assert caught.value is primary
+    assert primary.add_note_calls == expected_cleanup_calls - 1
+    assert len(allocator.releases) == expected_cleanup_calls
+    assert workspace._released is True
+    assert not workspace._bases
+    workspace.release()
     assert len(allocator.releases) == expected_cleanup_calls
 
 
