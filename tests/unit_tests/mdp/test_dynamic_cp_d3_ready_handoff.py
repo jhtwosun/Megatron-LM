@@ -77,7 +77,7 @@ class _ProducerOwner:
         self.aborts += 1
 
 
-def _authority(*, participant_ranks=(7, 3, 5), decoder_ranks=(5, 7)):
+def _authority(*, participant_ranks=(7, 3, 5), decoder_ranks=(5, 7), source_rank=3):
     codec = MultimodalDecoderPayloadCodec()
     records = []
     for record in _records():
@@ -93,7 +93,7 @@ def _authority(*, participant_ranks=(7, 3, 5), decoder_ranks=(5, 7)):
     source = codec.build_source_window(tuple(records), source_dp_lane=0)
     metadata = DecoderMetadataGatherResult(
         global_manifest=build_decoder_global_manifest((source.metadata_manifest(),)),
-        source_rank_by_lane={0: 3},
+        source_rank_by_lane={0: source_rank},
     )
     authority_api = _authority_api()
     item_authority = authority_api.derive_decoder_item_authority(
@@ -136,9 +136,11 @@ def _registered_producer(authority, rank):
     return owner, producer
 
 
-def _context(*, rank=5, participant_ranks=(7, 3, 5), decoder_ranks=(5, 7)):
+def _context(*, rank=5, participant_ranks=(7, 3, 5), decoder_ranks=(5, 7), source_rank=3):
     binding_api = import_module("megatron.core.mdp.dynamic_cp_d3_workspace_binding")
-    codec, authority = _authority(participant_ranks=participant_ranks, decoder_ranks=decoder_ranks)
+    codec, authority = _authority(
+        participant_ranks=participant_ranks, decoder_ranks=decoder_ranks, source_rank=source_rank
+    )
     allocator = DirectBufferAllocator()
     owner = binding_api._D3WorkspaceBindingOwner(
         rank=rank,
@@ -273,6 +275,68 @@ def test_nondecode_rank_returns_empty_without_placement_or_rebuild():
         assert ready.assignments == ready.records == ()
         assert dict(ready.embedding_leaves) == {}
         assert calls == []
+    finally:
+        bound.cleanup()
+        assert owner.is_idle
+
+
+def test_d4_ready_handoff_reuses_exact_prepared_carriers_inside_gate_2(monkeypatch):
+    api = import_module("megatron.core.mdp.dynamic_cp_d4_ready_handoff")
+    binding_api = import_module("megatron.core.mdp.dynamic_cp_d4_group_binding")
+    context = _context(
+        rank=2, participant_ranks=(0, 1, 2, 3), decoder_ranks=(0, 1, 2, 3), source_rank=0
+    )
+    codec, authority, owner, _, bound, payload, embedding = context
+    binding = binding_api._make_repeated_d4_group_binding(
+        world_group=_Group(tuple(range(8)), 2),
+        domain_group=_Group((0, 1, 2, 3), 2),
+        expert_group=None,
+        global_rank=2,
+        expert_parallel_size=1,
+        device=torch.device("cuda", 0),
+        timeout_seconds=5.0,
+        group_ranks_getter=lambda group: group._ranks,
+        status_gather_factory=lambda **_: lambda *_args, **_kwargs: None,
+    )
+    events = []
+
+    class _Runner:
+        def run(self, **kwargs):
+            assert kwargs["gate_id"] == 2
+            events.append("run")
+            ready = kwargs["prepare"]()
+            events.append("prepared")
+            return kwargs["domain_collective"](ready)
+
+    monkeypatch.setattr(type(binding), "begin_attempt", lambda *_args, **_kwargs: _Runner())
+
+    def decoder_group(*, group_size):
+        endpoint_ranks = {
+            assignment.endpoint_ranks
+            for microbatch in authority.plan.microbatches
+            for assignment in microbatch.assignments
+            if 2 in assignment.endpoint_ranks and len(assignment.endpoint_ranks) == group_size
+        }
+        assert len(endpoint_ranks) == 1
+        return _Group(endpoint_ranks.pop(), 2)
+
+    try:
+        ready = api.run_repeated_d4_decoder_ready(
+            binding,
+            authority,
+            workspace_owner=owner,
+            producer=bound,
+            payload_bundle=payload,
+            embedding_exchange=embedding,
+            cp_partition_mode="contiguous",
+            decoder_group_getter=decoder_group,
+            decoder_group_ranks_getter=lambda group: group._ranks,
+            rebuild_microbatch=codec.rebuild_microbatch,
+        )
+
+        assert ready.payload_bundle_authority_digest == payload.bundle_authority_digest
+        assert ready.embedding_route_authority_digest == embedding.route_authority_digest
+        assert events == ["run", "prepared"]
     finally:
         bound.cleanup()
         assert owner.is_idle
