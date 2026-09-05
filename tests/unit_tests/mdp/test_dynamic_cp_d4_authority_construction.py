@@ -316,6 +316,64 @@ def test_payload_transport_prepares_everything_before_domain_collective(monkeypa
     assert events == ["run", "attach", "bundle", "prepared", "collective"]
 
 
+def test_embedding_transport_prepares_everything_before_domain_collective(monkeypatch):
+    api = import_module("megatron.core.mdp.dynamic_cp_d4_embedding_transport")
+    binding, authority = _iteration_authority(rank=0)
+    item_id = authority.global_manifest.items[0].item_id
+    output = torch.zeros((1, authority.bridge_width), dtype=authority.bridge_dtype)
+    item_outputs = {item_id: output}
+    send_buffer, receive_buffer = object(), object()
+    prepared = object()
+    received = object()
+    events = []
+
+    def run(binding_arg, authority_arg, **kwargs):
+        assert binding_arg is binding
+        assert authority_arg is authority
+        assert kwargs["gate_id"] == 1
+        events.append("run")
+        value = kwargs["prepare"]()
+        events.append("prepared")
+        return kwargs["domain_collective"](value)
+
+    def prepare(ledger, reverse_ledger, **kwargs):
+        assert ledger is authority.embedding_ledger
+        assert reverse_ledger is authority.gradient_ledger
+        expected_keys = {
+            entry.key
+            for entry in authority.embedding_ledger.entries
+            if entry.src_global_rank == binding.global_rank
+        }
+        assert set(kwargs["local_tensors"]) == expected_keys
+        assert all(value is output for value in kwargs["local_tensors"].values())
+        assert kwargs["send_buffer"] is send_buffer
+        assert kwargs["receive_buffer"] is receive_buffer
+        events.append("prepare")
+        return prepared
+
+    def execute(value, **kwargs):
+        assert value is prepared
+        assert kwargs["group"] is binding.domain_group
+        events.append("collective")
+        return received
+
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", run)
+    monkeypatch.setattr(api, "prepare_dynamic_bridge_exchange", prepare)
+    monkeypatch.setattr(api, "_execute_validated_dynamic_bridge_exchange", execute)
+
+    result = api.run_repeated_d4_embedding(
+        binding,
+        authority,
+        item_outputs=item_outputs,
+        send_buffer=send_buffer,
+        receive_buffer=receive_buffer,
+        all_to_all_single=lambda *_args, **_kwargs: None,
+    )
+
+    assert result is prepared
+    assert events == ["run", "prepare", "prepared", "collective"]
+
+
 if _WORLD8:
 
     @pytest.fixture(scope="module")
@@ -542,3 +600,97 @@ def test_world8_payload_rejects_rank6_then_retries_without_cross_domain_routes(g
     assert all(key.sample_id.source_dp_lane == lane for key in received)
     for key, tensor in received.items():
         torch.testing.assert_close(tensor, expected_packet.tensor_fields[key.field_name])
+
+
+@pytest.mark.skipif(not _WORLD8, reason="needs torchrun world8")
+def test_world8_embedding_rejects_rank6_then_retries_without_cross_domain_routes(groups):
+    api = import_module("megatron.core.mdp.dynamic_cp_d4_embedding_transport")
+    bridge = import_module("megatron.core.mdp.dynamic_cp_bridge")
+    world, domain_group = groups
+    rank = torch.distributed.get_rank()
+    lane = rank // 4
+    domain_ranks = tuple(range(lane * 4, lane * 4 + 4))
+    device = torch.device("cuda", torch.cuda.current_device())
+    binding = binding_api._make_repeated_d4_group_binding(
+        world_group=world,
+        domain_group=domain_group,
+        expert_group=None,
+        global_rank=rank,
+        expert_parallel_size=1,
+        device=device,
+        timeout_seconds=30.0,
+    )
+    source_window = _source_window(lane, device=device)
+    metadata = gather_decoder_source_manifests(
+        source_window.metadata_manifest() if rank == domain_ranks[0] else None,
+        expected_source_lanes=(lane,),
+        group=domain_group,
+        group_ranks=domain_ranks,
+        global_rank=rank,
+        device=device,
+        timeout_seconds=30.0,
+    )
+    authority = _authority_api().build_repeated_d4_iteration_authority(
+        binding,
+        metadata,
+        max_seqlen_per_rank=8,
+        minimum_cp_size=1,
+        solver=_FullGroupSolver(),
+        bridge_width=16,
+        bridge_dtype=torch.bfloat16,
+    )
+    item_id = authority.global_manifest.items[0].item_id
+    output = torch.full(
+        (authority.output_rows_by_item[item_id], authority.bridge_width),
+        lane + 1,
+        dtype=authority.bridge_dtype,
+        device=device,
+    )
+    inputs, outputs = bridge.dynamic_bridge_split_sizes(
+        authority.embedding_ledger,
+        reverse_ledger=authority.gradient_ledger,
+        plan=authority.plan,
+        global_manifest=authority.global_manifest,
+        producer_rank_by_item=authority.producer_rank_by_item,
+        output_rows_by_item=authority.output_rows_by_item,
+        width=authority.bridge_width,
+        dtype=authority.bridge_dtype,
+        participant_ranks=authority.participant_ranks,
+        global_rank=rank,
+    )
+    send_buffer = torch.empty(sum(inputs), dtype=authority.bridge_dtype, device=device)
+    receive_buffer = torch.empty(sum(outputs), dtype=authority.bridge_dtype, device=device)
+    collective_calls = 0
+
+    def tracked_all_to_all(*args, **kwargs):
+        nonlocal collective_calls
+        collective_calls += 1
+        return torch.distributed.all_to_all_single(*args, **kwargs)
+
+    invalid_outputs = {item_id: output} if rank in (domain_ranks[0], 6) else {}
+    with pytest.raises(MdpPlanError, match="rejected rank 6"):
+        api.run_repeated_d4_embedding(
+            binding,
+            authority,
+            item_outputs=invalid_outputs,
+            send_buffer=send_buffer,
+            receive_buffer=receive_buffer,
+            all_to_all_single=tracked_all_to_all,
+        )
+    assert collective_calls == 0
+
+    prepared = api.run_repeated_d4_embedding(
+        binding,
+        authority,
+        item_outputs={item_id: output} if rank == domain_ranks[0] else {},
+        send_buffer=send_buffer,
+        receive_buffer=receive_buffer,
+        all_to_all_single=tracked_all_to_all,
+    )
+    received = prepared.received_tensors
+
+    assert collective_calls == 1
+    assert received
+    assert all(key.item_id.source_dp_lane == lane for key in received)
+    for tensor in received.values():
+        torch.testing.assert_close(tensor, output)
