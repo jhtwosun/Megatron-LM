@@ -56,8 +56,18 @@ _SCHEDULE_RETURN_SEAL = object()
 _COMPLETION_SEAL = object()
 _CURSOR_ENTRY_SEAL = object()
 _COMPLETION_ENTRY_SEAL = object()
+_COMPLETION_CLEANUP_ESCROW_SEAL = object()
+_GRADIENT_HANDOFF_SEAL = object()
+_GRADIENT_HANDOFF_ENTRY_SEAL = object()
+_GRADIENT_HANDOFF_ESCROW_SEAL = object()
+_GRADIENT_COMPLETION_ENTRY_SEAL = object()
 _ACTIVE_CURSORS: dict[int, tuple[Any, ...]] = {}
 _ACTIVE_COMPLETIONS: dict[int, tuple[Any, ...]] = {}
+_COMPLETION_CLEANUP_ESCROWS: dict[int, Any] = {}
+_ACTIVE_GRADIENT_HANDOFFS: dict[int, tuple[Any, ...]] = {}
+_GRADIENT_HANDOFF_ESCROWS: dict[int, Any] = {}
+_TRUSTED_GRADIENT_HANDOFFS: dict[int, Any] = {}
+_RETIRED_GRADIENT_HANDOFFS: dict[int, weakref.ReferenceType[Any]] = {}
 
 
 class _OwnerEscrow:
@@ -100,6 +110,33 @@ class _CleanupEscrow:
         self.cursor_entry = None
         self.completion = None
         self.completion_entry = None
+
+
+class _CompletionCleanupEscrow:
+    __slots__ = ("completion", "entry", "lifecycle", "owner_entry", "reference", "seal")
+
+    def __init__(self, reference, owner_entry, lifecycle, completion, entry, *, seal):
+        if seal is not _COMPLETION_CLEANUP_ESCROW_SEAL:
+            raise MdpConfigurationError(
+                "MDP: dynamic decoder completion cleanup escrow is privately minted."
+            )
+        self.reference = reference
+        self.owner_entry = owner_entry
+        self.lifecycle = lifecycle
+        self.completion = completion
+        self.entry = entry
+        self.seal = seal
+
+
+def _install_completion_cleanup(
+    owner_entry, lifecycle, cleanup, completion, completion_entry, completion_cleanup
+) -> None:
+    lifecycle.completion = completion
+    lifecycle.completion_entry = completion_entry
+    cleanup.completion = completion
+    cleanup.completion_entry = completion_entry
+    _COMPLETION_CLEANUP_ESCROWS[id(completion)] = completion_cleanup
+    _ACTIVE_COMPLETIONS[id(completion)] = completion_entry
 
 
 class _D4DynamicDecoderReplayCursor:
@@ -188,6 +225,312 @@ class _D4DynamicDecoderCompletion:
     def __post_init__(self):
         if self._seal is not _COMPLETION_SEAL:
             raise MdpConfigurationError("MDP: dynamic decoder completion is privately minted.")
+
+
+class _GradientHandoffEscrow:
+    __slots__ = ("completion_entry", "entry", "reference", "seal", "trusted")
+
+    def __init__(self, reference, entry, trusted, completion_entry, *, seal):
+        if seal is not _GRADIENT_HANDOFF_ESCROW_SEAL:
+            raise MdpConfigurationError("MDP: dynamic decoder gradient escrow is privately minted.")
+        self.reference = reference
+        self.entry = entry
+        self.trusted = trusted
+        self.completion_entry = completion_entry
+        self.seal = seal
+
+
+class _D4DynamicDecoderGradientHandoff:
+    """One-shot owner of completed dynamic replay resources for Gate3."""
+
+    __slots__ = (
+        "__weakref__",
+        "_consumed",
+        "_runtime",
+        "_state",
+        "_trusted",
+        "authority",
+        "binding",
+        "completion",
+        "embedding_leaves",
+        "is_selected",
+        "records",
+        "text_only",
+    )
+
+    def __init__(self, trusted: tuple[Any, ...], *, seal):
+        if seal is not _GRADIENT_HANDOFF_SEAL:
+            raise MdpConfigurationError(
+                "MDP: dynamic decoder gradient handoff is privately minted."
+            )
+        self._runtime = trusted[0]
+        self.authority = trusted[1]
+        self.binding = trusted[2]
+        self.records = trusted[3]
+        self.embedding_leaves = trusted[4]
+        self.completion = trusted[7]
+        self.text_only = trusted[10]
+        self.is_selected = trusted[11]
+        self._trusted = trusted
+        self._state = _ACTIVE
+        self._consumed = False
+
+    def require(self) -> "_D4DynamicDecoderGradientHandoff":
+        identity = id(self)
+        entry = _ACTIVE_GRADIENT_HANDOFFS.get(identity)
+        escrow = _TRUSTED_GRADIENT_HANDOFFS.get(identity)
+        if (
+            type(entry) is not tuple
+            or len(entry) != 4
+            or type(entry[0]) is not weakref.ReferenceType
+            or entry[0]() is not self
+            or entry[3] is not _GRADIENT_HANDOFF_ENTRY_SEAL
+            or type(escrow) is not _GradientHandoffEscrow
+            or escrow.seal is not _GRADIENT_HANDOFF_ESCROW_SEAL
+            or escrow.reference is not entry[0]
+            or escrow.reference() is not self
+            or escrow.entry is not entry
+            or escrow.trusted is not entry[1]
+            or _GRADIENT_HANDOFF_ESCROWS.get(identity) is not escrow
+        ):
+            retired = _RETIRED_GRADIENT_HANDOFFS.get(identity)
+            if retired is not None and retired() is self:
+                raise MdpStateError("MDP: dynamic decoder gradient handoff is retired.")
+            raise MdpStateError("MDP: dynamic decoder gradient handoff is the exact active owner.")
+        trusted = entry[1]
+        current = (
+            self._runtime,
+            self.authority,
+            self.binding,
+            self.records,
+            self.embedding_leaves,
+            self.completion,
+            self.text_only,
+            self.is_selected,
+            self._trusted,
+        )
+        expected = (
+            trusted[0],
+            trusted[1],
+            trusted[2],
+            trusted[3],
+            trusted[4],
+            trusted[7],
+            trusted[10],
+            trusted[11],
+            trusted,
+        )
+        runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(trusted[0]))
+        completion_entry = _ACTIVE_COMPLETIONS.get(id(trusted[7]))
+        if (
+            self._state is not _ACTIVE
+            or type(entry[2]) is not bool
+            or self._consumed is not entry[2]
+            or any(actual is not wanted for actual, wanted in zip(current, expected, strict=True))
+            or runtime_entry is None
+            or runtime_entry[0] is not trusted[0]
+            or runtime_entry[1] is not entry[0]
+            or completion_entry is not escrow.completion_entry
+            or type(completion_entry) is not tuple
+            or len(completion_entry) != 9
+            or completion_entry[0] is not entry[0]
+            or completion_entry[1] is not trusted[7]
+            or completion_entry[2] is not trusted[8]
+            or completion_entry[3] is not trusted[13]
+            or completion_entry[4] is not trusted[7]._lifecycle
+            or completion_entry[5] is not trusted[1]
+            or completion_entry[6] is not trusted[7].globally_reduced_num_tokens
+            or completion_entry[7] != trusted[9]
+            or completion_entry[8] is not _GRADIENT_COMPLETION_ENTRY_SEAL
+            or trusted[7]._owner is not trusted[8]
+            or trusted[7]._owner_entry is not trusted[13]
+            or trusted[7]._lifecycle is not completion_entry[4]
+            or trusted[7].authority is not trusted[1]
+            or trusted[7]._seal is not _COMPLETION_SEAL
+            or _tensor_descriptor(completion_entry[6]) != completion_entry[7]
+        ):
+            raise MdpStateError("MDP: dynamic decoder gradient handoff retains sealed resources.")
+        return self
+
+    def consume(
+        self, authority: _DynamicIterationAuthority, completion: _D4DynamicDecoderCompletion, /
+    ) -> "_D4DynamicDecoderGradientHandoff":
+        self.require()
+        if self._consumed:
+            raise MdpStateError("MDP: dynamic decoder gradient handoff is consumed exactly once.")
+        if authority is not self.authority or completion is not self.completion:
+            raise MdpStateError(
+                "MDP: dynamic decoder gradient handoff consumes exact authority and completion."
+            )
+        entry = _ACTIVE_GRADIENT_HANDOFFS[id(self)]
+        _snapshot_local_authority(self.binding, authority)
+        if self.require() is not self or _ACTIVE_GRADIENT_HANDOFFS.get(id(self)) is not entry:
+            raise MdpStateError(
+                "MDP: dynamic decoder gradient handoff retains exact post-snapshot ownership."
+            )
+        next_entry = (entry[0], entry[1], True, entry[3])
+        self._consumed = True
+        _ACTIVE_GRADIENT_HANDOFFS[id(self)] = next_entry
+        escrow = _TRUSTED_GRADIENT_HANDOFFS[id(self)]
+        escrow.entry = next_entry
+        return self
+
+    def abort(self, primary_error: BaseException | None = None) -> None:
+        if primary_error is not None and not isinstance(primary_error, BaseException):
+            raise MdpConfigurationError(
+                "MDP: dynamic decoder gradient handoff abort error is an exception."
+            )
+        identity = id(self)
+        escrow = _GRADIENT_HANDOFF_ESCROWS.get(identity)
+        active_entry = _ACTIVE_GRADIENT_HANDOFFS.get(identity)
+        trusted_candidate = _TRUSTED_GRADIENT_HANDOFFS.get(identity)
+        if (
+            type(escrow) is _GradientHandoffEscrow
+            and trusted_candidate is escrow
+            and type(active_entry) is tuple
+            and active_entry is escrow.entry
+            and active_entry[1] is escrow.trusted
+            and self._trusted is escrow.trusted
+        ):
+            escrow = trusted_candidate
+        if (
+            type(escrow) is not _GradientHandoffEscrow
+            or escrow.seal is not _GRADIENT_HANDOFF_ESCROW_SEAL
+            or escrow.reference() is not self
+        ):
+            self.require()
+        self._abort_from_escrow(escrow, primary_error)
+
+    def _abort_from_escrow(
+        self, escrow: _GradientHandoffEscrow, primary_error: BaseException | None = None
+    ) -> None:
+        if primary_error is not None and not isinstance(primary_error, BaseException):
+            raise MdpConfigurationError(
+                "MDP: dynamic decoder gradient handoff abort error is an exception."
+            )
+        identity = id(self)
+        retired = _RETIRED_GRADIENT_HANDOFFS.get(identity)
+        if retired is not None and retired() is self:
+            raise MdpStateError("MDP: dynamic decoder gradient handoff is retired.")
+        if (
+            type(escrow) is not _GradientHandoffEscrow
+            or escrow.seal is not _GRADIENT_HANDOFF_ESCROW_SEAL
+            or type(escrow.reference) is not weakref.ReferenceType
+            or escrow.reference() is not self
+            or type(escrow.entry) is not tuple
+            or len(escrow.entry) != 4
+            or escrow.entry[0] is not escrow.reference
+            or escrow.entry[1] is not escrow.trusted
+            or escrow.entry[3] is not _GRADIENT_HANDOFF_ENTRY_SEAL
+        ):
+            raise MdpStateError("MDP: dynamic decoder gradient cleanup uses its exact escrow.")
+        entry, trusted = escrow.entry, escrow.trusted
+        primary = (
+            primary_error
+            if primary_error is not None
+            else MdpStateError("MDP: dynamic decoder gradient handoff was aborted.")
+        )
+        integrity_error = None
+        try:
+            current = (
+                object.__getattribute__(self, "_runtime"),
+                object.__getattribute__(self, "authority"),
+                object.__getattribute__(self, "binding"),
+                object.__getattribute__(self, "records"),
+                object.__getattribute__(self, "embedding_leaves"),
+                object.__getattribute__(self, "completion"),
+                object.__getattribute__(self, "text_only"),
+                object.__getattribute__(self, "is_selected"),
+                object.__getattribute__(self, "_trusted"),
+            )
+            expected = (
+                trusted[0],
+                trusted[1],
+                trusted[2],
+                trusted[3],
+                trusted[4],
+                trusted[7],
+                trusted[10],
+                trusted[11],
+                trusted,
+            )
+            if (
+                object.__getattribute__(self, "_state") is not _ACTIVE
+                or object.__getattribute__(self, "_consumed") is not entry[2]
+                or any(
+                    actual is not wanted for actual, wanted in zip(current, expected, strict=True)
+                )
+            ):
+                integrity_error = MdpStateError(
+                    "MDP: dynamic decoder gradient handoff retains sealed resources."
+                )
+        except BaseException as error:
+            integrity_error = error
+        if _ACTIVE_GRADIENT_HANDOFFS.get(identity) is entry:
+            del _ACTIVE_GRADIENT_HANDOFFS[identity]
+        if _GRADIENT_HANDOFF_ESCROWS.get(identity) is escrow:
+            del _GRADIENT_HANDOFF_ESCROWS[identity]
+        if _TRUSTED_GRADIENT_HANDOFFS.get(identity) is escrow:
+            del _TRUSTED_GRADIENT_HANDOFFS[identity]
+        retired_registry = _RETIRED_GRADIENT_HANDOFFS
+
+        def forget(reference, registry=retired_registry):
+            if registry.get(identity) is reference:
+                del registry[identity]
+
+        reference = weakref.ref(self, forget)
+        current_retired = _RETIRED_GRADIENT_HANDOFFS.get(identity)
+        retired_owner = None if current_retired is None else current_retired()
+        if current_retired is None or retired_owner is None or retired_owner is self:
+            _RETIRED_GRADIENT_HANDOFFS[identity] = reference
+        runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(trusted[0]))
+        if runtime_entry is not None and runtime_entry[1] is entry[0]:
+            del _forward._ACTIVE_RUNTIME_OWNERS[id(trusted[0])]
+        if _ACTIVE_COMPLETIONS.get(id(trusted[7])) is escrow.completion_entry:
+            del _ACTIVE_COMPLETIONS[id(trusted[7])]
+        resources, leaf_bases, release = trusted[5], trusted[6], trusted[12]
+        binding_owner, buffers, _operations, forward_handle = resources
+        self._state = _RETIRED
+        self._consumed = True
+        self._runtime = None
+        self.authority = None
+        self.binding = None
+        self.records = ()
+        self.embedding_leaves = MappingProxyType({})
+        self.completion = None
+        self.text_only = None
+        self.is_selected = None
+        self._trusted = ()
+        escrow.reference = None
+        escrow.entry = None
+        escrow.trusted = None
+        escrow.completion_entry = None
+        escrow.seal = None
+        if integrity_error is not None:
+            _add_cleanup_note(
+                primary, "dynamic decoder gradient handoff integrity validation failed."
+            )
+        if forward_handle is not None:
+            try:
+                forward_handle.release_forward_only()
+            except BaseException as error:
+                _add_cleanup_note(
+                    primary, f"suppressed dynamic replay graph release error: {error!r}"
+                )
+        if binding_owner is not None:
+            try:
+                binding_owner.restore(primary)
+            except BaseException as error:
+                _add_cleanup_note(
+                    primary, f"suppressed dynamic replay binding restore error: {error!r}"
+                )
+        for buffer in (*leaf_bases, *buffers):
+            try:
+                release(buffer)
+            except BaseException as error:
+                _add_cleanup_note(
+                    primary, f"suppressed dynamic replay buffer release error: {error!r}"
+                )
 
 
 _PENDING_OWNERS: dict[int, tuple[Any, ...]] = {}
@@ -709,11 +1052,33 @@ class _D4DynamicDecoderReplayOwner:
             escrow.token_descriptor,
             _COMPLETION_ENTRY_SEAL,
         )
-        escrow.completion = completion
-        escrow.completion_entry = completion_entry
-        entry[-4].completion = completion
-        entry[-4].completion_entry = completion_entry
-        _ACTIVE_COMPLETIONS[id(completion)] = completion_entry
+        completion_cleanup = _CompletionCleanupEscrow(
+            entry[0],
+            entry,
+            escrow,
+            completion,
+            completion_entry,
+            seal=_COMPLETION_CLEANUP_ESCROW_SEAL,
+        )
+        try:
+            _install_completion_cleanup(
+                entry, escrow, entry[-4], completion, completion_entry, completion_cleanup
+            )
+        except BaseException:
+            if _ACTIVE_COMPLETIONS.get(id(completion)) is completion_entry:
+                del _ACTIVE_COMPLETIONS[id(completion)]
+            if _COMPLETION_CLEANUP_ESCROWS.get(id(completion)) is completion_cleanup:
+                del _COMPLETION_CLEANUP_ESCROWS[id(completion)]
+            if escrow.completion is completion:
+                escrow.completion = None
+            if escrow.completion_entry is completion_entry:
+                escrow.completion_entry = None
+            cleanup = entry[-4]
+            if cleanup.completion is completion:
+                cleanup.completion = None
+            if cleanup.completion_entry is completion_entry:
+                cleanup.completion_entry = None
+            raise
         return completion
 
     def require_completion(
@@ -722,9 +1087,17 @@ class _D4DynamicDecoderReplayOwner:
         entry = self._require(_ACTIVE_OWNERS, _ACTIVE)
         escrow = entry[-3]
         completion_entry = _ACTIVE_COMPLETIONS.get(id(completion))
+        completion_cleanup = _COMPLETION_CLEANUP_ESCROWS.get(id(completion))
         if (
             type(completion) is not _D4DynamicDecoderCompletion
             or completion_entry is not escrow.completion_entry
+            or type(completion_cleanup) is not _CompletionCleanupEscrow
+            or completion_cleanup.seal is not _COMPLETION_CLEANUP_ESCROW_SEAL
+            or completion_cleanup.reference is not entry[0]
+            or completion_cleanup.owner_entry is not entry
+            or completion_cleanup.lifecycle is not escrow
+            or completion_cleanup.completion is not completion
+            or completion_cleanup.entry is not completion_entry
             or type(completion_entry) is not tuple
             or len(completion_entry) != 8
             or type(completion_entry[0]) is not weakref.ReferenceType
@@ -751,6 +1124,230 @@ class _D4DynamicDecoderReplayOwner:
                 "MDP: dynamic decoder completion retains its exact owner and token."
             )
         return completion
+
+    def _claim_for_gradient(
+        self, authority: _DynamicIterationAuthority, completion: _D4DynamicDecoderCompletion, /
+    ) -> _D4DynamicDecoderGradientHandoff:
+        """Transfer completed dynamic replay ownership without releasing resources."""
+        entry = self._require(_ACTIVE_OWNERS, _ACTIVE)
+        if authority is not entry[2]:
+            raise MdpStateError(
+                "MDP: dynamic decoder gradient handoff requires exact iteration authority."
+            )
+        self.require_completion(completion)
+        lifecycle, cleanup = entry[-3], entry[-4]
+        cursor, cursor_entry = cleanup.cursor, cleanup.cursor_entry
+        completion_entry = cleanup.completion_entry
+        completion_cleanup = _COMPLETION_CLEANUP_ESCROWS.get(id(completion))
+        schedule_return = lifecycle.schedule_return
+        runtime = entry[1]
+        runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        if (
+            type(cursor) is not _D4DynamicDecoderReplayCursor
+            or type(cursor_entry) is not tuple
+            or len(cursor_entry) != 7
+            or _ACTIVE_CURSORS.get(id(cursor)) is not cursor_entry
+            or cursor_entry[0]() is not cursor
+            or cursor_entry[1]() is not self
+            or cursor_entry[2] is not entry
+            or cursor_entry[3] is not lifecycle
+            or cursor_entry[4] is not entry[-1].records
+            or cursor_entry[5] != len(entry[-1].records)
+            or cursor_entry[6] is not _CURSOR_ENTRY_SEAL
+            or lifecycle.cursor is not cursor
+            or lifecycle.cursor_entry is not cursor_entry
+            or type(schedule_return) is not _D4DynamicDecoderScheduleReturn
+            or schedule_return is not lifecycle.schedule_return
+            or schedule_return._owner is not self
+            or schedule_return._cursor is not cursor
+            or schedule_return._owner_entry is not entry
+            or schedule_return._lifecycle is not lifecycle
+            or schedule_return._seal is not _SCHEDULE_RETURN_SEAL
+            or lifecycle.completion is not completion
+            or completion_entry is not lifecycle.completion_entry
+            or type(completion_cleanup) is not _CompletionCleanupEscrow
+            or completion_cleanup.seal is not _COMPLETION_CLEANUP_ESCROW_SEAL
+            or completion_cleanup.reference is not entry[0]
+            or completion_cleanup.owner_entry is not entry
+            or completion_cleanup.lifecycle is not lifecycle
+            or completion_cleanup.completion is not completion
+            or completion_cleanup.entry is not completion_entry
+            or _ACTIVE_COMPLETIONS.get(id(completion)) is not completion_entry
+            or lifecycle.token is not completion.globally_reduced_num_tokens
+            or _tensor_descriptor(lifecycle.token) != lifecycle.token_descriptor
+            or runtime_entry is None
+            or runtime_entry[0] is not runtime
+            or runtime_entry[1] is not entry[0]
+        ):
+            raise MdpStateError(
+                "MDP: dynamic decoder gradient handoff follows exact completed replay."
+            )
+        _snapshot_local_authority(entry[3], authority)
+        if (
+            self._require(_ACTIVE_OWNERS, _ACTIVE) is not entry
+            or _ACTIVE_CURSORS.get(id(cursor)) is not cursor_entry
+            or _ACTIVE_COMPLETIONS.get(id(completion)) is not completion_entry
+            or _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime)) is not runtime_entry
+        ):
+            raise MdpStateError(
+                "MDP: dynamic decoder gradient handoff retains exact post-snapshot ownership."
+            )
+        handoff_trusted = entry[4]
+        binding_owner, buffers, operations = handoff_trusted[-3:]
+        forward_handle = handoff_trusted[10]
+        resources = (binding_owner, buffers, operations, forward_handle)
+        base = (
+            runtime,
+            authority,
+            entry[3],
+            entry[-1].records,
+            entry[-1].embedding_leaves,
+            resources,
+            tuple(entry[-2]),
+            completion,
+            self,
+            lifecycle.token_descriptor,
+            all(record.text_only for record in entry[-1].records),
+            forward_handle is not None,
+            entry[6],
+            entry,
+        )
+        handoff = _D4DynamicDecoderGradientHandoff(base, seal=_GRADIENT_HANDOFF_SEAL)
+        handoff_identity = id(handoff)
+        runtime_identity = id(runtime)
+        active_handoffs = _ACTIVE_GRADIENT_HANDOFFS
+        runtime_owners = _forward._ACTIVE_RUNTIME_OWNERS
+        handoff_escrows = _GRADIENT_HANDOFF_ESCROWS
+        trusted_handoffs = _TRUSTED_GRADIENT_HANDOFFS
+        minted_escrow = []
+
+        def retire(
+            reference,
+            active=active_handoffs,
+            runtimes=runtime_owners,
+            escrows=handoff_escrows,
+            trusted_registry=trusted_handoffs,
+        ):
+            current = active.get(handoff_identity)
+            if current is not None and current[0] is reference:
+                del active[handoff_identity]
+            current = runtimes.get(runtime_identity)
+            if current is not None and current[1] is reference:
+                del runtimes[runtime_identity]
+            exact_escrow = minted_escrow[0] if minted_escrow else None
+            current = escrows.get(handoff_identity)
+            if current is exact_escrow and exact_escrow.reference is reference:
+                del escrows[handoff_identity]
+            if (
+                trusted_registry.get(handoff_identity) is exact_escrow
+                and exact_escrow.reference is reference
+            ):
+                del trusted_registry[handoff_identity]
+
+        handoff_reference = weakref.ref(handoff, retire)
+        new_completion_entry = (
+            handoff_reference,
+            completion,
+            self,
+            entry,
+            lifecycle,
+            authority,
+            lifecycle.token,
+            lifecycle.token_descriptor,
+            _GRADIENT_COMPLETION_ENTRY_SEAL,
+        )
+        trusted = (*base, new_completion_entry)
+        handoff._trusted = trusted
+        handoff_entry = (handoff_reference, trusted, False, _GRADIENT_HANDOFF_ENTRY_SEAL)
+        gradient_escrow = _GradientHandoffEscrow(
+            handoff_reference,
+            handoff_entry,
+            trusted,
+            new_completion_entry,
+            seal=_GRADIENT_HANDOFF_ESCROW_SEAL,
+        )
+        minted_escrow.append(gradient_escrow)
+        retired_handoff = _RETIRED_GRADIENT_HANDOFFS.get(handoff_identity)
+        if (
+            handoff_identity in _ACTIVE_GRADIENT_HANDOFFS
+            or handoff_identity in _GRADIENT_HANDOFF_ESCROWS
+            or handoff_identity in _TRUSTED_GRADIENT_HANDOFFS
+            or (retired_handoff is not None and retired_handoff() is not None)
+        ):
+            raise MdpStateError(
+                "MDP: dynamic decoder gradient handoff requires a fresh registry identity."
+            )
+        if retired_handoff is not None:
+            del _RETIRED_GRADIENT_HANDOFFS[handoff_identity]
+        predecessor_identity = id(self)
+        predecessor_registry = _RETIRED_OWNERS
+
+        def forget_predecessor(reference, registry=predecessor_registry):
+            if registry.get(predecessor_identity) is reference:
+                del registry[predecessor_identity]
+
+        predecessor_reference = weakref.ref(self, forget_predecessor)
+        _ACTIVE_GRADIENT_HANDOFFS[handoff_identity] = handoff_entry
+        _GRADIENT_HANDOFF_ESCROWS[handoff_identity] = gradient_escrow
+        _TRUSTED_GRADIENT_HANDOFFS[handoff_identity] = gradient_escrow
+        _forward._ACTIVE_RUNTIME_OWNERS[runtime_identity] = (runtime, handoff_reference)
+        _ACTIVE_COMPLETIONS[id(completion)] = new_completion_entry
+        if _COMPLETION_CLEANUP_ESCROWS.get(id(completion)) is completion_cleanup:
+            del _COMPLETION_CLEANUP_ESCROWS[id(completion)]
+        if _ACTIVE_CURSORS.get(id(cursor)) is cursor_entry:
+            del _ACTIVE_CURSORS[id(cursor)]
+        if _ACTIVE_OWNERS.get(predecessor_identity) is entry:
+            del _ACTIVE_OWNERS[predecessor_identity]
+        if _TRUSTED_OWNERS.get(predecessor_identity) is entry:
+            del _TRUSTED_OWNERS[predecessor_identity]
+        if _OWNER_ESCROWS.get(predecessor_identity) is lifecycle:
+            del _OWNER_ESCROWS[predecessor_identity]
+        current_retired = _RETIRED_OWNERS.get(predecessor_identity)
+        retired_owner = None if current_retired is None else current_retired()
+        if current_retired is None or retired_owner is None or retired_owner is self:
+            _RETIRED_OWNERS[predecessor_identity] = predecessor_reference
+        cursor._state = _RETIRED
+        cursor._owner = None
+        cursor._owner_entry = None
+        cursor._lifecycle = None
+        self._state = _RETIRED
+        self.authority = None
+        self.binding = None
+        self.ready = None
+        self.records = ()
+        self.embedding_leaves = MappingProxyType({})
+        self._runtime = None
+        self._trusted = ()
+        lifecycle.entry = None
+        lifecycle.reference = None
+        lifecycle.cursor = None
+        lifecycle.cursor_entry = None
+        lifecycle.token = None
+        lifecycle.token_descriptor = None
+        lifecycle.schedule_return = None
+        lifecycle.completion = None
+        lifecycle.completion_entry = None
+        lifecycle.seal = None
+        cleanup.cursor = None
+        cleanup.cursor_entry = None
+        cleanup.completion = None
+        cleanup.completion_entry = None
+        cleanup.seal = None
+        try:
+            if handoff.require() is not handoff:
+                raise MdpStateError(
+                    "MDP: dynamic decoder gradient handoff activates its exact owner."
+                )
+        except BaseException as primary:
+            try:
+                handoff._abort_from_escrow(gradient_escrow, primary)
+            except BaseException as cleanup_error:
+                _add_cleanup_note(
+                    primary,
+                    f"suppressed dynamic gradient activation cleanup error: {cleanup_error!r}",
+                )
+            raise
+        return handoff
 
     def _abort_from_entry(self, entry: tuple[Any, ...], primary: BaseException) -> None:
         identity = id(self)
@@ -859,9 +1456,25 @@ class _D4DynamicDecoderReplayOwner:
         try:
             completion = cleanup.completion
             if completion is not None:
+                completion_cleanup = _COMPLETION_CLEANUP_ESCROWS.get(id(completion))
+                if (
+                    type(completion_cleanup) is not _CompletionCleanupEscrow
+                    or completion_cleanup.seal is not _COMPLETION_CLEANUP_ESCROW_SEAL
+                    or completion_cleanup.reference is not entry[0]
+                    or completion_cleanup.owner_entry is not entry
+                    or completion_cleanup.lifecycle is not lifecycle
+                    or completion_cleanup.completion is not completion
+                    or type(completion_cleanup.entry) is not tuple
+                    or len(completion_cleanup.entry) != 8
+                ):
+                    raise MdpStateError(
+                        "MDP: dynamic decoder cleanup retains exact completion escrow."
+                    )
+                canonical_entry = completion_cleanup.entry
                 completion_entry = _ACTIVE_COMPLETIONS.get(id(completion))
-                completion_provenance = (
-                    type(completion_entry) is tuple
+                completion_ownership = (
+                    completion_entry is canonical_entry
+                    and type(completion_entry) is tuple
                     and len(completion_entry) == 8
                     and type(completion_entry[0]) is weakref.ReferenceType
                     and completion_entry[0]() is self
@@ -869,25 +1482,31 @@ class _D4DynamicDecoderReplayOwner:
                     and completion_entry[2] is entry
                     and completion_entry[3] is lifecycle
                     and completion_entry[4] is entry[2]
-                    and completion_entry[5] is lifecycle.token
-                    and completion_entry[6] == lifecycle.token_descriptor
                     and completion_entry[7] is _COMPLETION_ENTRY_SEAL
-                    and type(completion_entry[5]) is Tensor
-                    and _tensor_descriptor(completion_entry[5]) == completion_entry[6]
                 )
                 if (
-                    completion_provenance
+                    completion_ownership
                     and _ACTIVE_COMPLETIONS.get(id(completion)) is completion_entry
                 ):
                     del _ACTIVE_COMPLETIONS[id(completion)]
                 if (
-                    not completion_provenance
+                    completion_ownership
+                    and _COMPLETION_CLEANUP_ESCROWS.get(id(completion)) is completion_cleanup
+                ):
+                    del _COMPLETION_CLEANUP_ESCROWS[id(completion)]
+                if (
+                    not completion_ownership
                     or type(completion) is not _D4DynamicDecoderCompletion
                     or completion._owner is not self
                     or completion._owner_entry is not entry
                     or completion._lifecycle is not lifecycle
                     or completion._seal is not _COMPLETION_SEAL
+                    or completion_entry[5] is not lifecycle.token
+                    or completion_entry[6] != lifecycle.token_descriptor
+                    or type(completion_entry[5]) is not Tensor
+                    or _tensor_descriptor(completion_entry[5]) != completion_entry[6]
                     or completion_entry[5] is not completion.globally_reduced_num_tokens
+                    or cleanup.completion is not completion
                 ):
                     raise MdpStateError(
                         "MDP: dynamic decoder cleanup retains exact completion provenance."

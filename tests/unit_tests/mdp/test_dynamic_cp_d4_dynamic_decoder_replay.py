@@ -419,6 +419,24 @@ def _run(parts, *, rebuild=None):
     )
 
 
+def _completed(parts):
+    owner = _run(parts)
+    cursor = owner.replay_cursor()
+    for _ in owner.records:
+        next(cursor)
+    token = torch.tensor(7, device=parts.runtime.device)
+    owner.capture_global_num_tokens(token)
+    schedule_return = owner.mark_schedule_returned(cursor)
+    completion = owner.prepare_completion(cursor, schedule_return)
+    return SimpleNamespace(
+        owner=owner,
+        cursor=cursor,
+        token=token,
+        schedule_return=schedule_return,
+        completion=completion,
+    )
+
+
 @pytest.mark.parametrize("mutation", ("active_entry", "authority"))
 def test_dynamic_gate2_rejects_publication_substitution_before_runner_attempt(
     monkeypatch, mutation
@@ -519,6 +537,316 @@ def test_dynamic_replay_lifecycle_uses_exact_records_token_and_completion(monkey
     owner.abort()
     assert parts.api._ACTIVE_CURSORS == {}
     assert parts.api._ACTIVE_COMPLETIONS == {}
+
+
+@pytest.mark.parametrize("cp_size", (1, 2, 4))
+def test_dynamic_replay_claims_exact_gradient_handoff_without_release(monkeypatch, cp_size):
+    parts = _parts(monkeypatch, cp_size=cp_size)
+    completed = _completed(parts)
+    owner_entry = completed.owner._trusted
+    records = completed.owner.records
+    leaves = completed.owner.embedding_leaves
+
+    handoff = completed.owner._claim_for_gradient(parts.authority, completed.completion)
+
+    assert type(handoff) is parts.api._D4DynamicDecoderGradientHandoff
+    assert handoff.require() is handoff
+    assert handoff.authority is parts.authority
+    assert handoff.binding is parts.binding
+    assert handoff.records is records
+    assert handoff.embedding_leaves is leaves
+    assert handoff.completion is completed.completion
+    assert handoff._trusted[13] is owner_entry
+    assert parts.allocator.released == []
+    assert parts.handle.calls == 0
+    assert parts.binding_owner.calls == []
+    assert forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)][1]() is handoff
+    with pytest.raises(MdpStateError, match="replay owner is retired"):
+        completed.owner.require()
+    with pytest.raises(MdpStateError, match="replay owner is retired"):
+        completed.owner._claim_for_gradient(parts.authority, completed.completion)
+
+    assert handoff.consume(parts.authority, completed.completion) is handoff
+    with pytest.raises(MdpStateError, match="consumed exactly once"):
+        handoff.consume(parts.authority, completed.completion)
+    handoff.abort()
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    assert parts.allocator.released == [
+        *(value for _, value in parts.allocator.acquired),
+        *parts.old_buffers,
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutation", ("missing", "underconsume", "schedule_return", "token", "authority", "completion")
+)
+def test_dynamic_gradient_claim_rejects_incomplete_or_substituted_lifecycle(monkeypatch, mutation):
+    parts = _parts(monkeypatch)
+    if mutation == "missing":
+        owner = _run(parts)
+        completion = object()
+    else:
+        completed = _completed(parts)
+        owner, completion = completed.owner, completed.completion
+        if mutation == "underconsume":
+            entry = parts.api._ACTIVE_CURSORS[id(completed.cursor)]
+            prior = (*entry[:5], entry[5] - 1, entry[6])
+            parts.api._ACTIVE_CURSORS[id(completed.cursor)] = prior
+            owner._trusted[-3].cursor_entry = prior
+            owner._trusted[-4].cursor_entry = prior
+        elif mutation == "schedule_return":
+            object.__setattr__(completed.schedule_return, "_owner", object())
+        elif mutation == "token":
+            assert (
+                parts.api._ACTIVE_COMPLETIONS[id(completed.completion)]
+                is parts.api._COMPLETION_CLEANUP_ESCROWS[id(completed.completion)].entry
+            )
+            completed.token.add_(1)
+        elif mutation == "authority":
+            pass
+        elif mutation == "completion":
+            completion = object()
+    authority = object() if mutation == "authority" else parts.authority
+
+    with pytest.raises(MdpStateError):
+        owner._claim_for_gradient(authority, completion)
+
+    assert owner.require() is owner
+    owner.abort()
+    assert parts.handle.calls == 1
+    assert id(parts.runtime) not in forward_api._ACTIVE_RUNTIME_OWNERS
+    assert parts.api._ACTIVE_COMPLETIONS == {}
+
+
+def test_dynamic_gradient_activation_failure_aborts_successor_and_retries(monkeypatch):
+    parts = _parts(monkeypatch)
+    completed = _completed(parts)
+    handoff_type = parts.api._D4DynamicDecoderGradientHandoff
+    original = handoff_type.require
+    primary = RuntimeError("activation failed")
+
+    def reject(_self):
+        raise primary
+
+    monkeypatch.setattr(handoff_type, "require", reject)
+    with pytest.raises(RuntimeError, match="activation failed") as caught:
+        completed.owner._claim_for_gradient(parts.authority, completed.completion)
+    assert caught.value is primary
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    assert parts.allocator.released == [
+        *(value for _, value in parts.allocator.acquired),
+        *parts.old_buffers,
+    ]
+    assert id(parts.runtime) not in forward_api._ACTIVE_RUNTIME_OWNERS
+    assert parts.api._ACTIVE_GRADIENT_HANDOFFS == {}
+    monkeypatch.setattr(handoff_type, "require", original)
+
+    fresh = _parts(monkeypatch, runtime=parts.runtime)
+    fresh_owner = _run(fresh)
+    fresh_owner.abort()
+
+
+def test_dynamic_gradient_abort_preserves_foreign_registries_and_reentry(monkeypatch):
+    parts = _parts(monkeypatch)
+    completed = _completed(parts)
+    handoff = completed.owner._claim_for_gradient(parts.authority, completed.completion)
+    api = parts.api
+    foreign_owner = (object(),)
+    foreign_completion = (object(),)
+    foreign_runtime = (object(), lambda: None)
+    api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)] = foreign_owner
+    api._ACTIVE_COMPLETIONS[id(completed.completion)] = foreign_completion
+    forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] = foreign_runtime
+    reentry = []
+
+    def callback():
+        assert api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)] is foreign_owner
+        assert api._ACTIVE_COMPLETIONS[id(completed.completion)] is foreign_completion
+        assert forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] is foreign_runtime
+        try:
+            handoff.abort(RuntimeError("reenter"))
+        except BaseException as error:
+            reentry.append(error)
+
+    parts.allocator.callback = callback
+    primary = RuntimeError("primary")
+    handoff.abort(primary)
+
+    assert api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)] is foreign_owner
+    assert api._ACTIVE_COMPLETIONS[id(completed.completion)] is foreign_completion
+    assert forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] is foreign_runtime
+    assert len(reentry) == len(parts.allocator.released)
+    assert all(isinstance(error, MdpStateError) for error in reentry)
+    assert parts.allocator.released == [
+        *(value for _, value in parts.allocator.acquired),
+        *parts.old_buffers,
+    ]
+    del api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)]
+    del api._ACTIVE_COMPLETIONS[id(completed.completion)]
+    del forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)]
+
+
+def test_dynamic_gradient_abort_rejects_same_self_forged_trusted_escrow(monkeypatch):
+    parts = _parts(monkeypatch)
+    completed = _completed(parts)
+    handoff = completed.owner._claim_for_gradient(parts.authority, completed.completion)
+    api = parts.api
+    exact = api._GRADIENT_HANDOFF_ESCROWS[id(handoff)]
+    bomb_calls = []
+    reentry = []
+
+    def bomb(value):
+        bomb_calls.append(value)
+
+    forged_trusted = list(exact.trusted)
+    forged_trusted[12] = bomb
+    forged_trusted = tuple(forged_trusted)
+    forged_entry = (
+        exact.reference,
+        forged_trusted,
+        exact.entry[2],
+        api._GRADIENT_HANDOFF_ENTRY_SEAL,
+    )
+    forged = api._GradientHandoffEscrow(
+        exact.reference,
+        forged_entry,
+        forged_trusted,
+        exact.completion_entry,
+        seal=api._GRADIENT_HANDOFF_ESCROW_SEAL,
+    )
+    api._TRUSTED_GRADIENT_HANDOFFS[id(handoff)] = forged
+
+    def callback():
+        assert api._TRUSTED_GRADIENT_HANDOFFS[id(handoff)] is forged
+        try:
+            handoff.abort(RuntimeError("reenter"))
+        except BaseException as error:
+            reentry.append(error)
+
+    parts.allocator.callback = callback
+    handoff.abort(RuntimeError("primary"))
+
+    assert bomb_calls == []
+    assert parts.allocator.released == [
+        *(value for _, value in parts.allocator.acquired),
+        *parts.old_buffers,
+    ]
+    assert len(reentry) == len(parts.allocator.released)
+    assert all(isinstance(error, MdpStateError) for error in reentry)
+    assert api._TRUSTED_GRADIENT_HANDOFFS[id(handoff)] is forged
+    del api._TRUSTED_GRADIENT_HANDOFFS[id(handoff)]
+
+
+def test_dynamic_gradient_dropped_handoff_preserves_foreign_escrows(monkeypatch):
+    parts = _parts(monkeypatch)
+    completed = _completed(parts)
+    handoff = completed.owner._claim_for_gradient(parts.authority, completed.completion)
+    api = parts.api
+    identity = id(handoff)
+    reference = weakref.ref(handoff)
+    exact = api._GRADIENT_HANDOFF_ESCROWS[identity]
+    foreign = api._GradientHandoffEscrow(
+        exact.reference,
+        exact.entry,
+        exact.trusted,
+        exact.completion_entry,
+        seal=api._GRADIENT_HANDOFF_ESCROW_SEAL,
+    )
+    api._GRADIENT_HANDOFF_ESCROWS[identity] = foreign
+    api._TRUSTED_GRADIENT_HANDOFFS[identity] = foreign
+
+    del handoff
+    gc.collect()
+
+    assert reference() is None
+    assert identity not in api._ACTIVE_GRADIENT_HANDOFFS
+    assert id(parts.runtime) not in forward_api._ACTIVE_RUNTIME_OWNERS
+    assert api._GRADIENT_HANDOFF_ESCROWS[identity] is foreign
+    assert api._TRUSTED_GRADIENT_HANDOFFS[identity] is foreign
+    del api._GRADIENT_HANDOFF_ESCROWS[identity]
+    del api._TRUSTED_GRADIENT_HANDOFFS[identity]
+    del api._ACTIVE_COMPLETIONS[id(completed.completion)]
+
+
+def test_dynamic_gradient_handoff_rejects_authority_and_completion_substitution(monkeypatch):
+    parts = _parts(monkeypatch)
+    completed = _completed(parts)
+    handoff = completed.owner._claim_for_gradient(parts.authority, completed.completion)
+
+    with pytest.raises(MdpStateError, match="exact authority and completion"):
+        handoff.consume(object(), completed.completion)
+    with pytest.raises(MdpStateError, match="exact authority and completion"):
+        handoff.consume(parts.authority, object())
+    handoff.abort()
+
+
+def test_dynamic_completion_cleanup_preserves_forged_escrow(monkeypatch):
+    parts = _parts(monkeypatch)
+    completed = _completed(parts)
+    api = parts.api
+    exact = api._COMPLETION_CLEANUP_ESCROWS[id(completed.completion)]
+    replacement_entry = (*exact.entry[:-1], object())
+    forged = api._CompletionCleanupEscrow(
+        exact.reference,
+        exact.owner_entry,
+        exact.lifecycle,
+        exact.completion,
+        replacement_entry,
+        seal=api._COMPLETION_CLEANUP_ESCROW_SEAL,
+    )
+    api._COMPLETION_CLEANUP_ESCROWS[id(completed.completion)] = forged
+    active_entry = api._ACTIVE_COMPLETIONS[id(completed.completion)]
+
+    completed.owner.abort(RuntimeError("primary"))
+
+    assert api._COMPLETION_CLEANUP_ESCROWS[id(completed.completion)] is forged
+    assert api._ACTIVE_COMPLETIONS[id(completed.completion)] is active_entry
+    assert parts.handle.calls == 1
+    assert parts.allocator.released == [
+        *(value for _, value in parts.allocator.acquired),
+        *parts.old_buffers,
+    ]
+    del api._COMPLETION_CLEANUP_ESCROWS[id(completed.completion)]
+    del api._ACTIVE_COMPLETIONS[id(completed.completion)]
+
+
+@pytest.mark.parametrize("reenter", (False, True), ids=("raise", "abort-reentry"))
+def test_dynamic_completion_partial_install_rolls_back(monkeypatch, reenter):
+    parts = _parts(monkeypatch)
+    owner = _run(parts)
+    cursor = owner.replay_cursor()
+    for _ in owner.records:
+        next(cursor)
+    token = torch.tensor(7, device=parts.runtime.device)
+    owner.capture_global_num_tokens(token)
+    returned = owner.mark_schedule_returned(cursor)
+    api = parts.api
+    original = api._install_completion_cleanup
+    primary = RuntimeError("completion install failed")
+
+    def fail(*args):
+        original(*args)
+        if reenter:
+            owner.abort(primary)
+        raise primary
+
+    monkeypatch.setattr(api, "_install_completion_cleanup", fail)
+    with pytest.raises(RuntimeError, match="completion install failed") as caught:
+        owner.prepare_completion(cursor, returned)
+    assert caught.value is primary
+    assert api._ACTIVE_COMPLETIONS == {}
+    assert api._COMPLETION_CLEANUP_ESCROWS == {}
+    if reenter:
+        assert id(parts.runtime) not in forward_api._ACTIVE_RUNTIME_OWNERS
+        assert parts.handle.calls == 1
+    else:
+        assert owner.require() is owner
+        monkeypatch.setattr(api, "_install_completion_cleanup", original)
+        completion = owner.prepare_completion(cursor, returned)
+        assert owner.require_completion(completion) is completion
+        owner.abort()
 
 
 def test_dynamic_replay_cursor_rejects_cleanup_escrow_entry_substitution(monkeypatch):
@@ -753,6 +1081,7 @@ def test_dynamic_replay_rejects_coordinated_completion_token_substitution(monkey
         api._tensor_descriptor(replacement_token),
         api._COMPLETION_ENTRY_SEAL,
     )
+    assert replacement_entry is not api._COMPLETION_CLEANUP_ESCROWS[id(completion)].entry
     lifecycle.completion_entry = replacement_entry
     api._ACTIVE_COMPLETIONS[id(completion)] = replacement_entry
 
