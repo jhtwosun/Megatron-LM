@@ -170,10 +170,12 @@ class _D4EncoderFinalizeOwner:
         ):
             raise MdpStateError("MDP: Gate6 owner retains consumed runtime-token authority.")
         runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        backward_completion = trusted[5]
         complete_entry = _gate5._ACTIVE_COMPLETIONS.get(id(trusted[5]))
         carrier_entry = _gate4._ACTIVE_CARRIERS.get(id(trusted[4]))
         receipt_entry = _gradient._ACTIVE_RECEIPTS.get(id(trusted[7]))
-        replay_entry = _replay._ACTIVE_COMPLETIONS.get(id(trusted[3]))
+        normalized = backward_completion.normalized_completion_escrow
+        replay_entry = normalized.registry.get(id(trusted[3]))
         if (
             runtime_entry is None
             or runtime_entry[0] is not runtime
@@ -193,7 +195,6 @@ class _D4EncoderFinalizeOwner:
             or finalize is not _encoder.finalize_encoder_grads
         ):
             raise MdpStateError("MDP: Gate6 retains every exact migrated capability.")
-        backward_completion = trusted[5]
         carrier = trusted[4]
         receipt = trusted[7]
         replay_completion = trusted[3]
@@ -201,6 +202,7 @@ class _D4EncoderFinalizeOwner:
             complete_entry[1] is not backward_completion
             or complete_entry[2] is not backward_completion.selected
             or complete_entry[3] is not backward_completion.text_only
+            or complete_entry[4] is not normalized
             or backward_completion.authority is not trusted[2]
             or backward_completion.completion is not replay_completion
             or backward_completion.gate4_carrier is not carrier
@@ -223,11 +225,11 @@ class _D4EncoderFinalizeOwner:
             or replay_entry[2] is not trusted[2]
             or replay_completion.authority is not trusted[2]
             or replay_completion.globally_reduced_num_tokens is not replay_entry[3]
-            or replay_completion._seal is not _replay._COMPLETION_SEAL
-            or replay_completion._owner is not trusted[17]
-            or _replay._tensor_descriptor(replay_entry[3]) != replay_entry[4]
         ):
             raise MdpStateError("MDP: Gate6 retains exact nested capability authority.")
+        _gate5._validate_normalized_completion(
+            self, trusted[2], replay_completion, normalized, replay_entry
+        )
         validate_prepared_dynamic_bridge_exchange(receipt.exchange)
         if type(carrier) is _gate4._D4EncoderBackwardMember:
             if (
@@ -342,7 +344,7 @@ class _D4EncoderFinalizeOwner:
             (_gate5._ACTIVE_COMPLETIONS, trusted[5]),
             (_gate4._ACTIVE_CARRIERS, trusted[4]),
             (_gradient._ACTIVE_RECEIPTS, trusted[7]),
-            (_replay._ACTIVE_COMPLETIONS, trusted[3]),
+            (trusted[5].normalized_completion_escrow.registry, trusted[3]),
         ):
             capability_entry = registry.get(id(value))
             if capability_entry is not None and capability_entry[0]() is self:
@@ -605,9 +607,10 @@ def run_repeated_d4_encoder_gradient_finalize(
     successor_entry = None
     prepared = None
     started = False
+    transferred = False
 
     def prepare() -> _PreparedD4EncoderFinalize:
-        nonlocal successor, successor_entry, prepared, started
+        nonlocal successor, successor_entry, prepared, started, transferred
         if started:
             raise MdpStateError("MDP: Gate6 preparation is one-shot.")
         started = True
@@ -643,7 +646,9 @@ def run_repeated_d4_encoder_gradient_finalize(
         complete_entry = _gate5._ACTIVE_COMPLETIONS.get(id(prior[5]))
         carrier_entry = _gate4._ACTIVE_CARRIERS.get(id(prior[4]))
         receipt_entry = _gradient._ACTIVE_RECEIPTS.get(id(prior[7]))
-        replay_entry = _replay._ACTIVE_COMPLETIONS.get(id(prior[3]))
+        owner_escrow = _gate5._TRUSTED_OWNER_ESCROWS.get(id(predecessor))
+        normalized = prior[5].normalized_completion_escrow
+        replay_entry = normalized.registry.get(id(prior[3]))
         if (
             runtime_entry is None
             or runtime_entry[1]() is not predecessor
@@ -653,24 +658,28 @@ def run_repeated_d4_encoder_gradient_finalize(
             or carrier_entry[0]() is not predecessor
             or receipt_entry is None
             or receipt_entry[0]() is not predecessor
-            or replay_entry is None
-            or replay_entry[0]() is not predecessor
+            or type(owner_escrow) is not _gate5._OwnerEscrow
+            or owner_escrow.seal is not _gate5._OWNER_ESCROW_SEAL
+            or replay_entry is not owner_escrow.decoder_completion_entry
         ):
             raise MdpStateError("MDP: Gate6 claims every exact predecessor capability.")
         successor_entry = (reference, *trusted, True, False)
-        _ACTIVE_OWNERS[id(successor)] = successor_entry
-        _replay._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
-        _gate5._ACTIVE_COMPLETIONS[id(prior[5])] = (reference, *complete_entry[1:])
-        _gate4._ACTIVE_CARRIERS[id(prior[4])] = (reference, *carrier_entry[1:])
-        _gradient._ACTIVE_RECEIPTS[id(prior[7])] = (reference, *receipt_entry[1:])
-        _replay._ACTIVE_COMPLETIONS[id(prior[3])] = (reference, *replay_entry[1:])
-        _gate5._ACTIVE_OWNERS.pop(id(predecessor))
-        _gate5._RETIRED_OWNERS[id(predecessor)] = weakref.ref(predecessor)
-        predecessor._state = _gate5._RETIRED
-        predecessor.binding = predecessor.authority = predecessor.completion = None
-        predecessor.gate4_carrier = predecessor.backward_completion = predecessor._runtime = None
-        predecessor._trusted = ()
-        predecessor._backward_done = True
+        migrated_runtime = (runtime, reference)
+        migrated_complete = (reference, *complete_entry[1:])
+        migrated_carrier = (reference, *carrier_entry[1:])
+        migrated_receipt = (reference, *receipt_entry[1:])
+        migrated_replay = (reference, *replay_entry[1:])
+        predecessor._claim_for_gradient_finalize(
+            successor,
+            _ACTIVE_OWNERS,
+            successor_entry,
+            migrated_runtime,
+            migrated_carrier,
+            migrated_receipt,
+            migrated_replay,
+            migrated_complete,
+        )
+        transferred = True
         local_error = None
         binding_owner = prior[6][0]
         if binding_owner is not None:
@@ -748,13 +757,15 @@ def run_repeated_d4_encoder_gradient_finalize(
             ) from error
     except BaseException as error:
         target = None
-        if successor is None:
+        foreign_entry = None
+        if not transferred:
             target = predecessor
         elif _ACTIVE_OWNERS.get(id(successor)) is successor_entry:
             target = successor
         elif (
             (retired := _RETIRED_OWNERS.get(id(successor))) is None or retired() is not successor
         ) and successor_entry is not None:
+            foreign_entry = _ACTIVE_OWNERS.get(id(successor))
             _ACTIVE_OWNERS[id(successor)] = successor_entry
             target = successor
         if target is not None:
@@ -762,4 +773,6 @@ def run_repeated_d4_encoder_gradient_finalize(
                 target.abort(error)
             except BaseException as cleanup_error:
                 _add_cleanup_note(error, f"suppressed Gate6 cleanup error: {cleanup_error!r}")
+        if foreign_entry is not None:
+            _ACTIVE_OWNERS[id(successor)] = foreign_entry
         raise

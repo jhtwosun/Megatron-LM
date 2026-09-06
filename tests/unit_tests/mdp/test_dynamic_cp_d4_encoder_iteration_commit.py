@@ -73,8 +73,9 @@ def _parts(monkeypatch, runtime=None, *, cleanup_error=False):
         torch.float32,
         replay._forward._OPERATIONS_SEAL,
     )
+    completion_owner = object()
     completion = replay._D4FixedDecoderCompletion(
-        authority, token, object(), replay._COMPLETION_SEAL
+        authority, token, completion_owner, replay._COMPLETION_SEAL
     )
     received = MappingProxyType({})
     exchange = PreparedDynamicBridgeExchange(
@@ -96,8 +97,25 @@ def _parts(monkeypatch, runtime=None, *, cleanup_error=False):
     carrier = gate4._D4EncoderBackwardEmpty(
         authority, completion, receipt, (), True, gate4._EMPTY_SEAL
     )
+    provenance = gradient._D4ReplayGradientProvenance(
+        replay,
+        completion_owner,
+        None,
+        None,
+        token,
+        replay._tensor_descriptor(token),
+        operations.acquire,
+        operations.release,
+        gradient._PROVENANCE_SEAL,
+    )
+    normalized = gate5._NormalizedDecoderCompletionToken(
+        replay._ACTIVE_COMPLETIONS,
+        provenance.release,
+        provenance,
+        gate5._NORMALIZED_COMPLETION_SEAL,
+    )
     backward_completion = gate5._D4EncoderBackwardComplete(
-        authority, completion, carrier, False, True, gate5._COMPLETE_SEAL
+        authority, completion, carrier, False, True, gate5._COMPLETE_SEAL, normalized
     )
     resources = (None, (buffer,), operations, None)
     trusted = (
@@ -124,12 +142,14 @@ def _parts(monkeypatch, runtime=None, *, cleanup_error=False):
     owner._restore_started = True
     owner._finalized = True
     reference = weakref.ref(owner)
+    completion_entry = (reference, completion, authority, token, replay._tensor_descriptor(token))
     gate6._ACTIVE_OWNERS[id(owner)] = (reference, *trusted, True, True)
     gate5._ACTIVE_COMPLETIONS[id(backward_completion)] = (
         reference,
         backward_completion,
         False,
         True,
+        normalized,
     )
     gate4._ACTIVE_CARRIERS[id(carrier)] = (
         reference,
@@ -148,13 +168,7 @@ def _parts(monkeypatch, runtime=None, *, cleanup_error=False):
         exchange,
         received,
     )
-    replay._ACTIVE_COMPLETIONS[id(completion)] = (
-        reference,
-        completion,
-        authority,
-        token,
-        replay._tensor_descriptor(token),
-    )
+    replay._ACTIVE_COMPLETIONS[id(completion)] = completion_entry
     replay._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
     ready = gate6._D4EncoderOnlyCommitReady(
         owner, runtime, authority, token, 7, token_authority, gate6._READY_SEAL

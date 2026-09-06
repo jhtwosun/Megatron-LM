@@ -4,14 +4,14 @@
 
 import weakref
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch import Tensor
 
 from megatron.core.mdp import dynamic_cp_d4_encoder_backward_authorization as _gate4
+from megatron.core.mdp import dynamic_cp_d4_encoder_forward as _forward
 from megatron.core.mdp import dynamic_cp_d4_encoder_gradient as _gradient
-from megatron.core.mdp import dynamic_cp_d4_fixed_decoder_replay as _replay
 from megatron.core.mdp.activation import EncoderForwardHandle
 from megatron.core.mdp.dynamic_cp import GlobalVisionItemId
 from megatron.core.mdp.dynamic_cp_bridge import DynamicBridgeKey
@@ -36,10 +36,15 @@ _RETIRED = object()
 _PREPARED_SEAL = object()
 _COMPLETE_SEAL = object()
 _OWNER_SEAL = object()
+_NORMALIZED_COMPLETION_SEAL = object()
+_OWNER_ESCROW_SEAL = object()
 _ACTIVE_OWNERS: dict[int, tuple[Any, ...]] = {}
 _RETIRED_OWNERS: dict[int, weakref.ReferenceType[Any]] = {}
 _ACTIVE_COMPLETIONS: dict[int, tuple[Any, ...]] = {}
 _ACTIVE_PREPARED: dict[int, tuple[Any, ...]] = {}
+_OWNER_ESCROWS: dict[int, Any] = {}
+_TRUSTED_OWNER_ESCROWS: dict[int, Any] = {}
+_CANONICAL_OWNER_ESCROWS: dict[int, Any] = {}
 
 
 def _add_cleanup_note(primary: BaseException, message: str) -> None:
@@ -47,6 +52,151 @@ def _add_cleanup_note(primary: BaseException, message: str) -> None:
         primary.add_note(message)
     except BaseException:
         pass
+
+
+def _same_entry(actual: Any, expected: tuple[Any, ...]) -> bool:
+    return (
+        type(actual) is tuple
+        and len(actual) == len(expected)
+        and all(value is item for value, item in zip(actual, expected, strict=True))
+    )
+
+
+def _mark_owner_retired(owner: Any) -> None:
+    identity = id(owner)
+
+    def remove(reference, registry=_RETIRED_OWNERS, identity=identity):
+        if registry.get(identity) is reference:
+            del registry[identity]
+
+    _RETIRED_OWNERS[identity] = weakref.ref(owner, remove)
+
+
+class _NormalizedDecoderCompletionToken(NamedTuple):
+    registry: dict[int, tuple[Any, ...]]
+    release: Any
+    provenance: _gradient._D4ReplayGradientProvenance
+    seal: object
+
+
+class _OwnerEscrow(NamedTuple):
+    reference: weakref.ReferenceType[Any]
+    owner_entry: tuple[Any, ...]
+    runtime_entry: tuple[Any, ...]
+    carrier_entry: tuple[Any, ...]
+    receipt_entry: tuple[Any, ...]
+    decoder_completion_entry: tuple[Any, ...]
+    backward_completion_entry: tuple[Any, ...]
+    prepared_identity: int
+    normalized: _NormalizedDecoderCompletionToken
+    seal: object
+
+
+def _validate_normalized_completion(
+    owner: Any,
+    authority: _DynamicIterationAuthority,
+    completion: Any,
+    normalized: Any,
+    completion_entry: Any,
+) -> None:
+    if (
+        type(normalized) is not _NormalizedDecoderCompletionToken
+        or normalized.seal is not _NORMALIZED_COMPLETION_SEAL
+        or type(normalized.registry) is not dict
+        or normalized.registry.get(id(completion)) is not completion_entry
+        or type(completion_entry) is not tuple
+        or len(completion_entry) < 2
+        or type(completion_entry[0]) is not weakref.ReferenceType
+        or completion_entry[0]() is not owner
+        or completion_entry[1] is not completion
+        or type(normalized.provenance) is not _gradient._D4ReplayGradientProvenance
+        or normalized.provenance._seal is not _gradient._PROVENANCE_SEAL
+        or normalized.release is not normalized.provenance.release
+        or completion._owner is not normalized.provenance.predecessor
+        or completion.authority is not authority
+        or completion.globally_reduced_num_tokens is not normalized.provenance.token
+        or _gate4._tensor_descriptor(normalized.provenance.token)
+        != normalized.provenance.token_descriptor
+    ):
+        raise MdpStateError("MDP: Gate5 retains exact normalized decoder completion.")
+
+
+def _owner_escrow_integrity_unchecked(owner: Any, escrow: Any) -> bool:
+    if (
+        type(escrow) is not _OwnerEscrow
+        or escrow.seal is not _OWNER_ESCROW_SEAL
+        or type(escrow.reference) is not weakref.ReferenceType
+        or escrow.reference() is not owner
+        or type(escrow.owner_entry) is not tuple
+        or len(escrow.owner_entry) != 12
+        or type(escrow.runtime_entry) is not tuple
+        or len(escrow.runtime_entry) != 2
+        or type(escrow.carrier_entry) is not tuple
+        or len(escrow.carrier_entry) < 2
+        or type(escrow.receipt_entry) is not tuple
+        or len(escrow.receipt_entry) < 2
+        or type(escrow.decoder_completion_entry) is not tuple
+        or len(escrow.decoder_completion_entry) < 2
+        or type(escrow.backward_completion_entry) is not tuple
+        or len(escrow.backward_completion_entry) != 5
+        or escrow.owner_entry[0] is not escrow.reference
+        or not _same_entry(escrow.runtime_entry, (escrow.owner_entry[1], escrow.reference))
+        or escrow.carrier_entry[0] is not escrow.reference
+        or escrow.carrier_entry[1] is not escrow.owner_entry[5]
+        or escrow.receipt_entry[0] is not escrow.reference
+        or escrow.receipt_entry[1] is not escrow.owner_entry[8]
+        or escrow.decoder_completion_entry[0] is not escrow.reference
+        or escrow.decoder_completion_entry[1] is not escrow.owner_entry[4]
+        or type(escrow.owner_entry[6]) is not _D4EncoderBackwardComplete
+        or not _same_entry(
+            escrow.backward_completion_entry,
+            (
+                escrow.reference,
+                escrow.owner_entry[6],
+                escrow.owner_entry[6].selected,
+                escrow.owner_entry[6].text_only,
+                escrow.normalized,
+            ),
+        )
+        or escrow.owner_entry[6]._seal is not _COMPLETE_SEAL
+        or escrow.owner_entry[6].normalized_completion_escrow is not escrow.normalized
+        or type(escrow.normalized) is not _NormalizedDecoderCompletionToken
+        or escrow.normalized.seal is not _NORMALIZED_COMPLETION_SEAL
+        or type(escrow.normalized.provenance) is not _gradient._D4ReplayGradientProvenance
+        or escrow.normalized.provenance._seal is not _gradient._PROVENANCE_SEAL
+        or escrow.normalized.release is not escrow.normalized.provenance.release
+        or escrow.owner_entry[4]._owner is not escrow.normalized.provenance.predecessor
+        or escrow.owner_entry[4].authority is not escrow.owner_entry[3]
+        or escrow.owner_entry[4].globally_reduced_num_tokens
+        is not escrow.normalized.provenance.token
+        or _gate4._tensor_descriptor(escrow.normalized.provenance.token)
+        != escrow.normalized.provenance.token_descriptor
+        or type(escrow.owner_entry[7]) is not tuple
+        or len(escrow.owner_entry[7]) != 4
+        or escrow.owner_entry[7][2] is not escrow.owner_entry[11]
+        or type(escrow.owner_entry[11]) is not _forward._D4EncoderForwardOperations
+        or escrow.owner_entry[11]._seal is not _forward._OPERATIONS_SEAL
+        or escrow.normalized.release is not escrow.owner_entry[11].release
+    ):
+        return False
+    return True
+
+
+def _owner_escrow_integrity_exact(owner: Any, escrow: Any) -> bool:
+    try:
+        return _owner_escrow_integrity_unchecked(owner, escrow)
+    except BaseException:
+        return False
+
+
+def _is_canonical_owner_escrow(owner: Any, escrow: Any) -> bool:
+    return (
+        type(escrow) is _OwnerEscrow
+        and escrow.seal is _OWNER_ESCROW_SEAL
+        and type(escrow.reference) is weakref.ReferenceType
+        and escrow.reference() is owner
+        and _CANONICAL_OWNER_ESCROWS.get(id(owner)) is escrow
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,14 +214,22 @@ class _PreparedD4EncoderBackward:
 @dataclass(frozen=True, slots=True)
 class _D4EncoderBackwardComplete:
     authority: _DynamicIterationAuthority = field(compare=False, repr=False)
-    completion: _replay._D4FixedDecoderCompletion = field(compare=False, repr=False)
+    completion: Any = field(compare=False, repr=False)
     gate4_carrier: Any = field(compare=False, repr=False)
     selected: bool
     text_only: bool
     _seal: object = field(compare=False, repr=False)
+    normalized_completion_escrow: _NormalizedDecoderCompletionToken = field(
+        compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
-        if type(self) is not _D4EncoderBackwardComplete or self._seal is not _COMPLETE_SEAL:
+        if (
+            type(self) is not _D4EncoderBackwardComplete
+            or self._seal is not _COMPLETE_SEAL
+            or type(self.normalized_completion_escrow) is not _NormalizedDecoderCompletionToken
+            or self.normalized_completion_escrow.seal is not _NORMALIZED_COMPLETION_SEAL
+        ):
             raise MdpConfigurationError("MDP: encoder backward completion is privately minted.")
 
 
@@ -79,8 +237,8 @@ def _validated_handle(
     carrier: _gate4._D4EncoderBackwardMember, operations: Any
 ) -> tuple[EncoderForwardHandle, tuple[tuple[Tensor, EncoderThdLayout], ...]]:
     if (
-        type(operations) is not _replay._forward._D4EncoderForwardOperations
-        or operations._seal is not _replay._forward._OPERATIONS_SEAL
+        type(operations) is not _forward._D4EncoderForwardOperations
+        or operations._seal is not _forward._OPERATIONS_SEAL
         or type(operations.device) is not torch.device
     ):
         raise MdpStateError("MDP: Gate5 retains exact encoder forward operations.")
@@ -141,11 +299,18 @@ def _leader_gradients(
         if item_id.local_item_id in by_local_id:
             raise MdpPlanError("MDP: Gate5 manifest has unique local encoder item ids.")
         by_local_id[item_id.local_item_id] = item_id
+    expected_keys = tuple(
+        entry.key
+        for entry in carrier.authority.gradient_ledger.entries
+        if entry.dst_global_rank == carrier.selected_ranks[0]
+    )
+    if tuple(carrier.routed_gradients) != expected_keys:
+        raise MdpPlanError("MDP: Gate5 receives exact canonical encoder gradient routes.")
     routed = {}
     for key, gradient in carrier.routed_gradients.items():
-        if type(key) is not DynamicBridgeKey or key.item_id in routed:
-            raise MdpPlanError("MDP: Gate5 receives one routed gradient per encoder item.")
-        routed[key.item_id] = gradient
+        if type(key) is not DynamicBridgeKey or key.item_id not in item_ids:
+            raise MdpPlanError("MDP: Gate5 receives only manifest encoder gradients.")
+        routed.setdefault(key.item_id, []).append(gradient)
     gradients = []
     visited = []
     for output, layout in pairs:
@@ -154,22 +319,25 @@ def _leader_gradients(
         for segment in layout.segments:
             try:
                 item_id = by_local_id[segment.global_item_id]
-                item_gradient = routed.pop(item_id)
+                item_gradients = routed.pop(item_id)
             except KeyError as error:
                 raise MdpPlanError(
                     "MDP: Gate5 gradients cover every encoder layout item."
                 ) from error
-            if (
-                type(item_gradient) is not Tensor
-                or tuple(item_gradient.shape) != (segment.output_rows, output.shape[1])
-                or item_gradient.dtype != output.dtype
-                or item_gradient.device != output.device
-                or not item_gradient.is_contiguous()
-                or item_gradient.requires_grad
-                or item_gradient.grad_fn is not None
-            ):
-                raise MdpStateError("MDP: Gate5 item gradients match encoder output geometry.")
-            full.narrow(0, cursor, segment.output_rows).copy_(item_gradient)
+            for item_gradient in item_gradients:
+                if (
+                    type(item_gradient) is not Tensor
+                    or tuple(item_gradient.shape) != (segment.output_rows, output.shape[1])
+                    or item_gradient.dtype != output.dtype
+                    or item_gradient.device != output.device
+                    or not item_gradient.is_contiguous()
+                    or item_gradient.requires_grad
+                    or item_gradient.grad_fn is not None
+                ):
+                    raise MdpStateError("MDP: Gate5 item gradients match encoder output geometry.")
+            destination = full.narrow(0, cursor, segment.output_rows)
+            for item_gradient in item_gradients:
+                destination.add_(item_gradient)
             visited.append(item_id)
             cursor += segment.output_rows
         gradients.append(full)
@@ -215,11 +383,21 @@ class _D4EncoderSelectedBackwardOwner:
         self._backward_done = False
 
     def require(self) -> "_D4EncoderSelectedBackwardOwner":
+        return self._require_backward_state(True)
+
+    def _require_backward_state(self, backward_done: bool) -> "_D4EncoderSelectedBackwardOwner":
+        retired = _RETIRED_OWNERS.get(id(self))
+        if retired is not None and retired() is self:
+            raise MdpStateError("MDP: Gate5 selected backward owner is retired.")
         entry = _ACTIVE_OWNERS.get(id(self))
-        if entry is None or entry[0]() is not self:
-            if id(self) in _RETIRED_OWNERS:
-                raise MdpStateError("MDP: Gate5 selected backward owner is retired.")
+        if (
+            type(entry) is not tuple
+            or len(entry) != 12
+            or type(entry[0]) is not weakref.ReferenceType
+            or entry[0]() is not self
+        ):
             raise MdpStateError("MDP: Gate5 selected backward owner is exact and active.")
+        escrow = _CANONICAL_OWNER_ESCROWS.get(id(self))
         current = (
             self._runtime,
             self.binding,
@@ -228,31 +406,49 @@ class _D4EncoderSelectedBackwardOwner:
             self.gate4_carrier,
             self.backward_completion,
         )
-        if self._state is not _ACTIVE or any(
-            actual is not expected for actual, expected in zip(current, entry[1:7], strict=True)
+        if (
+            type(escrow) is not _OwnerEscrow
+            or escrow.seal is not _OWNER_ESCROW_SEAL
+            or _OWNER_ESCROWS.get(id(self)) is not escrow
+            or _TRUSTED_OWNER_ESCROWS.get(id(self)) is not escrow
+            or _CANONICAL_OWNER_ESCROWS.get(id(self)) is not escrow
+            or entry is not escrow.owner_entry
+            or not _same_entry(entry, (escrow.reference, *self._trusted))
+            or self._state is not _ACTIVE
+            or any(
+                actual is not expected for actual, expected in zip(current, entry[1:7], strict=True)
+            )
         ):
             raise MdpStateError("MDP: Gate5 selected backward owner retains sealed resources.")
         _snapshot_local_authority(self.binding, self.authority)
         completion_entry = _ACTIVE_COMPLETIONS.get(id(self.backward_completion))
         if (
-            completion_entry is None
+            completion_entry is not escrow.backward_completion_entry
             or completion_entry[0]() is not self
             or completion_entry[1] is not self.backward_completion
             or completion_entry[2] is not self.backward_completion.selected
             or completion_entry[3] is not self.backward_completion.text_only
+            or completion_entry[4] is not self.backward_completion.normalized_completion_escrow
             or self.backward_completion.authority is not self.authority
             or self.backward_completion.completion is not self.completion
             or self.backward_completion.gate4_carrier is not self.gate4_carrier
             or self.backward_completion._seal is not _COMPLETE_SEAL
-            or self._backward_done is not True
+            or self._backward_done is not backward_done
         ):
             raise MdpStateError("MDP: Gate5 retains exact completed backward authority.")
+        _validate_normalized_completion(
+            self,
+            self.authority,
+            self.completion,
+            self.backward_completion.normalized_completion_escrow,
+            escrow.decoder_completion_entry,
+        )
         resources = entry[7]
         binding_owner, _buffers, _operations, handle = resources
         if type(self.gate4_carrier) is _gate4._D4EncoderBackwardMember:
             if (
                 handle is not self.gate4_carrier.forward_handle
-                or handle._backward_done is not True
+                or handle._backward_done is not backward_done
                 or handle._released is not False
                 or type(binding_owner) is not DynamicEncoderCpBinding
                 or binding_owner.active is not True
@@ -265,34 +461,88 @@ class _D4EncoderSelectedBackwardOwner:
     def abort(self, primary_error: BaseException | None = None) -> None:
         if primary_error is not None and not isinstance(primary_error, BaseException):
             raise MdpConfigurationError("MDP: Gate5 abort primary is an exception.")
-        entry = _ACTIVE_OWNERS.get(id(self))
-        if entry is None or entry[0]() is not self:
+        escrow = _CANONICAL_OWNER_ESCROWS.get(id(self))
+        if not _is_canonical_owner_escrow(self, escrow):
             self.require()
-        trusted = entry[1:]
+        self._abort_from_escrow(escrow, primary_error)
+
+    def _abort_from_escrow(
+        self, escrow: _OwnerEscrow, primary_error: BaseException | None = None
+    ) -> None:
+        if primary_error is not None and not isinstance(primary_error, BaseException):
+            raise MdpConfigurationError("MDP: Gate5 abort primary is an exception.")
+        retired = _RETIRED_OWNERS.get(id(self))
+        if retired is not None and retired() is self:
+            raise MdpStateError("MDP: Gate5 selected backward owner is retired.")
+        if (
+            type(escrow) is not _OwnerEscrow
+            or escrow.seal is not _OWNER_ESCROW_SEAL
+            or escrow.reference() is not self
+        ):
+            raise MdpStateError("MDP: Gate5 cleanup retains exact immutable escrow.")
+        trusted = escrow.owner_entry[1:]
         primary = (
             primary_error
             if primary_error is not None
             else MdpStateError("MDP: Gate5 owner aborted.")
         )
-        _ACTIVE_OWNERS.pop(id(self))
-        _RETIRED_OWNERS[id(self)] = weakref.ref(self)
+        live = tuple(
+            getattr(self, name, None)
+            for name in (
+                "_runtime",
+                "binding",
+                "authority",
+                "completion",
+                "gate4_carrier",
+                "backward_completion",
+            )
+        )
+        if (
+            not _owner_escrow_integrity_exact(self, escrow)
+            or _ACTIVE_OWNERS.get(id(self)) is not escrow.owner_entry
+            or _OWNER_ESCROWS.get(id(self)) is not escrow
+            or _TRUSTED_OWNER_ESCROWS.get(id(self)) is not escrow
+            or _CANONICAL_OWNER_ESCROWS.get(id(self)) is not escrow
+            or not _same_entry(
+                escrow.owner_entry, (escrow.reference, *getattr(self, "_trusted", ()))
+            )
+            or any(
+                value is not expected
+                for value, expected in zip(live, escrow.owner_entry[1:7], strict=True)
+            )
+        ):
+            _add_cleanup_note(primary, "Gate5 cleanup recovered mutated owner integrity.")
+        if _ACTIVE_OWNERS.get(id(self)) is escrow.owner_entry:
+            del _ACTIVE_OWNERS[id(self)]
+        if _OWNER_ESCROWS.get(id(self)) is escrow:
+            del _OWNER_ESCROWS[id(self)]
+        if _TRUSTED_OWNER_ESCROWS.get(id(self)) is escrow:
+            del _TRUSTED_OWNER_ESCROWS[id(self)]
+        if _CANONICAL_OWNER_ESCROWS.get(id(self)) is escrow:
+            del _CANONICAL_OWNER_ESCROWS[id(self)]
+        _mark_owner_retired(self)
         runtime = trusted[0]
-        runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
-        if runtime_entry is not None and runtime_entry[1]() is self:
-            del _replay._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)]
-        _ACTIVE_COMPLETIONS.pop(id(trusted[5]), None)
-        for prepared_id, prepared_entry in tuple(_ACTIVE_PREPARED.items()):
-            if prepared_entry[1] is self:
-                _ACTIVE_PREPARED.pop(prepared_id)
-        _gate4._ACTIVE_CARRIERS.pop(id(trusted[4]), None)
-        _gradient._ACTIVE_RECEIPTS.pop(id(trusted[7]), None)
-        _replay._ACTIVE_COMPLETIONS.pop(id(trusted[3]), None)
+        runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        if runtime_entry is escrow.runtime_entry:
+            del _forward._ACTIVE_RUNTIME_OWNERS[id(runtime)]
+        if _ACTIVE_COMPLETIONS.get(id(trusted[5])) is escrow.backward_completion_entry:
+            del _ACTIVE_COMPLETIONS[id(trusted[5])]
+        prepared_entry = _ACTIVE_PREPARED.get(escrow.prepared_identity)
+        if type(prepared_entry) is tuple and len(prepared_entry) == 4 and prepared_entry[1] is self:
+            del _ACTIVE_PREPARED[escrow.prepared_identity]
+        if _gate4._ACTIVE_CARRIERS.get(id(trusted[4])) is escrow.carrier_entry:
+            del _gate4._ACTIVE_CARRIERS[id(trusted[4])]
+        if _gradient._ACTIVE_RECEIPTS.get(id(trusted[7])) is escrow.receipt_entry:
+            del _gradient._ACTIVE_RECEIPTS[id(trusted[7])]
+        normalized = escrow.normalized
+        if normalized.registry.get(id(trusted[3])) is escrow.decoder_completion_entry:
+            del normalized.registry[id(trusted[3])]
         self._state = _RETIRED
         self._backward_done = True
         self.binding = self.authority = self.completion = self.gate4_carrier = None
         self.backward_completion = self._runtime = None
         self._trusted = ()
-        resources, leaf_bases, transport_buffers, operations = (
+        resources, leaf_bases, transport_buffers, _operations = (
             trusted[6],
             trusted[8],
             trusted[9],
@@ -311,15 +561,85 @@ class _D4EncoderSelectedBackwardOwner:
                 _add_cleanup_note(primary, f"suppressed Gate5 binding restore error: {error!r}")
         for buffer in (*transport_buffers, *leaf_bases, *predecessor_buffers):
             try:
-                operations.release(buffer)
+                normalized.release(buffer)
             except BaseException as error:
                 _add_cleanup_note(primary, f"suppressed Gate5 buffer release error: {error!r}")
+
+    def _claim_for_gradient_finalize(
+        self,
+        successor: Any,
+        successor_registry: dict[int, tuple[Any, ...]],
+        successor_entry: tuple[Any, ...],
+        runtime_entry: tuple[Any, ...],
+        carrier_entry: tuple[Any, ...],
+        receipt_entry: tuple[Any, ...],
+        decoder_completion_entry: tuple[Any, ...],
+        backward_completion_entry: tuple[Any, ...],
+    ) -> None:
+        """Transfer Gate5 ownership to a prepared Gate6 successor without release."""
+        self.require()
+        escrow = _CANONICAL_OWNER_ESCROWS.get(id(self))
+        reference = successor_entry[0] if type(successor_entry) is tuple else None
+        if (
+            type(escrow) is not _OwnerEscrow
+            or escrow.seal is not _OWNER_ESCROW_SEAL
+            or _OWNER_ESCROWS.get(id(self)) is not escrow
+            or _TRUSTED_OWNER_ESCROWS.get(id(self)) is not escrow
+            or _CANONICAL_OWNER_ESCROWS.get(id(self)) is not escrow
+            or _ACTIVE_OWNERS.get(id(self)) is not escrow.owner_entry
+            or type(successor_registry) is not dict
+            or successor_registry.get(id(successor)) is not None
+            or type(successor_entry) is not tuple
+            or len(successor_entry) != 21
+            or type(reference) is not weakref.ReferenceType
+            or reference() is not successor
+            or any(
+                actual is not expected
+                for actual, expected in zip(
+                    successor_entry[1:12], escrow.owner_entry[1:12], strict=True
+                )
+            )
+            or not _same_entry(runtime_entry, (self._runtime, reference))
+            or not _same_entry(carrier_entry, (reference, *escrow.carrier_entry[1:]))
+            or not _same_entry(receipt_entry, (reference, *escrow.receipt_entry[1:]))
+            or not _same_entry(
+                decoder_completion_entry, (reference, *escrow.decoder_completion_entry[1:])
+            )
+            or not _same_entry(
+                backward_completion_entry, (reference, *escrow.backward_completion_entry[1:])
+            )
+            or _forward._ACTIVE_RUNTIME_OWNERS.get(id(self._runtime)) is not escrow.runtime_entry
+            or _gate4._ACTIVE_CARRIERS.get(id(self.gate4_carrier)) is not escrow.carrier_entry
+            or _gradient._ACTIVE_RECEIPTS.get(id(escrow.receipt_entry[1]))
+            is not escrow.receipt_entry
+            or escrow.normalized.registry.get(id(self.completion))
+            is not escrow.decoder_completion_entry
+            or _ACTIVE_COMPLETIONS.get(id(self.backward_completion))
+            is not escrow.backward_completion_entry
+        ):
+            raise MdpStateError("MDP: Gate6 claims exact normalized Gate5 ownership.")
+        _forward._ACTIVE_RUNTIME_OWNERS[id(self._runtime)] = runtime_entry
+        _gate4._ACTIVE_CARRIERS[id(self.gate4_carrier)] = carrier_entry
+        _gradient._ACTIVE_RECEIPTS[id(escrow.receipt_entry[1])] = receipt_entry
+        escrow.normalized.registry[id(self.completion)] = decoder_completion_entry
+        _ACTIVE_COMPLETIONS[id(self.backward_completion)] = backward_completion_entry
+        successor_registry[id(successor)] = successor_entry
+        del _ACTIVE_OWNERS[id(self)]
+        del _OWNER_ESCROWS[id(self)]
+        del _TRUSTED_OWNER_ESCROWS[id(self)]
+        del _CANONICAL_OWNER_ESCROWS[id(self)]
+        _mark_owner_retired(self)
+        self._state = _RETIRED
+        self._backward_done = True
+        self.binding = self.authority = self.completion = self.gate4_carrier = None
+        self.backward_completion = self._runtime = None
+        self._trusted = ()
 
 
 def run_repeated_d4_encoder_selected_backward(
     predecessor: _gate4._D4EncoderBackwardAuthorizationOwner,
     authority: _DynamicIterationAuthority,
-    completion: _replay._D4FixedDecoderCompletion,
+    completion: Any,
     *,
     byte_generator=None,
 ) -> _D4EncoderSelectedBackwardOwner:
@@ -333,10 +653,11 @@ def run_repeated_d4_encoder_selected_backward(
     prepared = None
     successor = None
     successor_entry = None
+    successor_escrow = None
     started = False
 
     def prepare() -> _PreparedD4EncoderBackward:
-        nonlocal prepared, successor, successor_entry, started
+        nonlocal prepared, successor, successor_entry, successor_escrow, started
         if started:
             raise MdpStateError("MDP: selected Gate5 preparation is one-shot.")
         started = True
@@ -348,15 +669,17 @@ def run_repeated_d4_encoder_selected_backward(
             type(predecessor.carrier) is _gate4._D4EncoderBackwardEmpty
             and predecessor.carrier.text_only
         )
-        complete = _D4EncoderBackwardComplete(
-            authority, completion, predecessor.carrier, selected, text_only, _COMPLETE_SEAL
-        )
         prior_entry = _gate4._ACTIVE_OWNERS.get(id(predecessor))
         carrier_entry = _gate4._ACTIVE_CARRIERS.get(id(predecessor.carrier))
         receipt_entry = _gradient._ACTIVE_RECEIPTS.get(id(predecessor.receipt))
-        completion_entry = _replay._ACTIVE_COMPLETIONS.get(id(completion))
+        completion_escrow = prior_entry[11] if prior_entry is not None else None
+        completion_entry = (
+            completion_escrow[1].get(id(completion))
+            if type(completion_escrow) is tuple and len(completion_escrow) == 6
+            else None
+        )
         runtime_entry = (
-            _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(prior_entry[1]))
+            _forward._ACTIVE_RUNTIME_OWNERS.get(id(prior_entry[1]))
             if prior_entry is not None
             else None
         )
@@ -375,6 +698,21 @@ def run_repeated_d4_encoder_selected_backward(
         ):
             raise MdpStateError("MDP: Gate5 claims exact predecessor registries.")
         prior = prior_entry[1:]
+        normalized = _NormalizedDecoderCompletionToken(
+            completion_escrow[1],
+            completion_escrow[3],
+            completion_escrow[4],
+            _NORMALIZED_COMPLETION_SEAL,
+        )
+        complete = _D4EncoderBackwardComplete(
+            authority,
+            completion,
+            predecessor.carrier,
+            selected,
+            text_only,
+            _COMPLETE_SEAL,
+            normalized,
+        )
         trusted = (
             prior[0],
             binding,
@@ -389,24 +727,71 @@ def run_repeated_d4_encoder_selected_backward(
             prior[8],
         )
         successor = _D4EncoderSelectedBackwardOwner(trusted, _OWNER_SEAL)
-        reference = weakref.ref(successor)
+        escrow_holder = []
+        successor_identity = id(successor)
+
+        def retire(
+            retired_reference,
+            holder=escrow_holder,
+            identity=successor_identity,
+            registries=(_OWNER_ESCROWS, _TRUSTED_OWNER_ESCROWS, _CANONICAL_OWNER_ESCROWS),
+        ):
+            if not holder:
+                return
+            exact_escrow = holder[0]
+            if exact_escrow.reference is not retired_reference:
+                return
+            for registry in registries:
+                if registry.get(identity) is exact_escrow:
+                    del registry[identity]
+
+        reference = weakref.ref(successor, retire)
         successor_entry = (reference, *trusted)
-        runtime_entry = (prior[0], reference)
+        successor_runtime_entry = (prior[0], reference)
         migrated_carrier = (reference, *carrier_entry[1:])
         migrated_receipt = (reference, *receipt_entry[1:])
         migrated_completion = (reference, *completion_entry[1:])
         prepared = _PreparedD4EncoderBackward(successor, gradients, selected, _PREPARED_SEAL)
-        predecessor._claim_for_selected_backward(
-            successor,
-            _ACTIVE_OWNERS,
+        backward_completion_entry = (reference, complete, selected, text_only, normalized)
+        prepared_entry = (prepared, successor, gradients, selected)
+        owner_escrow = _OwnerEscrow(
+            reference,
             successor_entry,
-            runtime_entry,
+            successor_runtime_entry,
             migrated_carrier,
             migrated_receipt,
             migrated_completion,
+            backward_completion_entry,
+            id(prepared),
+            normalized,
+            _OWNER_ESCROW_SEAL,
         )
-        _ACTIVE_COMPLETIONS[id(complete)] = (reference, complete, selected, text_only)
-        _ACTIVE_PREPARED[id(prepared)] = (prepared, successor, gradients, selected)
+        escrow_holder.append(owner_escrow)
+        successor_escrow = owner_escrow
+        _OWNER_ESCROWS[id(successor)] = owner_escrow
+        _TRUSTED_OWNER_ESCROWS[id(successor)] = owner_escrow
+        _CANONICAL_OWNER_ESCROWS[id(successor)] = owner_escrow
+        try:
+            predecessor._claim_for_selected_backward(
+                successor,
+                _ACTIVE_OWNERS,
+                successor_entry,
+                successor_runtime_entry,
+                migrated_carrier,
+                migrated_receipt,
+                migrated_completion,
+            )
+        except BaseException:
+            if _ACTIVE_OWNERS.get(id(successor)) is not successor_entry:
+                if _OWNER_ESCROWS.get(id(successor)) is owner_escrow:
+                    del _OWNER_ESCROWS[id(successor)]
+                if _TRUSTED_OWNER_ESCROWS.get(id(successor)) is owner_escrow:
+                    del _TRUSTED_OWNER_ESCROWS[id(successor)]
+                if _CANONICAL_OWNER_ESCROWS.get(id(successor)) is owner_escrow:
+                    del _CANONICAL_OWNER_ESCROWS[id(successor)]
+            raise
+        _ACTIVE_COMPLETIONS[id(complete)] = backward_completion_entry
+        _ACTIVE_PREPARED[id(prepared)] = prepared_entry
         return prepared
 
     def authorize(value):
@@ -423,6 +808,7 @@ def run_repeated_d4_encoder_selected_backward(
             or value._seal is not _PREPARED_SEAL
         ):
             raise MdpTaskFatalError("MDP: Gate5 retains exact prepared backward.")
+        value.owner._require_backward_state(False)
         return value
 
     try:
@@ -452,13 +838,22 @@ def run_repeated_d4_encoder_selected_backward(
                 "MDP: selected encoder backward failed after Gate5 final WORLD."
             ) from error
     except BaseException as error:
-        target = (
-            successor
-            if successor is not None and _ACTIVE_OWNERS.get(id(successor)) is successor_entry
-            else predecessor
-        )
         try:
-            target.abort(error)
+            escrow = successor_escrow
+            if (
+                type(escrow) is _OwnerEscrow
+                and escrow.seal is _OWNER_ESCROW_SEAL
+                and (
+                    _ACTIVE_OWNERS.get(id(successor)) is escrow.owner_entry
+                    or (
+                        (retired := _gate4._RETIRED_OWNERS.get(id(predecessor))) is not None
+                        and retired() is predecessor
+                    )
+                )
+            ):
+                successor._abort_from_escrow(escrow, error)
+            else:
+                predecessor.abort(error)
         except BaseException as cleanup_error:
             _add_cleanup_note(error, f"suppressed Gate5 cleanup error: {cleanup_error!r}")
         raise

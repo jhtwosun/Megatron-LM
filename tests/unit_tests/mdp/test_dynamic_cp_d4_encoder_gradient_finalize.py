@@ -90,8 +90,9 @@ def _parts(monkeypatch, *, role="member", restore_error=None, cleanup_error=Fals
     else:
         dynamic_binding = None
         handle = None
+    completion_owner = object()
     completion = replay_api._D4FixedDecoderCompletion(
-        authority, token, object(), replay_api._COMPLETION_SEAL
+        authority, token, completion_owner, replay_api._COMPLETION_SEAL
     )
     received = MappingProxyType({})
     exchange = PreparedDynamicBridgeExchange(
@@ -127,8 +128,25 @@ def _parts(monkeypatch, *, role="member", restore_error=None, cleanup_error=Fals
         carrier = gate4._D4EncoderBackwardEmpty(
             authority, completion, receipt, selected_ranks, text_only, gate4._EMPTY_SEAL
         )
+    provenance = gradient_api._D4ReplayGradientProvenance(
+        replay_api,
+        completion_owner,
+        None,
+        None,
+        token,
+        replay_api._tensor_descriptor(token),
+        operations.carrier.acquire,
+        operations.carrier.release,
+        gradient_api._PROVENANCE_SEAL,
+    )
+    normalized = gate5._NormalizedDecoderCompletionToken(
+        replay_api._ACTIVE_COMPLETIONS,
+        provenance.release,
+        provenance,
+        gate5._NORMALIZED_COMPLETION_SEAL,
+    )
     backward_completion = gate5._D4EncoderBackwardComplete(
-        authority, completion, carrier, selected, text_only, gate5._COMPLETE_SEAL
+        authority, completion, carrier, selected, text_only, gate5._COMPLETE_SEAL, normalized
     )
     buffers = (object(), object())
     leaf_bases = (object(),)
@@ -150,13 +168,17 @@ def _parts(monkeypatch, *, role="member", restore_error=None, cleanup_error=Fals
     owner = gate5._D4EncoderSelectedBackwardOwner(trusted, gate5._OWNER_SEAL)
     owner._backward_done = True
     reference = weakref.ref(owner)
-    gate5._ACTIVE_OWNERS[id(owner)] = (reference, *trusted)
-    gate5._ACTIVE_COMPLETIONS[id(backward_completion)] = (
+    completion_entry = (
         reference,
-        backward_completion,
-        selected,
-        text_only,
+        completion,
+        authority,
+        token,
+        replay_api._tensor_descriptor(token),
     )
+    owner_entry = (reference, *trusted)
+    backward_completion_entry = (reference, backward_completion, selected, text_only, normalized)
+    gate5._ACTIVE_OWNERS[id(owner)] = owner_entry
+    gate5._ACTIVE_COMPLETIONS[id(backward_completion)] = backward_completion_entry
     role_entry = (
         (selected_ranks, 0, True, handle, received) if selected else (selected_ranks, text_only)
     )
@@ -176,14 +198,24 @@ def _parts(monkeypatch, *, role="member", restore_error=None, cleanup_error=Fals
         exchange,
         received,
     )
-    replay_api._ACTIVE_COMPLETIONS[id(completion)] = (
+    replay_api._ACTIVE_COMPLETIONS[id(completion)] = completion_entry
+    runtime_entry = (runtime, reference)
+    replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = runtime_entry
+    owner_escrow = gate5._OwnerEscrow(
         reference,
-        completion,
-        authority,
-        token,
-        replay_api._tensor_descriptor(token),
+        owner_entry,
+        runtime_entry,
+        gate4._ACTIVE_CARRIERS[id(carrier)],
+        gradient_api._ACTIVE_RECEIPTS[id(receipt)],
+        completion_entry,
+        backward_completion_entry,
+        id(object()),
+        normalized,
+        gate5._OWNER_ESCROW_SEAL,
     )
-    replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
+    gate5._OWNER_ESCROWS[id(owner)] = owner_escrow
+    gate5._TRUSTED_OWNER_ESCROWS[id(owner)] = owner_escrow
+    gate5._CANONICAL_OWNER_ESCROWS[id(owner)] = owner_escrow
     original_require = gate5._D4EncoderSelectedBackwardOwner.require
     require_calls = []
 
@@ -246,6 +278,55 @@ def test_gate6_restores_then_finalizes_after_world_domain_world(monkeypatch, rol
     assert parts.runtime._captured_num_tokens is parts.token
     assert parts.runtime._token_capture_count == 1 and parts.runtime._token_consumed is True
     assert parts.require_calls and all(value is parts.owner for value in parts.require_calls)
+    assert id(parts.owner) not in gate5._ACTIVE_OWNERS
+    assert id(parts.owner) not in gate5._OWNER_ESCROWS
+    assert id(parts.owner) not in gate5._TRUSTED_OWNER_ESCROWS
+    assert id(parts.owner) not in gate5._CANONICAL_OWNER_ESCROWS
+    assert parts.operations.released == []
+    with pytest.raises(MdpStateError, match="retired"):
+        parts.owner.require()
+    ready.owner.abort()
+
+
+@pytest.mark.parametrize("timing", ("before", "after"))
+def test_gate6_transfer_failure_cleans_exact_owner_and_preserves_foreign_target(
+    monkeypatch, timing
+):
+    primary = RuntimeError(f"{timing} transfer failure")
+    parts = _parts(monkeypatch, restore_error=(primary if timing == "after" else None))
+    original = gate5._D4EncoderSelectedBackwardOwner._claim_for_gradient_finalize
+    foreign = object()
+    successor_ids = []
+
+    def claim(owner, successor, registry, *args):
+        successor_ids.append(id(successor))
+        if timing == "before":
+            raise primary
+        original(owner, successor, registry, *args)
+        registry[id(successor)] = foreign
+
+    monkeypatch.setattr(
+        gate5._D4EncoderSelectedBackwardOwner, "_claim_for_gradient_finalize", claim
+    )
+    with pytest.raises(RuntimeError, match=f"{timing} transfer failure") as caught:
+        api.run_repeated_d4_encoder_gradient_finalize(
+            parts.owner, parts.authority, parts.owner.completion
+        )
+    assert caught.value is primary
+    assert parts.operations.released == list(parts.buffers)
+    assert id(parts.runtime) not in replay_api._forward._ACTIVE_RUNTIME_OWNERS
+    if timing == "after":
+        assert api._ACTIVE_OWNERS[successor_ids[0]] is foreign
+        del api._ACTIVE_OWNERS[successor_ids[0]]
+    else:
+        assert id(parts.owner) not in gate5._ACTIVE_OWNERS
+    monkeypatch.setattr(
+        gate5._D4EncoderSelectedBackwardOwner, "_claim_for_gradient_finalize", original
+    )
+    fresh = _parts(monkeypatch, runtime=parts.runtime)
+    ready = api.run_repeated_d4_encoder_gradient_finalize(
+        fresh.owner, fresh.authority, fresh.owner.completion
+    )
     ready.owner.abort()
 
 
@@ -341,6 +422,7 @@ def test_domain_integrity_failure_converges_at_final_world_without_finalize(
 def test_callback_mutation_blocks_physical_finalize_and_capability(monkeypatch, mutation):
     parts = _parts(monkeypatch)
     foreign = _Operations(object())
+    foreign_owner_entries = []
 
     def runner(_binding, _authority, **kwargs):
         value = kwargs["prepare"]()
@@ -382,7 +464,9 @@ def test_callback_mutation_blocks_physical_finalize_and_capability(monkeypatch, 
                 lambda _value: (_ for _ in ()).throw(AssertionError("foreign release")),
             )
         else:
-            api._ACTIVE_OWNERS[id(value.owner)] = (weakref.ref(foreign), foreign)
+            foreign_entry = (weakref.ref(foreign), foreign)
+            foreign_owner_entries.append((id(value.owner), foreign_entry))
+            api._ACTIVE_OWNERS[id(value.owner)] = foreign_entry
         return value
 
     monkeypatch.setattr(api, "run_repeated_d4_authority_collective", runner)
@@ -395,6 +479,10 @@ def test_callback_mutation_blocks_physical_finalize_and_capability(monkeypatch, 
     if mutation == "runtime_slot":
         assert replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)][1]() is foreign
         replay_api._forward._ACTIVE_RUNTIME_OWNERS.pop(id(parts.runtime))
+    elif mutation == "owner_registry":
+        owner_id, foreign_entry = foreign_owner_entries[0]
+        assert api._ACTIVE_OWNERS[owner_id] is foreign_entry
+        api._ACTIVE_OWNERS.pop(owner_id)
 
 
 @pytest.mark.parametrize("mode", ("first", "final", "substitute", "reenter"))
