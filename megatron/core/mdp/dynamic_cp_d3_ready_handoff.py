@@ -19,7 +19,10 @@ from megatron.core.mdp.dynamic_cp_d3_local_placement import (
 from megatron.core.mdp.dynamic_cp_d3_ready_artifacts import (
     _expected_assignments as _canonical_ready_assignments,
 )
-from megatron.core.mdp.dynamic_cp_d3_ready_artifacts import _materialize_d3_decoder_ready_artifacts
+from megatron.core.mdp.dynamic_cp_d3_ready_artifacts import (
+    _materialize_d3_decoder_ready_artifacts,
+    _validate_canonical_assignments,
+)
 from megatron.core.mdp.dynamic_cp_d3_workspace_binding import _D3WorkspaceBindingOwner
 from megatron.core.mdp.dynamic_cp_runtime import (
     DecoderReadyIteration,
@@ -39,7 +42,7 @@ from megatron.core.mdp.dynamic_cp_transport import (
 )
 from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError
 
-__all__ = ("_compose_d3_decoder_ready_handoff",)
+__all__ = ("_compose_d3_decoder_ready_handoff", "_compose_local_decoder_ready_handoff")
 
 
 def _validate_inputs(
@@ -135,6 +138,68 @@ def _compose_d3_decoder_ready_handoff(
         )
     else:
         artifacts = _LocalDecoderReadyArtifacts((), MappingProxyType({}))
+    return _compose_local_decoder_ready_handoff(
+        authority=authority,
+        global_rank=workspace.rank,
+        payload_bundle=bundle,
+        payload_result=payload_result,
+        embedding_exchange=exchange,
+        embedding_result=embedding_result,
+        assignments=assignments,
+        artifacts=artifacts,
+        cp_partition_mode=cp_partition_mode,
+        decoder_group_ranks_getter=decoder_group_ranks_getter,
+    )
+
+
+def _compose_local_decoder_ready_handoff(
+    *,
+    authority: _DynamicIterationAuthority,
+    global_rank: int,
+    payload_bundle: PreparedDecoderPayloadBundle,
+    payload_result: Mapping,
+    embedding_exchange: PreparedDynamicBridgeExchange,
+    embedding_result: Mapping,
+    assignments: tuple,
+    artifacts: _LocalDecoderReadyArtifacts,
+    cp_partition_mode: str,
+    decoder_group_ranks_getter: Callable[[Any], Any],
+) -> DecoderReadyIteration:
+    """Build one ready carrier from already-validated, locally owned inputs."""
+    if type(authority) is not _DynamicIterationAuthority:
+        raise MdpConfigurationError("MDP: local ready handoff uses exact iteration authority.")
+    if type(global_rank) is not int or global_rank not in authority.participant_ranks:
+        raise MdpConfigurationError("MDP: local ready handoff rank belongs to its authority.")
+    bundle = validate_prepared_decoder_payload_bundle(payload_bundle)
+    exchange = validate_prepared_dynamic_bridge_exchange(embedding_exchange)
+    if exchange.phase is not BridgePhase.EMBEDDING:
+        raise MdpBridgeError("MDP: local ready handoff consumes the embedding bridge phase.")
+    if payload_result is not bundle.received_tensors:
+        raise MdpBridgeError("MDP: local ready handoff retains the exact payload mapping.")
+    if embedding_result is not exchange.received_tensors:
+        raise MdpBridgeError("MDP: local ready handoff retains the exact embedding mapping.")
+    if (
+        bundle.global_rank != global_rank
+        or bundle.participant_ranks != authority.participant_ranks
+        or exchange.global_rank != global_rank
+        or exchange.participant_ranks != authority.participant_ranks
+        or exchange.dtype != authority.bridge_dtype
+    ):
+        raise MdpBridgeError("MDP: local ready handoff transports match exact authority.")
+    if type(assignments) is not tuple or type(artifacts) is not _LocalDecoderReadyArtifacts:
+        raise MdpConfigurationError(
+            "MDP: local ready handoff uses exact assignments and materialized artifacts."
+        )
+    if cp_partition_mode not in ("contiguous", "zigzag"):
+        raise MdpConfigurationError(
+            "MDP: local ready handoff CP partition mode is contiguous or zigzag."
+        )
+    assignments = _validate_canonical_assignments(
+        authority,
+        global_rank=global_rank,
+        assignments=assignments,
+        group_ranks_getter=decoder_group_ranks_getter,
+    )
     digest = _decoder_ready_authority_digest(
         global_manifest_digest=authority.global_manifest.digest,
         decoder_plan_digest=_dynamic_iteration_plan_digest(authority),
@@ -144,11 +209,11 @@ def _compose_d3_decoder_ready_handoff(
         cp_partition_mode=cp_partition_mode,
     )
     ready = _build_decoder_ready_iteration(
-        role=_expected_role(plan=authority.plan, global_rank=workspace.rank),
+        role=_expected_role(plan=authority.plan, global_rank=global_rank),
         authority_digest=digest,
         global_manifest=authority.global_manifest,
         plan=authority.plan,
-        global_rank=workspace.rank,
+        global_rank=global_rank,
         participant_ranks=authority.participant_ranks,
         cp_partition_mode=cp_partition_mode,
         payload_bundle=bundle,

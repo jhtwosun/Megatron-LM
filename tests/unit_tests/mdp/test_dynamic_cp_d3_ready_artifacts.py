@@ -106,15 +106,20 @@ def _codec_placement():
 
 
 class _Group:
-    def __init__(self, size):
-        self._size = size
+    def __init__(self, ranks, rank):
+        self._ranks = ranks
+        self._rank = rank
 
     def size(self):
-        return self._size
+        return len(self._ranks)
+
+    def rank(self):
+        return self._ranks.index(self._rank)
 
 
 def _assignments(placement):
     assignments = []
+    groups = {}
     for microbatch in placement.workspace.authority.plan.microbatches:
         candidates = tuple(
             assignment
@@ -127,7 +132,10 @@ def _assignments(placement):
             LocalDecoderAssignment(
                 key=DecoderMicrobatchKey(microbatch.microbatch_index),
                 assignment=assignment,
-                cp_group=_Group(assignment.local_cp_size),
+                cp_group=groups.setdefault(
+                    assignment.endpoint_ranks,
+                    _Group(assignment.endpoint_ranks, placement.workspace.rank),
+                ),
             )
         )
     return tuple(assignments)
@@ -234,6 +242,183 @@ def test_materializes_manifest_packets_as_exact_payload_views_and_codec_records(
                         packet.tensor_fields[spec.name]
                         is placement.payload_destination_views[route_key]
                     )
+    finally:
+        workspace.release()
+
+
+def test_workspace_free_core_materializes_exact_owned_inputs_without_d3_capabilities():
+    workspace, placement = _placement(participant_ranks=(7, 3, 5))
+    assignments = _api()._expected_assignments(placement, _assignments(placement))
+    calls = []
+    authority = workspace.authority
+    try:
+        assert not hasattr(placement.embedding_exchange, "device")
+        assert (
+            placement.embedding_exchange.send_buffer.device
+            == placement.embedding_exchange.receive_buffer.device
+        )
+        artifacts = _api()._materialize_local_decoder_ready_artifacts(
+            authority=authority,
+            global_rank=workspace.rank,
+            payload_bundle=placement.payload_bundle,
+            payload_result=placement.payload_destination_views,
+            embedding_exchange=placement.embedding_exchange,
+            embedding_leaves=placement.embedding_leaves,
+            assignments=assignments,
+            group_ranks_getter=lambda group: group._ranks,
+            cp_partition_mode="contiguous",
+            rebuild_microbatch=_rebuild(calls),
+        )
+
+        assert artifacts.embedding_leaves is placement.embedding_leaves
+        assert len(artifacts.records) == len(assignments) == len(calls)
+        assert all(call[0] is authority.global_manifest for call in calls)
+        assert all(call[1] is assignment.assignment for call, assignment in zip(calls, assignments))
+    finally:
+        workspace.release()
+
+
+def test_d3_materializer_delegates_exact_inputs_to_shared_canonical_core(monkeypatch):
+    workspace, placement = _placement()
+    assignments = _assignments(placement)
+    captured = {}
+    sentinel = object()
+
+    def materialize(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(_api(), "_materialize_canonical_decoder_ready_artifacts", materialize)
+    try:
+        result = _api()._materialize_d3_decoder_ready_artifacts(
+            placement=placement,
+            assignments=assignments,
+            cp_partition_mode="contiguous",
+            rebuild_microbatch=_rebuild([]),
+        )
+        assert result is sentinel
+        validated_authority = workspace._validated_authority
+        assert captured["authority"] is validated_authority
+        assert validated_authority is not workspace.authority
+        assert validated_authority.global_manifest is workspace.authority.global_manifest
+        assert validated_authority.plan is workspace.authority.plan
+        assert validated_authority.payload_ledger is workspace.authority.payload_ledger
+        assert validated_authority.embedding_ledger is workspace.authority.embedding_ledger
+        assert captured["payload_bundle"] is placement.payload_bundle
+        assert captured["payload_result"] is placement.payload_destination_views
+        assert captured["embedding_exchange"] is placement.embedding_exchange
+        assert captured["embedding_leaves"] is placement.embedding_leaves
+        assert tuple(value.assignment for value in captured["assignments"]) == tuple(
+            value.assignment for value in assignments
+        )
+        assert tuple(value.key for value in captured["assignments"]) == tuple(
+            placement.embedding_leaves
+        )
+        assert set(captured) == {
+            "authority",
+            "global_rank",
+            "payload_bundle",
+            "payload_result",
+            "embedding_exchange",
+            "embedding_leaves",
+            "assignments",
+            "cp_partition_mode",
+            "rebuild_microbatch",
+        }
+    finally:
+        workspace.release()
+
+
+def test_workspace_free_core_rejects_same_storage_altered_stride_before_callback():
+    workspace, placement = _placement()
+    assignments = _api()._expected_assignments(placement, _assignments(placement))
+    payload_result = dict(placement.payload_destination_views)
+    key = next(key for key, tensor in payload_result.items() if tensor.numel() > 1)
+    source = payload_result[key]
+    payload_result[key] = torch.as_strided(
+        source,
+        size=source.shape,
+        stride=tuple(0 for _ in source.stride()),
+        storage_offset=source.storage_offset(),
+    )
+    calls = []
+    try:
+        with pytest.raises(MdpBridgeError, match="retains exact transport views"):
+            _api()._materialize_local_decoder_ready_artifacts(
+                authority=workspace.authority,
+                global_rank=workspace.rank,
+                payload_bundle=placement.payload_bundle,
+                payload_result=MappingProxyType(payload_result),
+                embedding_exchange=placement.embedding_exchange,
+                embedding_leaves=placement.embedding_leaves,
+                assignments=assignments,
+                group_ranks_getter=lambda group: group._ranks,
+                cp_partition_mode="contiguous",
+                rebuild_microbatch=lambda *args, **kwargs: calls.append((args, kwargs)),
+            )
+        assert calls == []
+    finally:
+        workspace.release()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("late-assignment", "preserve exact plan order and identity"),
+        ("wrong-group-rank", "retain exact native group size, order, and rank"),
+        ("leaf-geometry", "exact geometry and detached-leaf semantics"),
+        ("leaf-alias", "do not alias transport buffers or each other"),
+    ),
+)
+def test_workspace_free_core_rejects_all_late_structure_before_first_codec_callback(
+    mutation, message
+):
+    workspace, placement, _ = _codec_placement()
+    canonical_assignments = _api()._expected_assignments(placement, _assignments(placement))
+    assignments = canonical_assignments
+    leaves = placement.embedding_leaves
+    calls = []
+    if mutation == "late-assignment":
+        assignments = (
+            *assignments[:-1],
+            replace(assignments[-1], assignment=assignments[0].assignment),
+        )
+    elif mutation == "wrong-group-rank":
+        endpoints = assignments[0].assignment.endpoint_ranks
+        wrong_rank = endpoints[-1] if workspace.rank != endpoints[-1] else endpoints[0]
+        assignments = (
+            replace(assignments[0], cp_group=_Group(endpoints, wrong_rank)),
+            *assignments[1:],
+        )
+    else:
+        key, leaf = next(iter(leaves.items()))
+        if mutation == "leaf-geometry":
+            replacement = torch.empty(
+                (leaf.shape[0], leaf.shape[1] + 1),
+                dtype=leaf.dtype,
+                device=leaf.device,
+                requires_grad=True,
+            )
+        else:
+            replacement = placement.embedding_exchange.receive_buffer[: leaf.numel()].view_as(leaf)
+            replacement.requires_grad_(True)
+        leaves = MappingProxyType({key: replacement})
+
+    try:
+        with pytest.raises((MdpConfigurationError, MdpPlanError), match=message):
+            _api()._materialize_local_decoder_ready_artifacts(
+                authority=workspace.authority,
+                global_rank=workspace.rank,
+                payload_bundle=placement.payload_bundle,
+                payload_result=placement.payload_destination_views,
+                embedding_exchange=placement.embedding_exchange,
+                embedding_leaves=leaves,
+                assignments=assignments,
+                group_ranks_getter=lambda group: group._ranks,
+                cp_partition_mode="contiguous",
+                rebuild_microbatch=lambda *args, **kwargs: calls.append((args, kwargs)),
+            )
+        assert calls == []
     finally:
         workspace.release()
 

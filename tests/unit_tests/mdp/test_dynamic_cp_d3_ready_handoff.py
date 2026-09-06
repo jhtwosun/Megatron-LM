@@ -15,7 +15,12 @@ from megatron.core.mdp.dynamic_cp_bridge_transport import prepare_dynamic_bridge
 from megatron.core.mdp.dynamic_cp_d3_metadata_transport import DecoderMetadataGatherResult
 from megatron.core.mdp.dynamic_cp_execution import build_decoder_global_manifest
 from megatron.core.mdp.dynamic_cp_transport import prepare_decoder_payload_bundle
-from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError, MdpStateError
+from megatron.core.mdp.errors import (
+    MdpBridgeError,
+    MdpConfigurationError,
+    MdpPlanError,
+    MdpStateError,
+)
 from megatron.core.mdp.rank_mapping import MdpRankView
 from megatron.core.mdp.storage import MdpEmbeddingStorage
 from tests.unit_tests.mdp.test_dynamic_cp_d3_authority_construction import _authority_api
@@ -183,7 +188,8 @@ def _context(*, rank=5, participant_ranks=(7, 3, 5), decoder_ranks=(5, 7), sourc
 
 def _group_getter(rank):
     def get_group(*, group_size):
-        return _Group((rank,) if group_size == 1 else (5, 7), rank)
+        ranks = (rank,) if group_size == 1 else (5, 7)
+        return _Group(ranks, rank)
 
     return get_group
 
@@ -228,6 +234,7 @@ def test_composes_qwen_vision_and_text_ready_handoff_with_one_canonical_assignme
     _, authority, owner, _, bound, payload, embedding = context
     api = _api()
     materialize = api._materialize_d3_decoder_ready_artifacts
+    compose_local = api._compose_local_decoder_ready_handoff
     captured = {}
     digest_authorities = []
 
@@ -239,7 +246,12 @@ def test_composes_qwen_vision_and_text_ready_handoff_with_one_canonical_assignme
         captured["assignments"] = kwargs["assignments"]
         return materialize(**kwargs)
 
+    def capture_local_ready(**kwargs):
+        captured["local_ready"] = kwargs
+        return compose_local(**kwargs)
+
     monkeypatch.setattr(api, "_materialize_d3_decoder_ready_artifacts", capture_materialization)
+    monkeypatch.setattr(api, "_compose_local_decoder_ready_handoff", capture_local_ready)
     monkeypatch.setattr(api, "_dynamic_iteration_plan_digest", plan_digest)
     try:
         ready = _compose(context)
@@ -250,6 +262,14 @@ def test_composes_qwen_vision_and_text_ready_handoff_with_one_canonical_assignme
         assert tuple(ready.embedding_leaves) == (ready.assignments[0].key,)
         assert ready.assignments[0].key is next(iter(ready.embedding_leaves))
         assert captured["assignments"] is ready.assignments
+        assert captured["local_ready"]["authority"] is authority
+        assert captured["local_ready"]["global_rank"] == 5
+        assert captured["local_ready"]["payload_bundle"] is payload
+        assert captured["local_ready"]["payload_result"] is payload.received_tensors
+        assert captured["local_ready"]["embedding_exchange"] is embedding
+        assert captured["local_ready"]["embedding_result"] is embedding.received_tensors
+        assert captured["local_ready"]["assignments"] is ready.assignments
+        assert captured["local_ready"]["artifacts"].records is ready.records
         assert ready.decoder_plan_digest == authority.plan.digest
         runtime.validate_decoder_ready_iteration(
             ready,
@@ -289,6 +309,74 @@ def test_nondecode_rank_returns_empty_without_placement_or_rebuild():
         assert owner.is_idle
 
 
+def test_workspace_free_ready_core_uses_only_exact_owned_local_inputs(monkeypatch):
+    context = _context()
+    _, authority, owner, _, bound, payload, embedding = context
+    runtime = import_module("megatron.core.mdp.dynamic_cp_runtime")
+    try:
+        ready = _compose(context)
+        artifacts = runtime._LocalDecoderReadyArtifacts(
+            records=ready.records, embedding_leaves=ready.embedding_leaves
+        )
+        monkeypatch.setattr(
+            _api(),
+            "_validate_inputs",
+            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("D3 owner path reused")),
+        )
+
+        rebuilt = _api()._compose_local_decoder_ready_handoff(
+            authority=authority,
+            global_rank=ready.global_rank,
+            payload_bundle=payload,
+            payload_result=payload.received_tensors,
+            embedding_exchange=embedding,
+            embedding_result=embedding.received_tensors,
+            assignments=ready.assignments,
+            artifacts=artifacts,
+            cp_partition_mode="contiguous",
+            decoder_group_ranks_getter=_group_ranks,
+        )
+
+        assert rebuilt.records is ready.records
+        assert rebuilt.embedding_leaves is ready.embedding_leaves
+        assert rebuilt.assignments is ready.assignments
+    finally:
+        bound.cleanup()
+        assert owner.is_idle
+
+
+def test_workspace_free_ready_core_rejects_wrong_native_local_rank():
+    context = _context()
+    _, authority, owner, _, bound, payload, embedding = context
+    runtime = import_module("megatron.core.mdp.dynamic_cp_runtime")
+    try:
+        ready = _compose(context)
+        endpoints = ready.assignments[0].assignment.endpoint_ranks
+        wrong_rank = endpoints[-1] if ready.global_rank != endpoints[-1] else endpoints[0]
+        assignments = (
+            replace(ready.assignments[0], cp_group=_Group(endpoints, wrong_rank)),
+            *ready.assignments[1:],
+        )
+        with pytest.raises(MdpPlanError, match="retain exact native group size, order, and rank"):
+            _api()._compose_local_decoder_ready_handoff(
+                authority=authority,
+                global_rank=ready.global_rank,
+                payload_bundle=payload,
+                payload_result=payload.received_tensors,
+                embedding_exchange=embedding,
+                embedding_result=embedding.received_tensors,
+                assignments=assignments,
+                artifacts=runtime._LocalDecoderReadyArtifacts(
+                    records=ready.records, embedding_leaves=ready.embedding_leaves
+                ),
+                cp_partition_mode="contiguous",
+                decoder_group_ranks_getter=_group_ranks,
+            )
+    finally:
+        bound.cleanup()
+        assert owner.is_idle
+
+
 def test_d4_ready_handoff_reuses_exact_prepared_carriers_inside_gate_2(monkeypatch):
     api = import_module("megatron.core.mdp.dynamic_cp_d4_ready_handoff")
     binding_api = import_module("megatron.core.mdp.dynamic_cp_d4_group_binding")
@@ -319,6 +407,8 @@ def test_d4_ready_handoff_reuses_exact_prepared_carriers_inside_gate_2(monkeypat
 
     monkeypatch.setattr(type(binding), "begin_attempt", lambda *_args, **_kwargs: _Runner())
 
+    groups = {}
+
     def decoder_group(*, group_size):
         endpoint_ranks = {
             assignment.endpoint_ranks
@@ -327,7 +417,7 @@ def test_d4_ready_handoff_reuses_exact_prepared_carriers_inside_gate_2(monkeypat
             if 2 in assignment.endpoint_ranks and len(assignment.endpoint_ranks) == group_size
         }
         assert len(endpoint_ranks) == 1
-        return _Group(endpoint_ranks.pop(), 2)
+        return groups.setdefault(group_size, _Group(endpoint_ranks.pop(), 2))
 
     try:
         ready = api.run_repeated_d4_decoder_ready(
