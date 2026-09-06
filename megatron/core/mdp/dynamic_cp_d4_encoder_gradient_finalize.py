@@ -36,6 +36,9 @@ _ACTIVE_OWNERS: dict[int, tuple[Any, ...]] = {}
 _RETIRED_OWNERS: dict[int, weakref.ReferenceType[Any]] = {}
 _ACTIVE_READY: dict[int, tuple[Any, ...]] = {}
 _ACTIVE_PREPARED: dict[int, tuple[Any, ...]] = {}
+_ACTIVE_COMMIT_HANDOFFS: dict[int, tuple[Any, ...]] = {}
+_RETIRED_COMMIT_HANDOFFS: dict[int, weakref.ReferenceType[Any]] = {}
+_COMMIT_HANDOFF_SEAL = object()
 
 
 def _add_cleanup_note(primary: BaseException, message: str) -> None:
@@ -357,6 +360,220 @@ class _D4EncoderFinalizeOwner:
                 release(buffer)
             except BaseException as error:
                 _add_cleanup_note(primary, f"suppressed Gate6 buffer release error: {error!r}")
+
+
+class _D4EncoderCommitHandoff:
+    """Cleaned one-shot ownership retained for a later Gate7 commit."""
+
+    __slots__ = (
+        "__weakref__",
+        "runtime",
+        "authority",
+        "ready",
+        "token",
+        "iteration",
+        "token_authority",
+        "_state",
+        "_seal",
+    )
+
+    def __init__(self, trusted: tuple[Any, ...], seal: object) -> None:
+        if seal is not _COMMIT_HANDOFF_SEAL:
+            raise MdpConfigurationError("MDP: Gate7 cleanup handoff is privately minted.")
+        (
+            self.runtime,
+            self.authority,
+            self.ready,
+            self.token,
+            self.iteration,
+            self.token_authority,
+        ) = trusted[:6]
+        self._state = _ACTIVE
+        self._seal = seal
+
+    def require(self) -> "_D4EncoderCommitHandoff":
+        entry = _ACTIVE_COMMIT_HANDOFFS.get(id(self))
+        if entry is None or entry[0]() is not self:
+            if id(self) in _RETIRED_COMMIT_HANDOFFS:
+                raise MdpStateError("MDP: Gate7 cleanup handoff is retired.")
+            raise MdpStateError("MDP: Gate7 cleanup handoff is exact and active.")
+        trusted = entry[1:]
+        runtime, authority, ready, token, iteration, token_authority, idle_slots = trusted
+        runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        ready_entry = _ACTIVE_READY.get(id(ready))
+        if (
+            self._state is not _ACTIVE
+            or self._seal is not _COMMIT_HANDOFF_SEAL
+            or self.runtime is not runtime
+            or self.authority is not authority
+            or self.ready is not ready
+            or self.token is not token
+            or type(self.iteration) is not int
+            or self.iteration != iteration
+            or self.token_authority != token_authority
+            or type(ready) is not _D4EncoderOnlyCommitReady
+            or ready.owner is not self
+            or ready.runtime is not runtime
+            or ready.authority is not authority
+            or ready.token is not token
+            or ready.iteration != iteration
+            or ready.token_authority != token_authority
+            or ready._seal is not _READY_SEAL
+            or runtime_entry is None
+            or runtime_entry[0] is not runtime
+            or runtime_entry[1]() is not self
+            or ready_entry is None
+            or ready_entry[0]() is not self
+            or ready_entry[1] is not ready
+            or runtime.state is not MdpRuntimeState.EMPTY
+            or runtime._iteration != iteration
+            or runtime._captured_num_tokens is not token
+            or runtime._token_capture_count != 1
+            or runtime._token_consumed is not True
+            or _token_authority(token) != token_authority
+            or any(registry.get(identity) is not None for registry, identity in idle_slots)
+        ):
+            raise MdpStateError("MDP: Gate7 cleanup handoff retains exact commit authority.")
+        return self
+
+    def abort(self, primary_error: BaseException | None = None) -> None:
+        if primary_error is not None and not isinstance(primary_error, BaseException):
+            raise MdpConfigurationError("MDP: Gate7 cleanup abort primary is an exception.")
+        entry = _ACTIVE_COMMIT_HANDOFFS.get(id(self))
+        if entry is None or entry[0]() is not self:
+            self.require()
+        trusted = entry[1:]
+        runtime, _authority, ready, token = trusted[:4]
+        _ACTIVE_COMMIT_HANDOFFS.pop(id(self))
+        _RETIRED_COMMIT_HANDOFFS[id(self)] = weakref.ref(self)
+        runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        if runtime_entry is not None and runtime_entry[1]() is self:
+            _replay._forward._ACTIVE_RUNTIME_OWNERS.pop(id(runtime))
+        ready_entry = _ACTIVE_READY.get(id(ready))
+        if ready_entry is not None and ready_entry[0]() is self:
+            _ACTIVE_READY.pop(id(ready))
+        if (
+            runtime._captured_num_tokens is token
+            and runtime._token_capture_count == 1
+            and runtime._token_consumed is True
+        ):
+            runtime._captured_num_tokens = None
+            runtime._token_capture_count = 0
+            runtime._token_consumed = False
+        self._state = _RETIRED
+        self.runtime = self.authority = self.ready = self.token = None
+        self.iteration = -1
+        self.token_authority = ()
+        self._seal = None
+        object.__setattr__(ready, "owner", None)
+        object.__setattr__(ready, "runtime", None)
+        object.__setattr__(ready, "authority", None)
+        object.__setattr__(ready, "token", None)
+        object.__setattr__(ready, "token_authority", ())
+
+
+def _claim_for_commit(
+    owner: _D4EncoderFinalizeOwner,
+    authority: _DynamicIterationAuthority,
+    ready: _D4EncoderOnlyCommitReady,
+) -> _D4EncoderCommitHandoff:
+    """Retire Gate6 resources and preserve only exact consumed-token authority."""
+    if type(owner) is not _D4EncoderFinalizeOwner:
+        raise MdpConfigurationError("MDP: Gate7 cleanup requires its exact Gate6 owner.")
+    owner.require_commit_ready(ready)
+    if authority is not owner.authority:
+        raise MdpStateError("MDP: Gate7 cleanup uses the exact Gate6 authority.")
+    owner_entry = _ACTIVE_OWNERS.get(id(owner))
+    ready_entry = _ACTIVE_READY.get(id(ready))
+    if (
+        owner_entry is None
+        or owner_entry[0]() is not owner
+        or ready_entry is None
+        or ready_entry[0]() is not owner
+    ):
+        raise MdpStateError("MDP: Gate7 cleanup claims exact Gate6 registries.")
+    prior = owner_entry[1:-2]
+    runtime, token, iteration, token_authority = prior[0], prior[11], prior[12], prior[13]
+    idle_slots = (
+        (_ACTIVE_OWNERS, id(owner)),
+        (_gate5._ACTIVE_COMPLETIONS, id(prior[5])),
+        (_gate4._ACTIVE_CARRIERS, id(prior[4])),
+        (_gradient._ACTIVE_RECEIPTS, id(prior[7])),
+        (_replay._ACTIVE_COMPLETIONS, id(prior[3])),
+    )
+    trusted = (runtime, authority, ready, token, iteration, token_authority, idle_slots)
+    handoff = _D4EncoderCommitHandoff(trusted, _COMMIT_HANDOFF_SEAL)
+    reference = weakref.ref(handoff)
+    runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+    capability_entries = tuple(
+        (registry, value, registry.get(id(value)))
+        for registry, value in (
+            (_gate5._ACTIVE_COMPLETIONS, prior[5]),
+            (_gate4._ACTIVE_CARRIERS, prior[4]),
+            (_gradient._ACTIVE_RECEIPTS, prior[7]),
+            (_replay._ACTIVE_COMPLETIONS, prior[3]),
+        )
+    )
+    if (
+        runtime_entry is None
+        or runtime_entry[0] is not runtime
+        or runtime_entry[1]() is not owner
+        or any(
+            entry is None or entry[0]() is not owner
+            for _registry, _value, entry in capability_entries
+        )
+    ):
+        raise MdpStateError("MDP: Gate7 cleanup retains every exact Gate6 capability.")
+    handoff_entry = (reference, *trusted)
+    _ACTIVE_COMMIT_HANDOFFS[id(handoff)] = handoff_entry
+    _replay._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
+    _ACTIVE_READY[id(ready)] = (reference, ready)
+    object.__setattr__(ready, "owner", handoff)
+    for registry, value, _entry in capability_entries:
+        registry.pop(id(value))
+    _ACTIVE_OWNERS.pop(id(owner))
+    _RETIRED_OWNERS[id(owner)] = weakref.ref(owner)
+    for prepared_id, prepared_entry in tuple(_ACTIVE_PREPARED.items()):
+        if prepared_entry[1] is owner:
+            _ACTIVE_PREPARED.pop(prepared_id)
+    owner._state = _RETIRED
+    owner.binding = owner.authority = owner.completion = owner.backward_completion = None
+    owner.commit_ready = owner._runtime = None
+    owner._trusted = ()
+    resources, leaf_bases, transport_buffers = prior[6], prior[8], prior[9]
+    _binding_owner, predecessor_buffers, _operations, handle = resources
+    actions = []
+    if handle is not None:
+        actions.append(("graph", handle.release))
+    actions.extend(
+        ("buffer", lambda buffer=buffer: prior[16](buffer))
+        for buffer in (*transport_buffers, *leaf_bases, *predecessor_buffers)
+    )
+    primary = None
+    secondary_errors = []
+    try:
+        for label, callback in actions:
+            try:
+                callback()
+            except BaseException as error:
+                if primary is None:
+                    primary = error
+                else:
+                    secondary_errors.append((label, error))
+        if primary is not None:
+            raise primary
+        return handoff.require()
+    except BaseException as error:
+        current = _ACTIVE_COMMIT_HANDOFFS.get(id(handoff))
+        if current is not handoff_entry:
+            _ACTIVE_COMMIT_HANDOFFS[id(handoff)] = handoff_entry
+        try:
+            handoff.abort(error)
+        except BaseException as cleanup_error:
+            secondary_errors.append(("handoff", cleanup_error))
+        for label, secondary in secondary_errors:
+            _add_cleanup_note(error, f"suppressed Gate7 {label} cleanup error: {secondary!r}")
+        raise
 
 
 def run_repeated_d4_encoder_gradient_finalize(

@@ -26,6 +26,7 @@ class _Operations:
     def __init__(self, encoder_ddp, *, fail_release=False):
         self.released = []
         self.fail_release = fail_release
+        self.on_release = None
         self.carrier = replay_api._forward._D4EncoderForwardOperations(
             object(),
             lambda *_args: None,
@@ -46,6 +47,9 @@ class _Operations:
 
     def release(self, value):
         self.released.append(value)
+        if self.on_release is not None:
+            callback, self.on_release = self.on_release, None
+            callback()
         if self.fail_release:
             raise RuntimeError("cleanup release failed")
 
@@ -505,5 +509,181 @@ def test_live_ready_field_substitution_cannot_leak_registered_capability(monkeyp
     owner.commit_ready = None
     owner.abort()
     assert api._ACTIVE_READY == {}
+    assert ready.owner is None and ready.runtime is None and ready.token is None
+    assert parts.runtime._captured_num_tokens is None
+
+
+@pytest.mark.parametrize("role", ("member", "nonmember", "text"))
+def test_claim_for_commit_releases_gate6_resources_and_preserves_token(monkeypatch, role):
+    parts = _parts(monkeypatch, role=role)
+    ready = api.run_repeated_d4_encoder_gradient_finalize(
+        parts.owner, parts.authority, parts.owner.completion
+    )
+    owner = ready.owner
+    backward_completion = owner.backward_completion
+    carrier = owner._trusted[4]
+    receipt = owner._trusted[7]
+    completion = owner.completion
+    handoff = api._claim_for_commit(owner, parts.authority, ready)
+    assert handoff.require() is handoff
+    assert ready.owner is handoff
+    assert parts.runtime._captured_num_tokens is parts.token
+    assert parts.runtime._token_capture_count == 1
+    assert parts.runtime._token_consumed is True
+    assert parts.handle is None or parts.handle._released is True
+    assert parts.operations.released == list(parts.buffers)
+    with pytest.raises(MdpStateError, match="retired"):
+        owner.require()
+    assert id(backward_completion) not in gate5._ACTIVE_COMPLETIONS
+    assert id(carrier) not in gate4._ACTIVE_CARRIERS
+    assert id(receipt) not in gradient_api._ACTIVE_RECEIPTS
+    assert id(completion) not in replay_api._ACTIVE_COMPLETIONS
+    handoff.abort()
+    assert parts.runtime._captured_num_tokens is None
+    assert parts.runtime._token_capture_count == 0
+    assert parts.runtime._token_consumed is False
+    assert api._ACTIVE_COMMIT_HANDOFFS == {}
+    with pytest.raises(MdpStateError, match="retired"):
+        handoff.require()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("authority", "exact Gate6 authority"),
+        ("ready", "exact encoder-only commit authority"),
+        ("owner", "exact and active"),
+    ),
+)
+def test_claim_for_commit_rejects_substitution_without_consuming(monkeypatch, mutation, message):
+    parts = _parts(monkeypatch)
+    ready = api.run_repeated_d4_encoder_gradient_finalize(
+        parts.owner, parts.authority, parts.owner.completion
+    )
+    owner = ready.owner
+    owner_entry = api._ACTIVE_OWNERS[id(owner)]
+    argument_authority = parts.authority
+    argument_ready = ready
+    foreign = _Operations(object())
+    if mutation == "authority":
+        argument_authority = object()
+    elif mutation == "ready":
+        argument_ready = object.__new__(api._D4EncoderOnlyCommitReady)
+    else:
+        api._RETIRED_OWNERS.pop(id(owner), None)
+        api._ACTIVE_OWNERS[id(owner)] = (weakref.ref(foreign),)
+    with pytest.raises(MdpStateError, match=message):
+        api._claim_for_commit(owner, argument_authority, argument_ready)
+    if mutation == "owner":
+        api._ACTIVE_OWNERS[id(owner)] = owner_entry
+    assert owner.require_commit_ready(ready) is ready
+    owner.abort()
+
+
+def test_claim_for_commit_cleanup_failure_retires_and_rolls_back_token(monkeypatch):
+    parts = _parts(monkeypatch)
+    ready = api.run_repeated_d4_encoder_gradient_finalize(
+        parts.owner, parts.authority, parts.owner.completion
+    )
+    owner = ready.owner
+    parts.operations.fail_release = True
+    with pytest.raises(RuntimeError, match="release failed") as caught:
+        api._claim_for_commit(owner, parts.authority, ready)
+    assert len(caught.value.__notes__) == len(parts.buffers) - 1
+    assert parts.operations.released == list(parts.buffers)
+    assert parts.runtime._captured_num_tokens is None
+    assert parts.runtime._token_capture_count == 0
+    assert parts.runtime._token_consumed is False
+    assert api._ACTIVE_COMMIT_HANDOFFS == {}
+    assert api._ACTIVE_READY == {}
+    assert id(parts.runtime) not in replay_api._forward._ACTIVE_RUNTIME_OWNERS
+    with pytest.raises(MdpStateError, match="retired"):
+        owner.require()
+
+
+def test_commit_handoff_live_field_mutation_cannot_block_trusted_abort(monkeypatch):
+    parts = _parts(monkeypatch)
+    ready = api.run_repeated_d4_encoder_gradient_finalize(
+        parts.owner, parts.authority, parts.owner.completion
+    )
+    handoff = api._claim_for_commit(ready.owner, parts.authority, ready)
+    handoff.runtime = object()
+    handoff.ready = object()
+    handoff.abort()
+    assert parts.runtime._captured_num_tokens is None
+    assert api._ACTIVE_COMMIT_HANDOFFS == {}
+    assert api._ACTIVE_READY == {}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "delete_handoff",
+        "substitute_handoff",
+        "delete_runtime",
+        "substitute_runtime",
+        "delete_ready",
+        "substitute_ready",
+        "live_fields",
+        "reenter",
+    ),
+)
+def test_claim_cleanup_callback_mutation_is_drained_and_same_runtime_retries(monkeypatch, mutation):
+    parts = _parts(monkeypatch)
+    ready = api.run_repeated_d4_encoder_gradient_finalize(
+        parts.owner, parts.authority, parts.owner.completion
+    )
+    owner = ready.owner
+    foreign = _Operations(object())
+
+    def mutate():
+        handoff = ready.owner
+        if mutation == "delete_handoff":
+            api._ACTIVE_COMMIT_HANDOFFS.pop(id(handoff))
+        elif mutation == "substitute_handoff":
+            api._ACTIVE_COMMIT_HANDOFFS[id(handoff)] = (weakref.ref(foreign), foreign)
+        elif mutation == "delete_runtime":
+            replay_api._forward._ACTIVE_RUNTIME_OWNERS.pop(id(parts.runtime))
+        elif mutation == "substitute_runtime":
+            replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] = (
+                parts.runtime,
+                weakref.ref(foreign),
+            )
+        elif mutation == "delete_ready":
+            api._ACTIVE_READY.pop(id(ready))
+        elif mutation == "substitute_ready":
+            api._ACTIVE_READY[id(ready)] = (weakref.ref(foreign), foreign)
+        elif mutation == "live_fields":
+            handoff.runtime = handoff.authority = handoff.ready = object()
+        else:
+            handoff.abort()
+
+    parts.operations.on_release = mutate
+    with pytest.raises(MdpStateError, match="Gate7 cleanup handoff"):
+        api._claim_for_commit(owner, parts.authority, ready)
+    assert parts.operations.released == list(parts.buffers)
+    assert parts.runtime._captured_num_tokens is None
+    assert parts.runtime._token_capture_count == 0
+    assert parts.runtime._token_consumed is False
+    assert id(owner) in api._RETIRED_OWNERS
+    assert api._ACTIVE_COMMIT_HANDOFFS == {}
+    if mutation not in ("substitute_runtime",):
+        assert id(parts.runtime) not in replay_api._forward._ACTIVE_RUNTIME_OWNERS
+    else:
+        assert replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)][1]() is foreign
+        replay_api._forward._ACTIVE_RUNTIME_OWNERS.pop(id(parts.runtime))
+    if mutation == "substitute_ready":
+        assert api._ACTIVE_READY[id(ready)][0]() is foreign
+        api._ACTIVE_READY.pop(id(ready))
+    else:
+        assert id(ready) not in api._ACTIVE_READY
+
+    fresh = _parts(monkeypatch, runtime=parts.runtime)
+    fresh_ready = api.run_repeated_d4_encoder_gradient_finalize(
+        fresh.owner, fresh.authority, fresh.owner.completion
+    )
+    fresh_handoff = api._claim_for_commit(fresh_ready.owner, fresh.authority, fresh_ready)
+    fresh_handoff.abort()
+    assert fresh.runtime._captured_num_tokens is None
     assert ready.owner is None and ready.runtime is None and ready.token is None
     assert parts.runtime._captured_num_tokens is None
