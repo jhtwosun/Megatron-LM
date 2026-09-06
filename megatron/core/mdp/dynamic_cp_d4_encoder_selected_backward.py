@@ -332,10 +332,11 @@ def run_repeated_d4_encoder_selected_backward(
     binding = predecessor.binding
     prepared = None
     successor = None
+    successor_entry = None
     started = False
 
     def prepare() -> _PreparedD4EncoderBackward:
-        nonlocal prepared, successor, started
+        nonlocal prepared, successor, successor_entry, started
         if started:
             raise MdpStateError("MDP: selected Gate5 preparation is one-shot.")
         started = True
@@ -389,22 +390,22 @@ def run_repeated_d4_encoder_selected_backward(
         )
         successor = _D4EncoderSelectedBackwardOwner(trusted, _OWNER_SEAL)
         reference = weakref.ref(successor)
+        successor_entry = (reference, *trusted)
+        runtime_entry = (prior[0], reference)
         migrated_carrier = (reference, *carrier_entry[1:])
         migrated_receipt = (reference, *receipt_entry[1:])
         migrated_completion = (reference, *completion_entry[1:])
-        _ACTIVE_OWNERS[id(successor)] = (reference, *trusted)
-        _ACTIVE_COMPLETIONS[id(complete)] = (reference, complete, selected, text_only)
-        _replay._forward._ACTIVE_RUNTIME_OWNERS[id(prior[0])] = (prior[0], reference)
-        _gate4._ACTIVE_CARRIERS[id(prior[4])] = migrated_carrier
-        _gradient._ACTIVE_RECEIPTS[id(prior[3])] = migrated_receipt
-        _replay._ACTIVE_COMPLETIONS[id(completion)] = migrated_completion
-        _gate4._ACTIVE_OWNERS.pop(id(predecessor))
-        _gate4._RETIRED_OWNERS[id(predecessor)] = weakref.ref(predecessor)
-        predecessor._state = _gate4._RETIRED
-        predecessor.binding = predecessor.authority = predecessor.completion = None
-        predecessor.receipt = predecessor.carrier = predecessor._runtime = None
-        predecessor._trusted = ()
         prepared = _PreparedD4EncoderBackward(successor, gradients, selected, _PREPARED_SEAL)
+        predecessor._claim_for_selected_backward(
+            successor,
+            _ACTIVE_OWNERS,
+            successor_entry,
+            runtime_entry,
+            migrated_carrier,
+            migrated_receipt,
+            migrated_completion,
+        )
+        _ACTIVE_COMPLETIONS[id(complete)] = (reference, complete, selected, text_only)
         _ACTIVE_PREPARED[id(prepared)] = (prepared, successor, gradients, selected)
         return prepared
 
@@ -452,7 +453,9 @@ def run_repeated_d4_encoder_selected_backward(
             ) from error
     except BaseException as error:
         target = (
-            successor if successor is not None and id(successor) in _ACTIVE_OWNERS else predecessor
+            successor
+            if successor is not None and _ACTIVE_OWNERS.get(id(successor)) is successor_entry
+            else predecessor
         )
         try:
             target.abort(error)
