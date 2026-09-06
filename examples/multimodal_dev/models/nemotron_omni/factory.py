@@ -65,8 +65,9 @@ def validate_nemotron_omni_support(args, language_config, vision_config) -> None
         raise ValueError("Nemotron Omni M3 does not support tensor parallel execution.")
     if int(getattr(language_config, "pipeline_model_parallel_size", 1)) != 1:
         raise ValueError("Nemotron Omni M3 does not support pipeline parallel execution.")
-    if int(getattr(language_config, "context_parallel_size", 1)) != 1:
-        raise ValueError("Nemotron Omni M3 does not support decoder context parallel execution.")
+    decoder_cp = getattr(language_config, "context_parallel_size", 1)
+    if type(decoder_cp) is not int or decoder_cp not in (1, 4):
+        raise ValueError("Nemotron Omni M3 decoder CP must be exactly 1 or 4.")
     if getattr(language_config, "sequence_parallel", False):
         raise ValueError("Nemotron Omni M3 does not support sequence parallel execution.")
     if (

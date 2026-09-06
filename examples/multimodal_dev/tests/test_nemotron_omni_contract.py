@@ -808,7 +808,7 @@ def test_raw_sound_or_video_fails_before_generic_packing_or_planning(monkeypatch
         ("sound", "sound|audio"),
         ("tp", "tensor parallel"),
         ("pp", "pipeline parallel"),
-        ("decoder-cp", "context parallel"),
+        ("decoder-cp", "decoder CP"),
         ("sp", "sequence parallel"),
         ("vpp", "virtual pipeline"),
         ("layout", "pipeline layout"),
@@ -851,6 +851,58 @@ def test_invalid_configuration_is_rejected_by_the_model_support_matrix(failure, 
     )
     with pytest.raises(ValueError, match=match):
         factory.validate_nemotron_omni_support(args, language_config, vision_config)
+
+
+@pytest.mark.parametrize("decoder_cp", (1, 4))
+def test_decoder_cp_support_matrix_accepts_only_locked_launch_values(decoder_cp):
+    factory = _load("factory")
+    language_config = _minimal_transformer_config(context_parallel_size=decoder_cp)
+    vision_config = _minimal_transformer_config()
+    args = SimpleNamespace(
+        nemotron_omni_input_contract="expanded_sequence_v1",
+        nemotron_omni_enable_sound=False,
+        hybrid_layer_pattern=language_config.hybrid_layer_pattern,
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        mdp_encoder_cp=1,
+    )
+
+    factory.validate_nemotron_omni_support(args, language_config, vision_config)
+    projection_config, _submodules, _input_size = factory.get_nemotron_omni_projector_config(
+        language_config, vision_config, hybrid_layer_pattern=language_config.hybrid_layer_pattern
+    )
+
+    assert language_config.context_parallel_size == decoder_cp
+    assert projection_config.context_parallel_size == 1
+
+
+@pytest.mark.parametrize("decoder_cp", (0, 2, 3, 8, True, "4", 4.0))
+def test_invalid_decoder_cp_is_rejected_before_model_construction(monkeypatch, decoder_cp):
+    factory = _load("factory")
+    language_config = _minimal_transformer_config()
+    language_config.context_parallel_size = decoder_cp
+    vision_config = _minimal_transformer_config()
+    args = SimpleNamespace(
+        nemotron_omni_input_contract="expanded_sequence_v1",
+        nemotron_omni_enable_sound=False,
+        hybrid_layer_pattern=language_config.hybrid_layer_pattern,
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        mdp_encoder_cp=1,
+    )
+    construction_calls = []
+
+    def unexpected_specs(_pattern):
+        construction_calls.append("specs")
+        raise AssertionError("model construction was reached")
+
+    monkeypatch.setattr(factory, "get_nemotron_omni_specs", unexpected_specs)
+    with pytest.raises(ValueError, match="decoder CP must be exactly 1 or 4"):
+        factory.build_model(args, language_config, vision_config)
+
+    assert construction_calls == []
 
 
 @pytest.mark.parametrize("encoder_cp", (0, -1, 3, 8, True, "2", 2.0))
