@@ -10,7 +10,12 @@ import torch
 from megatron.core.mdp import dynamic_cp_d4_encoder_execution as execution_api
 from megatron.core.mdp import dynamic_cp_d4_encoder_forward as api
 from megatron.core.mdp.dynamic_cp import GlobalVisionItemId
-from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError, MdpTaskFatalError
+from megatron.core.mdp.errors import (
+    MdpConfigurationError,
+    MdpPlanError,
+    MdpStateError,
+    MdpTaskFatalError,
+)
 from megatron.core.mdp.plan import EncoderThdLayout, EncoderThdSegment
 from megatron.core.mdp.protocols import DynamicEncoderCpBinding
 
@@ -115,6 +120,7 @@ def _claim(*, rank=0, selected=True, leader=True, text_only=False, runtime=None)
             encoder_domain=SimpleNamespace(encoder_ddp=ddp),
             params_dtype=torch.float32,
             device=torch.device("cpu"),
+            _iteration=0,
         )
     else:
         events = runtime.encoder_domain.encoder_ddp.events
@@ -199,6 +205,67 @@ def _install_gate0(monkeypatch, events, *, reject=None, physical_error=None):
         lambda *_args, **_kwargs: events.append("payload-a2a") or bundle,
     )
     return bundle
+
+
+def _forward_owner(monkeypatch, *, runtime=None, invalid_output=False, text_only=False):
+    runtime, authority, claim, events = _claim(runtime=runtime, text_only=text_only)
+    runtime.adapter.invalid_output = invalid_output
+    _install_gate0(monkeypatch, events)
+    owner = api.run_repeated_d4_encoder_forward(
+        runtime, claim, authority, broadcast=lambda *_args, **_kwargs: None
+    )
+    return runtime, authority, owner, events
+
+
+def _install_gate1(
+    monkeypatch,
+    events,
+    *,
+    reject_at=None,
+    physical_error=None,
+    substitute=None,
+    converge_prepare_error=False,
+):
+    embedding = object()
+
+    def run(binding, authority, **kwargs):
+        del binding, authority
+        events.append(("gate", kwargs["gate_id"], kwargs["byte_generator"]))
+        try:
+            prepared = kwargs["prepare"]()
+        except Exception as local_error:
+            if not converge_prepare_error:
+                raise
+            events.append(("first-world-error", local_error))
+            raise MdpPlanError("Gate1 rejected the common plan") from local_error
+        events.append("world0")
+        if reject_at == "first":
+            raise RuntimeError("first WORLD rejected")
+        events.extend(("domain-status", "world1"))
+        if reject_at == "final":
+            raise RuntimeError("final WORLD rejected")
+        if physical_error is not None:
+            raise physical_error
+        result = kwargs["domain_collective"](prepared)
+        return substitute if substitute is not None else result
+
+    def prepare(binding, authority, **kwargs):
+        del binding, authority
+        events.append("embedding-prepare")
+        assert isinstance(kwargs["item_outputs"], MappingProxyType)
+        return embedding
+
+    def execute(binding, prepared, **kwargs):
+        del binding, kwargs
+        assert prepared is embedding
+        events.append("embedding-a2a")
+        return prepared
+
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", run)
+    monkeypatch.setattr(api, "_embedding_buffers", lambda owner: (object(), object()))
+    monkeypatch.setattr(api, "_prepare_repeated_d4_embedding", prepare)
+    monkeypatch.setattr(api, "_execute_repeated_d4_embedding", execute)
+    return embedding
 
 
 def test_gate0_begins_before_prepare_then_layout_pixels_and_encode(monkeypatch):
@@ -534,4 +601,185 @@ def test_abort_cleanup_notes_primary_then_replay_and_same_runtime_retry(monkeypa
         runtime, fresh_claim, fresh_authority, broadcast=lambda *_a, **_k: None
     )
     assert fresh.require() is fresh
+    fresh.abort()
+
+
+def test_gate1_publishes_once_then_transfers_exact_graph_owner(monkeypatch):
+    runtime, authority, owner, events = _forward_owner(monkeypatch)
+    handle = owner.forward_handle
+    assert handle.consumed is False
+    generator = object()
+    embedding = _install_gate1(monkeypatch, events)
+    publication = api.run_repeated_d4_encoder_publication(owner, byte_generator=generator)
+
+    assert publication.require() is publication
+    assert publication.authority is authority
+    assert publication.embedding_bundle is embedding
+    assert publication.output is not None
+    assert publication.forward_handle is handle
+    assert handle.consumed is False
+    assert events[-6:] == [
+        ("gate", 1, generator),
+        "embedding-prepare",
+        "world0",
+        "domain-status",
+        "world1",
+        "embedding-a2a",
+    ]
+    with pytest.raises(MdpStateError, match="forward owner is retired"):
+        owner.require()
+    assert owner.forward_handle is None
+    publication.abort()
+    assert handle.consumed is True
+    assert len(runtime.adapter.restored) == 1
+
+
+def test_gate1_text_only_transfers_typed_empty_publication(monkeypatch):
+    runtime, authority, owner, events = _forward_owner(monkeypatch, text_only=True)
+    embedding = _install_gate1(monkeypatch, events)
+
+    publication = api.run_repeated_d4_encoder_publication(owner)
+
+    assert publication.authority is authority
+    assert publication.embedding_bundle is embedding
+    assert publication.text_only is True
+    assert publication.output is None
+    assert publication.forward_handle is None
+    assert publication.item_outputs == {}
+    publication.abort()
+    assert runtime.adapter.restored == []
+
+
+def test_gate1_begins_before_retained_forward_error_and_skips_a2a(monkeypatch):
+    runtime, _, owner, events = _forward_owner(monkeypatch, invalid_output=True)
+    retained = owner.local_forward_error
+    _install_gate1(monkeypatch, events, converge_prepare_error=True)
+
+    with pytest.raises(MdpPlanError, match="common plan") as raised:
+        api.run_repeated_d4_encoder_publication(owner)
+
+    gate1_events = events[events.index(("gate", 1, None)) :]
+    assert raised.value.__cause__ is retained
+    assert gate1_events[0:2] == [("gate", 1, None), ("first-world-error", retained)]
+    assert "embedding-prepare" not in gate1_events
+    assert "embedding-a2a" not in gate1_events
+    assert "domain-status" not in gate1_events
+    assert "world1" not in gate1_events
+    assert runtime.adapter.restored == [raised.value]
+
+
+@pytest.mark.parametrize("boundary", ("first", "final"))
+def test_gate1_each_world_rejection_cleans_without_embedding_a2a(monkeypatch, boundary):
+    runtime, _, owner, events = _forward_owner(monkeypatch)
+    _install_gate1(monkeypatch, events, reject_at=boundary)
+
+    with pytest.raises(RuntimeError, match=f"{boundary} WORLD rejected") as raised:
+        api.run_repeated_d4_encoder_publication(owner)
+
+    assert "embedding-prepare" in events
+    assert "embedding-a2a" not in events
+    assert runtime.adapter.restored == [raised.value]
+    assert len(runtime.allocator.released) == len(runtime.allocator.acquired)
+
+
+def test_gate1_prepare_reentry_and_result_substitution_retire_owner(monkeypatch):
+    runtime, _, owner, events = _forward_owner(monkeypatch)
+    _install_gate1(monkeypatch, events)
+    with pytest.raises(AttributeError):
+        object.__setattr__(owner, "_publication_started", False)
+
+    def reenter(binding, authority, **kwargs):
+        del binding, authority
+        kwargs["prepare"]()
+        kwargs["prepare"]()
+
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", reenter)
+    with pytest.raises(MdpStateError, match="preparation is one-shot"):
+        api.run_repeated_d4_encoder_publication(owner)
+    assert len(runtime.adapter.restored) == 1
+
+    runtime, _, owner, events = _forward_owner(monkeypatch, runtime=runtime)
+    _install_gate1(monkeypatch, events, substitute=object())
+    with pytest.raises(MdpTaskFatalError, match="runner returned its owner"):
+        api.run_repeated_d4_encoder_publication(owner)
+    assert len(runtime.adapter.restored) == 2
+
+
+def test_gate1_physical_reentry_cannot_reset_invocation_state(monkeypatch):
+    runtime, _, owner, events = _forward_owner(monkeypatch)
+    callback = {}
+    calls = []
+
+    def run(_binding, _authority, **kwargs):
+        prepared = kwargs["prepare"]()
+        callback["physical"] = kwargs["domain_collective"]
+        return callback["physical"](prepared)
+
+    def execute(*_args, **_kwargs):
+        calls.append("a2a")
+        with pytest.raises(AttributeError):
+            object.__setattr__(owner, "_publication_physical_started", False)
+        callback["physical"](owner)
+
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", run)
+    monkeypatch.setattr(api, "_embedding_buffers", lambda _owner: (object(), object()))
+    monkeypatch.setattr(api, "_prepare_repeated_d4_embedding", lambda *_a, **_k: object())
+    monkeypatch.setattr(api, "_execute_repeated_d4_embedding", execute)
+
+    with pytest.raises(MdpTaskFatalError, match="physical callback is one-shot"):
+        api.run_repeated_d4_encoder_publication(owner)
+    assert calls == ["a2a"]
+    assert len(runtime.adapter.restored) == 1
+
+
+def test_gate1_physical_failure_is_taskfatal_and_cleanup_notes_exact_primary(monkeypatch):
+    runtime, _, owner, events = _forward_owner(monkeypatch)
+    runtime.adapter.fail_restore = True
+    runtime.allocator.fail_release = True
+    _install_gate1(monkeypatch, events)
+
+    def fail_execute(*_args, **_kwargs):
+        raise RuntimeError("embedding A2A failed")
+
+    monkeypatch.setattr(api, "_execute_repeated_d4_embedding", fail_execute)
+    with pytest.raises(MdpTaskFatalError, match="physical execution failed") as raised:
+        api.run_repeated_d4_encoder_publication(owner)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert runtime.adapter.restored == [raised.value]
+    notes = getattr(raised.value, "__notes__", ())
+    assert any("restore error" in note for note in notes)
+    assert any("buffer release error" in note for note in notes)
+
+
+def test_gate1_rejection_uses_forward_handle_graph_release_and_notes_failure(monkeypatch):
+    runtime, _, owner, events = _forward_owner(monkeypatch)
+    handle = owner.forward_handle
+    original = handle.release_forward_only
+
+    def release_then_fail():
+        original()
+        raise RuntimeError("graph release failed")
+
+    handle.release_forward_only = release_then_fail
+    _install_gate1(monkeypatch, events, reject_at="final")
+    with pytest.raises(RuntimeError, match="final WORLD rejected") as raised:
+        api.run_repeated_d4_encoder_publication(owner)
+
+    assert handle.consumed
+    assert runtime.adapter.restored == [raised.value]
+    assert any("graph release error" in note for note in raised.value.__notes__)
+
+
+def test_gate1_rejection_allows_fresh_same_runtime_forward(monkeypatch):
+    runtime, _, owner, events = _forward_owner(monkeypatch)
+    _install_gate1(monkeypatch, events, reject_at="final")
+    with pytest.raises(RuntimeError) as raised:
+        api.run_repeated_d4_encoder_publication(owner)
+    assert runtime.adapter.restored == [raised.value]
+
+    runtime.adapter.fail_restore = False
+    runtime.allocator.fail_release = False
+    fresh_runtime, _, fresh, _ = _forward_owner(monkeypatch, runtime=runtime)
+    assert fresh_runtime is runtime
     fresh.abort()
