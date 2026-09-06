@@ -41,6 +41,16 @@ _RETIRED_COMMIT_HANDOFFS: dict[int, weakref.ReferenceType[Any]] = {}
 _COMMIT_HANDOFF_SEAL = object()
 
 
+def _mark_owner_retired(owner: Any) -> None:
+    identity = id(owner)
+
+    def remove(reference: weakref.ReferenceType[Any]) -> None:
+        if _RETIRED_OWNERS.get(identity) is reference:
+            del _RETIRED_OWNERS[identity]
+
+    _RETIRED_OWNERS[identity] = weakref.ref(owner, remove)
+
+
 def _add_cleanup_note(primary: BaseException, message: str) -> None:
     try:
         primary.add_note(message)
@@ -123,7 +133,8 @@ class _D4EncoderFinalizeOwner:
     def require(self) -> "_D4EncoderFinalizeOwner":
         entry = _ACTIVE_OWNERS.get(id(self))
         if entry is None or entry[0]() is not self:
-            if id(self) in _RETIRED_OWNERS:
+            retired = _RETIRED_OWNERS.get(id(self))
+            if retired is not None and retired() is self:
                 raise MdpStateError("MDP: Gate6 encoder-finalize owner is retired.")
             raise MdpStateError("MDP: Gate6 encoder-finalize owner is exact and active.")
         trusted = entry[1:]
@@ -302,7 +313,7 @@ class _D4EncoderFinalizeOwner:
             else MdpStateError("MDP: Gate6 owner aborted.")
         )
         _ACTIVE_OWNERS.pop(id(self))
-        _RETIRED_OWNERS[id(self)] = weakref.ref(self)
+        _mark_owner_retired(self)
         for prepared_id, prepared_entry in tuple(_ACTIVE_PREPARED.items()):
             if prepared_entry[1] is self:
                 _ACTIVE_PREPARED.pop(prepared_id)
@@ -532,7 +543,7 @@ def _claim_for_commit(
     for registry, value, _entry in capability_entries:
         registry.pop(id(value))
     _ACTIVE_OWNERS.pop(id(owner))
-    _RETIRED_OWNERS[id(owner)] = weakref.ref(owner)
+    _mark_owner_retired(owner)
     for prepared_id, prepared_entry in tuple(_ACTIVE_PREPARED.items()):
         if prepared_entry[1] is owner:
             _ACTIVE_PREPARED.pop(prepared_id)
@@ -741,7 +752,9 @@ def run_repeated_d4_encoder_gradient_finalize(
             target = predecessor
         elif _ACTIVE_OWNERS.get(id(successor)) is successor_entry:
             target = successor
-        elif id(successor) not in _RETIRED_OWNERS and successor_entry is not None:
+        elif (
+            (retired := _RETIRED_OWNERS.get(id(successor))) is None or retired() is not successor
+        ) and successor_entry is not None:
             _ACTIVE_OWNERS[id(successor)] = successor_entry
             target = successor
         if target is not None:

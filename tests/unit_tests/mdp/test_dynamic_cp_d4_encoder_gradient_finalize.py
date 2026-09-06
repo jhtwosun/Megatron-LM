@@ -450,7 +450,9 @@ def test_physical_failure_is_task_fatal_without_capability(monkeypatch):
     assert parts.runtime._token_capture_count == 0 and parts.runtime._token_consumed is False
 
 
-@pytest.mark.parametrize("mode", ("abort", "abort_raise", "delete_owner", "runtime_substitute"))
+@pytest.mark.parametrize(
+    "mode", ("abort", "abort_raise", "delete_owner", "stale_tombstone", "runtime_substitute")
+)
 def test_finalizer_reentry_cannot_mint_or_leak_capability(monkeypatch, mode):
     parts = _parts(monkeypatch)
     primary = KeyboardInterrupt("finalizer callback failed")
@@ -463,7 +465,13 @@ def test_finalizer_reentry_cannot_mint_or_leak_capability(monkeypatch, mode):
             successor.abort(primary)
             if mode == "abort_raise":
                 raise primary
-        elif mode == "delete_owner":
+        elif mode in ("delete_owner", "stale_tombstone"):
+            if mode == "stale_tombstone":
+                tombstone = _Operations(object())
+                stale = weakref.ref(tombstone)
+                del tombstone
+                assert stale() is None
+                api._RETIRED_OWNERS[id(successor)] = stale
             api._ACTIVE_OWNERS.pop(id(successor))
         else:
             replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] = (
