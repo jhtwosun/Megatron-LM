@@ -67,6 +67,8 @@ _ACTIVE_OWNERS: dict[int, tuple[Any, ...]] = {}
 _RETIRED_OWNERS: dict[int, weakref.ReferenceType[Any]] = {}
 _ACTIVE_CURSORS: dict[int, tuple[Any, ...]] = {}
 _ACTIVE_COMPLETIONS: dict[int, tuple[Any, ...]] = {}
+_ACTIVE_GRADIENT_HANDOFFS: dict[int, tuple[Any, ...]] = {}
+_RETIRED_GRADIENT_HANDOFFS: dict[int, weakref.ReferenceType[Any]] = {}
 
 
 def _add_cleanup_note(primary: BaseException, message: str) -> None:
@@ -518,6 +520,185 @@ class _D4FixedDecoderCompletion:
             raise MdpConfigurationError("MDP: fixed decoder completion is privately minted.")
 
 
+class _D4FixedDecoderGradientHandoff:
+    """Registered one-shot owner transferred from completed fixed decoder replay."""
+
+    __slots__ = (
+        "__weakref__",
+        "authority",
+        "binding",
+        "records",
+        "embedding_leaves",
+        "completion",
+        "text_only",
+        "is_selected",
+        "_runtime",
+        "_trusted",
+        "_state",
+        "_consumed",
+    )
+
+    def __init__(self, trusted: tuple[Any, ...]) -> None:
+        (self._runtime, self.authority, self.binding, self.records, self.embedding_leaves) = (
+            trusted[:5]
+        )
+        self.completion = trusted[7]
+        self.text_only = trusted[10]
+        self.is_selected = trusted[11]
+        self._trusted = trusted
+        self._state = _ACTIVE
+        self._consumed = False
+
+    def require(self) -> "_D4FixedDecoderGradientHandoff":
+        entry = _ACTIVE_GRADIENT_HANDOFFS.get(id(self))
+        if entry is None or entry[0]() is not self:
+            retired = _RETIRED_GRADIENT_HANDOFFS.get(id(self))
+            if retired is not None and retired() is self:
+                raise MdpStateError("MDP: fixed decoder gradient handoff is retired.")
+            raise MdpStateError("MDP: fixed decoder gradient handoff is the exact active owner.")
+        current = (
+            self._runtime,
+            self.authority,
+            self.binding,
+            self.records,
+            self.embedding_leaves,
+            *self._trusted[5:7],
+            self.completion,
+            *self._trusted[8:10],
+            self.text_only,
+            self.is_selected,
+        )
+        if (
+            self._state is not _ACTIVE
+            or self._consumed is not entry[-1]
+            or any(
+                actual is not expected
+                for actual, expected in zip(current, entry[1:-1], strict=True)
+            )
+        ):
+            raise MdpStateError("MDP: fixed decoder gradient handoff retains sealed resources.")
+        completion_entry = _ACTIVE_COMPLETIONS.get(id(self.completion))
+        if (
+            completion_entry is None
+            or completion_entry[0]() is not self
+            or completion_entry[1] is not self.completion
+            or self.completion.authority is not self.authority
+            or self.completion.globally_reduced_num_tokens is not completion_entry[3]
+            or self.completion._owner is not self._trusted[8]
+            or self.completion._seal is not _COMPLETION_SEAL
+            or _tensor_descriptor(completion_entry[3]) != completion_entry[4]
+            or completion_entry[4] != self._trusted[9]
+        ):
+            raise MdpStateError(
+                "MDP: fixed decoder gradient handoff retains exact completion provenance."
+            )
+        return self
+
+    def consume(
+        self, authority: _DynamicIterationAuthority, completion: _D4FixedDecoderCompletion, /
+    ) -> "_D4FixedDecoderGradientHandoff":
+        self.require()
+        if self._consumed:
+            raise MdpStateError("MDP: fixed decoder gradient handoff is consumed exactly once.")
+        if authority is not self.authority or completion is not self.completion:
+            raise MdpStateError(
+                "MDP: fixed decoder gradient handoff consumes exact authority and completion."
+            )
+        _snapshot_local_authority(self.binding, authority)
+        self._consumed = True
+        entry = _ACTIVE_GRADIENT_HANDOFFS[id(self)]
+        _ACTIVE_GRADIENT_HANDOFFS[id(self)] = (*entry[:-1], True)
+        return self
+
+    def abort(self, primary_error: BaseException | None = None) -> None:
+        if primary_error is not None and not isinstance(primary_error, BaseException):
+            raise MdpConfigurationError(
+                "MDP: fixed decoder gradient handoff abort error is an exception."
+            )
+        entry = _ACTIVE_GRADIENT_HANDOFFS.get(id(self))
+        if entry is None or entry[0]() is not self:
+            self.require()
+        trusted = entry[1:-1]
+        integrity_error = None
+        try:
+            current = (
+                object.__getattribute__(self, "_runtime"),
+                object.__getattribute__(self, "authority"),
+                object.__getattribute__(self, "binding"),
+                object.__getattribute__(self, "records"),
+                object.__getattribute__(self, "embedding_leaves"),
+                *trusted[5:7],
+                object.__getattribute__(self, "completion"),
+                *trusted[8:10],
+                object.__getattribute__(self, "text_only"),
+                object.__getattribute__(self, "is_selected"),
+            )
+            if (
+                object.__getattribute__(self, "_state") is not _ACTIVE
+                or object.__getattribute__(self, "_consumed") is not entry[-1]
+                or any(
+                    actual is not expected
+                    for actual, expected in zip(current, trusted, strict=True)
+                )
+            ):
+                integrity_error = MdpStateError(
+                    "MDP: fixed decoder gradient handoff retains sealed resources."
+                )
+        except BaseException as error:
+            integrity_error = error
+        primary = (
+            primary_error
+            if primary_error is not None
+            else MdpStateError("MDP: fixed decoder gradient handoff was aborted.")
+        )
+        _ACTIVE_GRADIENT_HANDOFFS.pop(id(self))
+        _RETIRED_GRADIENT_HANDOFFS[id(self)] = weakref.ref(self)
+        runtime = trusted[0]
+        runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        if runtime_entry is not None and runtime_entry[1]() is self:
+            del _forward._ACTIVE_RUNTIME_OWNERS[id(runtime)]
+        completion = trusted[7]
+        _ACTIVE_COMPLETIONS.pop(id(completion), None)
+        self._state = _RETIRED
+        self._consumed = True
+        self.authority = None
+        self.binding = None
+        self.records = ()
+        self.embedding_leaves = MappingProxyType({})
+        self.completion = None
+        self.text_only = None
+        self.is_selected = None
+        self._runtime = None
+        self._trusted = ()
+        if integrity_error is not None:
+            _add_cleanup_note(
+                primary, "fixed decoder gradient handoff integrity validation failed."
+            )
+        handoff_resources, leaf_bases = trusted[5], trusted[6]
+        binding_owner, buffers, operations, forward_handle = handoff_resources
+        if forward_handle is not None:
+            try:
+                forward_handle.release_forward_only()
+            except BaseException as error:
+                _add_cleanup_note(
+                    primary, f"suppressed decoder replay graph release error: {error!r}"
+                )
+        if binding_owner is not None:
+            try:
+                binding_owner.restore(primary)
+            except BaseException as error:
+                _add_cleanup_note(
+                    primary, f"suppressed decoder replay binding restore error: {error!r}"
+                )
+        for buffer in (*leaf_bases, *buffers):
+            try:
+                operations.release(buffer)
+            except BaseException as error:
+                _add_cleanup_note(
+                    primary, f"suppressed decoder replay buffer release error: {error!r}"
+                )
+
+
 class _D4FixedDecoderReplayOwner:
     """Registered owner of fixed replay records, leaves, and predecessor resources."""
 
@@ -739,6 +920,99 @@ class _D4FixedDecoderReplayOwner:
         ):
             raise MdpStateError("MDP: fixed decoder completion retains its exact owner and token.")
         return completion
+
+    def _claim_for_gradient(
+        self, authority: _DynamicIterationAuthority, completion: _D4FixedDecoderCompletion, /
+    ) -> _D4FixedDecoderGradientHandoff:
+        """Transfer completed replay resources without releasing them."""
+        self.require()
+        if authority is not self.authority:
+            raise MdpStateError(
+                "MDP: fixed decoder gradient handoff requires exact iteration authority."
+            )
+        self.require_completion(completion)
+        _snapshot_local_authority(self.binding, authority)
+        entry = _ACTIVE_OWNERS[id(self)]
+        escrow = entry[-1]
+        cursor = escrow.cursor
+        cursor_entry = None if cursor is None else _ACTIVE_CURSORS.get(id(cursor))
+        if (
+            cursor is None
+            or cursor_entry is None
+            or cursor_entry[0]() is not cursor
+            or cursor_entry[1]() is not self
+            or cursor_entry[3] != len(self.records)
+            or cursor._state is not _ACTIVE
+            or cursor._owner is not self
+            or escrow.schedule_return is None
+            or escrow.completion is not completion
+            or escrow.token is not completion.globally_reduced_num_tokens
+            or _tensor_descriptor(escrow.token) != escrow.token_descriptor
+        ):
+            raise MdpStateError(
+                "MDP: fixed decoder gradient handoff follows exact completed replay."
+            )
+        runtime = entry[1]
+        runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        if (
+            runtime_entry is None
+            or runtime_entry[0] is not runtime
+            or runtime_entry[1]() is not self
+        ):
+            raise MdpStateError(
+                "MDP: fixed decoder gradient handoff replaces the exact replay owner."
+            )
+        handoff_resources = entry[6]
+        trusted = (
+            *entry[1:-1],
+            completion,
+            self,
+            escrow.token_descriptor,
+            all(record.text_only for record in self.records),
+            handoff_resources[3] is not None,
+        )
+        handoff = _D4FixedDecoderGradientHandoff(trusted)
+        handoff_identity = id(handoff)
+        runtime_identity = id(runtime)
+
+        def retire(reference: weakref.ReferenceType[Any]) -> None:
+            current = _ACTIVE_GRADIENT_HANDOFFS.get(handoff_identity)
+            if current is not None and current[0] is reference:
+                del _ACTIVE_GRADIENT_HANDOFFS[handoff_identity]
+            current_runtime = _forward._ACTIVE_RUNTIME_OWNERS.get(runtime_identity)
+            if current_runtime is not None and current_runtime[1] is reference:
+                del _forward._ACTIVE_RUNTIME_OWNERS[runtime_identity]
+
+        handoff_reference = weakref.ref(handoff, retire)
+        predecessor_reference = weakref.ref(self)
+        completion_entry = _ACTIVE_COMPLETIONS[id(completion)]
+        token = completion_entry[3]
+        token_descriptor = completion_entry[4]
+
+        _ACTIVE_GRADIENT_HANDOFFS[handoff_identity] = (handoff_reference, *trusted, False)
+        _forward._ACTIVE_RUNTIME_OWNERS[runtime_identity] = (runtime, handoff_reference)
+        _ACTIVE_COMPLETIONS[id(completion)] = (
+            handoff_reference,
+            completion,
+            authority,
+            token,
+            token_descriptor,
+        )
+        _ACTIVE_CURSORS.pop(id(cursor))
+        cursor._state = _RETIRED
+        cursor._owner = None
+        _ACTIVE_OWNERS.pop(id(self))
+        _RETIRED_OWNERS[id(self)] = predecessor_reference
+        self._state = _RETIRED
+        self.authority = None
+        self.binding = None
+        self.records = ()
+        self.embedding_leaves = MappingProxyType({})
+        self._runtime = None
+        self._trusted = ()
+        self._prepared_reference = None
+        self._prepared_handoff_reference = None
+        return handoff
 
     def abort(self, primary_error: BaseException | None = None) -> None:
         if primary_error is not None and not isinstance(primary_error, BaseException):

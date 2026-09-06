@@ -119,7 +119,9 @@ def _binding(group):
     )
 
 
-def _parts(monkeypatch, *, vision=True, microbatches=2, runtime=None):
+def _parts(monkeypatch, *, vision=True, selected=None, microbatches=2, runtime=None):
+    if selected is None:
+        selected = vision
     group = _Group()
     binding = _binding(group)
     samples = []
@@ -197,24 +199,24 @@ def _parts(monkeypatch, *, vision=True, microbatches=2, runtime=None):
     allocator = _Allocator() if runtime is None else runtime.allocator
     operations = SimpleNamespace(acquire=allocator.acquire, release=allocator.release)
     runtime = runtime or SimpleNamespace(device=torch.device("cpu"), allocator=allocator)
-    binding_owner = _BindingOwner() if vision else None
-    handle = _Handle() if vision else None
+    binding_owner = _BindingOwner() if selected else None
+    handle = _Handle() if selected else None
     old_buffers = (torch.empty(0), torch.empty(0))
     trusted = (
         runtime,
         authority,
         binding,
-        (0, 1) if vision else (),
-        object() if vision else None,
-        object() if vision else None,
+        (0, 1) if selected else (),
+        object() if selected else None,
+        object() if selected else None,
         payload,
         embedding,
-        object() if vision else None,
+        object() if selected else None,
         MappingProxyType({}),
         handle,
         not vision,
-        vision,
-        vision,
+        selected,
+        selected,
         binding_owner,
         old_buffers,
         operations,
@@ -310,6 +312,18 @@ def _run(parts, *, byte_generator=None):
         cp_partition_mode="zigzag",
         byte_generator=byte_generator,
     )
+
+
+def _complete(parts):
+    owner = _run(parts)
+    cursor = owner.replay_cursor()
+    for _record in owner.records:
+        next(cursor)
+    token = torch.tensor(1.0)
+    owner.capture_global_num_tokens(token)
+    schedule_return = owner.mark_schedule_returned(cursor)
+    completion = owner.prepare_completion(cursor, schedule_return)
+    return owner, cursor, token, schedule_return, completion
 
 
 def test_gate2_transfers_exact_resources_and_exposes_monotonic_cursor(monkeypatch):
@@ -611,3 +625,139 @@ def test_abort_preserves_primary_and_rejects_replay(monkeypatch):
     assert any("buffer release error" in note for note in primary.__notes__)
     with pytest.raises(MdpStateError, match="owner is retired"):
         owner.abort(primary)
+
+
+@pytest.mark.parametrize(("vision", "selected"), ((False, False), (True, False), (True, True)))
+def test_gradient_handoff_transfers_exact_completed_replay_without_release(
+    monkeypatch, vision, selected
+):
+    parts = _parts(monkeypatch, vision=vision, selected=selected, microbatches=1)
+    owner, cursor, token, _schedule_return, completion = _complete(parts)
+    releases = tuple(parts.allocator.released)
+
+    handoff = owner._claim_for_gradient(parts.authority, completion)
+
+    assert type(handoff) is api._D4FixedDecoderGradientHandoff
+    assert handoff.require() is handoff
+    assert handoff.authority is parts.authority
+    assert handoff.binding is parts.binding
+    assert handoff.completion is completion
+    assert handoff.records[0].text_only is (not vision)
+    assert handoff.text_only is (not vision)
+    assert handoff.is_selected is selected
+    assert handoff.embedding_leaves is not None
+    assert completion._owner is owner
+    assert completion.globally_reduced_num_tokens is token
+    completion_entry = api._ACTIVE_COMPLETIONS[id(completion)]
+    assert completion_entry[0]() is handoff
+    assert completion_entry[1] is completion
+    assert completion_entry[3] is token
+    assert completion_entry[4] == api._tensor_descriptor(token)
+    assert forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)][1]() is handoff
+    assert tuple(parts.allocator.released) == releases
+    with pytest.raises(MdpStateError, match="owner is retired"):
+        owner.require()
+    with pytest.raises(MdpStateError, match="exact active cursor"):
+        next(cursor)
+
+    handoff.abort()
+    assert parts.handle is None or parts.handle.consumed
+    assert parts.binding_owner is None or not parts.binding_owner.active
+    assert forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+
+
+def test_gradient_handoff_claim_rejects_substitution_without_consuming(monkeypatch):
+    parts = _parts(monkeypatch)
+    owner, _cursor, _token, _schedule_return, completion = _complete(parts)
+
+    for authority in (object(), copy.copy(parts.authority)):
+        with pytest.raises(MdpStateError, match="exact iteration authority"):
+            owner._claim_for_gradient(authority, completion)
+        assert owner.require() is owner
+    with pytest.raises(MdpStateError, match="exact owner and token"):
+        owner._claim_for_gradient(parts.authority, copy.copy(completion))
+    assert owner.require() is owner
+
+    records = owner.records
+    owner.records = ()
+    with pytest.raises(MdpStateError, match="sealed resources"):
+        owner._claim_for_gradient(parts.authority, completion)
+    owner.records = records
+    assert owner.require() is owner
+
+    snapshot_calls = []
+
+    def reject_mutated_authority(binding, authority):
+        snapshot_calls.append((binding, authority))
+        raise MdpStateError("mutated iteration authority")
+
+    monkeypatch.setattr(api, "_snapshot_local_authority", reject_mutated_authority)
+    with pytest.raises(MdpStateError, match="mutated iteration authority"):
+        owner._claim_for_gradient(parts.authority, completion)
+    assert snapshot_calls == [(parts.binding, parts.authority)]
+    assert owner.require() is owner
+    monkeypatch.setattr(api, "_snapshot_local_authority", lambda binding, authority: authority)
+    handoff = owner._claim_for_gradient(parts.authority, completion)
+    handoff.abort()
+
+
+def test_gradient_handoff_consume_is_exact_and_one_shot(monkeypatch):
+    parts = _parts(monkeypatch)
+    owner, _cursor, _token, _schedule_return, completion = _complete(parts)
+    handoff = owner._claim_for_gradient(parts.authority, completion)
+
+    for authority, candidate in (
+        (copy.copy(parts.authority), completion),
+        (parts.authority, copy.copy(completion)),
+    ):
+        with pytest.raises(MdpStateError, match="exact authority and completion"):
+            handoff.consume(authority, candidate)
+        assert handoff.require() is handoff
+
+    def reject_mutated_authority(_binding, _authority):
+        raise MdpStateError("mutated iteration authority")
+
+    monkeypatch.setattr(api, "_snapshot_local_authority", reject_mutated_authority)
+    with pytest.raises(MdpStateError, match="mutated iteration authority"):
+        handoff.consume(parts.authority, completion)
+    assert handoff.require() is handoff
+    assert handoff._consumed is False
+    monkeypatch.setattr(api, "_snapshot_local_authority", lambda binding, authority: authority)
+    assert handoff.consume(parts.authority, completion) is handoff
+    with pytest.raises(MdpStateError, match="consumed exactly once"):
+        handoff.consume(parts.authority, completion)
+    handoff.abort()
+    with pytest.raises(MdpStateError, match="handoff is retired"):
+        handoff.consume(parts.authority, completion)
+
+
+def test_gradient_handoff_abort_clears_before_hostile_notes_and_allows_fresh_runtime(monkeypatch):
+    parts = _parts(monkeypatch)
+    owner, _cursor, _token, _schedule_return, completion = _complete(parts)
+    handoff = owner._claim_for_gradient(parts.authority, completion)
+    reentry = []
+
+    class HostilePrimary(BaseException):
+        def add_note(self, _message):
+            try:
+                handoff.abort(self)
+            except MdpStateError as error:
+                reentry.append(error)
+            raise RuntimeError("hostile note")
+
+    del handoff.authority
+    parts.allocator.fail_release = True
+    primary = HostilePrimary("schedule failed")
+    handoff.abort(primary)
+
+    assert reentry and all("retired" in str(error) for error in reentry)
+    assert parts.handle.consumed
+    assert not parts.binding_owner.active
+    assert forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+    with pytest.raises(MdpStateError, match="handoff is retired"):
+        handoff.abort(primary)
+
+    parts.allocator.fail_release = False
+    fresh = _parts(monkeypatch, runtime=parts.runtime)
+    fresh_owner = _run(fresh)
+    fresh_owner.abort()
