@@ -1248,3 +1248,50 @@ def test_cleanup_without_primary_raises_exact_first_hostile_error_after_all_acti
     assert caught.value is primary
     assert cleanup_calls == [primary, secondary]
     assert primary.add_note_calls == 1
+
+
+class _CaptureOwnerToken:
+    pass
+
+
+def test_capture_owner_registry_is_nonconsuming_one_shot_and_independent():
+    runtime = object.__new__(MdpRuntime)
+    runtime._d4_encoder_capture_owner = None
+    runtime._d4_encoder_capture_trusted_owner = None
+    runtime._retired_d4_encoder_capture_owners = {}
+    legacy_window = object()
+    legacy_plan = object()
+    legacy_producer = object()
+    runtime._window = legacy_window
+    runtime._plan = legacy_plan
+    runtime._pre_authority_dynamic_producer = legacy_producer
+    owner = _CaptureOwnerToken()
+
+    runtime._register_d4_encoder_capture_owner(owner)
+    runtime._require_d4_encoder_capture_owner(owner)
+    runtime._require_d4_encoder_capture_owner(owner)
+    runtime._retire_d4_encoder_capture_owner(owner)
+
+    assert runtime._d4_encoder_capture_owner is None
+    assert runtime._d4_encoder_capture_trusted_owner is None
+    assert runtime._window is legacy_window
+    assert runtime._plan is legacy_plan
+    assert runtime._pre_authority_dynamic_producer is legacy_producer
+    with pytest.raises(MdpStateError, match="retired"):
+        runtime._require_d4_encoder_capture_owner(owner)
+
+
+def test_capture_owner_registry_rejects_foreign_without_consuming_active():
+    runtime = object.__new__(MdpRuntime)
+    runtime._d4_encoder_capture_owner = None
+    runtime._d4_encoder_capture_trusted_owner = None
+    runtime._retired_d4_encoder_capture_owners = {}
+    owner = _CaptureOwnerToken()
+    foreign = _CaptureOwnerToken()
+    runtime._register_d4_encoder_capture_owner(owner)
+
+    with pytest.raises(MdpStateError, match="exact active"):
+        runtime._require_d4_encoder_capture_owner(foreign)
+
+    assert runtime._d4_encoder_capture_owner is owner
+    runtime._retire_d4_encoder_capture_owner(owner)

@@ -127,6 +127,11 @@ class MdpRuntime:
         # phase machine never reads this slot.
         self._pre_authority_dynamic_producer: Any | None = None
         self._retired_pre_authority_dynamic_producers: dict[int, weakref.ReferenceType[Any]] = {}
+        # Capture-only repeated-D4 ownership is independent of the legacy
+        # window/plan phase machine and of the D3 producer handoff above.
+        self._d4_encoder_capture_owner: Any | None = None
+        self._d4_encoder_capture_trusted_owner: Any | None = None
+        self._retired_d4_encoder_capture_owners: dict[int, weakref.ReferenceType[Any]] = {}
         # Window-capture overlap: one in-flight prefetch keyed by the data
         # iterator's identity, so an interleaved eval (different iterator)
         # leaves a pending train prefetch untouched. The prefetch thread runs
@@ -886,6 +891,52 @@ class MdpRuntime:
                 "MDP: dynamic producer supports runtime-owned one-shot identity."
             ) from error
         self._pre_authority_dynamic_producer = producer
+
+    def _register_d4_encoder_capture_owner(self, owner: Any) -> None:
+        """Install one capture-only owner by exact identity."""
+        if (
+            self._d4_encoder_capture_owner is not None
+            or self._d4_encoder_capture_trusted_owner is not None
+        ):
+            raise MdpStateError("MDP: runtime already owns one D4 encoder capture.")
+        reference = self._retired_d4_encoder_capture_owners.get(id(owner))
+        if reference is not None and reference() is owner:
+            raise MdpStateError("MDP: runtime rejects a retired D4 encoder capture.")
+        try:
+            weakref.ref(owner)
+        except TypeError as error:
+            raise MdpStateError(
+                "MDP: D4 encoder capture supports runtime-owned one-shot identity."
+            ) from error
+        self._d4_encoder_capture_owner = self._d4_encoder_capture_trusted_owner = owner
+
+    def _require_d4_encoder_capture_owner(self, owner: Any) -> None:
+        """Require without consuming the exact active capture-only owner."""
+        if self._d4_encoder_capture_trusted_owner is owner:
+            if self._d4_encoder_capture_owner is owner:
+                return
+            raise MdpStateError(
+                "MDP: runtime D4 encoder capture slot matches its trusted owner."
+            )
+        reference = self._retired_d4_encoder_capture_owners.get(id(owner))
+        if reference is not None and reference() is owner:
+            raise MdpStateError("MDP: runtime rejects a retired D4 encoder capture.")
+        raise MdpStateError("MDP: runtime has the exact active D4 encoder capture owner.")
+
+    def _retire_d4_encoder_capture_owner(self, owner: Any) -> None:
+        """Retire the exact active capture owner before its resources are released."""
+        if self._d4_encoder_capture_trusted_owner is not owner:
+            self._require_d4_encoder_capture_owner(owner)
+        owner_identity = id(owner)
+        tombstones = self._retired_d4_encoder_capture_owners
+
+        def remove_tombstone(reference: weakref.ReferenceType[Any]) -> None:
+            if tombstones.get(owner_identity) is reference:
+                del tombstones[owner_identity]
+
+        tombstones[owner_identity] = weakref.ref(owner, remove_tombstone)
+        self._d4_encoder_capture_owner = None
+        self._d4_encoder_capture_trusted_owner = None
 
     def _validate_pre_authority_dynamic_producer(self, owner: Any, producer: Any) -> None:
         """Require the one unconsumed producer registered by this runtime."""
