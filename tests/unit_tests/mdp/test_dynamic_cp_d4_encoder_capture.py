@@ -397,6 +397,28 @@ def test_normal_exception_identity_is_retained(monkeypatch):
     owner.abort(original)
 
 
+def test_execution_claim_requires_joint_authority_without_consuming_owner(monkeypatch):
+    runtime = _runtime(0)
+    source_window, _, locations = _source_window(0)
+    operations = capture_api._snapshot_d4_encoder_capture_operations(
+        _Adapter(), _Codec(source_window, locations)
+    )
+    _window(monkeypatch)
+    owner = capture_api._capture_d4_encoder_source(
+        runtime=runtime,
+        binding=_binding(0),
+        data_iterators=iter((object(),)),
+        num_microbatches=1,
+        operations=operations,
+    )
+
+    with pytest.raises(MdpStateError, match="exact joint authority"):
+        owner._claim_for_execution(object())
+
+    assert owner.require() is owner
+    owner.abort()
+
+
 def test_owner_mutation_cleans_only_trusted_pixels_and_rejects_replay(monkeypatch):
     runtime = _runtime(0)
     source_window, _, locations = _source_window(0)

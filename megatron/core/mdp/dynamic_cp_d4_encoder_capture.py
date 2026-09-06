@@ -311,6 +311,94 @@ class _D4EncoderCaptureOwner:
                 error, f"suppressed D4 encoder pixel release error: {cleanup_error!r}"
             )
 
+    def _claim_for_execution(self, authority: Any, /) -> tuple[Any, ...]:
+        """Transfer exact capture resources after joint-authority validation."""
+        from megatron.core.mdp.dynamic_cp_runtime import (
+            _dynamic_iteration_plan_digest,
+            _DynamicIterationAuthority,
+        )
+
+        self.require()
+        if (
+            type(authority) is not _DynamicIterationAuthority
+            or authority.encoder_plan is None
+            or authority.joint_plan_digest is None
+        ):
+            raise MdpStateError("MDP: encoder execution claim requires exact joint authority.")
+        _dynamic_iteration_plan_digest(authority)
+        binding = self._trusted_binding
+        if authority.participant_ranks != binding.domain_ranks:
+            raise MdpStateError("MDP: encoder execution authority matches its exact D4 domain.")
+        if self._trusted_error is not None:
+            raise MdpStateError("MDP: failed encoder source capture cannot be claimed.")
+        is_source = binding.global_rank == binding.domain_ranks[0]
+        metadata = (self._trusted_source_window, self._trusted_manifest, self._trusted_locations)
+        if is_source:
+            source_window, local_manifest, locations = metadata
+            if (
+                type(source_window) is not DecoderSourceWindow
+                or type(local_manifest) is not DecoderSourceManifest
+            ):
+                raise MdpStateError(
+                    "MDP: encoder execution source retains exact authority metadata."
+                )
+            expected_sample_ids = tuple(sample.sample_id for sample in source_window.samples)
+            locations_by_microbatch: dict[int, list[int]] = {}
+            for microbatch_id, local_sample_id in locations.values():
+                locations_by_microbatch.setdefault(microbatch_id, []).append(local_sample_id)
+            if (
+                source_window.metadata_manifest() != local_manifest
+                or authority.global_manifest.samples != local_manifest.samples
+                or authority.global_manifest.items != local_manifest.items
+                or authority.global_manifest.payloads != local_manifest.payloads
+                or tuple(locations) != expected_sample_ids
+                or len(set(locations.values())) != len(locations)
+                or any(
+                    tuple(sorted(local_ids)) != tuple(range(len(local_ids)))
+                    for local_ids in locations_by_microbatch.values()
+                )
+            ):
+                raise MdpStateError(
+                    "MDP: encoder execution source retains exact authority metadata."
+                )
+        elif (
+            self._trusted_source_window is not None
+            or self._trusted_manifest is not None
+            or self._trusted_locations
+            or self._trusted_pixels
+        ):
+            raise MdpStateError("MDP: encoder execution non-source capture is exactly empty.")
+        runtime = self._trusted_runtime
+        transfer = (
+            runtime,
+            binding,
+            self._trusted_source_window,
+            self._trusted_manifest,
+            self._trusted_locations,
+            self._trusted_pixels,
+        )
+        runtime._retire_d4_encoder_capture_owner(self)
+        self._state = _RETIRED_OWNER
+        for name in (
+            "_runtime",
+            "_binding",
+            "_source_window",
+            "_local_manifest",
+            "_sample_locations",
+            "_pixel_sidecar",
+            "_local_prepare_error",
+            "_trusted_runtime",
+            "_trusted_binding",
+            "_trusted_source_window",
+            "_trusted_manifest",
+            "_trusted_locations",
+            "_trusted_pixels",
+            "_trusted_pixel_view",
+            "_trusted_error",
+        ):
+            setattr(self, name, None)
+        return transfer
+
 
 def _validate_capture_context(
     runtime: Any, binding: Any, operations: Any, num_microbatches: Any
