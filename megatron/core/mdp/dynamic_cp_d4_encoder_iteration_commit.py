@@ -5,6 +5,7 @@
 import weakref
 from typing import Any
 
+from megatron.core.mdp import dynamic_cp_d4_encoder_forward as _forward
 from megatron.core.mdp import dynamic_cp_d4_encoder_gradient_finalize as _gate6
 from megatron.core.mdp.dynamic_cp_d4_authority_collective import (
     run_repeated_d4_authority_collective,
@@ -48,7 +49,7 @@ def _retire_for_commit(handoff: _gate6._D4EncoderCommitHandoff) -> tuple[Any, ..
     if entry is None or entry[0]() is not handoff:
         raise MdpStateError("MDP: Gate7 commits its exact cleaned handoff.")
     runtime, authority, ready, token, iteration, token_authority = entry[1:7]
-    runtime_entry = _gate6._replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+    runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
     ready_entry = _gate6._ACTIVE_READY.get(id(ready))
     if (
         runtime_entry is None
@@ -61,7 +62,7 @@ def _retire_for_commit(handoff: _gate6._D4EncoderCommitHandoff) -> tuple[Any, ..
         raise MdpStateError("MDP: Gate7 retires exact runtime and commit registries.")
     _gate6._ACTIVE_COMMIT_HANDOFFS.pop(id(handoff))
     _gate6._RETIRED_COMMIT_HANDOFFS[id(handoff)] = weakref.ref(handoff)
-    _gate6._replay._forward._ACTIVE_RUNTIME_OWNERS.pop(id(runtime))
+    _forward._ACTIVE_RUNTIME_OWNERS.pop(id(runtime))
     _gate6._ACTIVE_READY.pop(id(ready))
     handoff._state = _gate6._RETIRED
     handoff.runtime = handoff.authority = handoff.ready = handoff.token = None

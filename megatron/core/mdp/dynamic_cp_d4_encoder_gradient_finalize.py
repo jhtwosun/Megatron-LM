@@ -9,9 +9,9 @@ from typing import Any
 import torch
 
 from megatron.core.mdp import dynamic_cp_d4_encoder_backward_authorization as _gate4
+from megatron.core.mdp import dynamic_cp_d4_encoder_forward as _forward
 from megatron.core.mdp import dynamic_cp_d4_encoder_gradient as _gradient
 from megatron.core.mdp import dynamic_cp_d4_encoder_selected_backward as _gate5
-from megatron.core.mdp import dynamic_cp_d4_fixed_decoder_replay as _replay
 from megatron.core.mdp import encoder as _encoder
 from megatron.core.mdp.activation import EncoderForwardHandle
 from megatron.core.mdp.dynamic_cp_bridge_transport import validate_prepared_dynamic_bridge_exchange
@@ -30,6 +30,7 @@ __all__ = ()
 _ACTIVE = object()
 _RETIRED = object()
 _OWNER_SEAL = object()
+_COMPLETION_SNAPSHOT_SEAL = object()
 _READY_SEAL = object()
 _PREPARED_SEAL = object()
 _ACTIVE_OWNERS: dict[int, tuple[Any, ...]] = {}
@@ -72,6 +73,17 @@ def _validate_runtime_authority(runtime, token, iteration, token_descriptor) -> 
         or _token_authority(token) != token_descriptor
     ):
         raise MdpStateError("MDP: Gate6 retains exact runtime and decoder-token authority.")
+
+
+@dataclass(frozen=True, slots=True)
+class _Gate6CompletionSnapshot:
+    normalized: _gate5._NormalizedDecoderCompletionToken = field(compare=False, repr=False)
+    completion_entry: tuple[Any, ...] = field(compare=False, repr=False)
+    seal: object = field(compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self) is not _Gate6CompletionSnapshot or self.seal is not _COMPLETION_SNAPSHOT_SEAL:
+            raise MdpConfigurationError("MDP: Gate6 completion snapshot is privately minted.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,12 +181,18 @@ class _D4EncoderFinalizeOwner:
             and _token_authority(token) == token_descriptor
         ):
             raise MdpStateError("MDP: Gate6 owner retains consumed runtime-token authority.")
-        runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
         backward_completion = trusted[5]
         complete_entry = _gate5._ACTIVE_COMPLETIONS.get(id(trusted[5]))
         carrier_entry = _gate4._ACTIVE_CARRIERS.get(id(trusted[4]))
         receipt_entry = _gradient._ACTIVE_RECEIPTS.get(id(trusted[7]))
-        normalized = backward_completion.normalized_completion_escrow
+        completion_snapshot = trusted[17]
+        if (
+            type(completion_snapshot) is not _Gate6CompletionSnapshot
+            or completion_snapshot.seal is not _COMPLETION_SNAPSHOT_SEAL
+        ):
+            raise MdpStateError("MDP: Gate6 retains its sealed completion snapshot.")
+        normalized = completion_snapshot.normalized
         replay_entry = normalized.registry.get(id(trusted[3]))
         if (
             runtime_entry is None
@@ -186,10 +204,10 @@ class _D4EncoderFinalizeOwner:
             or carrier_entry[0]() is not self
             or receipt_entry is None
             or receipt_entry[0]() is not self
-            or replay_entry is None
+            or replay_entry is not completion_snapshot.completion_entry
             or replay_entry[0]() is not self
-            or type(operations) is not _replay._forward._D4EncoderForwardOperations
-            or operations._seal is not _replay._forward._OPERATIONS_SEAL
+            or type(operations) is not _forward._D4EncoderForwardOperations
+            or operations._seal is not _forward._OPERATIONS_SEAL
             or operations.encoder_ddp is not trusted[14]
             or operations.release is not trusted[16]
             or finalize is not _encoder.finalize_encoder_grads
@@ -207,6 +225,7 @@ class _D4EncoderFinalizeOwner:
             or backward_completion.completion is not replay_completion
             or backward_completion.gate4_carrier is not carrier
             or backward_completion._seal is not _gate5._COMPLETE_SEAL
+            or backward_completion.normalized_completion_escrow is not normalized
             or carrier_entry[1] is not carrier
             or carrier_entry[2] is not trusted[2]
             or carrier_entry[3] is not replay_completion
@@ -222,9 +241,8 @@ class _D4EncoderFinalizeOwner:
             or receipt.received_tensors is not receipt.exchange.received_tensors
             or receipt._seal is not _gradient._RECEIPT_SEAL
             or replay_entry[1] is not replay_completion
-            or replay_entry[2] is not trusted[2]
             or replay_completion.authority is not trusted[2]
-            or replay_completion.globally_reduced_num_tokens is not replay_entry[3]
+            or replay_completion.globally_reduced_num_tokens is not normalized.provenance.token
         ):
             raise MdpStateError("MDP: Gate6 retains exact nested capability authority.")
         _gate5._validate_normalized_completion(
@@ -329,9 +347,9 @@ class _D4EncoderFinalizeOwner:
                 object.__setattr__(exact_ready, "token", None)
                 object.__setattr__(exact_ready, "token_authority", ())
         runtime = trusted[0]
-        runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
         if runtime_entry is not None and runtime_entry[1]() is self:
-            _replay._forward._ACTIVE_RUNTIME_OWNERS.pop(id(runtime))
+            _forward._ACTIVE_RUNTIME_OWNERS.pop(id(runtime))
         if (
             runtime._captured_num_tokens is trusted[11]
             and runtime._token_capture_count == 1
@@ -344,11 +362,15 @@ class _D4EncoderFinalizeOwner:
             (_gate5._ACTIVE_COMPLETIONS, trusted[5]),
             (_gate4._ACTIVE_CARRIERS, trusted[4]),
             (_gradient._ACTIVE_RECEIPTS, trusted[7]),
-            (trusted[5].normalized_completion_escrow.registry, trusted[3]),
         ):
             capability_entry = registry.get(id(value))
             if capability_entry is not None and capability_entry[0]() is self:
                 registry.pop(id(value))
+        completion_snapshot = trusted[17]
+        completion_registry = completion_snapshot.normalized.registry
+        completion_entry = completion_registry.get(id(trusted[3]))
+        if completion_entry is completion_snapshot.completion_entry:
+            completion_registry.pop(id(trusted[3]))
         self._state = _RETIRED
         self._restore_started = True
         self._finalized = True
@@ -412,7 +434,7 @@ class _D4EncoderCommitHandoff:
             raise MdpStateError("MDP: Gate7 cleanup handoff is exact and active.")
         trusted = entry[1:]
         runtime, authority, ready, token, iteration, token_authority, idle_slots = trusted
-        runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
         ready_entry = _ACTIVE_READY.get(id(ready))
         if (
             self._state is not _ACTIVE
@@ -459,9 +481,9 @@ class _D4EncoderCommitHandoff:
         runtime, _authority, ready, token = trusted[:4]
         _ACTIVE_COMMIT_HANDOFFS.pop(id(self))
         _RETIRED_COMMIT_HANDOFFS[id(self)] = weakref.ref(self)
-        runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
         if runtime_entry is not None and runtime_entry[1]() is self:
-            _replay._forward._ACTIVE_RUNTIME_OWNERS.pop(id(runtime))
+            _forward._ACTIVE_RUNTIME_OWNERS.pop(id(runtime))
         ready_entry = _ACTIVE_READY.get(id(ready))
         if ready_entry is not None and ready_entry[0]() is self:
             _ACTIVE_READY.pop(id(ready))
@@ -507,24 +529,26 @@ def _claim_for_commit(
         raise MdpStateError("MDP: Gate7 cleanup claims exact Gate6 registries.")
     prior = owner_entry[1:-2]
     runtime, token, iteration, token_authority = prior[0], prior[11], prior[12], prior[13]
+    completion_snapshot = prior[17]
+    completion_registry = completion_snapshot.normalized.registry
     idle_slots = (
         (_ACTIVE_OWNERS, id(owner)),
         (_gate5._ACTIVE_COMPLETIONS, id(prior[5])),
         (_gate4._ACTIVE_CARRIERS, id(prior[4])),
         (_gradient._ACTIVE_RECEIPTS, id(prior[7])),
-        (_replay._ACTIVE_COMPLETIONS, id(prior[3])),
+        (completion_registry, id(prior[3])),
     )
     trusted = (runtime, authority, ready, token, iteration, token_authority, idle_slots)
     handoff = _D4EncoderCommitHandoff(trusted, _COMMIT_HANDOFF_SEAL)
     reference = weakref.ref(handoff)
-    runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+    runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
     capability_entries = tuple(
         (registry, value, registry.get(id(value)))
         for registry, value in (
             (_gate5._ACTIVE_COMPLETIONS, prior[5]),
             (_gate4._ACTIVE_CARRIERS, prior[4]),
             (_gradient._ACTIVE_RECEIPTS, prior[7]),
-            (_replay._ACTIVE_COMPLETIONS, prior[3]),
+            (completion_registry, prior[3]),
         )
     )
     if (
@@ -535,11 +559,12 @@ def _claim_for_commit(
             entry is None or entry[0]() is not owner
             for _registry, _value, entry in capability_entries
         )
+        or completion_registry.get(id(prior[3])) is not completion_snapshot.completion_entry
     ):
         raise MdpStateError("MDP: Gate7 cleanup retains every exact Gate6 capability.")
     handoff_entry = (reference, *trusted)
     _ACTIVE_COMMIT_HANDOFFS[id(handoff)] = handoff_entry
-    _replay._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
+    _forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
     _ACTIVE_READY[id(ready)] = (reference, ready)
     object.__setattr__(ready, "owner", handoff)
     for registry, value, _entry in capability_entries:
@@ -592,7 +617,7 @@ def _claim_for_commit(
 def run_repeated_d4_encoder_gradient_finalize(
     predecessor: _gate5._D4EncoderSelectedBackwardOwner,
     authority: _DynamicIterationAuthority,
-    completion: _replay._D4FixedDecoderCompletion,
+    completion: Any,
     *,
     byte_generator=None,
 ) -> _D4EncoderOnlyCommitReady:
@@ -619,11 +644,12 @@ def run_repeated_d4_encoder_gradient_finalize(
         if prior_entry is None or prior_entry[0]() is not predecessor:
             raise MdpStateError("MDP: Gate6 claims its exact Gate5 registry.")
         prior = prior_entry[1:]
-        runtime, token, operations = prior[0], completion.globally_reduced_num_tokens, prior[10]
+        normalized = prior[5].normalized_completion_escrow
+        runtime, token, operations = prior[0], normalized.provenance.token, prior[10]
         token_descriptor = _token_authority(token) if isinstance(token, torch.Tensor) else ()
         if (
-            type(operations) is not _replay._forward._D4EncoderForwardOperations
-            or operations._seal is not _replay._forward._OPERATIONS_SEAL
+            type(operations) is not _forward._D4EncoderForwardOperations
+            or operations._seal is not _forward._OPERATIONS_SEAL
         ):
             raise MdpStateError("MDP: Gate6 retains exact runtime, token, and encoder operations.")
         iteration = runtime._iteration
@@ -637,17 +663,15 @@ def run_repeated_d4_encoder_gradient_finalize(
             operations.encoder_ddp,
             finalize,
             operations.release,
-            completion._owner,
         )
         successor = _D4EncoderFinalizeOwner(trusted, _OWNER_SEAL)
         successor._restore_started = True
         reference = weakref.ref(successor)
-        runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
         complete_entry = _gate5._ACTIVE_COMPLETIONS.get(id(prior[5]))
         carrier_entry = _gate4._ACTIVE_CARRIERS.get(id(prior[4]))
         receipt_entry = _gradient._ACTIVE_RECEIPTS.get(id(prior[7]))
         owner_escrow = _gate5._TRUSTED_OWNER_ESCROWS.get(id(predecessor))
-        normalized = prior[5].normalized_completion_escrow
         replay_entry = normalized.registry.get(id(prior[3]))
         if (
             runtime_entry is None
@@ -663,12 +687,17 @@ def run_repeated_d4_encoder_gradient_finalize(
             or replay_entry is not owner_escrow.decoder_completion_entry
         ):
             raise MdpStateError("MDP: Gate6 claims every exact predecessor capability.")
-        successor_entry = (reference, *trusted, True, False)
         migrated_runtime = (runtime, reference)
         migrated_complete = (reference, *complete_entry[1:])
         migrated_carrier = (reference, *carrier_entry[1:])
         migrated_receipt = (reference, *receipt_entry[1:])
         migrated_replay = (reference, *replay_entry[1:])
+        completion_snapshot = _Gate6CompletionSnapshot(
+            normalized, migrated_replay, _COMPLETION_SNAPSHOT_SEAL
+        )
+        trusted = (*trusted, completion_snapshot)
+        successor._trusted = trusted
+        successor_entry = (reference, *trusted, True, False)
         predecessor._claim_for_gradient_finalize(
             successor,
             _ACTIVE_OWNERS,

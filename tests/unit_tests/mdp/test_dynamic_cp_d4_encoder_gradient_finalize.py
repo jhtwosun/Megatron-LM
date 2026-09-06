@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from megatron.core.mdp import dynamic_cp_bridge_transport as bridge_transport
+from megatron.core.mdp import dynamic_cp_d4_dynamic_decoder_replay as dynamic_replay_api
 from megatron.core.mdp import dynamic_cp_d4_encoder_backward_authorization as gate4
 from megatron.core.mdp import dynamic_cp_d4_encoder_gradient as gradient_api
 from megatron.core.mdp import dynamic_cp_d4_encoder_gradient_finalize as api
@@ -64,7 +65,15 @@ def _runtime():
     return runtime
 
 
-def _parts(monkeypatch, *, role="member", restore_error=None, cleanup_error=False, runtime=None):
+def _parts(
+    monkeypatch,
+    *,
+    role="member",
+    restore_error=None,
+    cleanup_error=False,
+    runtime=None,
+    decoder_mode="fixed",
+):
     runtime = runtime or _runtime()
     authority = SimpleNamespace()
     binding = SimpleNamespace()
@@ -91,9 +100,32 @@ def _parts(monkeypatch, *, role="member", restore_error=None, cleanup_error=Fals
         dynamic_binding = None
         handle = None
     completion_owner = object()
-    completion = replay_api._D4FixedDecoderCompletion(
-        authority, token, completion_owner, replay_api._COMPLETION_SEAL
+    predecessor_entry = None if decoder_mode == "fixed" else object()
+    completion_lifecycle = None if decoder_mode == "fixed" else object()
+    completion_registry = (
+        replay_api._ACTIVE_COMPLETIONS
+        if decoder_mode == "fixed"
+        else dynamic_replay_api._ACTIVE_COMPLETIONS
     )
+    if decoder_mode == "fixed":
+        completion = replay_api._D4FixedDecoderCompletion(
+            authority, token, completion_owner, replay_api._COMPLETION_SEAL
+        )
+        token_descriptor = replay_api._tensor_descriptor(token)
+        completion_seal = None
+        replay_mode = replay_api
+    else:
+        completion = dynamic_replay_api._D4DynamicDecoderCompletion(
+            authority,
+            token,
+            completion_owner,
+            predecessor_entry,
+            completion_lifecycle,
+            dynamic_replay_api._COMPLETION_SEAL,
+        )
+        token_descriptor = dynamic_replay_api._tensor_descriptor(token)
+        completion_seal = dynamic_replay_api._GRADIENT_COMPLETION_ENTRY_SEAL
+        replay_mode = dynamic_replay_api
     received = MappingProxyType({})
     exchange = PreparedDynamicBridgeExchange(
         BridgePhase.GRADIENT,
@@ -129,21 +161,18 @@ def _parts(monkeypatch, *, role="member", restore_error=None, cleanup_error=Fals
             authority, completion, receipt, selected_ranks, text_only, gate4._EMPTY_SEAL
         )
     provenance = gradient_api._D4ReplayGradientProvenance(
-        replay_api,
+        replay_mode,
         completion_owner,
-        None,
-        None,
+        predecessor_entry,
+        completion_lifecycle,
         token,
-        replay_api._tensor_descriptor(token),
+        token_descriptor,
         operations.carrier.acquire,
         operations.carrier.release,
         gradient_api._PROVENANCE_SEAL,
     )
     normalized = gate5._NormalizedDecoderCompletionToken(
-        replay_api._ACTIVE_COMPLETIONS,
-        provenance.release,
-        provenance,
-        gate5._NORMALIZED_COMPLETION_SEAL,
+        completion_registry, provenance.release, provenance, gate5._NORMALIZED_COMPLETION_SEAL
     )
     backward_completion = gate5._D4EncoderBackwardComplete(
         authority, completion, carrier, selected, text_only, gate5._COMPLETE_SEAL, normalized
@@ -168,13 +197,20 @@ def _parts(monkeypatch, *, role="member", restore_error=None, cleanup_error=Fals
     owner = gate5._D4EncoderSelectedBackwardOwner(trusted, gate5._OWNER_SEAL)
     owner._backward_done = True
     reference = weakref.ref(owner)
-    completion_entry = (
-        reference,
-        completion,
-        authority,
-        token,
-        replay_api._tensor_descriptor(token),
-    )
+    if decoder_mode == "fixed":
+        completion_entry = (reference, completion, authority, token, token_descriptor)
+    else:
+        completion_entry = (
+            reference,
+            completion,
+            completion_owner,
+            predecessor_entry,
+            completion_lifecycle,
+            authority,
+            token,
+            token_descriptor,
+            completion_seal,
+        )
     owner_entry = (reference, *trusted)
     backward_completion_entry = (reference, backward_completion, selected, text_only, normalized)
     gate5._ACTIVE_OWNERS[id(owner)] = owner_entry
@@ -198,7 +234,7 @@ def _parts(monkeypatch, *, role="member", restore_error=None, cleanup_error=Fals
         exchange,
         received,
     )
-    replay_api._ACTIVE_COMPLETIONS[id(completion)] = completion_entry
+    completion_registry[id(completion)] = completion_entry
     runtime_entry = (runtime, reference)
     replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = runtime_entry
     owner_escrow = gate5._OwnerEscrow(
@@ -250,6 +286,7 @@ def _parts(monkeypatch, *, role="member", restore_error=None, cleanup_error=Fals
         authority=authority,
         binding=binding,
         token=token,
+        completion=completion,
         owner=owner,
         dynamic_binding=dynamic_binding,
         handle=handle,
@@ -259,13 +296,16 @@ def _parts(monkeypatch, *, role="member", restore_error=None, cleanup_error=Fals
         finalizes=finalizes,
         events=events,
         encoder_ddp=encoder_ddp,
+        completion_registry=completion_registry,
+        decoder_mode=decoder_mode,
         require_calls=require_calls,
     )
 
 
+@pytest.mark.parametrize("decoder_mode", ("fixed", "dynamic"))
 @pytest.mark.parametrize("role", ("member", "nonmember", "text"))
-def test_gate6_restores_then_finalizes_after_world_domain_world(monkeypatch, role):
-    parts = _parts(monkeypatch, role=role)
+def test_gate6_restores_then_finalizes_after_world_domain_world(monkeypatch, role, decoder_mode):
+    parts = _parts(monkeypatch, role=role, decoder_mode=decoder_mode)
     marker = object()
     ready = api.run_repeated_d4_encoder_gradient_finalize(
         parts.owner, parts.authority, parts.owner.completion, byte_generator=marker
@@ -275,6 +315,10 @@ def test_gate6_restores_then_finalizes_after_world_domain_world(monkeypatch, rol
     assert parts.dynamic_binding is None or parts.dynamic_binding.active is False
     assert parts.finalizes == [(parts.encoder_ddp, parts.token, tuple(parts.events))]
     assert ready.owner.require_commit_ready(ready) is ready
+    assert len(parts.completion_registry[id(parts.completion)]) == (
+        5 if decoder_mode == "fixed" else 9
+    )
+    assert parts.completion_registry[id(parts.completion)][0]() is ready.owner
     assert parts.runtime._captured_num_tokens is parts.token
     assert parts.runtime._token_capture_count == 1 and parts.runtime._token_consumed is True
     assert parts.require_calls and all(value is parts.owner for value in parts.require_calls)
@@ -485,9 +529,10 @@ def test_callback_mutation_blocks_physical_finalize_and_capability(monkeypatch, 
         api._ACTIVE_OWNERS.pop(owner_id)
 
 
+@pytest.mark.parametrize("decoder_mode", ("fixed", "dynamic"))
 @pytest.mark.parametrize("mode", ("first", "final", "substitute", "reenter"))
-def test_rejection_substitution_reentry_cleanup_and_fresh_retry(monkeypatch, mode):
-    parts = _parts(monkeypatch)
+def test_rejection_substitution_reentry_cleanup_and_fresh_retry(monkeypatch, mode, decoder_mode):
+    parts = _parts(monkeypatch, decoder_mode=decoder_mode)
     primary = MdpPlanError(f"{mode} rejected")
 
     def runner(_binding, _authority, **kwargs):
@@ -513,11 +558,60 @@ def test_rejection_substitution_reentry_cleanup_and_fresh_retry(monkeypatch, mod
     assert parts.restores == [None] and parts.finalizes == []
     assert id(parts.runtime) not in replay_api._forward._ACTIVE_RUNTIME_OWNERS
     if mode == "first":
-        fresh = _parts(monkeypatch, runtime=parts.runtime)
+        fresh = _parts(monkeypatch, runtime=parts.runtime, decoder_mode=decoder_mode)
         ready = api.run_repeated_d4_encoder_gradient_finalize(
             fresh.owner, fresh.authority, fresh.owner.completion
         )
         ready.owner.abort()
+
+
+@pytest.mark.parametrize("decoder_mode", ("fixed", "dynamic"))
+@pytest.mark.parametrize("mutation", ("delete", "replace", "registry", "clone"))
+def test_gate6_cleanup_uses_captured_normalized_registry_after_final_world_mutation(
+    monkeypatch, decoder_mode, mutation
+):
+    parts = _parts(monkeypatch, decoder_mode=decoder_mode)
+    foreign = object()
+
+    def runner(_binding, _authority, **kwargs):
+        prepared = kwargs["prepare"]()
+        prepared = kwargs["domain_collective"](prepared)
+        if mutation == "delete":
+            object.__delattr__(prepared.owner.backward_completion, "normalized_completion_escrow")
+        elif mutation == "replace":
+            object.__setattr__(
+                prepared.owner.backward_completion, "normalized_completion_escrow", object()
+            )
+        elif mutation == "registry":
+            parts.completion_registry[id(parts.completion)] = foreign
+        else:
+            current = parts.completion_registry[id(parts.completion)]
+            foreign_entry = (weakref.ref(prepared.owner), *current[1:])
+            assert foreign_entry is not current and len(foreign_entry) == len(current)
+            parts.completion_registry[id(parts.completion)] = foreign_entry
+            nonlocal_foreign_entry.append(foreign_entry)
+        return prepared
+
+    nonlocal_foreign_entry = []
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", runner)
+    with pytest.raises(MdpTaskFatalError, match="after Gate6 final WORLD"):
+        api.run_repeated_d4_encoder_gradient_finalize(
+            parts.owner, parts.authority, parts.completion
+        )
+    assert parts.finalizes == [] and api._ACTIVE_READY == {}
+    assert parts.operations.released == list(parts.buffers)
+    assert id(parts.runtime) not in replay_api._forward._ACTIVE_RUNTIME_OWNERS
+    if mutation in ("registry", "clone"):
+        expected_foreign = foreign if mutation == "registry" else nonlocal_foreign_entry[0]
+        assert parts.completion_registry[id(parts.completion)] is expected_foreign
+        del parts.completion_registry[id(parts.completion)]
+    else:
+        assert id(parts.completion) not in parts.completion_registry
+    fresh = _parts(monkeypatch, runtime=parts.runtime, decoder_mode=decoder_mode)
+    ready = api.run_repeated_d4_encoder_gradient_finalize(
+        fresh.owner, fresh.authority, fresh.completion
+    )
+    ready.owner.abort()
 
 
 def test_physical_failure_is_task_fatal_without_capability(monkeypatch):
@@ -609,9 +703,12 @@ def test_live_ready_field_substitution_cannot_leak_registered_capability(monkeyp
     assert parts.runtime._captured_num_tokens is None
 
 
+@pytest.mark.parametrize("decoder_mode", ("fixed", "dynamic"))
 @pytest.mark.parametrize("role", ("member", "nonmember", "text"))
-def test_claim_for_commit_releases_gate6_resources_and_preserves_token(monkeypatch, role):
-    parts = _parts(monkeypatch, role=role)
+def test_claim_for_commit_releases_gate6_resources_and_preserves_token(
+    monkeypatch, role, decoder_mode
+):
+    parts = _parts(monkeypatch, role=role, decoder_mode=decoder_mode)
     ready = api.run_repeated_d4_encoder_gradient_finalize(
         parts.owner, parts.authority, parts.owner.completion
     )
@@ -633,7 +730,7 @@ def test_claim_for_commit_releases_gate6_resources_and_preserves_token(monkeypat
     assert id(backward_completion) not in gate5._ACTIVE_COMPLETIONS
     assert id(carrier) not in gate4._ACTIVE_CARRIERS
     assert id(receipt) not in gradient_api._ACTIVE_RECEIPTS
-    assert id(completion) not in replay_api._ACTIVE_COMPLETIONS
+    assert id(completion) not in parts.completion_registry
     handoff.abort()
     assert parts.runtime._captured_num_tokens is None
     assert parts.runtime._token_capture_count == 0

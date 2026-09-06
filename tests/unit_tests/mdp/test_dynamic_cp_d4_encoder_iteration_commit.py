@@ -136,13 +136,17 @@ def _parts(monkeypatch, runtime=None, *, cleanup_error=False):
         encoder_ddp,
         gate6._encoder.finalize_encoder_grads,
         release,
-        completion._owner,
     )
     owner = gate6._D4EncoderFinalizeOwner(trusted, gate6._OWNER_SEAL)
     owner._restore_started = True
     owner._finalized = True
     reference = weakref.ref(owner)
     completion_entry = (reference, completion, authority, token, replay._tensor_descriptor(token))
+    completion_snapshot = gate6._Gate6CompletionSnapshot(
+        normalized, completion_entry, gate6._COMPLETION_SNAPSHOT_SEAL
+    )
+    trusted = (*trusted, completion_snapshot)
+    owner._trusted = trusted
     gate6._ACTIVE_OWNERS[id(owner)] = (reference, *trusted, True, True)
     gate5._ACTIVE_COMPLETIONS[id(backward_completion)] = (
         reference,
