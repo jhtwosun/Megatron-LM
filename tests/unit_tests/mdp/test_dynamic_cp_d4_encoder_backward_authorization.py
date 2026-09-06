@@ -204,6 +204,7 @@ def test_gate4_arms_exact_member_follower_nonmember_and_text_carriers(
     )
     assert parts.events == [("begin", 4, marker), "world0", "domain", "world1"]
     assert owner.require() is owner
+    assert owner.binding is parts.binding
     assert owner.receipt is parts.receipt and owner.completion is parts.completion
     assert replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)][1]() is owner
     with pytest.raises(MdpStateError, match="gradient route owner is retired"):
@@ -325,6 +326,19 @@ def test_authorized_owner_hostile_field_cleanup_uses_registry_escrow(monkeypatch
     with pytest.raises(MdpStateError, match="retired"):
         owner.abort()
     assert any("integrity" in note for note in primary.__notes__)
+
+
+def test_authorized_owner_rejects_binding_substitution_and_trusted_abort(monkeypatch):
+    parts = _parts(monkeypatch)
+    owner = api.run_repeated_d4_encoder_backward_authorization(
+        parts.predecessor, parts.authority, parts.completion
+    )
+    owner.binding = SimpleNamespace(global_rank=parts.binding.global_rank)
+    with pytest.raises(MdpStateError, match="sealed resources"):
+        owner.require()
+    owner.abort()
+    assert id(parts.runtime) not in replay_api._forward._ACTIVE_RUNTIME_OWNERS
+    assert parts.operations.released == list(parts.all_buffers)
 
 
 @pytest.mark.parametrize("mutation", ("binding", "released", "backward", "received"))

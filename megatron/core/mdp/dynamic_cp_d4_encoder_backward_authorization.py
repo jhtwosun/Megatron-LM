@@ -111,6 +111,7 @@ class _D4EncoderBackwardAuthorizationOwner:
 
     __slots__ = (
         "__weakref__",
+        "binding",
         "authority",
         "completion",
         "receipt",
@@ -126,6 +127,7 @@ class _D4EncoderBackwardAuthorizationOwner:
         if seal is not _OWNER_SEAL:
             raise MdpConfigurationError("MDP: encoder backward owner is privately minted.")
         self._runtime, self.authority, self.completion, self.receipt, self.carrier = trusted[:5]
+        self.binding = trusted[9]
         self._trusted = trusted
         self._state = _ACTIVE
         self._prepared_reference = None
@@ -208,10 +210,15 @@ class _D4EncoderBackwardAuthorizationOwner:
                 raise MdpStateError("MDP: encoder backward owner is retired.")
             raise MdpStateError("MDP: encoder backward owner is the exact active owner.")
         current = (self._runtime, self.authority, self.completion, self.receipt, self.carrier)
-        if self._state is not _ACTIVE or any(
-            actual is not expected for actual, expected in zip(current, entry[1:6], strict=True)
+        if (
+            self._state is not _ACTIVE
+            or self.binding is not entry[10]
+            or any(
+                actual is not expected for actual, expected in zip(current, entry[1:6], strict=True)
+            )
         ):
             raise MdpStateError("MDP: encoder backward owner retains sealed resources.")
+        _snapshot_local_authority(self.binding, self.authority)
         carrier_entry = _ACTIVE_CARRIERS.get(id(self.carrier))
         receipt_entry = _gradient._ACTIVE_RECEIPTS.get(id(self.receipt))
         completion_entry = _replay._ACTIVE_COMPLETIONS.get(id(self.completion))
@@ -304,9 +311,13 @@ class _D4EncoderBackwardAuthorizationOwner:
                 object.__getattribute__(self, name)
                 for name in ("_runtime", "authority", "completion", "receipt", "carrier")
             )
-            if object.__getattribute__(self, "_state") is not _ACTIVE or any(
-                actual is not expected
-                for actual, expected in zip(current, trusted[:5], strict=True)
+            if (
+                object.__getattribute__(self, "_state") is not _ACTIVE
+                or object.__getattribute__(self, "binding") is not trusted[9]
+                or any(
+                    actual is not expected
+                    for actual, expected in zip(current, trusted[:5], strict=True)
+                )
             ):
                 integrity_error = MdpStateError(
                     "MDP: encoder backward owner retains sealed resources."
@@ -323,6 +334,7 @@ class _D4EncoderBackwardAuthorizationOwner:
         _gradient._ACTIVE_RECEIPTS.pop(id(trusted[3]), None)
         _replay._ACTIVE_COMPLETIONS.pop(id(trusted[2]), None)
         self._state = _RETIRED
+        self.binding = None
         self.authority = None
         self.completion = None
         self.receipt = None
@@ -445,6 +457,7 @@ def run_repeated_d4_encoder_backward_authorization(
             trusted[8],
             trusted[9],
             trusted[10],
+            binding,
         )
         prepared_owner = _D4EncoderBackwardAuthorizationOwner(owner_trusted, _OWNER_SEAL)
         prepared_owner._prepare_from(predecessor)
