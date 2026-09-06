@@ -3,6 +3,7 @@
 """Private D3 metadata transport wire and collective contracts."""
 
 import os
+import struct
 from datetime import timedelta
 from importlib import import_module
 from types import MappingProxyType
@@ -27,7 +28,7 @@ def _transport_api():
     return import_module("megatron.core.mdp.dynamic_cp_d3_metadata_transport")
 
 
-def _source_manifest(lane=0):
+def _source_manifest(lane=0, *, input_dtype=torch.int64):
     sample_id = GlobalSampleId(lane, 0)
     item_id = GlobalVisionItemId(lane, 0)
     sample = DecoderSampleMetadata(
@@ -45,7 +46,7 @@ def _source_manifest(lane=0):
         decoder_offsets=(1,),
     )
     tensors = {
-        "input_ids": torch.arange(4, dtype=torch.int64).view(1, 4),
+        "input_ids": torch.arange(4, dtype=input_dtype).view(1, 4),
         "position_ids": torch.arange(4, dtype=torch.int64).view(1, 4),
     }
     fields = tuple(
@@ -374,6 +375,105 @@ def test_metadata_transport_converges_malformed_body_before_return(monkeypatch):
         )
     assert len(statuses) == 2
     assert statuses[1][2] == 1
+
+
+def test_shared_metadata_core_preserves_legacy_projection_bytes(monkeypatch):
+    api = _transport_api()
+    manifest = _source_manifest()
+    body = api.encode_decoder_source_manifest(manifest)
+    statuses = []
+
+    def status_gather(value, *, timeout_seconds):
+        statuses.append(value)
+        return (value,)
+
+    monkeypatch.setattr(api, "make_precollective_status_gather", lambda **_: status_gather)
+    monkeypatch.setattr(api, "_gather_body", lambda *_, **__: (body,))
+
+    public = api.gather_decoder_source_manifests(
+        manifest,
+        expected_source_lanes=(0,),
+        group=object(),
+        group_ranks=(0,),
+        global_rank=0,
+        device=torch.device("cuda", 0),
+        timeout_seconds=1.0,
+    )
+
+    assert public == api.DecoderMetadataGatherResult(
+        api.build_decoder_global_manifest((manifest,)), {0: 0}
+    )
+    assert statuses[1][3:5] == struct.unpack("<qq", public.global_manifest.digest)
+
+
+def test_shared_metadata_projector_failure_converges_with_exact_local_cause(monkeypatch):
+    api = _transport_api()
+    manifest = _source_manifest()
+    body = api.encode_decoder_source_manifest(manifest)
+    statuses = []
+    original = MdpConfigurationError("projector rejected global schema")
+
+    def status_gather(value, *, timeout_seconds):
+        statuses.append(value)
+        return (value,)
+
+    monkeypatch.setattr(api, "make_precollective_status_gather", lambda **_: status_gather)
+    monkeypatch.setattr(api, "_gather_body", lambda *_, **__: (body,))
+
+    def reject(*_args):
+        raise original
+
+    with pytest.raises(MdpPlanError, match="body decode or global manifest") as caught:
+        api._gather_decoder_source_metadata(
+            manifest,
+            expected_source_lanes=(0,),
+            group=object(),
+            group_ranks=(0,),
+            global_rank=0,
+            device=torch.device("cuda", 0),
+            timeout_seconds=1.0,
+            projector=reject,
+        )
+
+    assert caught.value.__cause__ is original
+    assert len(statuses) == 2
+    assert statuses[1][2:] == (1, 0, 0, 0, statuses[0][-1])
+
+
+def test_public_d3_global_schema_failure_converges_with_exact_cause(monkeypatch):
+    api = _transport_api()
+    manifests = (_source_manifest(0), _source_manifest(1, input_dtype=torch.int32))
+    bodies = tuple(api.encode_decoder_source_manifest(manifest) for manifest in manifests)
+    statuses = []
+
+    def status_gather(value, *, timeout_seconds):
+        statuses.append(value)
+        if len(statuses) == 1:
+            return tuple(
+                (value[0], rank, 0, 1, rank, len(bodies[rank]), value[-1]) for rank in range(2)
+            )
+        return tuple((value[0], rank, *value[2:]) for rank in range(2))
+
+    monkeypatch.setattr(api, "make_precollective_status_gather", lambda **_: status_gather)
+    monkeypatch.setattr(api, "_gather_body", lambda *_, **__: bodies)
+
+    with pytest.raises(MdpPlanError, match="body decode or global manifest") as caught:
+        api.gather_decoder_source_manifests(
+            manifests[0],
+            expected_source_lanes=(0, 1),
+            group=object(),
+            group_ranks=(0, 1),
+            global_rank=0,
+            device=torch.device("cuda", 0),
+            timeout_seconds=1.0,
+        )
+
+    assert type(caught.value.__cause__) is MdpConfigurationError
+    assert str(caught.value.__cause__) == (
+        "MDP: decoder tensor field dtype, device, and leading shape are globally compatible."
+    )
+    assert len(statuses) == 2
+    assert statuses[1][2:6] == (1, 0, 0, 0)
 
 
 @pytest.mark.skipif(

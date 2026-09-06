@@ -5,7 +5,7 @@
 import hashlib
 import math
 import struct
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from types import MappingProxyType
@@ -483,7 +483,7 @@ def _gather_body(
     )
 
 
-def gather_decoder_source_manifests(
+def _gather_decoder_source_metadata(
     local_manifest: DecoderSourceManifest | None,
     *,
     expected_source_lanes: tuple[int, ...],
@@ -494,7 +494,8 @@ def gather_decoder_source_manifests(
     timeout_seconds: float,
     max_manifest_words: int = _MAX_MANIFEST_WORDS,
     local_prepare_error: Exception | None = None,
-) -> DecoderMetadataGatherResult:
+    projector: Callable[[tuple[DecoderSourceManifest, ...], Mapping[int, int]], tuple[Any, bytes]],
+) -> Any:
     """Gather one optional source manifest per expected lane after status consensus.
 
     ``group``, ``group_ranks``, ``global_rank``, and CUDA ``device`` are an
@@ -560,7 +561,7 @@ def gather_decoder_source_manifests(
     rows = _gather_body(
         body, lengths=lengths, group=group, ranks=ranks, device=device, timeout=timeout
     )
-    result: DecoderMetadataGatherResult | None = None
+    result: Any = None
     body_error: Exception | None = None
     try:
         manifests: dict[int, DecoderSourceManifest] = {}
@@ -575,11 +576,13 @@ def gather_decoder_source_manifests(
                 )
             manifests[source_lane] = manifest
             authority[source_lane] = rank
-        result = DecoderMetadataGatherResult(
-            build_decoder_global_manifest(tuple(manifests[lane] for lane in lanes)),
-            {lane: authority[lane] for lane in lanes},
+        result, result_digest = projector(
+            tuple(manifests[lane] for lane in lanes),
+            MappingProxyType({lane: authority[lane] for lane in lanes}),
         )
-        digest_words = struct.unpack("<qq", result.global_manifest.digest)
+        if not isinstance(result_digest, bytes) or len(result_digest) != 16:
+            raise MdpPlanError("MDP: metadata projection returns an exact 16-byte digest.")
+        digest_words = struct.unpack("<qq", result_digest)
     except Exception as error:
         body_error = error
         digest_words = (0, 0)
@@ -605,3 +608,37 @@ def gather_decoder_source_manifests(
         raise body_error
     assert result is not None
     return result
+
+
+def _project_decoder_metadata(
+    manifests: tuple[DecoderSourceManifest, ...], authority: Mapping[int, int]
+) -> tuple[DecoderMetadataGatherResult, bytes]:
+    result = DecoderMetadataGatherResult(build_decoder_global_manifest(manifests), authority)
+    return result, result.global_manifest.digest
+
+
+def gather_decoder_source_manifests(
+    local_manifest: DecoderSourceManifest | None,
+    *,
+    expected_source_lanes: tuple[int, ...],
+    group: Any,
+    group_ranks: tuple[int, ...],
+    global_rank: int,
+    device: torch.device,
+    timeout_seconds: float,
+    max_manifest_words: int = _MAX_MANIFEST_WORDS,
+    local_prepare_error: Exception | None = None,
+) -> DecoderMetadataGatherResult:
+    """Gather one optional source manifest per expected lane after status consensus."""
+    return _gather_decoder_source_metadata(
+        local_manifest,
+        expected_source_lanes=expected_source_lanes,
+        group=group,
+        group_ranks=group_ranks,
+        global_rank=global_rank,
+        device=device,
+        timeout_seconds=timeout_seconds,
+        max_manifest_words=max_manifest_words,
+        local_prepare_error=local_prepare_error,
+        projector=_project_decoder_metadata,
+    )
