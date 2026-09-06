@@ -8,6 +8,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.mdp import dynamic_cp_d4_dynamic_decoder_replay as dynamic_api
 from megatron.core.mdp import dynamic_cp_d4_encoder_forward as forward_api
 from megatron.core.mdp import dynamic_cp_d4_fixed_decoder_replay as replay_api
 from megatron.core.mdp import dynamic_cp_d4_native_schedule as api
@@ -100,6 +101,308 @@ def _aborter(events):
         events.append((owner, error))
 
     return abort
+
+
+def _dynamic_owner(monkeypatch, *, records=("record-0", "record-1")):
+    runtime = SimpleNamespace(device=torch.device("cpu"))
+    authority = object()
+    binding = object()
+    released = []
+    restored = []
+    graph_releases = []
+    leaf = torch.empty(1)
+    buffer = torch.empty(1)
+    operations = SimpleNamespace(release=released.append)
+    handle = SimpleNamespace(release_forward_only=lambda: graph_releases.append(True))
+    binding_owner = SimpleNamespace(restore=lambda primary=None: restored.append(primary))
+    handoff_trusted = (
+        runtime,
+        authority,
+        binding,
+        (0,),
+        object(),
+        object(),
+        object(),
+        SimpleNamespace(receive_buffer=buffer),
+        object(),
+        MappingProxyType({}),
+        handle,
+        False,
+        True,
+        True,
+        binding_owner,
+        (buffer,),
+        operations,
+    )
+    trusted = (
+        runtime,
+        authority,
+        binding,
+        handoff_trusted,
+        lambda **_kwargs: None,
+        operations.release,
+        runtime.device,
+    )
+    owner = dynamic_api._D4DynamicDecoderReplayOwner(trusted, seal=dynamic_api._OWNER_SEAL)
+    reference = weakref.ref(owner)
+    escrow = dynamic_api._OwnerEscrow(reference, None, seal=dynamic_api._OWNER_ESCROW_SEAL)
+    ready = SimpleNamespace(records=records, embedding_leaves=MappingProxyType({"leaf": leaf}))
+    cleanup = dynamic_api._CleanupEscrow(seal=dynamic_api._CLEANUP_ESCROW_SEAL)
+    entry = (reference, *trusted, cleanup, escrow, (leaf,), ready)
+    escrow.entry = entry
+    owner.ready = ready
+    owner.records = records
+    owner.embedding_leaves = ready.embedding_leaves
+    owner._state = dynamic_api._ACTIVE
+    owner._trusted = entry
+    dynamic_api._ACTIVE_OWNERS[id(owner)] = entry
+    dynamic_api._TRUSTED_OWNERS[id(owner)] = entry
+    dynamic_api._OWNER_ESCROWS[id(owner)] = escrow
+    forward_api._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
+    monkeypatch.setattr(dynamic_api, "_snapshot_local_authority", lambda actual, expected: expected)
+    state = SimpleNamespace(
+        records=records,
+        runtime=runtime,
+        released=released,
+        restored=restored,
+        graph_releases=graph_releases,
+        resources=(leaf, buffer),
+    )
+    return owner, state
+
+
+@pytest.mark.parametrize("container", (lambda value: value, lambda value: [value]))
+def test_dynamic_frontend_preserves_native_result_record_order_and_token(monkeypatch, container):
+    owner, state = _dynamic_owner(monkeypatch)
+    finalizer = api._wrap_d4_native_finalizer(lambda _model, _token: None)
+    native_result = object()
+    seen = []
+
+    def schedule(*, data_iterator, num_microbatches, forward_only):
+        assert forward_only is False
+        assert num_microbatches == len(state.records)
+        iterator = data_iterator[0] if isinstance(data_iterator, list) else data_iterator
+        seen.extend(next(iterator) for _ in range(num_microbatches))
+        finalizer("model", torch.tensor(5.0))
+        return native_result
+
+    result = api._run_d4_dynamic_native_schedule(
+        schedule,
+        owner,
+        _aborter([]),
+        data_iterator=container(iter(("raw",))),
+        num_microbatches=99,
+        forward_only=False,
+    )
+
+    assert type(result) is api._D4DynamicNativeScheduleSuccess
+    assert result.native_result is native_result
+    lifecycle = dynamic_api._ACTIVE_OWNERS[id(owner)][-3]
+    assert result.completion is lifecycle.completion
+    assert result.completion.globally_reduced_num_tokens is lifecycle.token
+    assert seen == list(state.records)
+    owner.abort()
+
+
+@pytest.mark.parametrize(
+    ("data_iterator", "forward_only", "message"),
+    (([iter(()), iter(())], False, "VPP1 exactly"), (iter(()), True, "training-only")),
+)
+def test_dynamic_frontend_rejects_vpp_and_forward_only_before_cursor(
+    monkeypatch, data_iterator, forward_only, message
+):
+    owner, state = _dynamic_owner(monkeypatch)
+    schedule_calls = []
+    aborts = []
+
+    def schedule(*, data_iterator, num_microbatches, forward_only):
+        schedule_calls.append((data_iterator, num_microbatches, forward_only))
+
+    with pytest.raises(MdpConfigurationError, match=message):
+        api._run_d4_dynamic_native_schedule(
+            schedule,
+            owner,
+            _aborter(aborts),
+            data_iterator=data_iterator,
+            num_microbatches=1,
+            forward_only=forward_only,
+        )
+    assert dynamic_api._ACTIVE_OWNERS[id(owner)][-3].cursor is None
+    assert schedule_calls == []
+    assert aborts == []
+    owner.abort()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "before",
+        "finalizer",
+        "after",
+        "missing",
+        "duplicate",
+        "underconsume",
+        "overconsume",
+        "mutated",
+    ),
+)
+def test_dynamic_frontend_failure_retires_sink_aborts_once_and_allows_fresh_run(
+    monkeypatch, failure
+):
+    owner, _state = _dynamic_owner(monkeypatch, records=("record",))
+    aborts = []
+    nested_aborts = []
+    primary = RuntimeError(f"dynamic native {failure}")
+
+    def native_finalizer(_model, _token):
+        if failure == "finalizer":
+            raise primary
+
+    finalizer = api._wrap_d4_native_finalizer(native_finalizer)
+
+    def scheduled_abort(actual, error):
+        assert api._ACTIVE_TOKEN_SINK is None
+        assert api._TOKEN_SINKS == {}
+        if failure == "before":
+            with pytest.raises(MdpStateError, match="one active invocation"):
+                api._run_d4_dynamic_native_schedule(
+                    schedule,
+                    actual,
+                    _aborter(nested_aborts),
+                    data_iterator=iter(("raw",)),
+                    num_microbatches=1,
+                    forward_only=False,
+                )
+        actual.abort(error)
+        aborts.append((actual, error))
+
+    def schedule(*, data_iterator, num_microbatches, forward_only):
+        token = None
+        if failure != "underconsume":
+            next(data_iterator)
+        if failure == "overconsume":
+            next(data_iterator)
+        if failure == "before":
+            raise primary
+        if failure != "missing":
+            token = torch.tensor(1.0)
+            finalizer("model", token)
+        if failure == "duplicate":
+            finalizer("model", torch.tensor(2.0))
+        if failure == "mutated":
+            token.add_(1)
+        if failure == "after":
+            raise primary
+        return "bad"
+
+    expected = RuntimeError if failure in ("before", "finalizer", "after") else MdpStateError
+    with pytest.raises(expected) as caught:
+        api._run_d4_dynamic_native_schedule(
+            schedule,
+            owner,
+            scheduled_abort,
+            data_iterator=iter(("raw",)),
+            num_microbatches=1,
+            forward_only=False,
+        )
+    if expected is RuntimeError:
+        assert caught.value is primary
+    assert aborts == [(owner, caught.value)]
+    assert nested_aborts == []
+    assert api._ACTIVE_TOKEN_SINK is None
+    assert api._TOKEN_SINKS == {}
+    assert api._ACTIVE_BOUNDARY is None
+    assert api._BOUNDARIES == {}
+    assert dynamic_api._ACTIVE_CURSORS == {}
+    assert dynamic_api._ACTIVE_COMPLETIONS == {}
+    assert _state.graph_releases == [True]
+    assert len(_state.restored) == 1
+    assert _state.released == list(_state.resources)
+
+    fresh, _fresh_state = _dynamic_owner(monkeypatch, records=("fresh",))
+    fresh_finalizer = api._wrap_d4_native_finalizer(lambda _model, _token: None)
+
+    def retry(*, data_iterator, num_microbatches, forward_only):
+        next(data_iterator)
+        fresh_finalizer("model", torch.tensor(3.0))
+        return "fresh"
+
+    fresh_result = api._run_d4_dynamic_native_schedule(
+        retry,
+        fresh,
+        _aborter([]),
+        data_iterator=iter(("raw",)),
+        num_microbatches=1,
+        forward_only=False,
+    )
+    assert fresh_result.native_result == "fresh"
+    fresh.abort()
+
+
+def test_dynamic_cursor_registry_substitution_is_preserved_during_trusted_abort(monkeypatch):
+    owner, state = _dynamic_owner(monkeypatch, records=("record",))
+    finalizer = api._wrap_d4_native_finalizer(lambda _model, _token: None)
+    foreign = (object(),)
+    aborts = []
+
+    def schedule(*, data_iterator, num_microbatches, forward_only):
+        cursor = data_iterator
+        next(cursor)
+        dynamic_api._ACTIVE_CURSORS[id(cursor)] = foreign
+        finalizer("model", torch.tensor(1.0))
+
+    def abort(actual, error):
+        actual.abort(error)
+        aborts.append((actual, error))
+
+    with pytest.raises(MdpStateError, match="cursor exhaustion") as caught:
+        api._run_d4_dynamic_native_schedule(
+            schedule,
+            owner,
+            abort,
+            data_iterator=iter(("raw",)),
+            num_microbatches=1,
+            forward_only=False,
+        )
+
+    assert aborts == [(owner, caught.value)]
+    assert dynamic_api._ACTIVE_CURSORS[next(iter(dynamic_api._ACTIVE_CURSORS))] is foreign
+    assert state.released == list(state.resources)
+    assert state.graph_releases == [True]
+    assert len(state.restored) == 1
+    dynamic_api._ACTIVE_CURSORS.clear()
+
+
+def test_dynamic_completion_registry_substitution_aborts_without_foreign_mutation(monkeypatch):
+    owner, state = _dynamic_owner(monkeypatch, records=("record",))
+    finalizer = api._wrap_d4_native_finalizer(lambda _model, _token: None)
+    original = dynamic_api._D4DynamicDecoderReplayOwner.prepare_completion
+    foreign = (object(),)
+
+    def substitute(self, cursor, schedule_return):
+        completion = original(self, cursor, schedule_return)
+        dynamic_api._ACTIVE_COMPLETIONS[id(completion)] = foreign
+        return completion
+
+    monkeypatch.setattr(dynamic_api._D4DynamicDecoderReplayOwner, "prepare_completion", substitute)
+
+    def schedule(*, data_iterator, num_microbatches, forward_only):
+        next(data_iterator)
+        finalizer("model", torch.tensor(1.0))
+
+    with pytest.raises(MdpStateError, match="exact owner and token"):
+        api._run_d4_dynamic_native_schedule(
+            schedule,
+            owner,
+            lambda actual, error: actual.abort(error),
+            data_iterator=iter(("raw",)),
+            num_microbatches=1,
+            forward_only=False,
+        )
+
+    assert dynamic_api._ACTIVE_COMPLETIONS[next(iter(dynamic_api._ACTIVE_COMPLETIONS))] is foreign
+    assert state.released == list(state.resources)
+    dynamic_api._ACTIVE_COMPLETIONS.clear()
 
 
 def _real_owner(monkeypatch, *, runtime=None, records=("record",)):

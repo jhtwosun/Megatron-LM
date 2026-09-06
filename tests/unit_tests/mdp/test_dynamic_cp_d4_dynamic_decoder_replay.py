@@ -496,6 +496,282 @@ def test_dynamic_gate2_reuses_one_captured_group_across_microbatches(monkeypatch
     owner.abort()
 
 
+@pytest.mark.parametrize("cp_size", (1, 2, 4))
+def test_dynamic_replay_lifecycle_uses_exact_records_token_and_completion(monkeypatch, cp_size):
+    parts = _parts(monkeypatch, cp_size=cp_size)
+    owner = _run(parts)
+    cursor = owner.replay_cursor()
+
+    assert tuple(next(cursor) for _ in owner.records) == owner.records
+    assert owner._trusted[-4].cursor is cursor
+    assert owner._trusted[-4].cursor_entry is parts.api._ACTIVE_CURSORS[id(cursor)]
+    with pytest.raises(MdpStateError, match="permits exactly"):
+        next(cursor)
+    token = torch.tensor(7, device=parts.runtime.device)
+    owner.capture_global_num_tokens(token)
+    schedule_return = owner.mark_schedule_returned(cursor)
+    completion = owner.prepare_completion(cursor, schedule_return)
+
+    assert owner.require_completion(completion) is completion
+    assert completion.authority is parts.authority
+    assert completion.globally_reduced_num_tokens is token
+    assert owner.prepare_completion(cursor, schedule_return) is completion
+    owner.abort()
+    assert parts.api._ACTIVE_CURSORS == {}
+    assert parts.api._ACTIVE_COMPLETIONS == {}
+
+
+def test_dynamic_replay_cursor_rejects_cleanup_escrow_entry_substitution(monkeypatch):
+    parts = _parts(monkeypatch)
+    owner = _run(parts)
+    cursor = owner.replay_cursor()
+    cleanup = owner._trusted[-4]
+    exact_entry = cleanup.cursor_entry
+    cleanup.cursor_entry = (*exact_entry[:5], 1, exact_entry[6])
+
+    with pytest.raises(MdpStateError, match="exact active cursor"):
+        next(cursor)
+
+    owner.abort()
+    assert id(cursor) not in parts.api._ACTIVE_CURSORS
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    assert parts.allocator.released == [
+        *(value for _, value in parts.allocator.acquired),
+        *parts.old_buffers,
+    ]
+
+
+@pytest.mark.parametrize("cp_size", (1, 2, 4))
+def test_real_dynamic_owner_runs_unchanged_native_schedule(monkeypatch, cp_size):
+    parts = _parts(monkeypatch, cp_size=cp_size)
+    owner = _run(parts)
+    native = import_module("megatron.core.mdp.dynamic_cp_d4_native_schedule")
+    finalizer = native._wrap_d4_native_finalizer(lambda _model, _token: None)
+    seen = []
+    native_result = object()
+
+    def schedule(*, data_iterator, num_microbatches, forward_only):
+        assert forward_only is False
+        assert num_microbatches == len(owner.records)
+        seen.extend(next(data_iterator) for _ in range(num_microbatches))
+        finalizer("model", torch.tensor(9, device=parts.runtime.device))
+        return native_result
+
+    success = native._run_d4_dynamic_native_schedule(
+        schedule,
+        owner,
+        lambda actual, primary: actual.abort(primary),
+        data_iterator=iter(("replaced",)),
+        num_microbatches=999,
+        forward_only=False,
+    )
+
+    assert success.native_result is native_result
+    assert owner.require_completion(success.completion) is success.completion
+    assert seen == list(owner.records)
+    owner.abort()
+
+
+def test_dynamic_replay_rejects_underconsume_and_mutated_token_then_retries(monkeypatch):
+    parts = _parts(monkeypatch)
+    owner = _run(parts)
+    cursor = owner.replay_cursor()
+    next(cursor)
+    with pytest.raises(MdpStateError, match="cursor exhaustion"):
+        owner.mark_schedule_returned(cursor)
+    for _ in range(len(owner.records) - 1):
+        next(cursor)
+    token = torch.tensor(3, device=parts.runtime.device)
+    owner.capture_global_num_tokens(token)
+    schedule_return = owner.mark_schedule_returned(cursor)
+    token.add_(1)
+    with pytest.raises(MdpStateError, match="exact in-place num_tokens"):
+        owner.prepare_completion(cursor, schedule_return)
+    owner.abort()
+
+    fresh = _parts(monkeypatch, runtime=parts.runtime)
+    fresh_owner = _run(fresh)
+    fresh_owner.abort()
+
+
+def test_dynamic_replay_rejects_completion_substitution_and_double_capabilities(monkeypatch):
+    parts = _parts(monkeypatch)
+    owner = _run(parts)
+    cursor = owner.replay_cursor()
+    for _ in owner.records:
+        next(cursor)
+    with pytest.raises(MdpStateError, match="exactly one cursor"):
+        owner.replay_cursor()
+    token = torch.tensor(2, device=parts.runtime.device)
+    owner.capture_global_num_tokens(token)
+    with pytest.raises(MdpStateError, match="captures global num_tokens once"):
+        owner.capture_global_num_tokens(token)
+    schedule_return = owner.mark_schedule_returned(cursor)
+    with pytest.raises(MdpStateError, match="returns once"):
+        owner.mark_schedule_returned(cursor)
+    completion = owner.prepare_completion(cursor, schedule_return)
+    object.__setattr__(completion, "globally_reduced_num_tokens", token.clone())
+    with pytest.raises(MdpStateError, match="exact owner and token"):
+        owner.require_completion(completion)
+    owner.abort()
+    assert id(cursor) not in parts.api._ACTIVE_CURSORS
+    assert id(completion) not in parts.api._ACTIVE_COMPLETIONS
+
+
+def test_dynamic_replay_mutated_cursor_abort_retires_exact_registry_entry(monkeypatch):
+    parts = _parts(monkeypatch)
+    owner = _run(parts)
+    cursor = owner.replay_cursor()
+    cursor._owner = None
+
+    owner.abort()
+
+    assert id(cursor) not in parts.api._ACTIVE_CURSORS
+    assert parts.api._ACTIVE_COMPLETIONS == {}
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    assert parts.allocator.released == [
+        *(value for _, value in parts.allocator.acquired),
+        *parts.old_buffers,
+    ]
+
+
+def test_dynamic_replay_abort_preserves_another_owners_exact_cursor(monkeypatch):
+    api = _api()
+    parts_a = _parts(monkeypatch)
+    owner_a = _run(parts_a)
+    cursor_a = owner_a.replay_cursor()
+    cursor_entry_a = api._ACTIVE_CURSORS[id(cursor_a)]
+    parts_b = _parts(monkeypatch)
+    owner_b = _run(parts_b)
+    cursor_b = owner_b.replay_cursor()
+    cursor_entry_b = api._ACTIVE_CURSORS[id(cursor_b)]
+    lifecycle_a = owner_a._trusted[-3]
+    lifecycle_a.cursor = cursor_b
+    lifecycle_a.cursor_entry = cursor_entry_b
+    owner_a._trusted[-4].cursor_entry = cursor_entry_b
+
+    owner_a.abort()
+
+    assert api._ACTIVE_CURSORS.get(id(cursor_a)) is not cursor_entry_a
+    assert cursor_a._state is api._RETIRED
+    assert parts_a.handle.calls == 1
+    assert len(parts_a.binding_owner.calls) == 1
+    assert parts_a.allocator.released == [
+        *(value for _, value in parts_a.allocator.acquired),
+        *parts_a.old_buffers,
+    ]
+    assert api._ACTIVE_CURSORS[id(cursor_b)] is cursor_entry_b
+    assert next(cursor_b) is owner_b.records[0]
+    owner_b.abort()
+
+
+def test_dynamic_replay_abort_never_deletes_foreign_cleanup_cursor(monkeypatch):
+    api = _api()
+    parts_a = _parts(monkeypatch)
+    owner_a = _run(parts_a)
+    parts_b = _parts(monkeypatch)
+    owner_b = _run(parts_b)
+    cursor_b = owner_b.replay_cursor()
+    cursor_entry_b = api._ACTIVE_CURSORS[id(cursor_b)]
+    cleanup_a = owner_a._trusted[-4]
+    cleanup_a.cursor = cursor_b
+    cleanup_a.cursor_entry = cursor_entry_b
+
+    owner_a.abort()
+
+    assert api._ACTIVE_CURSORS[id(cursor_b)] is cursor_entry_b
+    assert next(cursor_b) is owner_b.records[0]
+    owner_b.abort()
+
+
+def test_dynamic_replay_abort_preserves_another_owners_exact_completion(monkeypatch):
+    api = _api()
+    parts_a = _parts(monkeypatch)
+    owner_a = _run(parts_a)
+    cursor_a = owner_a.replay_cursor()
+    for _ in owner_a.records:
+        next(cursor_a)
+    token_a = torch.tensor(2, device=parts_a.runtime.device)
+    owner_a.capture_global_num_tokens(token_a)
+    returned_a = owner_a.mark_schedule_returned(cursor_a)
+    completion_a = owner_a.prepare_completion(cursor_a, returned_a)
+    completion_entry_a = api._ACTIVE_COMPLETIONS[id(completion_a)]
+    parts_b = _parts(monkeypatch)
+    owner_b = _run(parts_b)
+    cursor_b = owner_b.replay_cursor()
+    for _ in owner_b.records:
+        next(cursor_b)
+    token_b = torch.tensor(2, device=parts_b.runtime.device)
+    owner_b.capture_global_num_tokens(token_b)
+    returned_b = owner_b.mark_schedule_returned(cursor_b)
+    completion_b = owner_b.prepare_completion(cursor_b, returned_b)
+    completion_entry_b = api._ACTIVE_COMPLETIONS[id(completion_b)]
+    lifecycle_a = owner_a._trusted[-3]
+    lifecycle_a.completion = completion_b
+    lifecycle_a.completion_entry = completion_entry_b
+    owner_a._trusted[-4].completion_entry = completion_entry_b
+
+    owner_a.abort()
+
+    assert api._ACTIVE_COMPLETIONS.get(id(completion_a)) is not completion_entry_a
+    assert id(cursor_a) not in api._ACTIVE_CURSORS
+    assert parts_a.handle.calls == 1
+    assert len(parts_a.binding_owner.calls) == 1
+    assert parts_a.allocator.released == [
+        *(value for _, value in parts_a.allocator.acquired),
+        *parts_a.old_buffers,
+    ]
+    assert api._ACTIVE_COMPLETIONS[id(completion_b)] is completion_entry_b
+    assert owner_b.require_completion(completion_b) is completion_b
+    owner_b.abort()
+
+
+def test_dynamic_replay_rejects_coordinated_completion_token_substitution(monkeypatch):
+    api = _api()
+    parts = _parts(monkeypatch)
+    owner = _run(parts)
+    cursor = owner.replay_cursor()
+    for _ in owner.records:
+        next(cursor)
+    token = torch.tensor(2, device=parts.runtime.device)
+    owner.capture_global_num_tokens(token)
+    schedule_return = owner.mark_schedule_returned(cursor)
+    completion = owner.prepare_completion(cursor, schedule_return)
+
+    replacement_token = token.clone()
+    object.__setattr__(completion, "globally_reduced_num_tokens", replacement_token)
+    lifecycle = owner._trusted[-3]
+    replacement_entry = (
+        weakref.ref(owner),
+        completion,
+        owner._trusted,
+        lifecycle,
+        owner.authority,
+        replacement_token,
+        api._tensor_descriptor(replacement_token),
+        api._COMPLETION_ENTRY_SEAL,
+    )
+    lifecycle.completion_entry = replacement_entry
+    api._ACTIVE_COMPLETIONS[id(completion)] = replacement_entry
+
+    with pytest.raises(MdpStateError, match="exact owner and token"):
+        owner.require_completion(completion)
+    owner.abort()
+
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    assert parts.allocator.released == [
+        *(value for _, value in parts.allocator.acquired),
+        *parts.old_buffers,
+    ]
+    assert api._ACTIVE_COMPLETIONS[id(completion)] is replacement_entry
+    assert id(cursor) not in api._ACTIVE_CURSORS
+    assert id(parts.runtime) not in forward_api._ACTIVE_RUNTIME_OWNERS
+    del api._ACTIVE_COMPLETIONS[id(completion)]
+
+
 @pytest.mark.parametrize(
     ("text_only", "selected"), ((True, False), (False, False)), ids=("text", "nonselected")
 )

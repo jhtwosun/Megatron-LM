@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Private native-schedule boundary for fixed-CP4 repeated-D4 replay."""
+"""Private native-schedule boundary for fixed and dynamic repeated-D4 replay."""
 
 import weakref
 from collections.abc import Callable
@@ -10,6 +10,11 @@ from typing import Any
 
 from torch import Tensor
 
+from megatron.core.mdp.dynamic_cp_d4_dynamic_decoder_replay import (
+    _D4DynamicDecoderCompletion,
+    _D4DynamicDecoderReplayCursor,
+    _D4DynamicDecoderReplayOwner,
+)
 from megatron.core.mdp.dynamic_cp_d4_fixed_decoder_replay import (
     _D4FixedDecoderCompletion,
     _D4FixedDecoderReplayCursor,
@@ -48,9 +53,7 @@ class _D4NativeTokenSink:
 
     __slots__ = ("__weakref__", "owner", "cursor", "token", "_state")
 
-    def __init__(
-        self, owner: _D4FixedDecoderReplayOwner, cursor: _D4FixedDecoderReplayCursor
-    ) -> None:
+    def __init__(self, owner: Any, cursor: Any) -> None:
         self.owner = owner
         self.cursor = cursor
         self.token = None
@@ -109,15 +112,35 @@ class _D4NativeScheduleSuccess:
             raise MdpConfigurationError("MDP: D4 native schedule success is privately minted.")
 
 
-def _activate_token_sink(
-    owner: _D4FixedDecoderReplayOwner, cursor: _D4FixedDecoderReplayCursor
-) -> _D4NativeTokenSink:
+@dataclass(frozen=True, slots=True)
+class _D4DynamicNativeScheduleSuccess:
+    """Native result plus the existing dynamic replay completion authority."""
+
+    native_result: Any = field(compare=False)
+    completion: _D4DynamicDecoderCompletion = field(compare=False)
+    _seal: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not _D4DynamicNativeScheduleSuccess
+            or self._seal is not _SUCCESS_SEAL
+            or type(self.completion) is not _D4DynamicDecoderCompletion
+        ):
+            raise MdpConfigurationError(
+                "MDP: D4 dynamic native schedule success is privately minted."
+            )
+
+
+def _activate_token_sink(owner: Any, cursor: Any) -> _D4NativeTokenSink:
     global _ACTIVE_TOKEN_SINK
     if _ACTIVE_TOKEN_SINK is not None:
         raise MdpStateError("MDP: D4 native schedule permits one active token sink.")
-    if (
-        type(owner) is not _D4FixedDecoderReplayOwner
-        or type(cursor) is not _D4FixedDecoderReplayCursor
+    if not (
+        (type(owner) is _D4FixedDecoderReplayOwner and type(cursor) is _D4FixedDecoderReplayCursor)
+        or (
+            type(owner) is _D4DynamicDecoderReplayOwner
+            and type(cursor) is _D4DynamicDecoderReplayCursor
+        )
     ):
         raise MdpStateError("MDP: D4 native schedule activates its exact replay cursor.")
     sink = _D4NativeTokenSink(owner, cursor)
@@ -194,19 +217,23 @@ def _wrap_d4_native_finalizer(
     return wrapped
 
 
-def _run_d4_native_schedule(
+def _run_native_schedule_core(
     forward_backward_func: Callable,
-    replay_owner: _D4FixedDecoderReplayOwner,
-    scheduled_abort: Callable[[_D4FixedDecoderReplayOwner, BaseException], Any],
+    replay_owner: Any,
+    scheduled_abort: Callable[[Any, BaseException], Any],
+    owner_type: type,
+    cursor_type: type,
+    success_type: type,
+    owner_error: str,
     /,
     *args,
     **kwargs,
-) -> _D4NativeScheduleSuccess:
+) -> Any:
     """Run the unchanged VPP1 native schedule over one exact replay cursor."""
     if not callable(forward_backward_func) or not callable(scheduled_abort):
         raise MdpConfigurationError("MDP: D4 native schedule and scheduled abort are callable.")
-    if type(replay_owner) is not _D4FixedDecoderReplayOwner:
-        raise MdpConfigurationError("MDP: D4 native schedule requires its exact replay owner.")
+    if type(replay_owner) is not owner_type:
+        raise MdpConfigurationError(owner_error)
     schedule_signature = signature(forward_backward_func)
     bound = schedule_signature.bind(*args, **kwargs)
     bound.apply_defaults()
@@ -229,6 +256,8 @@ def _run_d4_native_schedule(
     sink_entry = None
     try:
         cursor = replay_owner.replay_cursor()
+        if type(cursor) is not cursor_type:
+            raise MdpStateError("MDP: D4 native schedule receives its exact replay cursor.")
         bound.arguments["data_iterator"] = (
             [cursor] if isinstance(data_iterator, (list, tuple)) else cursor
         )
@@ -242,7 +271,7 @@ def _run_d4_native_schedule(
         schedule_return = replay_owner.mark_schedule_returned(cursor)
         completion = replay_owner.prepare_completion(cursor, schedule_return)
         replay_owner.require_completion(completion)
-        return _D4NativeScheduleSuccess(native_result, completion, _SUCCESS_SEAL)
+        return success_type(native_result, completion, _SUCCESS_SEAL)
     except BaseException as error:
         if sink is not None:
             assert sink_entry is not None
@@ -258,3 +287,47 @@ def _run_d4_native_schedule(
             del _BOUNDARIES[id(invocation)]
         if _ACTIVE_BOUNDARY is invocation:
             _ACTIVE_BOUNDARY = None
+
+
+def _run_d4_native_schedule(
+    forward_backward_func: Callable,
+    replay_owner: _D4FixedDecoderReplayOwner,
+    scheduled_abort: Callable[[_D4FixedDecoderReplayOwner, BaseException], Any],
+    /,
+    *args,
+    **kwargs,
+) -> _D4NativeScheduleSuccess:
+    """Run the unchanged VPP1 native schedule over one exact fixed replay cursor."""
+    return _run_native_schedule_core(
+        forward_backward_func,
+        replay_owner,
+        scheduled_abort,
+        _D4FixedDecoderReplayOwner,
+        _D4FixedDecoderReplayCursor,
+        _D4NativeScheduleSuccess,
+        "MDP: D4 native schedule requires its exact replay owner.",
+        *args,
+        **kwargs,
+    )
+
+
+def _run_d4_dynamic_native_schedule(
+    forward_backward_func: Callable,
+    replay_owner: _D4DynamicDecoderReplayOwner,
+    scheduled_abort: Callable[[_D4DynamicDecoderReplayOwner, BaseException], Any],
+    /,
+    *args,
+    **kwargs,
+) -> _D4DynamicNativeScheduleSuccess:
+    """Run the unchanged VPP1 native schedule over one exact dynamic replay cursor."""
+    return _run_native_schedule_core(
+        forward_backward_func,
+        replay_owner,
+        scheduled_abort,
+        _D4DynamicDecoderReplayOwner,
+        _D4DynamicDecoderReplayCursor,
+        _D4DynamicNativeScheduleSuccess,
+        "MDP: D4 dynamic native schedule requires its exact replay owner.",
+        *args,
+        **kwargs,
+    )
