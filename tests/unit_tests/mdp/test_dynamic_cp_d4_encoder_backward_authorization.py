@@ -23,10 +23,18 @@ from megatron.core.mdp.errors import MdpPlanError, MdpStateError, MdpTaskFatalEr
 
 class _Operations:
     def __init__(self):
+        self.acquire_calls = 0
         self.released = []
 
-    def release(self, value):
-        self.released.append(value)
+        def acquire(**_kwargs):
+            self.acquire_calls += 1
+            raise AssertionError("Gate4 must not acquire replay resources")
+
+        def release(value):
+            self.released.append(value)
+
+        self.acquire = acquire
+        self.release = release
 
 
 class _TupleClone(tuple):
@@ -142,7 +150,30 @@ def _parts(monkeypatch, *, rank=0, selected_size=2, text_only=False, runtime=Non
         token,
         replay_api._tensor_descriptor(token),
     )
-    trusted = (*trusted, receipt_entry, completion_entry)
+    provenance = gradient_api._D4ReplayGradientProvenance(
+        replay_api,
+        completion_provenance,
+        None,
+        None,
+        token,
+        completion_entry[4],
+        operations.acquire,
+        operations.release,
+        gradient_api._PROVENANCE_SEAL,
+    )
+    completion_escrow = (
+        replay_api,
+        replay_api._ACTIVE_COMPLETIONS,
+        completion_entry,
+        provenance.release,
+        provenance,
+        gradient_api._COMPLETION_ESCROW_SEAL,
+    )
+    assert provenance.acquire is operations.acquire
+    assert provenance.release is operations.release
+    assert completion_escrow[3] is provenance.release
+    assert operations.acquire_calls == 0
+    trusted = (*trusted, receipt_entry, completion_entry, completion_escrow)
     predecessor._trusted = trusted
     gradient_api._ACTIVE_OWNERS[id(predecessor)] = (reference, *trusted)
     gradient_api._ACTIVE_RECEIPTS[id(receipt)] = receipt_entry
