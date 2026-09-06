@@ -62,6 +62,7 @@ class _Allocator:
         self.acquired = []
         self.released = []
         self.fail_release = False
+        self.release_callback = None
 
     def acquire(self, *, rows, width, dtype, device, tag):
         tensor = torch.empty((rows, width), dtype=dtype, device=device)
@@ -70,6 +71,8 @@ class _Allocator:
 
     def release(self, tensor):
         self.released.append(tensor)
+        if self.release_callback is not None:
+            self.release_callback()
         if self.fail_release:
             raise RuntimeError("release failed")
 
@@ -87,8 +90,10 @@ class _BindingOwner:
 class _Handle:
     def __init__(self):
         self.consumed = False
+        self.calls = 0
 
     def release_forward_only(self):
+        self.calls += 1
         self.consumed = True
 
 
@@ -119,7 +124,9 @@ def _binding(group):
     )
 
 
-def _parts(monkeypatch, *, vision=True, selected=None, microbatches=2, runtime=None):
+def _parts(
+    monkeypatch, *, vision=True, selected=None, microbatches=2, runtime=None, publication=False
+):
     if selected is None:
         selected = vision
     group = _Group()
@@ -221,10 +228,18 @@ def _parts(monkeypatch, *, vision=True, selected=None, microbatches=2, runtime=N
         old_buffers,
         operations,
     )
-    handoff = forward_api._D4EncoderReplayHandoff(trusted)
-    reference = weakref.ref(handoff)
-    forward_api._ACTIVE_REPLAY_HANDOFFS[id(handoff)] = (reference, *trusted, False)
-    forward_api._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
+    if publication:
+        owner = forward_api._D4EncoderPublicationOwner(trusted)
+        reference = weakref.ref(owner)
+        forward_api._ACTIVE_PUBLICATIONS[id(owner)] = (reference, *trusted)
+        forward_api._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
+        handoff = None
+    else:
+        owner = None
+        handoff = forward_api._D4EncoderReplayHandoff(trusted)
+        reference = weakref.ref(handoff)
+        forward_api._ACTIVE_REPLAY_HANDOFFS[id(handoff)] = (reference, *trusted, False)
+        forward_api._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
     events = []
 
     monkeypatch.setattr(api, "_snapshot_local_authority", lambda b, a: a)
@@ -290,6 +305,7 @@ def _parts(monkeypatch, *, vision=True, selected=None, microbatches=2, runtime=N
     return SimpleNamespace(
         runtime=runtime,
         authority=authority,
+        publication=owner,
         handoff=handoff,
         binding=binding,
         payload=payload,
@@ -314,6 +330,16 @@ def _run(parts, *, byte_generator=None):
     )
 
 
+def _run_from_publication(parts, *, byte_generator=None):
+    return api._run_repeated_d4_fixed_decoder_replay_from_publication(
+        parts.publication,
+        parts.authority,
+        rebuild_microbatch=parts.rebuild,
+        cp_partition_mode="zigzag",
+        byte_generator=byte_generator,
+    )
+
+
 def _complete(parts):
     owner = _run(parts)
     cursor = owner.replay_cursor()
@@ -324,6 +350,244 @@ def _complete(parts):
     schedule_return = owner.mark_schedule_returned(cursor)
     completion = owner.prepare_completion(cursor, schedule_return)
     return owner, cursor, token, schedule_return, completion
+
+
+def test_publication_replay_claim_and_successor_transfer_are_atomic(monkeypatch):
+    parts = _parts(monkeypatch, publication=True)
+    generator = object()
+
+    owner = _run_from_publication(parts, byte_generator=generator)
+
+    assert owner.require() is owner
+    assert parts.events == [("gate", 2, generator), "world0", "domain", "world1"]
+    assert forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)][1]() is owner
+    with pytest.raises(MdpStateError, match="publication owner is retired"):
+        parts.publication.require()
+    owner.abort()
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+
+
+@pytest.mark.parametrize("mutated", (False, True))
+def test_publication_replay_preclaim_failure_retires_exact_owner_once_and_retries(
+    monkeypatch, mutated
+):
+    parts = _parts(monkeypatch, publication=True)
+    if mutated:
+        parts.publication.payload_bundle = object()
+        authority = parts.authority
+        message = "retains sealed fields"
+    else:
+        authority = copy.copy(parts.authority)
+        message = "exact iteration authority"
+
+    with pytest.raises(MdpStateError, match=message):
+        api._run_repeated_d4_fixed_decoder_replay_from_publication(
+            parts.publication,
+            authority,
+            rebuild_microbatch=parts.rebuild,
+            cp_partition_mode="zigzag",
+        )
+
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    assert tuple(parts.allocator.released) == parts.old_buffers
+    assert forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+    with pytest.raises(MdpStateError, match="publication owner is retired"):
+        parts.publication.abort()
+
+    fresh = _parts(monkeypatch, runtime=parts.runtime, publication=True)
+    owner = _run_from_publication(fresh)
+    owner.abort()
+
+
+def test_publication_replay_preconsume_failure_uses_handoff_cleanup_once(monkeypatch):
+    parts = _parts(monkeypatch, publication=True)
+    original = api._build_candidate
+    primary = RuntimeError("before replay consumption")
+    seen = []
+
+    def fail(handoff, *_args, **_kwargs):
+        seen.append(handoff)
+        handoff.payload_bundle = object()
+        raise primary
+
+    monkeypatch.setattr(api, "_build_candidate", fail)
+    with pytest.raises(RuntimeError) as raised:
+        _run_from_publication(parts)
+    assert raised.value is primary
+    assert len(seen) == 1
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    assert tuple(parts.allocator.released) == parts.old_buffers
+    assert forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+
+    monkeypatch.setattr(api, "_build_candidate", original)
+    fresh = _parts(monkeypatch, runtime=parts.runtime, publication=True)
+    owner = _run_from_publication(fresh)
+    owner.abort()
+
+
+def test_publication_replay_postconsume_failure_is_not_cleaned_twice(monkeypatch):
+    parts = _parts(monkeypatch, publication=True)
+    primary = MdpStateError("Gate2 rejected")
+
+    def reject(_binding, _authority, **kwargs):
+        kwargs["prepare"]()
+        raise primary
+
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", reject)
+    with pytest.raises(MdpStateError) as raised:
+        _run_from_publication(parts)
+    assert raised.value is primary
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    leaves = tuple(tensor for _tag, tensor in parts.allocator.acquired)
+    assert tuple(parts.allocator.released) == (*reversed(leaves), *parts.old_buffers)
+    assert forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+
+
+@pytest.mark.parametrize(
+    "mutation", ("raise", "delete", "substitute", "substitute_runtime", "mutate")
+)
+def test_publication_replay_activation_failure_cleans_exact_successor(monkeypatch, mutation):
+    parts = _parts(monkeypatch, publication=True)
+    original = api._D4FixedDecoderReplayOwner._activate_prepared
+    primary = RuntimeError("activation failed after registry installation")
+    foreign_owner = _Handle()
+    foreign = (parts.runtime, weakref.ref(foreign_owner))
+    observed_foreign = []
+
+    def fail(owner, handoff):
+        original(owner, handoff)
+        if mutation == "delete":
+            del api._ACTIVE_OWNERS[id(owner)]
+        elif mutation == "substitute":
+            api._ACTIVE_OWNERS[id(owner)] = foreign
+        elif mutation == "substitute_runtime":
+            forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] = foreign
+            parts.allocator.release_callback = lambda: observed_foreign.append(
+                forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is foreign
+            )
+        elif mutation == "mutate":
+            owner.records = ()
+            return
+        raise primary
+
+    monkeypatch.setattr(api._D4FixedDecoderReplayOwner, "_activate_prepared", fail)
+    error_type = MdpStateError if mutation == "mutate" else MdpTaskFatalError
+    expected = "sealed resources" if mutation == "mutate" else "activates after Gate2"
+    with pytest.raises(error_type, match=expected) as raised:
+        _run_from_publication(parts)
+    if mutation != "mutate":
+        assert raised.value.__cause__ is primary
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    leaves = tuple(tensor for _tag, tensor in parts.allocator.acquired)
+    expected_releases = (*leaves, *parts.old_buffers)
+    assert len(parts.allocator.released) == len(expected_releases)
+    assert all(
+        actual is expected
+        for actual, expected in zip(parts.allocator.released, expected_releases, strict=True)
+    )
+    if mutation == "substitute_runtime":
+        assert observed_foreign and all(observed_foreign)
+        parts.allocator.release_callback = None
+        assert forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] is foreign
+        del forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)]
+    else:
+        assert forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+    if mutation == "substitute":
+        assert api._ACTIVE_OWNERS.pop(next(iter(api._ACTIVE_OWNERS))) is foreign
+    else:
+        assert api._ACTIVE_OWNERS == {}
+
+    monkeypatch.setattr(api._D4FixedDecoderReplayOwner, "_activate_prepared", original)
+    fresh = _parts(monkeypatch, runtime=parts.runtime, publication=True)
+    owner = _run_from_publication(fresh)
+    owner.abort()
+
+
+def test_publication_replay_cleanup_reentry_observes_retired_owner(monkeypatch):
+    parts = _parts(monkeypatch, publication=True)
+    reentry = []
+    primary = MdpStateError("Gate2 rejected")
+
+    def reject(_binding, _authority, **kwargs):
+        kwargs["prepare"]()
+        raise primary
+
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", reject)
+
+    def reenter():
+        parts.allocator.release_callback = None
+        try:
+            _run_from_publication(parts)
+        except MdpStateError as error:
+            reentry.append(error)
+
+    parts.allocator.release_callback = reenter
+    with pytest.raises(MdpStateError) as raised:
+        _run_from_publication(parts)
+    assert raised.value is primary
+    assert len(reentry) == 1
+    assert "publication owner is retired" in str(reentry[0])
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    assert forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+
+
+@pytest.mark.parametrize(
+    "mutation", ("delete_handoff", "substitute_handoff", "delete_runtime", "substitute_runtime")
+)
+def test_publication_replay_escrow_survives_handoff_registry_mutation(monkeypatch, mutation):
+    parts = _parts(monkeypatch, publication=True)
+    primary = RuntimeError("handoff callback failed")
+    foreign_owner = _Handle()
+    foreign_runtime = (parts.runtime, weakref.ref(foreign_owner))
+    foreign_handoff = (object(), object())
+    observed_foreign = []
+    seen_handoff = []
+
+    def fail(_binding, _authority, **kwargs):
+        handoff = forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)][1]()
+        seen_handoff.append(handoff)
+        if mutation == "delete_handoff":
+            del forward_api._ACTIVE_REPLAY_HANDOFFS[id(handoff)]
+        elif mutation == "substitute_handoff":
+            forward_api._ACTIVE_REPLAY_HANDOFFS[id(handoff)] = foreign_handoff
+        elif mutation == "delete_runtime":
+            del forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)]
+        else:
+            forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] = foreign_runtime
+            parts.allocator.release_callback = lambda: observed_foreign.append(
+                forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is foreign_runtime
+            )
+        raise primary
+
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", fail)
+    with pytest.raises(RuntimeError) as raised:
+        _run_from_publication(parts)
+    assert raised.value is primary
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    assert tuple(parts.allocator.released) == parts.old_buffers
+    assert len(seen_handoff) == 1
+    if mutation == "substitute_handoff":
+        assert forward_api._ACTIVE_REPLAY_HANDOFFS[id(seen_handoff[0])] is foreign_handoff
+        del forward_api._ACTIVE_REPLAY_HANDOFFS[id(seen_handoff[0])]
+    else:
+        assert id(seen_handoff[0]) not in forward_api._ACTIVE_REPLAY_HANDOFFS
+    if mutation == "substitute_runtime":
+        assert observed_foreign and all(observed_foreign)
+        parts.allocator.release_callback = None
+        assert forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] is foreign_runtime
+        del forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)]
+    else:
+        assert forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+    fresh = _parts(monkeypatch, runtime=parts.runtime, publication=True)
+    owner = _run_from_publication(fresh)
+    owner.abort()
 
 
 def test_gate2_transfers_exact_resources_and_exposes_monotonic_cursor(monkeypatch):

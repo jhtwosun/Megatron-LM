@@ -1172,9 +1172,39 @@ def run_repeated_d4_fixed_decoder_replay(
             raise MdpTaskFatalError(
                 "MDP: fixed decoder replay activates after Gate2 final WORLD."
             ) from error
+        owner.require()
         return owner
     except BaseException as error:
-        if candidate is not None:
+        owner_entry = None if owner is None else _ACTIVE_OWNERS.get(id(owner))
+        owner_entry_is_exact = (
+            type(owner_entry) is tuple
+            and len(owner_entry) == 9
+            and type(owner_entry[0]) is weakref.ReferenceType
+            and owner_entry[0]() is owner
+        )
+        owner_was_activated = owner is not None and (
+            owner_entry_is_exact
+            or (
+                (retired := _forward._RETIRED_REPLAY_HANDOFFS.get(id(handoff))) is not None
+                and retired() is handoff
+            )
+        )
+        if owner_was_activated:
+            exact_owner_entry = owner_entry
+            if not owner_entry_is_exact:
+                exact_owner_entry = (weakref.ref(owner), *owner._trusted, _OwnerEscrow())
+                _ACTIVE_OWNERS[id(owner)] = exact_owner_entry
+            try:
+                owner.abort(error)
+            except BaseException as cleanup_error:
+                _add_cleanup_note(
+                    error, f"suppressed decoder replay owner cleanup error: {cleanup_error!r}"
+                )
+            finally:
+                if owner_entry is not None and owner_entry is not exact_owner_entry:
+                    _ACTIVE_OWNERS[id(owner)] = owner_entry
+            raise
+        if candidate is not None and handoff_operations is not None:
             for leaf in reversed(candidate.leaf_bases):
                 try:
                     handoff_operations.release(leaf)
@@ -1182,8 +1212,57 @@ def run_repeated_d4_fixed_decoder_replay(
                     _add_cleanup_note(
                         error, f"suppressed decoder leaf cleanup error: {cleanup_error!r}"
                     )
-        try:
-            handoff.abort(error)
-        except BaseException as cleanup_error:
-            _add_cleanup_note(error, f"suppressed decoder handoff cleanup error: {cleanup_error!r}")
+        if handoff_entry is not None:
+            current_entry = _forward._ACTIVE_REPLAY_HANDOFFS.get(id(handoff))
+            if current_entry is not handoff_entry:
+                _forward._ACTIVE_REPLAY_HANDOFFS[id(handoff)] = handoff_entry
+            try:
+                handoff.abort(error)
+            except BaseException as cleanup_error:
+                _add_cleanup_note(
+                    error, f"suppressed decoder handoff cleanup error: {cleanup_error!r}"
+                )
+            finally:
+                if current_entry is not None and current_entry is not handoff_entry:
+                    _forward._ACTIVE_REPLAY_HANDOFFS[id(handoff)] = current_entry
+        raise
+
+
+def _run_repeated_d4_fixed_decoder_replay_from_publication(
+    publication: _forward._D4EncoderPublicationOwner,
+    authority: _DynamicIterationAuthority,
+    *,
+    rebuild_microbatch: Callable[..., Any],
+    cp_partition_mode: str,
+    byte_generator: Callable[[int], Any] | None = None,
+) -> _D4FixedDecoderReplayOwner:
+    """Atomically claim a publication and return its exact fixed-replay successor."""
+    if type(publication) is not _forward._D4EncoderPublicationOwner:
+        raise MdpConfigurationError(
+            "MDP: fixed decoder publication replay uses an exact publication owner."
+        )
+    handoff = None
+    try:
+        publication.require()
+        if authority is not publication.authority:
+            raise MdpStateError(
+                "MDP: fixed decoder publication replay uses its exact iteration authority."
+            )
+        handoff = publication._claim_for_replay(authority)
+        return run_repeated_d4_fixed_decoder_replay(
+            handoff,
+            authority,
+            rebuild_microbatch=rebuild_microbatch,
+            cp_partition_mode=cp_partition_mode,
+            byte_generator=byte_generator,
+        )
+    except BaseException as primary:
+        if handoff is None:
+            try:
+                publication.abort(primary)
+            except BaseException as cleanup_error:
+                _add_cleanup_note(
+                    primary,
+                    f"suppressed fixed decoder publication cleanup error: {cleanup_error!r}",
+                )
         raise
