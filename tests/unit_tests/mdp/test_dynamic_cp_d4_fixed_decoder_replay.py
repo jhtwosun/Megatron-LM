@@ -81,9 +81,12 @@ class _BindingOwner:
     def __init__(self):
         self.active = True
         self.calls = []
+        self.callback = None
 
     def restore(self, primary=None):
         self.calls.append(primary)
+        if self.callback is not None:
+            self.callback()
         self.active = False
 
 
@@ -91,9 +94,12 @@ class _Handle:
     def __init__(self):
         self.consumed = False
         self.calls = 0
+        self.callback = None
 
     def release_forward_only(self):
         self.calls += 1
+        if self.callback is not None:
+            self.callback()
         self.consumed = True
 
 
@@ -1025,3 +1031,155 @@ def test_gradient_handoff_abort_clears_before_hostile_notes_and_allows_fresh_run
     fresh = _parts(monkeypatch, runtime=parts.runtime)
     fresh_owner = _run(fresh)
     fresh_owner.abort()
+
+
+def test_gradient_handoff_abort_preserves_foreign_registries_through_cleanup(monkeypatch):
+    parts = _parts(monkeypatch, microbatches=1)
+    owner, _cursor, token, _schedule_return, completion = _complete(parts)
+    handoff = owner._claim_for_gradient(parts.authority, completion)
+    foreign_owner = _Handle()
+    foreign_handoff = (weakref.ref(foreign_owner), object())
+    foreign_runtime = (parts.runtime, weakref.ref(foreign_owner))
+
+    class BombDescriptor:
+        def __eq__(self, _other):
+            raise AssertionError("foreign descriptor comparison executed")
+
+    foreign_completion = (
+        weakref.ref(foreign_owner),
+        completion,
+        parts.authority,
+        token,
+        BombDescriptor(),
+    )
+    observations = []
+    handoff_entry = api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)]
+    completion_entry = api._ACTIVE_COMPLETIONS[id(completion)]
+
+    def observe():
+        observations.append(
+            (
+                api._ACTIVE_GRADIENT_HANDOFFS.get(id(handoff)) is foreign_handoff,
+                forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is foreign_runtime,
+                api._ACTIVE_COMPLETIONS.get(id(completion)) is foreign_completion,
+            )
+        )
+
+    api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)] = foreign_handoff
+    forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] = foreign_runtime
+    api._ACTIVE_COMPLETIONS[id(completion)] = foreign_completion
+    parts.handle.callback = observe
+    parts.binding_owner.callback = observe
+    parts.allocator.release_callback = observe
+
+    handoff._abort_from_escrow(handoff_entry)
+
+    assert observations and all(all(value) for value in observations)
+    assert api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)] is foreign_handoff
+    assert forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] is foreign_runtime
+    assert api._ACTIVE_COMPLETIONS[id(completion)] is foreign_completion
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    leaves = tuple(tensor for _tag, tensor in parts.allocator.acquired)
+    assert tuple(parts.allocator.released) == (*leaves, *parts.old_buffers)
+
+    del api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)]
+    del forward_api._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)]
+    del api._ACTIVE_COMPLETIONS[id(completion)]
+    parts.allocator.release_callback = None
+    fresh = _parts(monkeypatch, runtime=parts.runtime)
+    fresh_owner = _run(fresh)
+    fresh_owner.abort()
+
+
+def test_gradient_handoff_cleanup_rejects_fabricated_escrow_without_consuming(monkeypatch):
+    parts = _parts(monkeypatch, microbatches=1)
+    owner, _cursor, _token, _schedule_return, completion = _complete(parts)
+    handoff = owner._claim_for_gradient(parts.authority, completion)
+
+    with pytest.raises(MdpStateError, match="exact handoff escrow"):
+        handoff._abort_from_escrow((object(),))
+    assert handoff.require() is handoff
+    handoff.abort()
+
+
+def test_gradient_handoff_abort_uses_escrow_after_completion_field_deletion(monkeypatch):
+    parts = _parts(monkeypatch, microbatches=1)
+    owner, _cursor, _token, _schedule_return, completion = _complete(parts)
+    handoff = owner._claim_for_gradient(parts.authority, completion)
+
+    object.__delattr__(completion, "globally_reduced_num_tokens")
+    handoff.abort()
+
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    assert api._ACTIVE_COMPLETIONS.get(id(completion)) is None
+    assert forward_api._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+    fresh = _parts(monkeypatch, runtime=parts.runtime)
+    fresh_owner = _run(fresh)
+    fresh_owner.abort()
+
+
+def test_replay_abort_preserves_foreign_completion_through_cleanup(monkeypatch):
+    parts = _parts(monkeypatch, microbatches=1)
+    owner, _cursor, token, _schedule_return, completion = _complete(parts)
+    foreign_owner = _Handle()
+
+    class BombDescriptor:
+        def __eq__(self, _other):
+            raise AssertionError("foreign descriptor comparison executed")
+
+    foreign_completion = (
+        weakref.ref(foreign_owner),
+        completion,
+        parts.authority,
+        token,
+        BombDescriptor(),
+    )
+    observations = []
+    api._ACTIVE_COMPLETIONS[id(completion)] = foreign_completion
+
+    def observe():
+        observations.append(api._ACTIVE_COMPLETIONS.get(id(completion)) is foreign_completion)
+
+    parts.handle.callback = observe
+    parts.binding_owner.callback = observe
+    parts.allocator.release_callback = observe
+    owner.abort()
+
+    assert observations and all(observations)
+    assert api._ACTIVE_COMPLETIONS[id(completion)] is foreign_completion
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    del api._ACTIVE_COMPLETIONS[id(completion)]
+    parts.allocator.release_callback = None
+    fresh = _parts(monkeypatch, runtime=parts.runtime)
+    fresh_owner = _run(fresh)
+    fresh_owner.abort()
+
+
+def test_gradient_handoff_escrow_cleanup_is_one_shot_during_callback_reentry(monkeypatch):
+    parts = _parts(monkeypatch, microbatches=1)
+    owner, _cursor, _token, _schedule_return, completion = _complete(parts)
+    handoff = owner._claim_for_gradient(parts.authority, completion)
+    handoff_entry = api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)]
+    reentry = []
+
+    def reenter():
+        parts.allocator.release_callback = None
+        try:
+            handoff._abort_from_escrow(handoff_entry)
+        except MdpStateError as error:
+            reentry.append(error)
+
+    parts.allocator.release_callback = reenter
+    handoff._abort_from_escrow(handoff_entry)
+
+    assert len(reentry) == 1
+    assert "handoff is retired" in str(reentry[0])
+    assert parts.handle.calls == 1
+    assert len(parts.binding_owner.calls) == 1
+    releases = tuple(parts.allocator.released)
+    with pytest.raises(MdpStateError, match="handoff is retired"):
+        handoff._abort_from_escrow(handoff_entry)
+    assert tuple(parts.allocator.released) == releases

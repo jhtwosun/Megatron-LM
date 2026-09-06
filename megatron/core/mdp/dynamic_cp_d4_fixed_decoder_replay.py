@@ -314,6 +314,7 @@ class _OwnerEscrow:
     token_descriptor: tuple[Any, ...] | None = None
     schedule_return: Any = None
     completion: Any = None
+    completion_entry: tuple[Any, ...] | None = None
 
 
 def _build_candidate(
@@ -567,6 +568,7 @@ class _D4FixedDecoderGradientHandoff:
             *self._trusted[8:10],
             self.text_only,
             self.is_selected,
+            self._trusted[12],
         )
         if (
             self._state is not _ACTIVE
@@ -579,7 +581,7 @@ class _D4FixedDecoderGradientHandoff:
             raise MdpStateError("MDP: fixed decoder gradient handoff retains sealed resources.")
         completion_entry = _ACTIVE_COMPLETIONS.get(id(self.completion))
         if (
-            completion_entry is None
+            completion_entry is not self._trusted[12]
             or completion_entry[0]() is not self
             or completion_entry[1] is not self.completion
             or self.completion.authority is not self.authority
@@ -616,9 +618,48 @@ class _D4FixedDecoderGradientHandoff:
                 "MDP: fixed decoder gradient handoff abort error is an exception."
             )
         entry = _ACTIVE_GRADIENT_HANDOFFS.get(id(self))
-        if entry is None or entry[0]() is not self:
+        if (
+            type(entry) is not tuple
+            or len(entry) != 15
+            or type(entry[0]) is not weakref.ReferenceType
+            or entry[0]() is not self
+        ):
             self.require()
+        self._abort_from_escrow(entry, primary_error)
+
+    def _abort_from_escrow(
+        self, entry: tuple[Any, ...], primary_error: BaseException | None = None
+    ) -> None:
+        """Retire using invocation-captured entries without reading live registries."""
+        if primary_error is not None and not isinstance(primary_error, BaseException):
+            raise MdpConfigurationError(
+                "MDP: fixed decoder gradient handoff abort error is an exception."
+            )
+        retired = _RETIRED_GRADIENT_HANDOFFS.get(id(self))
+        if retired is not None and retired() is self:
+            raise MdpStateError("MDP: fixed decoder gradient handoff is retired.")
+        if (
+            type(entry) is not tuple
+            or len(entry) != 15
+            or type(entry[0]) is not weakref.ReferenceType
+            or entry[0]() is not self
+        ):
+            raise MdpStateError(
+                "MDP: fixed decoder gradient cleanup uses its exact handoff escrow."
+            )
         trusted = entry[1:-1]
+        completion, completion_entry = trusted[7], trusted[12]
+        if not (
+            type(completion_entry) is tuple
+            and len(completion_entry) == 5
+            and completion_entry[0] is entry[0]
+            and completion_entry[1] is completion
+            and completion_entry[2] is trusted[1]
+            and completion_entry[4] == trusted[9]
+        ):
+            raise MdpStateError(
+                "MDP: fixed decoder gradient cleanup uses its exact completion escrow."
+            )
         integrity_error = None
         try:
             current = (
@@ -632,6 +673,7 @@ class _D4FixedDecoderGradientHandoff:
                 *trusted[8:10],
                 object.__getattribute__(self, "text_only"),
                 object.__getattribute__(self, "is_selected"),
+                trusted[12],
             )
             if (
                 object.__getattribute__(self, "_state") is not _ACTIVE
@@ -651,14 +693,21 @@ class _D4FixedDecoderGradientHandoff:
             if primary_error is not None
             else MdpStateError("MDP: fixed decoder gradient handoff was aborted.")
         )
-        _ACTIVE_GRADIENT_HANDOFFS.pop(id(self))
-        _RETIRED_GRADIENT_HANDOFFS[id(self)] = weakref.ref(self)
+        identity = id(self)
+        if _ACTIVE_GRADIENT_HANDOFFS.get(identity) is entry:
+            del _ACTIVE_GRADIENT_HANDOFFS[identity]
+
+        def forget_retired(reference: weakref.ReferenceType[Any]) -> None:
+            if _RETIRED_GRADIENT_HANDOFFS.get(identity) is reference:
+                del _RETIRED_GRADIENT_HANDOFFS[identity]
+
+        _RETIRED_GRADIENT_HANDOFFS[identity] = weakref.ref(self, forget_retired)
         runtime = trusted[0]
         runtime_entry = _forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
         if runtime_entry is not None and runtime_entry[1]() is self:
             del _forward._ACTIVE_RUNTIME_OWNERS[id(runtime)]
-        completion = trusted[7]
-        _ACTIVE_COMPLETIONS.pop(id(completion), None)
+        if _ACTIVE_COMPLETIONS.get(id(completion)) is completion_entry:
+            del _ACTIVE_COMPLETIONS[id(completion)]
         self._state = _RETIRED
         self._consumed = True
         self.authority = None
@@ -891,13 +940,15 @@ class _D4FixedDecoderReplayOwner:
             raise MdpStateError("MDP: fixed decoder completion retains exact in-place num_tokens.")
         completion = _D4FixedDecoderCompletion(self.authority, token, self, _COMPLETION_SEAL)
         escrow.completion = completion
-        _ACTIVE_COMPLETIONS[id(completion)] = (
+        completion_entry = (
             weakref.ref(self),
             completion,
             self.authority,
             token,
             escrow.token_descriptor,
         )
+        escrow.completion_entry = completion_entry
+        _ACTIVE_COMPLETIONS[id(completion)] = completion_entry
         return completion
 
     def require_completion(
@@ -908,7 +959,7 @@ class _D4FixedDecoderReplayOwner:
         escrow = _ACTIVE_OWNERS[id(self)][-1]
         if (
             type(completion) is not _D4FixedDecoderCompletion
-            or entry is None
+            or entry is not escrow.completion_entry
             or entry[0]() is not self
             or entry[1] is not completion
             or completion is not escrow.completion
@@ -985,19 +1036,21 @@ class _D4FixedDecoderReplayOwner:
 
         handoff_reference = weakref.ref(handoff, retire)
         predecessor_reference = weakref.ref(self)
-        completion_entry = _ACTIVE_COMPLETIONS[id(completion)]
+        completion_entry = escrow.completion_entry
+        if _ACTIVE_COMPLETIONS.get(id(completion)) is not completion_entry:
+            raise MdpStateError(
+                "MDP: fixed decoder gradient handoff retains exact completion provenance."
+            )
         token = completion_entry[3]
         token_descriptor = completion_entry[4]
 
-        _ACTIVE_GRADIENT_HANDOFFS[handoff_identity] = (handoff_reference, *trusted, False)
+        new_completion_entry = (handoff_reference, completion, authority, token, token_descriptor)
+        trusted = (*trusted, new_completion_entry)
+        handoff._trusted = trusted
+        handoff_entry = (handoff_reference, *trusted, False)
+        _ACTIVE_GRADIENT_HANDOFFS[handoff_identity] = handoff_entry
         _forward._ACTIVE_RUNTIME_OWNERS[runtime_identity] = (runtime, handoff_reference)
-        _ACTIVE_COMPLETIONS[id(completion)] = (
-            handoff_reference,
-            completion,
-            authority,
-            token,
-            token_descriptor,
-        )
+        _ACTIVE_COMPLETIONS[id(completion)] = new_completion_entry
         _ACTIVE_CURSORS.pop(id(cursor))
         cursor._state = _RETIRED
         cursor._owner = None
@@ -1059,7 +1112,9 @@ class _D4FixedDecoderReplayOwner:
             cursor._owner = None
         completion = escrow.completion
         if completion is not None:
-            _ACTIVE_COMPLETIONS.pop(id(completion), None)
+            completion_entry = _ACTIVE_COMPLETIONS.get(id(completion))
+            if completion_entry is escrow.completion_entry:
+                del _ACTIVE_COMPLETIONS[id(completion)]
         self._state = _RETIRED
         self.authority = None
         self.binding = None

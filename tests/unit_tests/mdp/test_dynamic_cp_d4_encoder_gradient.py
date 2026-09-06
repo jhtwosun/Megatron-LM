@@ -184,14 +184,11 @@ def _parts(
     )
     handoff = replay_api._D4FixedDecoderGradientHandoff(trusted)
     reference = weakref.ref(handoff)
+    completion_entry = (reference, completion, authority, token, trusted[9])
+    trusted = (*trusted, completion_entry)
+    handoff._trusted = trusted
     replay_api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)] = (reference, *trusted, False)
-    replay_api._ACTIVE_COMPLETIONS[id(completion)] = (
-        reference,
-        completion,
-        authority,
-        token,
-        trusted[9],
-    )
+    replay_api._ACTIVE_COMPLETIONS[id(completion)] = completion_entry
     replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
     events = []
     prepared_calls = []
