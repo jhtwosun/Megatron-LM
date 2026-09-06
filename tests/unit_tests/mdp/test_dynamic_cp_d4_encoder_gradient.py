@@ -44,6 +44,7 @@ class _Allocator:
         self.fail_release = False
         self.fail_acquire_at = None
         self.acquire_error = None
+        self.release_callback = None
 
     def acquire(self, *, rows, width, dtype, device, tag):
         if self.fail_acquire_at == len(self.acquired):
@@ -54,6 +55,8 @@ class _Allocator:
 
     def release(self, tensor):
         self.released.append(tensor)
+        if self.release_callback is not None:
+            self.release_callback()
         if self.fail_release:
             raise RuntimeError("release failed")
 
@@ -61,16 +64,20 @@ class _Allocator:
 class _BindingOwner:
     def __init__(self):
         self.active = True
+        self.calls = 0
 
     def restore(self, _primary=None):
+        self.calls += 1
         self.active = False
 
 
 class _Handle:
     def __init__(self):
         self.consumed = False
+        self.calls = 0
 
     def release_forward_only(self):
+        self.calls += 1
         self.consumed = True
 
 
@@ -110,6 +117,7 @@ def _parts(
     runtime=None,
     missing_grad=False,
     leaf_corruption=None,
+    replay_owner=False,
 ):
     group = _Group(rank)
     binding = _binding(group, rank)
@@ -163,38 +171,52 @@ def _parts(
     predecessor_buffers = (torch.empty(0), torch.empty(0))
     handoff_resources = (binding_owner, predecessor_buffers, operations, handle)
     leaf_bases = (leaf,) if leaf is not None else ()
-    predecessor = SimpleNamespace()
     token = torch.tensor(4.0)
-    completion = replay_api._D4FixedDecoderCompletion(
-        authority, token, predecessor, replay_api._COMPLETION_SEAL
-    )
-    trusted = (
-        runtime,
-        authority,
-        binding,
-        (record,),
-        leaves,
-        handoff_resources,
-        leaf_bases,
-        completion,
-        predecessor,
-        replay_api._tensor_descriptor(token),
-        not vision,
-        selected,
-    )
-    handoff = replay_api._D4FixedDecoderGradientHandoff(trusted)
-    reference = weakref.ref(handoff)
-    completion_entry = (reference, completion, authority, token, trusted[9])
-    trusted = (*trusted, completion_entry)
-    handoff._trusted = trusted
-    replay_api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)] = (reference, *trusted, False)
-    replay_api._ACTIVE_COMPLETIONS[id(completion)] = completion_entry
-    replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
+    replay_trusted = (runtime, authority, binding, (record,), leaves, handoff_resources, leaf_bases)
+    monkeypatch.setattr(replay_api, "_snapshot_local_authority", lambda b, a: a)
+    if replay_owner:
+        replay = replay_api._D4FixedDecoderReplayOwner(
+            trusted=replay_trusted, seal=replay_api._OWNER_SEAL
+        )
+        reference = weakref.ref(replay)
+        replay_api._ACTIVE_OWNERS[id(replay)] = (
+            reference,
+            *replay_trusted,
+            replay_api._OwnerEscrow(),
+        )
+        replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
+        cursor = replay.replay_cursor()
+        assert next(cursor) is record
+        replay.capture_global_num_tokens(token)
+        returned = replay.mark_schedule_returned(cursor)
+        completion = replay.prepare_completion(cursor, returned)
+        handoff = None
+    else:
+        replay = None
+        predecessor = SimpleNamespace()
+        completion = replay_api._D4FixedDecoderCompletion(
+            authority, token, predecessor, replay_api._COMPLETION_SEAL
+        )
+        trusted = (
+            *replay_trusted,
+            completion,
+            predecessor,
+            replay_api._tensor_descriptor(token),
+            not vision,
+            selected,
+        )
+        handoff = replay_api._D4FixedDecoderGradientHandoff(trusted)
+        reference = weakref.ref(handoff)
+        completion_entry = (reference, completion, authority, token, trusted[9])
+        trusted = (*trusted, completion_entry)
+        handoff._trusted = trusted
+        replay_api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)] = (reference, *trusted, False)
+        replay_api._ACTIVE_COMPLETIONS[id(completion)] = completion_entry
+        replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
     events = []
     prepared_calls = []
     physical_calls = []
 
-    monkeypatch.setattr(replay_api, "_snapshot_local_authority", lambda b, a: a)
     monkeypatch.setattr(api, "_validate_repeated_d4_group_binding", lambda value: value._authority)
     monkeypatch.setattr(
         api,
@@ -255,6 +277,7 @@ def _parts(
         authority=authority,
         binding=binding,
         handoff=handoff,
+        replay=replay,
         completion=completion,
         leaf=leaf,
         route_key=route_key,
@@ -277,6 +300,218 @@ def _run(parts, *, byte_generator=None):
         all_to_all_single=lambda *_args, **_kwargs: None,
         byte_generator=byte_generator,
     )
+
+
+def _run_from_replay(parts, *, byte_generator=None):
+    return api._run_repeated_d4_encoder_gradient_from_replay(
+        parts.replay,
+        parts.authority,
+        parts.completion,
+        all_to_all_single=lambda *_args, **_kwargs: None,
+        byte_generator=byte_generator,
+    )
+
+
+def test_replay_gradient_claim_and_successor_transfer_are_atomic(monkeypatch):
+    parts = _parts(monkeypatch, replay_owner=True)
+    generator = object()
+
+    owner = _run_from_replay(parts, byte_generator=generator)
+
+    assert owner.require() is owner
+    assert parts.events == [("gate", 3, generator), "world0", "domain", "world1", "physical"]
+    assert replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)][1]() is owner
+    with pytest.raises(MdpStateError, match="replay owner is retired"):
+        parts.replay.require()
+    owner.abort()
+    assert parts.handle.calls == 1
+    assert parts.binding_owner.calls == 1
+
+
+@pytest.mark.parametrize("mutated", (False, True))
+def test_replay_gradient_preclaim_failure_retires_once_and_retries(monkeypatch, mutated):
+    parts = _parts(monkeypatch, replay_owner=True)
+    if mutated:
+        parts.replay.records = ()
+        authority = parts.authority
+        message = "retains sealed resources"
+    else:
+        authority = copy.copy(parts.authority)
+        message = "exact iteration authority"
+
+    with pytest.raises(MdpStateError, match=message):
+        api._run_repeated_d4_encoder_gradient_from_replay(parts.replay, authority, parts.completion)
+    assert parts.handle.calls == 1
+    assert parts.binding_owner.calls == 1
+    assert tuple(parts.allocator.released) == (parts.leaf, *parts.predecessor_buffers)
+    assert replay_api._forward._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+
+    fresh = _parts(monkeypatch, runtime=parts.runtime, replay_owner=True)
+    owner = _run_from_replay(fresh)
+    owner.abort()
+
+
+@pytest.mark.parametrize(
+    "mutation", ("raise", "delete", "substitute", "runtime", "receipt", "completion", "trusted")
+)
+def test_replay_gradient_activation_failure_cleans_exact_successor(monkeypatch, mutation):
+    parts = _parts(monkeypatch, replay_owner=True)
+    original = api._D4EncoderGradientRouteOwner._activate_prepared
+    primary = RuntimeError("activation failed after registry installation")
+    foreign_owner = _Handle()
+    foreign_runtime = (parts.runtime, weakref.ref(foreign_owner))
+    foreign_nested = (weakref.ref(foreign_owner), object())
+    observed_foreign = []
+
+    def fail(owner, handoff, owner_entry, handoff_entry):
+        original(owner, handoff, owner_entry, handoff_entry)
+        if mutation == "delete":
+            del api._ACTIVE_OWNERS[id(owner)]
+        elif mutation == "substitute":
+            api._ACTIVE_OWNERS[id(owner)] = foreign_nested
+        elif mutation == "runtime":
+            replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] = foreign_runtime
+            parts.allocator.release_callback = lambda: observed_foreign.append(
+                replay_api._forward._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is foreign_runtime
+            )
+        elif mutation == "receipt":
+            receipt_identity = id(owner.receipt)
+            api._ACTIVE_RECEIPTS[receipt_identity] = foreign_nested
+            parts.allocator.release_callback = lambda: observed_foreign.append(
+                api._ACTIVE_RECEIPTS.get(receipt_identity) is foreign_nested
+            )
+        elif mutation == "completion":
+            completion_identity = id(owner.completion)
+            replay_api._ACTIVE_COMPLETIONS[completion_identity] = foreign_nested
+            parts.allocator.release_callback = lambda: observed_foreign.append(
+                replay_api._ACTIVE_COMPLETIONS.get(completion_identity) is foreign_nested
+            )
+        elif mutation == "trusted":
+            owner._trusted = ()
+        raise primary
+
+    monkeypatch.setattr(api._D4EncoderGradientRouteOwner, "_activate_prepared", fail)
+    with pytest.raises(MdpTaskFatalError, match="physical encoder-gradient") as raised:
+        _run_from_replay(parts)
+    assert raised.value.__cause__ is primary
+    assert parts.handle.calls == 1
+    assert parts.binding_owner.calls == 1
+    acquired = tuple(tensor for _tag, tensor in parts.allocator.acquired)
+    expected_releases = (*acquired, parts.leaf, *parts.predecessor_buffers)
+    assert len(parts.allocator.released) == len(expected_releases)
+    assert all(
+        actual is expected
+        for actual, expected in zip(parts.allocator.released, expected_releases, strict=True)
+    )
+    if mutation in ("runtime", "receipt", "completion"):
+        assert observed_foreign and all(observed_foreign)
+        parts.allocator.release_callback = None
+    if mutation == "runtime":
+        assert replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] is foreign_runtime
+        del replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)]
+    else:
+        assert replay_api._forward._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+    if mutation == "receipt":
+        assert next(iter(api._ACTIVE_RECEIPTS.values())) is foreign_nested
+        api._ACTIVE_RECEIPTS.clear()
+    else:
+        assert api._ACTIVE_RECEIPTS == {}
+    if mutation == "completion":
+        assert replay_api._ACTIVE_COMPLETIONS[id(parts.completion)] is foreign_nested
+        del replay_api._ACTIVE_COMPLETIONS[id(parts.completion)]
+    else:
+        assert replay_api._ACTIVE_COMPLETIONS.get(id(parts.completion)) is None
+    if mutation == "substitute":
+        assert api._ACTIVE_OWNERS.pop(next(iter(api._ACTIVE_OWNERS))) is foreign_nested
+    else:
+        assert api._ACTIVE_OWNERS == {}
+
+    monkeypatch.setattr(api._D4EncoderGradientRouteOwner, "_activate_prepared", original)
+    fresh = _parts(monkeypatch, runtime=parts.runtime, replay_owner=True)
+    owner = _run_from_replay(fresh)
+    owner.abort()
+
+
+@pytest.mark.parametrize("mutation", ("receipt", "completion", "runtime", "prepared"))
+def test_replay_gradient_preactivation_field_mutation_never_installs_wrong_keys(
+    monkeypatch, mutation
+):
+    parts = _parts(monkeypatch, replay_owner=True)
+    original = api._D4EncoderGradientRouteOwner._activate_prepared
+    foreign = object()
+
+    def mutate(owner, handoff, owner_entry, handoff_entry):
+        if mutation == "receipt":
+            owner.receipt = foreign
+        elif mutation == "completion":
+            owner.completion = foreign
+        elif mutation == "runtime":
+            owner._runtime = foreign
+        else:
+            owner._prepared_entry = None
+        original(owner, handoff, owner_entry, handoff_entry)
+
+    monkeypatch.setattr(api._D4EncoderGradientRouteOwner, "_activate_prepared", mutate)
+    with pytest.raises(MdpTaskFatalError, match="physical encoder-gradient"):
+        _run_from_replay(parts)
+
+    assert id(foreign) not in api._ACTIVE_RECEIPTS
+    assert id(foreign) not in replay_api._ACTIVE_COMPLETIONS
+    assert id(foreign) not in replay_api._forward._ACTIVE_RUNTIME_OWNERS
+    assert api._ACTIVE_OWNERS == {}
+    assert api._ACTIVE_RECEIPTS == {}
+    assert replay_api._ACTIVE_COMPLETIONS.get(id(parts.completion)) is None
+    assert replay_api._forward._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+    assert parts.handle.calls == 1
+    assert parts.binding_owner.calls == 1
+
+    monkeypatch.setattr(api._D4EncoderGradientRouteOwner, "_activate_prepared", original)
+    fresh = _parts(monkeypatch, runtime=parts.runtime, replay_owner=True)
+    owner = _run_from_replay(fresh)
+    owner.abort()
+
+
+@pytest.mark.parametrize("mutation", ("delete", "substitute", "runtime"))
+def test_replay_gradient_preactivation_uses_handoff_escrow(monkeypatch, mutation):
+    parts = _parts(monkeypatch, replay_owner=True)
+    primary = RuntimeError("gradient handoff callback failed")
+    foreign_owner = _Handle()
+    foreign_handoff = (weakref.ref(foreign_owner), object())
+    foreign_runtime = (parts.runtime, weakref.ref(foreign_owner))
+    observed_foreign = []
+    seen = []
+
+    def fail(_binding, _authority, **_kwargs):
+        handoff = replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)][1]()
+        seen.append(handoff)
+        if mutation == "delete":
+            del replay_api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)]
+        elif mutation == "substitute":
+            replay_api._ACTIVE_GRADIENT_HANDOFFS[id(handoff)] = foreign_handoff
+        else:
+            replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] = foreign_runtime
+            parts.allocator.release_callback = lambda: observed_foreign.append(
+                replay_api._forward._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is foreign_runtime
+            )
+        raise primary
+
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", fail)
+    with pytest.raises(RuntimeError) as raised:
+        _run_from_replay(parts)
+    assert raised.value is primary
+    assert parts.handle.calls == 1
+    assert parts.binding_owner.calls == 1
+    assert tuple(parts.allocator.released) == (parts.leaf, *parts.predecessor_buffers)
+    if mutation == "substitute":
+        assert replay_api._ACTIVE_GRADIENT_HANDOFFS[id(seen[0])] is foreign_handoff
+        del replay_api._ACTIVE_GRADIENT_HANDOFFS[id(seen[0])]
+    if mutation == "runtime":
+        assert observed_foreign and all(observed_foreign)
+        parts.allocator.release_callback = None
+        assert replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)] is foreign_runtime
+        del replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)]
+    else:
+        assert replay_api._forward._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
 
 
 @pytest.mark.parametrize(
@@ -446,7 +681,11 @@ def test_gate3_rejection_and_runner_substitution_never_execute_a2a(monkeypatch, 
         assert raised.value is primary
     assert parts.physical_calls == []
     assert parts.handle.consumed
+    assert id(parts.handoff) not in replay_api._ACTIVE_GRADIENT_HANDOFFS
     assert replay_api._forward._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+    fresh = _parts(monkeypatch, runtime=parts.runtime)
+    owner = _run(fresh)
+    owner.abort()
 
 
 def test_physical_failure_is_task_fatal_and_cleanup_uses_escrow(monkeypatch):

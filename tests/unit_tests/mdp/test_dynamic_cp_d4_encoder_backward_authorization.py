@@ -134,22 +134,19 @@ def _parts(monkeypatch, *, rank=0, selected_size=2, text_only=False, runtime=Non
     )
     predecessor = gradient_api._D4EncoderGradientRouteOwner(trusted, gradient_api._OWNER_SEAL)
     reference = weakref.ref(predecessor)
-    gradient_api._ACTIVE_OWNERS[id(predecessor)] = (reference, *trusted)
-    gradient_api._ACTIVE_RECEIPTS[id(receipt)] = (
-        reference,
-        receipt,
-        authority,
-        completion,
-        receipt.exchange,
-        received,
-    )
-    replay_api._ACTIVE_COMPLETIONS[id(completion)] = (
+    receipt_entry = (reference, receipt, authority, completion, receipt.exchange, received)
+    completion_entry = (
         reference,
         completion,
         authority,
         token,
         replay_api._tensor_descriptor(token),
     )
+    trusted = (*trusted, receipt_entry, completion_entry)
+    predecessor._trusted = trusted
+    gradient_api._ACTIVE_OWNERS[id(predecessor)] = (reference, *trusted)
+    gradient_api._ACTIVE_RECEIPTS[id(receipt)] = receipt_entry
+    replay_api._ACTIVE_COMPLETIONS[id(completion)] = completion_entry
     replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)] = (runtime, reference)
     monkeypatch.setattr(api, "_snapshot_local_authority", lambda binding, authority: authority)
     monkeypatch.setattr(api, "validate_encoder_dynamic_plan", lambda plan: plan)

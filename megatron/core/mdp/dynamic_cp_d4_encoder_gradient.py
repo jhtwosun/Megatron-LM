@@ -188,6 +188,8 @@ class _D4EncoderGradientRouteOwner:
         "_state",
         "_prepared_reference",
         "_prepared_handoff_reference",
+        "_prepared_entry",
+        "_prepared_handoff_entry",
     )
 
     def __init__(self, trusted: tuple[Any, ...], seal: object) -> None:
@@ -209,6 +211,8 @@ class _D4EncoderGradientRouteOwner:
         self._state = _ACTIVE
         self._prepared_reference = None
         self._prepared_handoff_reference = None
+        self._prepared_entry = None
+        self._prepared_handoff_entry = None
 
     def _prepare_from(self, handoff: _replay._D4FixedDecoderGradientHandoff) -> None:
         entry = _replay._ACTIVE_GRADIENT_HANDOFFS.get(id(handoff))
@@ -235,23 +239,86 @@ class _D4EncoderGradientRouteOwner:
 
         self._prepared_reference = weakref.ref(self, retire)
         self._prepared_handoff_reference = weakref.ref(handoff)
-
-    def _activate_prepared(self, handoff: _replay._D4FixedDecoderGradientHandoff) -> None:
-        reference = self._prepared_reference
-        runtime_identity = id(self._runtime)
-        _ACTIVE_OWNERS[id(self)] = (reference, *self._trusted)
-        _ACTIVE_RECEIPTS[id(self.receipt)] = (
-            reference,
+        receipt_entry = (
+            self._prepared_reference,
             self.receipt,
             self.authority,
             self.completion,
             self.receipt.exchange,
             self.receipt.received_tensors,
         )
-        _replay._forward._ACTIVE_RUNTIME_OWNERS[runtime_identity] = (self._runtime, reference)
-        completion_entry = _replay._ACTIVE_COMPLETIONS[id(self.completion)]
-        _replay._ACTIVE_COMPLETIONS[id(self.completion)] = (reference, *completion_entry[1:])
-        _replay._ACTIVE_GRADIENT_HANDOFFS.pop(id(handoff))
+        handoff_completion_entry = entry[13]
+        completion_entry = (self._prepared_reference, *handoff_completion_entry[1:])
+        self._trusted = (*self._trusted, receipt_entry, completion_entry)
+        self._prepared_entry = (self._prepared_reference, *self._trusted)
+        self._prepared_handoff_entry = entry
+
+    def _activate_prepared(
+        self,
+        handoff: _replay._D4FixedDecoderGradientHandoff,
+        owner_entry: tuple[Any, ...],
+        handoff_entry: tuple[Any, ...],
+    ) -> None:
+        if (
+            type(owner_entry) is not tuple
+            or len(owner_entry) != 17
+            or type(owner_entry[0]) is not weakref.ReferenceType
+            or owner_entry[0]() is not self
+            or type(handoff_entry) is not tuple
+            or len(handoff_entry) != 15
+            or type(handoff_entry[0]) is not weakref.ReferenceType
+            or handoff_entry[0]() is not handoff
+        ):
+            raise MdpStateError(
+                "MDP: encoder-only gradient activation uses exact prepared escrows."
+            )
+        trusted = owner_entry[1:]
+        current = (
+            self._runtime,
+            self.authority,
+            self.binding,
+            self.receipt,
+            self.completion,
+            self.records,
+            self.embedding_leaves,
+            *self._trusted[7:12],
+            self.text_only,
+            self.is_selected,
+            *self._trusted[14:16],
+        )
+        if (
+            self._state is not _ACTIVE
+            or self._prepared_entry is not owner_entry
+            or self._prepared_handoff_entry is not handoff_entry
+            or any(
+                actual is not expected for actual, expected in zip(current, trusted, strict=True)
+            )
+        ):
+            raise MdpStateError(
+                "MDP: encoder-only gradient activation retains sealed prepared resources."
+            )
+        handoff.require()
+        reference = owner_entry[0]
+        runtime, receipt, completion = trusted[0], trusted[3], trusted[4]
+        runtime_identity = id(runtime)
+        runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(runtime_identity)
+        if (
+            _ACTIVE_OWNERS.get(id(self)) is not None
+            or _ACTIVE_RECEIPTS.get(id(receipt)) is not None
+            or _replay._ACTIVE_GRADIENT_HANDOFFS.get(id(handoff)) is not handoff_entry
+            or _replay._ACTIVE_COMPLETIONS.get(id(completion)) is not handoff_entry[13]
+            or runtime_entry is None
+            or runtime_entry[0] is not runtime
+            or runtime_entry[1]() is not handoff
+        ):
+            raise MdpStateError(
+                "MDP: encoder-only gradient activation retains exact predecessor registries."
+            )
+        _ACTIVE_OWNERS[id(self)] = owner_entry
+        _ACTIVE_RECEIPTS[id(receipt)] = owner_entry[15]
+        _replay._forward._ACTIVE_RUNTIME_OWNERS[runtime_identity] = (runtime, reference)
+        _replay._ACTIVE_COMPLETIONS[id(completion)] = owner_entry[16]
+        del _replay._ACTIVE_GRADIENT_HANDOFFS[id(handoff)]
         _replay._RETIRED_GRADIENT_HANDOFFS[id(handoff)] = self._prepared_handoff_reference
         handoff._state = _replay._RETIRED
         handoff._consumed = True
@@ -266,6 +333,8 @@ class _D4EncoderGradientRouteOwner:
         handoff._trusted = ()
         self._prepared_reference = None
         self._prepared_handoff_reference = None
+        self._prepared_entry = None
+        self._prepared_handoff_entry = None
 
     def require(self) -> "_D4EncoderGradientRouteOwner":
         entry = _ACTIVE_OWNERS.get(id(self))
@@ -285,6 +354,7 @@ class _D4EncoderGradientRouteOwner:
             *self._trusted[7:12],
             self.text_only,
             self.is_selected,
+            *self._trusted[14:16],
         )
         if self._state is not _ACTIVE or any(
             actual is not expected for actual, expected in zip(current, entry[1:], strict=True)
@@ -293,7 +363,7 @@ class _D4EncoderGradientRouteOwner:
         receipt_entry = _ACTIVE_RECEIPTS.get(id(self.receipt))
         completion_entry = _replay._ACTIVE_COMPLETIONS.get(id(self.completion))
         if (
-            receipt_entry is None
+            receipt_entry is not self._trusted[14]
             or receipt_entry[0]() is not self
             or receipt_entry[1] is not self.receipt
             or self.receipt.authority is not self.authority
@@ -302,7 +372,7 @@ class _D4EncoderGradientRouteOwner:
             or self.receipt.received_tensors is not receipt_entry[5]
             or self.receipt.received_tensors is not self.receipt.exchange.received_tensors
             or self.receipt._seal is not _RECEIPT_SEAL
-            or completion_entry is None
+            or completion_entry is not self._trusted[15]
             or completion_entry[0]() is not self
             or completion_entry[1] is not self.completion
             or completion_entry[2] is not self.authority
@@ -322,6 +392,26 @@ class _D4EncoderGradientRouteOwner:
         entry = _ACTIVE_OWNERS.get(id(self))
         if entry is None or entry[0]() is not self:
             self.require()
+        self._abort_from_escrow(entry, primary_error)
+
+    def _abort_from_escrow(
+        self, entry: tuple[Any, ...], primary_error: BaseException | None = None
+    ) -> None:
+        """Retire using the exact entry prepared before activation callbacks."""
+        if primary_error is not None and not isinstance(primary_error, BaseException):
+            raise MdpConfigurationError(
+                "MDP: encoder-only gradient route abort error is an exception."
+            )
+        retired = _RETIRED_OWNERS.get(id(self))
+        if retired is not None and retired() is self:
+            raise MdpStateError("MDP: encoder-only gradient route owner is retired.")
+        if (
+            type(entry) is not tuple
+            or len(entry) != 17
+            or type(entry[0]) is not weakref.ReferenceType
+            or entry[0]() is not self
+        ):
+            raise MdpStateError("MDP: encoder-only gradient cleanup uses its exact owner escrow.")
         trusted = entry[1:]
         integrity_error = None
         try:
@@ -336,6 +426,7 @@ class _D4EncoderGradientRouteOwner:
                 *trusted[7:12],
                 object.__getattribute__(self, "text_only"),
                 object.__getattribute__(self, "is_selected"),
+                *trusted[14:16],
             )
             if object.__getattribute__(self, "_state") is not _ACTIVE or any(
                 actual is not expected for actual, expected in zip(current, trusted, strict=True)
@@ -350,14 +441,17 @@ class _D4EncoderGradientRouteOwner:
             if primary_error is not None
             else MdpStateError("MDP: encoder-only gradient route was aborted.")
         )
-        _ACTIVE_OWNERS.pop(id(self))
+        if _ACTIVE_OWNERS.get(id(self)) is entry:
+            del _ACTIVE_OWNERS[id(self)]
         _RETIRED_OWNERS[id(self)] = weakref.ref(self)
         runtime = trusted[0]
         runtime_entry = _replay._forward._ACTIVE_RUNTIME_OWNERS.get(id(runtime))
         if runtime_entry is not None and runtime_entry[1]() is self:
             del _replay._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)]
-        _ACTIVE_RECEIPTS.pop(id(trusted[3]), None)
-        _replay._ACTIVE_COMPLETIONS.pop(id(trusted[4]), None)
+        if _ACTIVE_RECEIPTS.get(id(trusted[3])) is trusted[14]:
+            del _ACTIVE_RECEIPTS[id(trusted[3])]
+        if _replay._ACTIVE_COMPLETIONS.get(id(trusted[4])) is trusted[15]:
+            del _replay._ACTIVE_COMPLETIONS[id(trusted[4])]
         self._state = _RETIRED
         self.authority = None
         self.binding = None
@@ -371,6 +465,8 @@ class _D4EncoderGradientRouteOwner:
         self._trusted = ()
         self._prepared_reference = None
         self._prepared_handoff_reference = None
+        self._prepared_entry = None
+        self._prepared_handoff_entry = None
         if integrity_error is not None:
             _add_cleanup_note(primary, "encoder-only gradient route integrity validation failed.")
         handoff_resources, leaf_bases, transport_buffers, operations = trusted[7:11]
@@ -416,17 +512,20 @@ def run_repeated_d4_encoder_gradient(
         raise MdpStateError("MDP: encoder-only gradient route uses exact authority and completion.")
     binding = handoff_entry[3]
     handoff_operations = handoff_entry[6][2]
+    cleanup_handoff_entry = handoff_entry
     candidate = None
     owner = None
+    owner_entry = None
     prepare_started = False
 
     def prepare() -> _GradientCandidate:
-        nonlocal candidate, owner, prepare_started
+        nonlocal candidate, cleanup_handoff_entry, owner, owner_entry, prepare_started
         if prepare_started:
             raise MdpStateError("MDP: encoder-only gradient preparation is one-shot.")
         prepare_started = True
         handoff.consume(authority, completion)
         entry = _replay._ACTIVE_GRADIENT_HANDOFFS[id(handoff)]
+        cleanup_handoff_entry = entry
         trusted = entry[1:-1]
         runtime = trusted[0]
         handoff_resources = trusted[5]
@@ -516,6 +615,7 @@ def run_repeated_d4_encoder_gradient(
             )
             owner = _D4EncoderGradientRouteOwner(owner_trusted, _OWNER_SEAL)
             owner._prepare_from(handoff)
+            owner_entry = owner._prepared_entry
             candidate = prepared_candidate
             return candidate
         except BaseException as error:
@@ -551,15 +651,33 @@ def run_repeated_d4_encoder_gradient(
             )
             if received is not candidate.receipt.received_tensors:
                 raise MdpBridgeError("MDP: encoder-only gradient A2A returns exact received views.")
-            owner._activate_prepared(handoff)
+            owner._activate_prepared(handoff, owner_entry, cleanup_handoff_entry)
         except BaseException as error:
             if type(error) is MdpTaskFatalError:
                 raise
             raise MdpTaskFatalError(
                 "MDP: physical encoder-gradient route failed after Gate3 final WORLD."
             ) from error
+        owner.require()
         return owner
     except BaseException as error:
+        current_owner_entry = None if owner is None else _ACTIVE_OWNERS.get(id(owner))
+        owner_entry_is_exact = current_owner_entry is owner_entry
+        owner_was_activated = owner is not None and (
+            owner_entry_is_exact
+            or (
+                (retired := _replay._RETIRED_GRADIENT_HANDOFFS.get(id(handoff))) is not None
+                and retired() is handoff
+            )
+        )
+        if owner_was_activated:
+            try:
+                owner._abort_from_escrow(owner_entry, error)
+            except BaseException as cleanup_error:
+                _add_cleanup_note(
+                    error, f"suppressed encoder gradient owner cleanup error: {cleanup_error!r}"
+                )
+            raise
         if candidate is not None:
             for buffer in reversed(candidate.transport_buffers):
                 try:
@@ -570,9 +688,49 @@ def run_repeated_d4_encoder_gradient(
                         f"suppressed encoder gradient buffer cleanup error: {cleanup_error!r}",
                     )
         try:
-            handoff.abort(error)
+            handoff._abort_from_escrow(cleanup_handoff_entry, error)
         except BaseException as cleanup_error:
             _add_cleanup_note(
                 error, f"suppressed encoder gradient handoff cleanup error: {cleanup_error!r}"
             )
+        raise
+
+
+def _run_repeated_d4_encoder_gradient_from_replay(
+    replay: _replay._D4FixedDecoderReplayOwner,
+    authority: _DynamicIterationAuthority,
+    completion: _replay._D4FixedDecoderCompletion,
+    *,
+    all_to_all_single: Callable[..., Any] = dist.all_to_all_single,
+    byte_generator: Callable[[int], Any] | None = None,
+) -> _D4EncoderGradientRouteOwner:
+    """Atomically claim completed replay and return its exact Gate3 successor."""
+    if type(replay) is not _replay._D4FixedDecoderReplayOwner:
+        raise MdpConfigurationError(
+            "MDP: encoder gradient replay route uses an exact fixed decoder owner."
+        )
+    handoff = None
+    try:
+        replay.require()
+        if authority is not replay.authority:
+            raise MdpStateError(
+                "MDP: encoder gradient replay route uses its exact iteration authority."
+            )
+        replay.require_completion(completion)
+        handoff = replay._claim_for_gradient(authority, completion)
+        return run_repeated_d4_encoder_gradient(
+            handoff,
+            authority,
+            completion,
+            all_to_all_single=all_to_all_single,
+            byte_generator=byte_generator,
+        )
+    except BaseException as primary:
+        if handoff is None:
+            try:
+                replay.abort(primary)
+            except BaseException as cleanup_error:
+                _add_cleanup_note(
+                    primary, f"suppressed fixed decoder replay cleanup error: {cleanup_error!r}"
+                )
         raise
