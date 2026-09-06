@@ -2,6 +2,7 @@
 
 """Gate0 selected-forward ownership and ordering contracts."""
 
+import copy
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
@@ -207,14 +208,41 @@ def _install_gate0(monkeypatch, events, *, reject=None, physical_error=None):
     return bundle
 
 
-def _forward_owner(monkeypatch, *, runtime=None, invalid_output=False, text_only=False):
-    runtime, authority, claim, events = _claim(runtime=runtime, text_only=text_only)
+def _forward_owner(
+    monkeypatch,
+    *,
+    runtime=None,
+    invalid_output=False,
+    text_only=False,
+    selected=True,
+    leader=True,
+    rank=0,
+):
+    runtime, authority, claim, events = _claim(
+        runtime=runtime, text_only=text_only, selected=selected, leader=leader, rank=rank
+    )
     runtime.adapter.invalid_output = invalid_output
     _install_gate0(monkeypatch, events)
     owner = api.run_repeated_d4_encoder_forward(
         runtime, claim, authority, broadcast=lambda *_args, **_kwargs: None
     )
     return runtime, authority, owner, events
+
+
+def _publication(monkeypatch, **kwargs):
+    runtime, authority, owner, events = _forward_owner(monkeypatch, **kwargs)
+    _install_gate1(monkeypatch, events)
+    publication = api.run_repeated_d4_encoder_publication(owner)
+    calls = []
+
+    def snapshot(binding, candidate):
+        calls.append((binding, candidate))
+        if candidate.participant_ranks != (0, 1, 2, 3):
+            raise MdpStateError("mutated authority")
+        return candidate
+
+    monkeypatch.setattr(api, "_snapshot_local_authority", snapshot)
+    return runtime, authority, publication, calls
 
 
 def _install_gate1(
@@ -782,4 +810,148 @@ def test_gate1_rejection_allows_fresh_same_runtime_forward(monkeypatch):
     runtime.allocator.fail_release = False
     fresh_runtime, _, fresh, _ = _forward_owner(monkeypatch, runtime=runtime)
     assert fresh_runtime is runtime
+    fresh.abort()
+
+
+def test_publication_claims_registered_replay_handoff_without_releasing(monkeypatch):
+    runtime, authority, publication, calls = _publication(monkeypatch)
+    handle = publication.forward_handle
+    binding_owner = publication._binding_owner
+    buffers = publication._buffers
+
+    handoff = publication._claim_for_replay(authority)
+
+    assert type(handoff) is api._D4EncoderReplayHandoff
+    assert handoff.require() is handoff
+    assert handoff.authority is authority
+    assert handoff.forward_handle is handle and not handle.consumed
+    assert handoff._binding_owner is binding_owner and binding_owner.active
+    assert handoff._buffers is buffers
+    assert runtime.allocator.released == []
+    assert calls == [(handoff.binding, authority)]
+    assert api._ACTIVE_RUNTIME_OWNERS[id(runtime)][1]() is handoff
+    with pytest.raises(MdpStateError, match="publication owner is retired"):
+        publication.require()
+    with pytest.raises(MdpStateError, match="publication owner is retired"):
+        publication.abort()
+    with pytest.raises(MdpStateError, match="publication owner is retired"):
+        publication._claim_for_replay(authority)
+    assert publication.authority is None
+    assert publication.forward_handle is None
+
+    assert handoff.consume(authority) is handoff
+    assert handoff.require() is handoff
+    with pytest.raises(MdpStateError, match="consumed exactly once"):
+        handoff.consume(authority)
+    handoff.abort()
+    assert handle.consumed
+    assert binding_owner.active is False
+    assert runtime.allocator.released == [tensor for _, tensor in runtime.allocator.acquired]
+    with pytest.raises(MdpStateError, match="replay handoff is retired"):
+        handoff.require()
+
+
+def test_foreign_clone_and_mutated_authority_do_not_consume_publication(monkeypatch):
+    _, authority, publication, calls = _publication(monkeypatch)
+    clone = copy.copy(authority)
+
+    for candidate in (object(), clone):
+        with pytest.raises(MdpStateError, match="exact iteration authority"):
+            publication._claim_for_replay(candidate)
+        assert publication.require() is publication
+    assert calls == []
+
+    original = authority.participant_ranks
+    authority.participant_ranks = (0, 1)
+    with pytest.raises(MdpStateError, match="mutated authority"):
+        publication._claim_for_replay(authority)
+    assert publication.require() is publication
+    authority.participant_ranks = original
+    handoff = publication._claim_for_replay(authority)
+    handoff.abort()
+
+
+@pytest.mark.parametrize(
+    ("rank", "selected", "leader", "text_only", "has_graph", "has_binding"),
+    (
+        (0, True, True, False, True, True),
+        (3, False, False, False, False, False),
+        (0, True, True, True, False, False),
+    ),
+)
+def test_replay_handoff_preserves_selected_nonselected_and_text_only_resources(
+    monkeypatch, rank, selected, leader, text_only, has_graph, has_binding
+):
+    _, authority, publication, _ = _publication(
+        monkeypatch, rank=rank, selected=selected, leader=leader, text_only=text_only
+    )
+    payload = publication.payload_bundle
+    embedding = publication.embedding_bundle
+    layout = publication.layout
+    handoff = publication._claim_for_replay(authority)
+
+    assert handoff.payload_bundle is payload
+    assert handoff.embedding_bundle is embedding
+    assert handoff.layout is layout
+    assert (handoff.forward_handle is not None) is has_graph
+    assert (handoff._binding_owner is not None) is has_binding
+    assert handoff.text_only is text_only
+    handoff.abort()
+
+
+def test_replay_abort_cleans_trusted_resources_after_live_mutation_and_reuses_runtime(monkeypatch):
+    runtime, authority, publication, _ = _publication(monkeypatch)
+    handoff = publication._claim_for_replay(authority)
+    handle = handoff.forward_handle
+    binding_owner = handoff._binding_owner
+    original_restore = binding_owner._restore
+    callback_states = []
+
+    def restore(primary):
+        callback_states.append(
+            (handoff.authority, api._ACTIVE_RUNTIME_OWNERS.get(id(runtime)), primary)
+        )
+        original_restore(primary)
+        raise RuntimeError("restore failed")
+
+    binding_owner._restore = restore
+    runtime.allocator.fail_release = True
+    note_states = []
+
+    class HostilePrimary(MdpStateError):
+        def add_note(self, note):
+            del note
+            try:
+                handoff.abort(self)
+            except BaseException as error:
+                reentry = error
+            else:
+                reentry = None
+            note_states.append(
+                (handoff.authority, api._ACTIVE_RUNTIME_OWNERS.get(id(runtime)), reentry)
+            )
+            raise RuntimeError("hostile add_note")
+
+    primary = HostilePrimary("replay failed")
+    del handoff.authority
+
+    handoff.abort(primary)
+
+    assert callback_states == [(None, None, primary)]
+    assert handle.consumed is True
+    assert binding_owner.active is False
+    assert note_states
+    assert all(authority is None and owner is None for authority, owner, _ in note_states)
+    assert all(
+        isinstance(reentry, MdpStateError) and "retired" in str(reentry)
+        for _, _, reentry in note_states
+    )
+    with pytest.raises(MdpStateError, match="replay handoff is retired"):
+        handoff.abort(primary)
+
+    runtime.adapter.fail_restore = False
+    runtime.allocator.fail_release = False
+    _, fresh_authority, fresh_publication, _ = _publication(monkeypatch, runtime=runtime)
+    fresh = fresh_publication._claim_for_replay(fresh_authority)
+    assert fresh.require() is fresh
     fresh.abort()

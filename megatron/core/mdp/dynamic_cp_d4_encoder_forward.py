@@ -13,6 +13,7 @@ import torch.distributed as dist
 from megatron.core.mdp.activation import EncoderForwardHandle
 from megatron.core.mdp.dynamic_cp_bridge import dynamic_bridge_split_sizes
 from megatron.core.mdp.dynamic_cp_d4_authority_collective import (
+    _snapshot_local_authority,
     run_repeated_d4_authority_collective,
 )
 from megatron.core.mdp.dynamic_cp_d4_embedding_transport import (
@@ -40,6 +41,8 @@ _ACTIVE_RUNTIME_OWNERS: dict[int, tuple[Any, weakref.ReferenceType[Any]]] = {}
 _RETIRED_OWNERS: dict[int, weakref.ReferenceType[Any]] = {}
 _ACTIVE_PUBLICATIONS: dict[int, tuple[Any, ...]] = {}
 _RETIRED_PUBLICATIONS: dict[int, weakref.ReferenceType[Any]] = {}
+_ACTIVE_REPLAY_HANDOFFS: dict[int, tuple[Any, ...]] = {}
+_RETIRED_REPLAY_HANDOFFS: dict[int, weakref.ReferenceType[Any]] = {}
 _LAYOUT_FIELDS = 11
 _OPERATIONS_SEAL = object()
 
@@ -671,6 +674,279 @@ class _D4EncoderPublicationOwner:
                 _add_cleanup_note(
                     primary, f"suppressed D4 publication buffer release error: {error!r}"
                 )
+
+    def _claim_for_replay(
+        self, authority: _DynamicIterationAuthority, /
+    ) -> "_D4EncoderReplayHandoff":
+        """Transfer exact Gate0/1 resources without releasing any of them."""
+        self.require()
+        if authority is not self.authority:
+            raise MdpStateError("MDP: D4 replay handoff requires its exact iteration authority.")
+        _snapshot_local_authority(self.binding, authority)
+        trusted = _ACTIVE_PUBLICATIONS[id(self)][1:]
+        handoff = _D4EncoderReplayHandoff(trusted)
+        handoff._activate_from(self)
+        return handoff
+
+
+class _D4EncoderReplayHandoff:
+    """Registered one-shot owner of the completed Gate0/1 resources."""
+
+    __slots__ = (
+        "__weakref__",
+        "authority",
+        "binding",
+        "selected_ranks",
+        "membership",
+        "layout",
+        "payload_bundle",
+        "embedding_bundle",
+        "output",
+        "item_outputs",
+        "forward_handle",
+        "text_only",
+        "is_selected",
+        "is_leader",
+        "_runtime",
+        "_binding_owner",
+        "_buffers",
+        "_operations",
+        "_state",
+        "_consumed",
+        "_trusted",
+    )
+
+    def __init__(self, trusted: tuple[Any, ...]) -> None:
+        (
+            self._runtime,
+            self.authority,
+            self.binding,
+            self.selected_ranks,
+            self.membership,
+            self.layout,
+            self.payload_bundle,
+            self.embedding_bundle,
+            self.output,
+            self.item_outputs,
+            self.forward_handle,
+            self.text_only,
+            self.is_selected,
+            self.is_leader,
+            self._binding_owner,
+            self._buffers,
+            self._operations,
+        ) = trusted
+        self._state = _ACTIVE
+        self._consumed = False
+        self._trusted = trusted
+
+    def _activate_from(self, predecessor: _D4EncoderPublicationOwner) -> None:
+        runtime = self._runtime
+        runtime_entry = _ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        publication_entry = _ACTIVE_PUBLICATIONS.get(id(predecessor))
+        if (
+            runtime_entry is None
+            or runtime_entry[0] is not runtime
+            or runtime_entry[1]() is not predecessor
+            or publication_entry is None
+            or publication_entry[0]() is not predecessor
+            or len(publication_entry[1:]) != len(self._trusted)
+            or any(
+                actual is not expected
+                for actual, expected in zip(publication_entry[1:], self._trusted, strict=True)
+            )
+        ):
+            raise MdpStateError("MDP: D4 replay handoff replaces its exact publication owner.")
+        identity = id(self)
+        runtime_identity = id(runtime)
+
+        def retire(reference: weakref.ReferenceType[Any]) -> None:
+            entry = _ACTIVE_REPLAY_HANDOFFS.get(identity)
+            if entry is not None and entry[0] is reference:
+                del _ACTIVE_REPLAY_HANDOFFS[identity]
+            runtime_entry = _ACTIVE_RUNTIME_OWNERS.get(runtime_identity)
+            if runtime_entry is not None and runtime_entry[1] is reference:
+                del _ACTIVE_RUNTIME_OWNERS[runtime_identity]
+
+        reference = weakref.ref(self, retire)
+        _ACTIVE_REPLAY_HANDOFFS[identity] = (reference, *self._trusted, False)
+        _ACTIVE_RUNTIME_OWNERS[runtime_identity] = (runtime, reference)
+        _ACTIVE_PUBLICATIONS.pop(id(predecessor))
+        predecessor_identity = id(predecessor)
+
+        def remove_predecessor(reference: weakref.ReferenceType[Any]) -> None:
+            if _RETIRED_PUBLICATIONS.get(predecessor_identity) is reference:
+                del _RETIRED_PUBLICATIONS[predecessor_identity]
+
+        _RETIRED_PUBLICATIONS[predecessor_identity] = weakref.ref(predecessor, remove_predecessor)
+        predecessor._state = _RETIRED
+        for name in (
+            "authority",
+            "binding",
+            "selected_ranks",
+            "membership",
+            "layout",
+            "payload_bundle",
+            "embedding_bundle",
+            "output",
+            "item_outputs",
+            "forward_handle",
+            "_runtime",
+            "_binding_owner",
+            "_buffers",
+            "_operations",
+        ):
+            setattr(predecessor, name, None)
+        predecessor._trusted = ()
+
+    def require(self) -> "_D4EncoderReplayHandoff":
+        """Validate this exact active handoff without consuming it."""
+        entry = _ACTIVE_REPLAY_HANDOFFS.get(id(self))
+        if entry is None or entry[0]() is not self:
+            retired = _RETIRED_REPLAY_HANDOFFS.get(id(self))
+            if retired is not None and retired() is self:
+                raise MdpStateError("MDP: D4 encoder replay handoff is retired.")
+            raise MdpStateError("MDP: D4 encoder replay handoff is the exact active owner.")
+        current = (
+            self._runtime,
+            self.authority,
+            self.binding,
+            self.selected_ranks,
+            self.membership,
+            self.layout,
+            self.payload_bundle,
+            self.embedding_bundle,
+            self.output,
+            self.item_outputs,
+            self.forward_handle,
+            self.text_only,
+            self.is_selected,
+            self.is_leader,
+            self._binding_owner,
+            self._buffers,
+            self._operations,
+        )
+        if (
+            self._state is not _ACTIVE
+            or self._consumed is not entry[-1]
+            or any(
+                actual is not expected
+                for actual, expected in zip(current, entry[1:-1], strict=True)
+            )
+        ):
+            raise MdpStateError("MDP: D4 encoder replay handoff retains sealed fields.")
+        return self
+
+    def consume(self, authority: _DynamicIterationAuthority, /) -> "_D4EncoderReplayHandoff":
+        """Mark the handoff claimed once while retaining runtime ownership."""
+        self.require()
+        if self._consumed:
+            raise MdpStateError("MDP: D4 encoder replay handoff is consumed exactly once.")
+        if authority is not self.authority:
+            raise MdpStateError("MDP: D4 encoder replay consumes its exact iteration authority.")
+        _snapshot_local_authority(self.binding, authority)
+        self._consumed = True
+        entry = _ACTIVE_REPLAY_HANDOFFS[id(self)]
+        _ACTIVE_REPLAY_HANDOFFS[id(self)] = (*entry[:-1], True)
+        return self
+
+    def abort(self, primary_error: BaseException | None = None) -> None:
+        """Retire once and release every transferred resource exactly once."""
+        if primary_error is not None and not isinstance(primary_error, BaseException):
+            raise MdpConfigurationError("MDP: D4 encoder replay abort error is an exception.")
+        entry = _ACTIVE_REPLAY_HANDOFFS.get(id(self))
+        if entry is None or entry[0]() is not self:
+            self.require()
+        integrity_error = None
+        try:
+            current = (
+                object.__getattribute__(self, "_runtime"),
+                object.__getattribute__(self, "authority"),
+                object.__getattribute__(self, "binding"),
+                object.__getattribute__(self, "selected_ranks"),
+                object.__getattribute__(self, "membership"),
+                object.__getattribute__(self, "layout"),
+                object.__getattribute__(self, "payload_bundle"),
+                object.__getattribute__(self, "embedding_bundle"),
+                object.__getattribute__(self, "output"),
+                object.__getattribute__(self, "item_outputs"),
+                object.__getattribute__(self, "forward_handle"),
+                object.__getattribute__(self, "text_only"),
+                object.__getattribute__(self, "is_selected"),
+                object.__getattribute__(self, "is_leader"),
+                object.__getattribute__(self, "_binding_owner"),
+                object.__getattribute__(self, "_buffers"),
+                object.__getattribute__(self, "_operations"),
+            )
+            if (
+                object.__getattribute__(self, "_state") is not _ACTIVE
+                or object.__getattribute__(self, "_consumed") is not entry[-1]
+                or any(
+                    actual is not expected
+                    for actual, expected in zip(current, entry[1:-1], strict=True)
+                )
+            ):
+                integrity_error = MdpStateError(
+                    "MDP: D4 encoder replay handoff retains sealed fields."
+                )
+        except BaseException as error:
+            integrity_error = error
+        _ACTIVE_REPLAY_HANDOFFS.pop(id(self))
+        trusted = entry[1:-1]
+        primary = (
+            primary_error
+            if primary_error is not None
+            else MdpStateError("MDP: D4 encoder replay handoff was aborted.")
+        )
+        identity = id(self)
+
+        def remove(reference: weakref.ReferenceType[Any]) -> None:
+            if _RETIRED_REPLAY_HANDOFFS.get(identity) is reference:
+                del _RETIRED_REPLAY_HANDOFFS[identity]
+
+        _RETIRED_REPLAY_HANDOFFS[identity] = weakref.ref(self, remove)
+        runtime = trusted[0]
+        runtime_entry = _ACTIVE_RUNTIME_OWNERS.get(id(runtime))
+        if runtime_entry is not None and runtime_entry[1]() is self:
+            del _ACTIVE_RUNTIME_OWNERS[id(runtime)]
+        binding_owner, buffers, operations = trusted[-3:]
+        forward_handle = trusted[10]
+        self._state = _RETIRED
+        for name in (
+            "authority",
+            "binding",
+            "selected_ranks",
+            "membership",
+            "layout",
+            "payload_bundle",
+            "embedding_bundle",
+            "output",
+            "item_outputs",
+            "forward_handle",
+            "_runtime",
+            "_binding_owner",
+            "_buffers",
+            "_operations",
+        ):
+            setattr(self, name, None)
+        self._trusted = ()
+        if integrity_error is not None:
+            _add_cleanup_note(primary, "D4 encoder replay integrity validation failed.")
+        if forward_handle is not None:
+            try:
+                forward_handle.release_forward_only()
+            except BaseException as error:
+                _add_cleanup_note(primary, f"suppressed encoder graph release error: {error!r}")
+        if binding_owner is not None:
+            try:
+                binding_owner.restore(primary)
+            except BaseException as error:
+                _add_cleanup_note(primary, f"suppressed encoder CP restore error: {error!r}")
+        for buffer in buffers:
+            try:
+                operations.release(buffer)
+            except BaseException as error:
+                _add_cleanup_note(primary, f"suppressed D4 replay buffer release error: {error!r}")
 
 
 def _transfer_to_publication(
