@@ -11,13 +11,13 @@ import torch
 from megatron.core.mdp import dynamic_cp_d4_dynamic_decoder_replay as dynamic_replay_api
 from megatron.core.mdp import dynamic_cp_d4_encoder_backward_authorization as gate4
 from megatron.core.mdp import dynamic_cp_d4_encoder_gradient as gradient_api
+from megatron.core.mdp import dynamic_cp_d4_encoder_gradient_finalize as gate6
+from megatron.core.mdp import dynamic_cp_d4_encoder_iteration_commit as gate7
 from megatron.core.mdp import dynamic_cp_d4_encoder_selected_backward as api
 from megatron.core.mdp import dynamic_cp_d4_fixed_decoder_replay as replay_api
 from megatron.core.mdp.activation import EncoderForwardHandle
-from megatron.core.mdp.bridge import BridgePhase
 from megatron.core.mdp.dynamic_cp import GlobalSampleId, GlobalVisionItemId
 from megatron.core.mdp.dynamic_cp_bridge import DynamicBridgeKey
-from megatron.core.mdp.dynamic_cp_bridge_transport import PreparedDynamicBridgeExchange
 from megatron.core.mdp.dynamic_cp_d3_metadata_transport import DecoderMetadataGatherResult
 from megatron.core.mdp.dynamic_cp_d4_authority_construction import (
     build_repeated_d4_joint_iteration_authority,
@@ -46,6 +46,7 @@ from megatron.core.mdp.dynamic_cp_plan import (
 from megatron.core.mdp.errors import MdpPlanError, MdpStateError, MdpTaskFatalError
 from megatron.core.mdp.plan import EncoderThdLayout, EncoderThdSegment
 from megatron.core.mdp.protocols import DynamicEncoderCpBinding
+from megatron.core.mdp.runtime import MdpRuntime, MdpRuntimeState
 from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
 
 
@@ -185,7 +186,7 @@ def _real_dynamic_authority(cp_size):
     return binding, authority
 
 
-def _real_dynamic_gate4(monkeypatch, cp_size):
+def _real_dynamic_gate4(monkeypatch, cp_size, events=None):
     binding, authority = _real_dynamic_authority(cp_size)
     samples = {sample.sample_id: sample for sample in authority.global_manifest.samples}
     items = {item.item_id: item for item in authority.global_manifest.items}
@@ -225,7 +226,17 @@ def _real_dynamic_gate4(monkeypatch, cp_size):
     for leaf in leaves.values():
         (leaf * 2.0).sum().backward()
     allocator = _DynamicAllocator()
-    runtime = SimpleNamespace(device=torch.device("cpu"), allocator=allocator)
+    runtime = object.__new__(MdpRuntime)
+    runtime.device = torch.device("cpu")
+    runtime.allocator = allocator
+    runtime._state = MdpRuntimeState.EMPTY
+    runtime._iteration = 7
+    runtime._pre_authority_dynamic_producer = None
+    runtime._handle = None
+    runtime._chunk_payload_bases = ()
+    runtime._captured_num_tokens = None
+    runtime._token_capture_count = 0
+    runtime._token_consumed = False
     operations = replay_api._forward._D4EncoderForwardOperations(
         allocator,
         allocator.acquire,
@@ -251,7 +262,9 @@ def _real_dynamic_gate4(monkeypatch, cp_size):
     )
     handle = EncoderForwardHandle(0, 0, (output,), (EncoderThdLayout(0, segments),))
     binding_owner = DynamicEncoderCpBinding(
-        SimpleNamespace(ranks=selected_ranks), is_current=lambda: True, restore=lambda *_args: None
+        SimpleNamespace(ranks=selected_ranks),
+        is_current=lambda: True,
+        restore=lambda *_args: events is not None and events.append("G6:restore"),
     )
     predecessor_buffers = (torch.empty(0),)
     handoff_resources = (binding_owner, predecessor_buffers, operations, handle)
@@ -338,43 +351,36 @@ def _real_dynamic_gate4(monkeypatch, cp_size):
     monkeypatch.setattr(
         gradient_api, "_validate_repeated_d4_group_binding", lambda value: value._authority
     )
-    monkeypatch.setattr(
-        gradient_api,
-        "dynamic_bridge_split_sizes",
-        lambda *_args, **_kwargs: ((0, 0, 0, 0), (0, 0, 0, 0)),
-    )
 
-    def prepare_exchange(*_args, **kwargs):
-        return PreparedDynamicBridgeExchange(
-            BridgePhase.GRADIENT,
-            torch.float32,
-            0,
-            (0, 1, 2, 3),
-            (0, 0, 0, 0),
-            (0, 0, 0, 0),
-            b"g" * 16,
-            kwargs["send_buffer"],
-            kwargs["receive_buffer"],
-            expected_received,
-        )
+    def exchange(exchange, **_kwargs):
+        assert tuple(exchange.received_tensors) == tuple(expected_received)
+        for key, expected in expected_received.items():
+            actual = exchange.received_tensors[key]
+            assert actual.shape == expected.shape and actual.dtype == expected.dtype
+            actual.copy_(expected)
+        if events is not None:
+            events.append("G3:A2A")
+        return exchange.received_tensors
 
-    monkeypatch.setattr(gradient_api, "prepare_dynamic_bridge_exchange", prepare_exchange)
-    monkeypatch.setattr(
-        gradient_api, "validate_prepared_dynamic_bridge_exchange", lambda value: value
-    )
-    monkeypatch.setattr(
-        gradient_api,
-        "_execute_validated_dynamic_bridge_exchange",
-        lambda exchange, **_kwargs: exchange.received_tensors,
-    )
-    runner = lambda _binding, _authority, **kwargs: kwargs["domain_collective"](kwargs["prepare"]())
-    monkeypatch.setattr(gradient_api, "run_repeated_d4_authority_collective", runner)
+    def runner(gate):
+        def run(_binding, _authority, **kwargs):
+            value = kwargs["prepare"]()
+            if events is not None:
+                events.append(f"G{gate}:W0")
+            value = kwargs["domain_collective"](value)
+            if events is not None:
+                events.extend((f"G{gate}:D", f"G{gate}:W1"))
+            return value
+
+        return run
+
+    monkeypatch.setattr(gradient_api, "_execute_validated_dynamic_bridge_exchange", exchange)
+    monkeypatch.setattr(gradient_api, "run_repeated_d4_authority_collective", runner(3))
     gate3 = gradient_api.run_repeated_d4_dynamic_encoder_gradient(
         handoff, authority, completion, all_to_all_single=lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(gate4, "_snapshot_local_authority", lambda b, a: a)
-    monkeypatch.setattr(gate4, "validate_prepared_dynamic_bridge_exchange", lambda value: value)
-    monkeypatch.setattr(gate4, "run_repeated_d4_authority_collective", runner)
+    monkeypatch.setattr(gate4, "run_repeated_d4_authority_collective", runner(4))
     gate4_owner = gate4.run_repeated_d4_encoder_backward_authorization(gate3, authority, completion)
     return (
         gate4_owner,
@@ -384,6 +390,7 @@ def _real_dynamic_gate4(monkeypatch, cp_size):
         len(records),
         operations,
         expected_backward,
+        binding,
     )
 
 
@@ -736,9 +743,16 @@ def test_gate5_runs_backward_only_after_world_domain_world(
 
 @pytest.mark.parametrize("decoder_cp_size", (1, 2, 4))
 def test_real_dynamic_replay_gate3_gate4_gate5_chain(monkeypatch, decoder_cp_size):
-    (predecessor, authority, completion, runtime, record_count, operations, expected_backward) = (
-        _real_dynamic_gate4(monkeypatch, decoder_cp_size)
-    )
+    (
+        predecessor,
+        authority,
+        completion,
+        runtime,
+        record_count,
+        operations,
+        expected_backward,
+        _binding,
+    ) = _real_dynamic_gate4(monkeypatch, decoder_cp_size)
     assert record_count == decoder_cp_size
     incoming = tuple(
         entry for entry in authority.gradient_ledger.entries if entry.dst_global_rank == 0
@@ -781,6 +795,134 @@ def test_real_dynamic_replay_gate3_gate4_gate5_chain(monkeypatch, decoder_cp_siz
     assert owner.backward_completion.normalized_completion_escrow.release is operations.release
     assert replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(runtime)][1]() is owner
     owner.abort()
+
+
+@pytest.mark.parametrize("decoder_cp_size", (1, 2, 4))
+def test_real_dynamic_replay_commits_through_gates3_to7(monkeypatch, decoder_cp_size):
+    events = []
+    (
+        predecessor,
+        authority,
+        completion,
+        runtime,
+        record_count,
+        operations,
+        expected_backward,
+        binding,
+    ) = _real_dynamic_gate4(monkeypatch, decoder_cp_size, events)
+    assert record_count == decoder_cp_size
+
+    def runner(gate):
+        def run(_binding, _authority, **kwargs):
+            value = kwargs["prepare"]()
+            events.append(f"G{gate}:W0")
+            value = kwargs["domain_collective"](value)
+            events.extend((f"G{gate}:D", f"G{gate}:W1"))
+            return value
+
+        return run
+
+    original_backward = predecessor.carrier.forward_handle.backward
+
+    def backward(gradients):
+        torch.testing.assert_close(gradients[0], expected_backward)
+        events.append("G5:backward")
+        return original_backward(gradients)
+
+    predecessor.carrier.forward_handle.backward = backward
+    monkeypatch.setattr(api, "_snapshot_local_authority", lambda b, a: a)
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", runner(5))
+    gate5_owner = api.run_repeated_d4_encoder_selected_backward(predecessor, authority, completion)
+    expected_releases = (
+        *gate5_owner._trusted[9],
+        *gate5_owner._trusted[8],
+        *gate5_owner._trusted[6][1],
+    )
+    backward_completion = gate5_owner.backward_completion
+    carrier = gate5_owner.gate4_carrier
+    receipt = gate5_owner._trusted[7]
+    gate5_identity = id(gate5_owner)
+    handle = carrier.forward_handle
+
+    monkeypatch.setattr(gate6, "_snapshot_local_authority", lambda b, a: a)
+    monkeypatch.setattr(gate6, "run_repeated_d4_authority_collective", runner(6))
+
+    def finalize(encoder_ddp, *, globally_reduced_num_tokens):
+        assert encoder_ddp is operations.encoder_ddp
+        assert globally_reduced_num_tokens is completion.globally_reduced_num_tokens
+        events.append("G6:finalize")
+
+    monkeypatch.setattr(gate6._encoder, "finalize_encoder_grads", finalize)
+    ready = gate6.run_repeated_d4_encoder_gradient_finalize(gate5_owner, authority, completion)
+    gate6_owner = ready.owner
+
+    def gate7_runner(_binding, _authority, **kwargs):
+        value = kwargs["prepare"]()
+        assert operations.allocator.released == list(expected_releases)
+        assert handle._released is True
+        events.append("G7:W0")
+        value = kwargs["domain_collective"](value)
+        events.extend(("G7:D", "G7:W1"))
+        return value
+
+    monkeypatch.setattr(gate7, "run_repeated_d4_authority_collective", gate7_runner)
+    commit_runtime = gate7._COMMIT_RUNTIME
+
+    def commit(exact_runtime, *, iteration, token):
+        assert exact_runtime is runtime
+        assert iteration == 7 and runtime._iteration == 7
+        assert token is completion.globally_reduced_num_tokens
+        assert runtime._captured_num_tokens is token
+        assert runtime._token_capture_count == 1 and runtime._token_consumed is True
+        events.append("G7:commit")
+        return commit_runtime(exact_runtime, iteration=iteration, token=token)
+
+    monkeypatch.setattr(gate7, "_COMMIT_RUNTIME", commit)
+    assert (
+        gate7.run_repeated_d4_encoder_iteration_commit(binding, authority, ready.owner, ready)
+        is None
+    )
+    assert events == [
+        "G3:W0",
+        "G3:D",
+        "G3:W1",
+        "G3:A2A",
+        "G4:W0",
+        "G4:D",
+        "G4:W1",
+        "G5:W0",
+        "G5:D",
+        "G5:W1",
+        "G5:backward",
+        "G6:restore",
+        "G6:W0",
+        "G6:D",
+        "G6:W1",
+        "G6:finalize",
+        "G7:W0",
+        "G7:D",
+        "G7:W1",
+        "G7:commit",
+    ]
+    assert operations.allocator.released == list(expected_releases)
+    assert handle._released is True
+    assert runtime._iteration == 8
+    assert runtime._captured_num_tokens is None
+    assert runtime._token_capture_count == 0 and runtime._token_consumed is False
+    assert id(runtime) not in replay_api._forward._ACTIVE_RUNTIME_OWNERS
+    assert id(completion) not in dynamic_replay_api._ACTIVE_COMPLETIONS
+    assert id(predecessor) not in gate4._ACTIVE_OWNERS
+    assert id(carrier) not in gate4._ACTIVE_CARRIERS
+    assert id(receipt) not in gradient_api._ACTIVE_RECEIPTS
+    assert id(backward_completion) not in api._ACTIVE_COMPLETIONS
+    assert gate5_identity not in api._ACTIVE_OWNERS
+    assert gate5_identity not in api._OWNER_ESCROWS
+    assert gate5_identity not in api._TRUSTED_OWNER_ESCROWS
+    assert gate5_identity not in api._CANONICAL_OWNER_ESCROWS
+    assert id(gate6_owner) not in gate6._ACTIVE_OWNERS
+    assert id(ready) not in gate6._ACTIVE_READY
+    assert ready.owner is None and ready.runtime is None and ready.token is None
+    assert gate6._ACTIVE_COMMIT_HANDOFFS == {}
 
 
 @pytest.mark.parametrize("decoder_mode", ("fixed", "dynamic"))
