@@ -156,6 +156,15 @@ MODEL_REGISTRY = {
         "mdp_adapter_factory": (
             "examples.multimodal_dev.models.nemotron_omni.mdp.build_mdp_adapter"
         ),
+        "energon_task_encoder_factory": (
+            "examples.multimodal_dev.models.nemotron_omni.energon.build_task_encoder"
+        ),
+        "energon_image_materializer_factory": (
+            "examples.multimodal_dev.models.nemotron_omni.energon.build_image_materializer"
+        ),
+        "energon_image_metadata_validator": (
+            "examples.multimodal_dev.models.nemotron_omni.energon.validate_image_metadata"
+        ),
         "dataset_providers": {
             "mock": (
                 "examples.multimodal_dev.models.nemotron_omni.data"
@@ -164,6 +173,10 @@ MODEL_REGISTRY = {
             "mdp_mock": (
                 "examples.multimodal_dev.models.nemotron_omni.data"
                 ".mdp_mock_dataset_provider"
+            ),
+            "energon": (
+                "examples.multimodal_dev.data.energon.provider"
+                ".train_valid_test_datasets_provider"
             ),
         },
     },

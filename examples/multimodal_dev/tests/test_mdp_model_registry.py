@@ -17,6 +17,18 @@ def test_qwen_registry_declares_a_lazy_mdp_adapter_factory():
     assert callable(pretrain_multimodal._resolve_provider_fn(factory))
 
 
+def test_nemotron_registry_declares_model_owned_energon_hooks():
+    entry = MODEL_REGISTRY["nemotron_omni"]
+    module = "examples.multimodal_dev.models.nemotron_omni.energon"
+
+    assert entry["energon_task_encoder_factory"] == f"{module}.build_task_encoder"
+    assert entry["energon_image_materializer_factory"] == f"{module}.build_image_materializer"
+    assert entry["energon_image_metadata_validator"] == f"{module}.validate_image_metadata"
+    assert entry["dataset_providers"]["energon"] == (
+        "examples.multimodal_dev.data.energon.provider.train_valid_test_datasets_provider"
+    )
+
+
 def test_mdp_adapter_builder_uses_selected_registry_factory(monkeypatch):
     """Adapter construction dispatches through the selected model entry."""
     calls = []
