@@ -258,3 +258,208 @@ def test_public_repeated_d4_runs_actual_qwen_backward_finalize_and_commit(
     assert selected_encoder_cp == [4]
     grads = [parameter.main_grad for parameter in runtime.encoder_domain.encoder_ddp.parameters()]
     assert any(gradient is not None and torch.count_nonzero(gradient) for gradient in grads)
+
+
+class _OptimizerParityDecoder(torch.nn.Module):
+    """One real decoder-domain parameter around the D4 vision leaf."""
+
+    vp_stage = None
+
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.25, dtype=torch.bfloat16, device="cuda"))
+
+    def forward(self, *, input_ids, vision_embeddings, packed_seq_params, **_kwargs):
+        assert packed_seq_params.cp_group.size() == 4
+        scalar = self.scale.float() * vision_embeddings.float().square().mean()
+        local_tokens = input_ids.shape[-1] // packed_seq_params.cp_group.size()
+        return scalar.expand(input_ids.shape[0], local_tokens)
+
+
+def _clone_named_parameters(module):
+    return {
+        name: parameter.detach().float().clone() for name, parameter in module.named_parameters()
+    }
+
+
+def _clone_optimizer_state(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().float().clone()
+    if isinstance(value, dict):
+        return {key: _clone_optimizer_state(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_clone_optimizer_state(item) for item in value)
+    return value
+
+
+def _optimizer_steps(value):
+    if isinstance(value, dict):
+        return tuple(int(item) for key, item in value.items() if key == "step") + tuple(
+            step for item in value.values() for step in _optimizer_steps(item)
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(step for item in value for step in _optimizer_steps(item))
+    return ()
+
+
+def _snapshot_batch(batch):
+    packed = batch["packed_seq_params"]
+    return {
+        "tensors": {
+            name: value.detach().clone() for name, value in batch.items() if torch.is_tensor(value)
+        },
+        "packed": {
+            name: value.detach().clone() if torch.is_tensor(value) else value
+            for name in (
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
+                "max_seqlen_q",
+                "max_seqlen_kv",
+                "total_tokens",
+            )
+            if (value := getattr(packed, name)) is not None
+        },
+    }
+
+
+def _run_optimizer_parity_mode(monkeypatch, *, dynamic_decoder, native_bind):
+    from megatron.core.mdp.optimizer import build_mdp_composite_optimizer
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+
+    runtime = _runtime()
+    integration._RUNTIME = runtime
+    selected_encoder_cp = []
+    captured_batches = []
+
+    def observe_encoder_cp(*args, membership, **kwargs):
+        selected_encoder_cp.append(membership.group_size)
+        return native_bind(*args, membership=membership, **kwargs)
+
+    def get_batch(iterator):
+        next(iterator)
+        batch = _batch()
+        assert not captured_batches
+        captured_batches.append(_snapshot_batch(batch))
+        return batch
+
+    monkeypatch.setattr(forward_step, "get_batch", get_batch)
+    monkeypatch.setattr(mdp_adapter_module, "_bind_dynamic_encoder_cp", observe_encoder_cp)
+    decoder = _OptimizerParityDecoder()
+    decoder_ddp = DistributedDataParallel(
+        config=_vision_config(),
+        ddp_config=DistributedDataParallelConfig(
+            use_distributed_optimizer=False,
+            overlap_grad_reduce=False,
+            overlap_param_gather=False,
+            grad_reduce_in_fp32=True,
+        ),
+        module=decoder,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
+    optimizer_config = OptimizerConfig(
+        optimizer="adam", lr=1e-2, bf16=True, clip_grad=0.1, weight_decay=0.0
+    )
+    decoder_optimizer = get_megatron_optimizer(
+        optimizer_config, [decoder_ddp], use_gloo_process_groups=False
+    )
+    encoder_optimizer = get_megatron_optimizer(
+        optimizer_config, [runtime.encoder_domain.encoder_ddp], use_gloo_process_groups=False
+    )
+    composite = build_mdp_composite_optimizer(decoder_optimizer, encoder_optimizer)
+    decoder_ddp.zero_grad_buffer()
+    runtime.encoder_domain.encoder_ddp.zero_grad_buffer()
+    initial_decoder = _clone_named_parameters(decoder_ddp)
+    initial_encoder = _clone_named_parameters(runtime.encoder_domain.encoder_ddp)
+    initial_optimizer = _clone_optimizer_state(composite.state_dict())
+    initial_cpu_rng = torch.get_rng_state().clone()
+    initial_cuda_rng = torch.cuda.get_rng_state().clone()
+
+    def finalize(_model, tokens):
+        decoder_ddp.finish_grad_sync()
+        dist.all_reduce(tokens)
+
+    config = SimpleNamespace(
+        dynamic_context_parallel=dynamic_decoder,
+        min_dynamic_context_parallel_size=1,
+        max_seqlen_per_dp_cp_rank=16,
+        finalize_model_grads_func=finalize,
+    )
+
+    def native_schedule(data_iterator, num_microbatches, forward_only):
+        assert num_microbatches == 1 and forward_only is False
+        output, output_loss_func = forward_step.forward_step(data_iterator, decoder_ddp)
+        loss, tokens, _ = output_loss_func(output)
+        loss.backward()
+        config.finalize_model_grads_func([], tokens)
+        assert int(tokens) == 128
+        return loss.detach()
+
+    try:
+        wrapped = integration.maybe_wrap_forward_backward(native_schedule, config)
+        loss = wrapped(data_iterator=iter((object(),)), num_microbatches=1, forward_only=False)
+        decoder_grads = {
+            name: parameter.main_grad.detach().float().clone()
+            for name, parameter in decoder_ddp.named_parameters()
+        }
+        encoder_grads = {
+            name: parameter.main_grad.detach().float().clone()
+            for name, parameter in runtime.encoder_domain.encoder_ddp.named_parameters()
+        }
+        success, grad_norm, _ = composite.step()
+        assert success and grad_norm > optimizer_config.clip_grad
+        assert selected_encoder_cp == [4]
+        decoder_state = _clone_named_parameters(decoder_ddp)
+        encoder_state = _clone_named_parameters(runtime.encoder_domain.encoder_ddp)
+        assert any(
+            not torch.equal(decoder_state[name], initial_decoder[name]) for name in decoder_state
+        )
+        assert any(
+            not torch.equal(encoder_state[name], initial_encoder[name]) for name in encoder_state
+        )
+        optimizer_state = _clone_optimizer_state(composite.state_dict())
+        steps = _optimizer_steps(optimizer_state)
+        assert len(steps) >= 2 and all(step == 1 for step in steps)
+        return {
+            "loss": loss.float(),
+            "grad_norm": float(grad_norm),
+            "initial_decoder": initial_decoder,
+            "initial_encoder": initial_encoder,
+            "initial_optimizer": initial_optimizer,
+            "initial_cpu_rng": initial_cpu_rng,
+            "initial_cuda_rng": initial_cuda_rng,
+            "captured_batches": tuple(captured_batches),
+            "decoder_grads": decoder_grads,
+            "encoder_grads": encoder_grads,
+            "decoder_state": decoder_state,
+            "encoder_state": encoder_state,
+            "optimizer_state": optimizer_state,
+        }
+    finally:
+        integration.reset_for_testing()
+
+
+def test_joint_dcp_one_step_optimizer_matches_fixed_cp4_reference(monkeypatch):
+    native_bind = mdp_adapter_module._bind_dynamic_encoder_cp
+    fixed = _run_optimizer_parity_mode(monkeypatch, dynamic_decoder=False, native_bind=native_bind)
+    assert integration.get_runtime() is None
+    joint = _run_optimizer_parity_mode(monkeypatch, dynamic_decoder=True, native_bind=native_bind)
+    assert integration.get_runtime() is None
+
+    assert torch.equal(joint["loss"], fixed["loss"])
+    assert abs(joint["grad_norm"] - fixed["grad_norm"]) / fixed["grad_norm"] < 1e-6
+    for section in (
+        "initial_decoder",
+        "initial_encoder",
+        "initial_optimizer",
+        "initial_cpu_rng",
+        "initial_cuda_rng",
+        "captured_batches",
+        "decoder_grads",
+        "encoder_grads",
+        "decoder_state",
+        "encoder_state",
+    ):
+        torch.testing.assert_close(joint[section], fixed[section], rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(joint["optimizer_state"], fixed["optimizer_state"])
