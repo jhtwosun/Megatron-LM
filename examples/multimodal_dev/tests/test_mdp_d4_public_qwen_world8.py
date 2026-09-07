@@ -23,7 +23,7 @@ from megatron.core.mdp.dynamic_encoder_adapter_capability import (
     mint_dynamic_encoder_adapter_capability,
 )
 from megatron.core.mdp.encoder import EncoderDomain, build_encoder_pg_collection
-from megatron.core.mdp.errors import MdpStateError
+from megatron.core.mdp.errors import MdpPlanError, MdpStateError
 from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
 from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
@@ -828,3 +828,112 @@ def test_domain_ep4_public_qwen_execution_uses_native_moe(
     assert runtime.iteration == 1
     assert runtime.state is MdpRuntimeState.EMPTY
     assert runtime.storage.get_leaf(0) is None
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+def test_domain_ep4_ecp2_one_rank_post_forward_failure_then_same_runtime_retry(
+    monkeypatch, mdp_group_registry, expert_replica_group, dynamic_decoder
+):
+    runtime = _runtime(
+        group_registry=mdp_group_registry, encoder_capacity=32, expert_parallel_size=4
+    )
+    integration._RUNTIME = runtime
+    domain_group = runtime.process_groups.encoder_cp_group
+    moe_pgs = ProcessGroupCollection(
+        tp=runtime.process_groups.singleton_group,
+        cp=domain_group,
+        tp_cp=domain_group,
+        ep=domain_group,
+        expt_tp=runtime.process_groups.singleton_group,
+        tp_ep=domain_group,
+        expt_dp=expert_replica_group,
+        tp_dp_cp=dist.group.WORLD,
+    )
+    decoder = _DomainEp4MoeDecoder(moe_pgs).bfloat16().cuda()
+    encoder_ddp = runtime.encoder_domain.encoder_ddp
+    encoder_ddp.zero_grad_buffer()
+    initial_encoder = _clone_named_parameters(encoder_ddp)
+    initial_decoder = _clone_named_parameters(decoder)
+    injected = []
+    native_encoder_forward = encoder_ddp.forward
+
+    def fail_once_after_forward(*args, **kwargs):
+        output = native_encoder_forward(*args, **kwargs)
+        if dist.get_rank() == 0 and not injected:
+            injected.append("rank0-post-forward")
+            return output[:-1]
+        return output
+
+    def get_batch(iterator):
+        next(iterator)
+        return _batch()
+
+    monkeypatch.setattr(encoder_ddp, "forward", fail_once_after_forward)
+    monkeypatch.setattr(forward_step, "get_batch", get_batch)
+    schedule_calls = []
+
+    def finalize(_model, tokens):
+        dist.all_reduce(tokens)
+
+    config = SimpleNamespace(
+        dynamic_context_parallel=dynamic_decoder,
+        min_dynamic_context_parallel_size=1,
+        max_seqlen_per_dp_cp_rank=16,
+        finalize_model_grads_func=finalize,
+    )
+
+    def native_schedule(data_iterator, num_microbatches, forward_only):
+        assert num_microbatches == 1 and forward_only is False
+        schedule_calls.append("schedule")
+        output, output_loss_func = forward_step.forward_step(data_iterator, decoder)
+        loss, tokens, _ = output_loss_func(output)
+        loss.backward()
+        config.finalize_model_grads_func([], tokens)
+        assert int(tokens) == 128
+        return loss.detach()
+
+    wrapped = integration.maybe_wrap_forward_backward(native_schedule, config)
+    with pytest.raises(MdpPlanError) as raised:
+        wrapped(data_iterator=iter((object(),)), num_microbatches=1, forward_only=False)
+
+    expected_error = "MDP: repeated-D4 WORLD rejected rank 0 with error code 1."
+    assert str(raised.value) == expected_error
+    observations = [None] * 8
+    dist.all_gather_object(
+        observations, (type(raised.value).__name__, str(raised.value), tuple(injected))
+    )
+    assert observations == [
+        ("MdpPlanError", expected_error, ("rank0-post-forward",) if rank == 0 else ())
+        for rank in range(8)
+    ]
+    assert schedule_calls == []
+    assert runtime.iteration == 0 and runtime.state is MdpRuntimeState.EMPTY
+    assert runtime.storage.get_leaf(0) is None
+    assert runtime.allocator._outstanding == 0
+    torch.testing.assert_close(_clone_named_parameters(encoder_ddp), initial_encoder)
+    torch.testing.assert_close(_clone_named_parameters(decoder), initial_decoder)
+    assert all(
+        parameter.main_grad is None or not torch.count_nonzero(parameter.main_grad)
+        for parameter in encoder_ddp.parameters()
+    )
+    assert all(parameter.grad is None for parameter in decoder.parameters())
+    encoder = encoder_ddp.module
+    assert encoder._encoder_cp_size == 4
+    assert encoder._encoder_cp_group is domain_group
+    assert integration.get_runtime() is runtime
+
+    loss = wrapped(data_iterator=iter((object(),)), num_microbatches=1, forward_only=False)
+
+    assert torch.isfinite(loss)
+    assert schedule_calls == ["schedule"]
+    assert runtime.iteration == 1 and runtime.state is MdpRuntimeState.EMPTY
+    assert runtime.storage.get_leaf(0) is None
+    assert runtime.allocator._outstanding == 0
+    assert any(
+        parameter.main_grad is not None and torch.count_nonzero(parameter.main_grad)
+        for parameter in encoder_ddp.parameters()
+    )
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad)
+        for parameter in decoder.parameters()
+    )
