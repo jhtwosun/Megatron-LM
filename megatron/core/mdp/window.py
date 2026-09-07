@@ -13,9 +13,21 @@ from typing import Any, Callable, Iterator, Mapping, Optional, Sequence, Union
 
 from torch import Tensor
 
+from megatron.core.mdp.dynamic_cp import GlobalVisionItemId
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.observability import nvtx_phase
-from megatron.core.mdp.protocols import CapturedMicrobatch, MdpModelAdapter, VisionDescriptor
+from megatron.core.mdp.protocols import (
+    CapturedMicrobatch,
+    MdpModelAdapter,
+    VisionCaptureMode,
+    VisionDescriptor,
+)
+from megatron.core.mdp.vision_locator import (
+    VisionDataLocator,
+    VisionLocatorCatalog,
+    VisionLocatorCatalogEntry,
+    build_vision_locator_catalog,
+)
 
 # Owner-sharded pixel reading: while ``capture`` fetches one microbatch, this
 # holds ``(microbatch_owner_worker_id, my_worker_id, is_worker_leader)`` so the model's collate
@@ -113,11 +125,15 @@ class MdpIterationWindow:
         records: Sequence[MdpMicrobatchRecord],
         descriptors: Sequence[VisionDescriptor],
         sidecar: Mapping[int, Tensor],
+        capture_mode: VisionCaptureMode,
+        locator_catalog: VisionLocatorCatalog,
         num_vpp_chunks: int,
     ) -> None:
         self._records = tuple(records)
         self._descriptors = tuple(descriptors)
         self._sidecar = dict(sidecar)
+        self._capture_mode = capture_mode
+        self._locator_catalog = locator_catalog
         self._num_vpp_chunks = num_vpp_chunks
         self._replayed = False
 
@@ -134,9 +150,7 @@ class MdpIterationWindow:
         num_workers: int,
         is_worker_leader: Optional[bool] = None,
         data_loader_source_worker_ids: Optional[Sequence[int]] = None,
-        capture_error_consensus: Optional[
-            Callable[[Optional[BaseException]], bool]
-        ] = None,
+        capture_error_consensus: Optional[Callable[[Optional[BaseException]], bool]] = None,
     ) -> "MdpIterationWindow":
         """Consume one real iterator and build records, descriptors, and sidecar.
 
@@ -177,6 +191,8 @@ class MdpIterationWindow:
         records = []
         descriptors = []
         sidecar = {}
+        capture_mode = None
+        locator_entries = []
         next_item_id = 0
         merge = adapter.spatial_merge_size
         effective_leader = True if is_worker_leader is None else is_worker_leader
@@ -188,13 +204,10 @@ class MdpIterationWindow:
             pending_record = None
             pending_descriptors = []
             pending_sidecar = {}
+            pending_locator_entries = []
             pending_next_item_id = next_item_id
             try:
-                _PIXEL_OWNERSHIP.value = (
-                    owner_worker_id,
-                    my_worker_id,
-                    effective_leader,
-                )
+                _PIXEL_OWNERSHIP.value = (owner_worker_id, my_worker_id, effective_leader)
                 with nvtx_phase("p1_get_batch"):
                     captured = adapter.get_batch(iterator)
                 if captured is None:
@@ -202,18 +215,32 @@ class MdpIterationWindow:
                         f"MDP: data iterator violates: {num_microbatches} microbatches per "
                         f"iteration (exhausted at microbatch {microbatch_id})."
                     )
-                _validate_captured(
-                    captured,
-                    microbatch_id,
-                    merge,
-                    expect_pixels=owns_pixels,
-                )
+                _validate_captured(captured, microbatch_id, merge, expect_pixels=owns_pixels)
+                if capture_mode is None:
+                    capture_mode = captured.vision_capture_mode
+                elif captured.vision_capture_mode is not capture_mode:
+                    raise MdpConfigurationError(
+                        "MDP: every microbatch in one window uses one exact capture mode."
+                    )
+                if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG and lane_id is None:
+                    raise MdpConfigurationError(
+                        "MDP: stable locator capture requires its source endpoint lane."
+                    )
                 vision_records = []
-                for item in captured.vision_items:
+                for item_index, item in enumerate(captured.vision_items):
                     t, h, w = item.grid_thw
                     output_rows = t * (h // merge) * (w // merge)
                     item_id = pending_next_item_id
                     pending_next_item_id += 1
+                    if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG:
+                        locator = captured.vision_locators[item_index]
+                        if locator.grid_thw != item.grid_thw:
+                            raise MdpConfigurationError(
+                                "MDP: captured locator grid matches its exact vision item."
+                            )
+                        pending_locator_entries.append(
+                            VisionLocatorCatalogEntry(GlobalVisionItemId(lane_id, item_id), locator)
+                        )
                     vision_records.append(
                         MdpMicrobatchVisionRecord(
                             global_item_id=item_id,
@@ -246,7 +273,7 @@ class MdpIterationWindow:
                                 owner_worker_id=owner_worker_id,
                             )
                         )
-                    if owns_pixels:
+                    if capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR and owns_pixels:
                         pending_sidecar[item_id] = captured.flat_pixel_payload[
                             item.payload_row_start : item.payload_row_start + item.payload_rows
                         ]
@@ -276,15 +303,19 @@ class MdpIterationWindow:
             records.append(pending_record)
             descriptors.extend(pending_descriptors)
             sidecar.update(pending_sidecar)
+            locator_entries.extend(pending_locator_entries)
             next_item_id = pending_next_item_id
-        return cls(records, descriptors, sidecar, num_vpp_chunks)
+        if capture_mode is None:
+            raise MdpStateError("MDP: iteration window captured no microbatches.")
+        expected_item_ids = tuple(entry.item_id for entry in locator_entries)
+        locator_catalog = build_vision_locator_catalog(expected_item_ids, tuple(locator_entries))
+        return cls(records, descriptors, sidecar, capture_mode, locator_catalog, num_vpp_chunks)
 
     def replay_iterators(self) -> list:
         """``num_vpp_chunks`` independent cursors; a second call raises."""
         if self._replayed:
             raise MdpStateError(
-                "MDP: iteration window violates: replay iterators are created once per "
-                "capture."
+                "MDP: iteration window violates: replay iterators are created once per " "capture."
             )
         self._replayed = True
         return [_ReplayCursor(self._records) for _ in range(self._num_vpp_chunks)]
@@ -303,6 +334,19 @@ class MdpIterationWindow:
         Contains the items from this worker's owned microbatches only.
         """
         return dict(self._sidecar)
+
+    def capture_payload_mode(self) -> VisionCaptureMode:
+        """Return the exact payload mode selected for this captured window."""
+        return self._capture_mode
+
+    def locator_catalog(self) -> VisionLocatorCatalog:
+        """Return the typed stable locator catalog, empty in source-pixel mode."""
+        return self._locator_catalog
+
+    def release_capture_payload(self) -> None:
+        """Sever locator references and release pixel references after capture transfer."""
+        self._locator_catalog = build_vision_locator_catalog((), ())
+        self._sidecar.clear()
 
     def release_pixels(self) -> None:
         """Drop the window/owner pixel references after P1.
@@ -326,6 +370,22 @@ def _validate_captured(
     diagnosed here.
     """
     params = captured.decoder_packed_seq_params
+    if type(captured.vision_capture_mode) is not VisionCaptureMode:
+        raise MdpConfigurationError("MDP: captured vision mode is an exact closed enum.")
+    if type(captured.vision_locators) is not tuple or any(
+        type(locator) is not VisionDataLocator for locator in captured.vision_locators
+    ):
+        raise MdpConfigurationError("MDP: captured vision locators are an exact tuple.")
+    for locator in captured.vision_locators:
+        VisionDataLocator(
+            locator.kind,
+            locator.path,
+            locator.member,
+            locator.column,
+            locator.index,
+            locator.grid_thw,
+            locator.declared_dimensions,
+        )
     if params is not None and getattr(params, "qkv_format", None) != "thd":
         raise MdpConfigurationError(
             f"MDP: microbatch {microbatch_id} violates: decoder_packed_seq_params."
@@ -333,7 +393,17 @@ def _validate_captured(
         )
     has_pixels = captured.flat_pixel_payload is not None
     has_items = bool(captured.vision_items)
-    if expect_pixels is False:
+    if captured.vision_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG:
+        if has_pixels or len(captured.vision_locators) != len(captured.vision_items):
+            raise MdpConfigurationError(
+                f"MDP: microbatch {microbatch_id} locator capture selects exactly one "
+                "aligned non-pixel carrier."
+            )
+    elif captured.vision_locators:
+        raise MdpConfigurationError(
+            f"MDP: microbatch {microbatch_id} source-pixel capture forbids locators."
+        )
+    elif expect_pixels is False:
         if has_pixels:
             raise MdpConfigurationError(
                 f"MDP: microbatch {microbatch_id} violates: non-owned microbatches "

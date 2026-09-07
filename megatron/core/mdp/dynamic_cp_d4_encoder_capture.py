@@ -22,7 +22,13 @@ from megatron.core.mdp.dynamic_cp_execution import (
     validate_decoder_source_window,
 )
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
+from megatron.core.mdp.protocols import VisionCaptureMode
 from megatron.core.mdp.runtime import MdpRuntime, MdpRuntimeState
+from megatron.core.mdp.vision_locator import (
+    VisionLocatorCatalog,
+    build_vision_locator_catalog,
+    validate_vision_locator_catalog,
+)
 from megatron.core.mdp.window import MdpIterationWindow
 
 __all__ = ()
@@ -151,6 +157,8 @@ class _D4EncoderCaptureOwner:
         "_local_manifest",
         "_sample_locations",
         "_pixel_sidecar",
+        "_capture_mode",
+        "_locator_catalog",
         "_local_prepare_error",
         "_state",
         "_trusted_runtime",
@@ -160,25 +168,39 @@ class _D4EncoderCaptureOwner:
         "_trusted_locations",
         "_trusted_pixels",
         "_trusted_pixel_view",
+        "_trusted_capture_mode",
+        "_trusted_locator_catalog",
         "_trusted_error",
     )
 
     def __init__(
-        self, runtime: MdpRuntime, binding: _RepeatedD4GroupBinding, *, _factory_seal: object
+        self,
+        runtime: MdpRuntime,
+        binding: _RepeatedD4GroupBinding,
+        capture_mode: VisionCaptureMode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+        *,
+        _factory_seal: object,
     ) -> None:
-        if _PENDING_OWNER_SEALS.pop(_factory_seal, None) != (id(runtime), id(binding)):
+        if _PENDING_OWNER_SEALS.pop(_factory_seal, None) != (
+            id(runtime),
+            id(binding),
+            capture_mode,
+        ):
             raise MdpConfigurationError(
                 "MDP: D4 encoder capture owner is minted by its private factory."
             )
         empty_locations = MappingProxyType({})
         empty_pixels = {}
         empty_pixel_view = MappingProxyType(empty_pixels)
+        empty_catalog = build_vision_locator_catalog((), ())
         self._runtime = self._trusted_runtime = runtime
         self._binding = self._trusted_binding = binding
         self._source_window = self._trusted_source_window = None
         self._local_manifest = self._trusted_manifest = None
         self._sample_locations = self._trusted_locations = empty_locations
         self._pixel_sidecar = self._trusted_pixel_view = empty_pixel_view
+        self._capture_mode = self._trusted_capture_mode = capture_mode
+        self._locator_catalog = self._trusted_locator_catalog = empty_catalog
         self._local_prepare_error = self._trusted_error = None
         self._trusted_pixels = empty_pixels
         self._state = _ACTIVE_OWNER
@@ -190,6 +212,7 @@ class _D4EncoderCaptureOwner:
         local_manifest: DecoderSourceManifest,
         sample_locations: Mapping[GlobalSampleId, tuple[int, int]],
         pixels: dict[int, torch.Tensor],
+        locator_catalog: VisionLocatorCatalog,
     ) -> None:
         locations = MappingProxyType(dict(sample_locations))
         pixel_view = MappingProxyType(pixels)
@@ -198,6 +221,7 @@ class _D4EncoderCaptureOwner:
         self._sample_locations = self._trusted_locations = locations
         self._pixel_sidecar = self._trusted_pixel_view = pixel_view
         self._trusted_pixels = pixels
+        self._locator_catalog = self._trusted_locator_catalog = locator_catalog
 
     def _install_error(self, error: Exception) -> None:
         self._local_prepare_error = self._trusted_error = error
@@ -211,6 +235,8 @@ class _D4EncoderCaptureOwner:
             or self._local_manifest is not self._trusted_manifest
             or self._sample_locations is not self._trusted_locations
             or self._pixel_sidecar is not self._trusted_pixel_view
+            or self._capture_mode is not self._trusted_capture_mode
+            or self._locator_catalog is not self._trusted_locator_catalog
             or self._local_prepare_error is not self._trusted_error
         ):
             return MdpStateError("MDP: D4 encoder capture retains its sealed capture fields.")
@@ -253,6 +279,16 @@ class _D4EncoderCaptureOwner:
         return self._trusted_pixel_view
 
     @property
+    def capture_mode(self) -> VisionCaptureMode:
+        self.require()
+        return self._trusted_capture_mode
+
+    @property
+    def locator_catalog(self) -> VisionLocatorCatalog:
+        self.require()
+        return self._trusted_locator_catalog
+
+    @property
     def local_prepare_error(self) -> Exception | None:
         self.require()
         return self._trusted_error
@@ -293,6 +329,8 @@ class _D4EncoderCaptureOwner:
             ("_local_manifest", None),
             ("_sample_locations", None),
             ("_pixel_sidecar", None),
+            ("_capture_mode", None),
+            ("_locator_catalog", None),
             ("_local_prepare_error", None),
             ("_trusted_runtime", None),
             ("_trusted_binding", None),
@@ -301,6 +339,8 @@ class _D4EncoderCaptureOwner:
             ("_trusted_locations", None),
             ("_trusted_pixels", None),
             ("_trusted_pixel_view", None),
+            ("_trusted_capture_mode", None),
+            ("_trusted_locator_catalog", None),
             ("_trusted_error", None),
         ):
             setattr(self, name, value)
@@ -331,6 +371,10 @@ class _D4EncoderCaptureOwner:
             raise MdpStateError("MDP: encoder execution authority matches its exact D4 domain.")
         if self._trusted_error is not None:
             raise MdpStateError("MDP: failed encoder source capture cannot be claimed.")
+        if self._trusted_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG:
+            raise MdpStateError(
+                "MDP: stable locator capture cannot enter execution before materialization."
+            )
         is_source = binding.global_rank == binding.domain_ranks[0]
         metadata = (self._trusted_source_window, self._trusted_manifest, self._trusted_locations)
         if is_source:
@@ -366,6 +410,7 @@ class _D4EncoderCaptureOwner:
             or self._trusted_manifest is not None
             or self._trusted_locations
             or self._trusted_pixels
+            or self._trusted_locator_catalog.entries
         ):
             raise MdpStateError("MDP: encoder execution non-source capture is exactly empty.")
         runtime = self._trusted_runtime
@@ -386,6 +431,8 @@ class _D4EncoderCaptureOwner:
             "_local_manifest",
             "_sample_locations",
             "_pixel_sidecar",
+            "_capture_mode",
+            "_locator_catalog",
             "_local_prepare_error",
             "_trusted_runtime",
             "_trusted_binding",
@@ -394,6 +441,8 @@ class _D4EncoderCaptureOwner:
             "_trusted_locations",
             "_trusted_pixels",
             "_trusted_pixel_view",
+            "_trusted_capture_mode",
+            "_trusted_locator_catalog",
             "_trusted_error",
         ):
             setattr(self, name, None)
@@ -453,15 +502,18 @@ def _capture_d4_encoder_source(
     data_iterators: Any,
     num_microbatches: int,
     operations: _D4EncoderCaptureOperations,
+    capture_mode: VisionCaptureMode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
 ) -> _D4EncoderCaptureOwner:
     """Capture only the validated domain source and return one owner on every rank."""
     _, source_lane, is_source = _validate_capture_context(
         runtime, binding, operations, num_microbatches
     )
+    if type(capture_mode) is not VisionCaptureMode:
+        raise MdpConfigurationError("MDP: D4 encoder capture mode is an exact closed enum.")
     token = object()
-    _PENDING_OWNER_SEALS[token] = (id(runtime), id(binding))
+    _PENDING_OWNER_SEALS[token] = (id(runtime), id(binding), capture_mode)
     try:
-        owner = _D4EncoderCaptureOwner(runtime, binding, _factory_seal=token)
+        owner = _D4EncoderCaptureOwner(runtime, binding, capture_mode, _factory_seal=token)
     except BaseException:
         _PENDING_OWNER_SEALS.pop(token, None)
         raise
@@ -470,6 +522,7 @@ def _capture_d4_encoder_source(
         return owner
 
     window = None
+    window_mode = None
     pixels_transferred = False
     try:
         window = MdpIterationWindow.capture(
@@ -484,17 +537,30 @@ def _capture_d4_encoder_source(
             data_loader_source_worker_ids=(0,),
             capture_error_consensus=None,
         )
+        window_mode = window.capture_payload_mode()
+        if window_mode is not capture_mode:
+            raise MdpStateError("MDP: D4 encoder capture window matches its requested mode.")
         pixels = window.payload_sidecar()
         if type(pixels) is not dict or any(
             type(item_id) is not int or not isinstance(tensor, torch.Tensor)
             for item_id, tensor in pixels.items()
         ):
             raise MdpStateError("MDP: D4 encoder capture owns an exact tensor pixel sidecar.")
+        if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG:
+            if pixels:
+                raise MdpStateError("MDP: D4 encoder locator capture owns no pixel sidecar.")
+            locator_catalog = window.locator_catalog()
+            validate_vision_locator_catalog(locator_catalog)
+        else:
+            locator_catalog = build_vision_locator_catalog((), ())
         owner._trusted_pixels = pixels
         pixel_view = MappingProxyType(pixels)
         owner._pixel_sidecar = owner._trusted_pixel_view = pixel_view
         pixels_transferred = True
-        window.release_pixels()
+        if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG:
+            window.release_capture_payload()
+        else:
+            window.release_pixels()
         source_window, sample_locations = operations.build_source_window(
             tuple(window.records()), source_dp_lane=source_lane
         )
@@ -505,6 +571,15 @@ def _capture_d4_encoder_source(
             raise MdpStateError("MDP: D4 encoder source window belongs to its source lane.")
         local_manifest = source_window.metadata_manifest()
         validate_decoder_source_manifest(local_manifest)
+        locator_item_ids = tuple(entry.item_id for entry in locator_catalog.entries)
+        manifest_item_ids = tuple(item.item_id for item in local_manifest.items)
+        if (
+            capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+            and locator_item_ids != manifest_item_ids
+        ) or (capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR and locator_item_ids):
+            raise MdpStateError(
+                "MDP: D4 encoder locator catalog exactly matches its source manifest."
+            )
         if not isinstance(sample_locations, Mapping):
             raise MdpStateError("MDP: D4 encoder capture sample locations are a mapping.")
         locations = dict(sample_locations)
@@ -522,12 +597,16 @@ def _capture_d4_encoder_source(
             local_manifest=local_manifest,
             sample_locations=locations,
             pixels=pixels,
+            locator_catalog=locator_catalog,
         )
     except BaseException as captured_error:
         error = _normalize_local_error(captured_error)
         if window is not None and not pixels_transferred:
             try:
-                window.release_pixels()
+                if window_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG:
+                    window.release_capture_payload()
+                else:
+                    window.release_pixels()
             except BaseException as cleanup_error:
                 _add_cleanup_note(
                     error, f"suppressed D4 encoder capture-window cleanup error: {cleanup_error!r}"

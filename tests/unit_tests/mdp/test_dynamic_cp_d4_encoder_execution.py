@@ -28,6 +28,7 @@ from megatron.core.mdp.dynamic_cp_plan import (
 from megatron.core.mdp.dynamic_cp_runtime import _joint_dynamic_plan_digest
 from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups
+from megatron.core.mdp.protocols import VisionCaptureMode
 from megatron.core.mdp.runtime import MdpRuntimeState
 from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -196,6 +197,7 @@ def _owner(monkeypatch, rank, source_window, locations, *, pixels=None):
     window = SimpleNamespace(
         records=lambda: (object(),),
         payload_sidecar=lambda: dict(pixels),
+        capture_payload_mode=lambda: VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
         release_pixels=lambda: pixels.clear(),
     )
     monkeypatch.setattr(capture_api.MdpIterationWindow, "capture", lambda *_a, **_k: window)

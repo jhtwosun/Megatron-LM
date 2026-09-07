@@ -28,8 +28,9 @@ from megatron.core.mdp.dynamic_cp_execution import build_decoder_global_manifest
 from megatron.core.mdp.dynamic_cp_plan import EncoderWorkEstimate
 from megatron.core.mdp.errors import MdpPlanError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups
-from megatron.core.mdp.protocols import DynamicEncoderCpBinding
+from megatron.core.mdp.protocols import DynamicEncoderCpBinding, VisionCaptureMode
 from megatron.core.mdp.runtime import MdpRuntimeState
+from megatron.core.mdp.vision_locator import build_vision_locator_catalog
 from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
 from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -267,8 +268,14 @@ def _parts(groups, *, selected_size, geometry, invalid=False, runtime=None):
     adapter = _Adapter(ddp, invalid=invalid and rank == 1)
     runtime.adapter = adapter
     token = object()
-    capture_api._PENDING_OWNER_SEALS[token] = (id(runtime), id(binding))
-    capture_owner = capture_api._D4EncoderCaptureOwner(runtime, binding, _factory_seal=token)
+    capture_api._PENDING_OWNER_SEALS[token] = (
+        id(runtime),
+        id(binding),
+        VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+    )
+    capture_owner = capture_api._D4EncoderCaptureOwner(
+        runtime, binding, VisionCaptureMode.SOURCE_PIXEL_SIDECAR, _factory_seal=token
+    )
     runtime._register_d4_encoder_capture_owner(capture_owner)
     if is_leader:
         capture_owner._install_source(
@@ -276,6 +283,7 @@ def _parts(groups, *, selected_size, geometry, invalid=False, runtime=None):
             local_manifest=source_window.metadata_manifest(),
             sample_locations=locations,
             pixels=pixels,
+            locator_catalog=build_vision_locator_catalog((), ()),
         )
     claim = execution_api.claim_d4_encoder_execution(capture_owner, authority)
     execution = authority.encoder_plan.waves[0].executions[0]

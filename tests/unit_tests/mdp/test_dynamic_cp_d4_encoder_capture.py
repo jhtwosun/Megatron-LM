@@ -17,8 +17,15 @@ from megatron.core.mdp import dynamic_cp_d4_encoder_capture as capture_api
 from megatron.core.mdp.dynamic_cp import GlobalSampleId, GlobalVisionItemId
 from megatron.core.mdp.dynamic_cp_d4_group_binding import _make_repeated_d4_group_binding
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
-from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
+from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem, VisionCaptureMode
 from megatron.core.mdp.runtime import MdpRuntimeState
+from megatron.core.mdp.vision_locator import (
+    VisionDataLocator,
+    VisionLocatorCatalogEntry,
+    VisionLocatorIndexSentinel,
+    VisionLocatorKind,
+    build_vision_locator_catalog,
+)
 from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
 from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -122,13 +129,41 @@ def _runtime(rank, *, device=torch.device("cuda", 0)):
     return runtime
 
 
-def _window(monkeypatch, *, pixels=None):
+def _locator_catalog(lane=0):
+    item_id = GlobalVisionItemId(lane, 0)
+    return build_vision_locator_catalog(
+        (item_id,),
+        (
+            VisionLocatorCatalogEntry(
+                item_id,
+                VisionDataLocator(
+                    VisionLocatorKind.SHARED_FILE,
+                    "/datasets/image.jpg",
+                    None,
+                    None,
+                    VisionLocatorIndexSentinel.UNUSED,
+                    (1, 2, 2),
+                ),
+            ),
+        ),
+    )
+
+
+def _window(monkeypatch, *, pixels=None, mode=None, catalog=None):
     pixels = {0: torch.ones(4, 4)} if pixels is None else pixels
+    mode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR if mode is None else mode
+    empty_catalog = build_vision_locator_catalog((), ())
+    catalog = empty_catalog if catalog is None else catalog
     window = SimpleNamespace(
         records=lambda: ("record",),
         payload_sidecar=lambda: dict(pixels),
+        capture_payload_mode=lambda: mode,
+        locator_catalog=lambda: catalog,
+        release_capture_payload=lambda: (pixels.clear(), setattr(window, "catalog", empty_catalog)),
         release_pixels=lambda: pixels.clear(),
     )
+    window.catalog = catalog
+    window.locator_catalog = lambda: window.catalog
     calls = []
 
     def capture(*args, **kwargs):
@@ -232,6 +267,76 @@ def test_all_ranks_get_typed_owner_and_only_domain_source_captures(monkeypatch, 
         assert dict(owner.pixel_sidecar) == {}
     owner.abort()
     assert runtime._d4_encoder_capture_owner is None
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_locator_mode_is_typed_on_all_ranks_and_only_source_advances(monkeypatch, rank):
+    runtime = _runtime(rank)
+    lane = rank // 4
+    source_window, _, locations = _source_window(lane)
+    operations = capture_api._snapshot_d4_encoder_capture_operations(
+        _Adapter(), _Codec(source_window, locations)
+    )
+    catalog = _locator_catalog(lane)
+    window, capture_calls = _window(
+        monkeypatch, pixels={}, mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG, catalog=catalog
+    )
+
+    class IteratorBomb:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise AssertionError("non-source advanced the data iterator")
+
+    owner = capture_api._capture_d4_encoder_source(
+        runtime=runtime,
+        binding=_binding(rank),
+        data_iterators=iter((object(),)) if rank in (0, 4) else IteratorBomb(),
+        num_microbatches=1,
+        operations=operations,
+        capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+    )
+
+    assert owner.capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    assert owner.pixel_sidecar == {}
+    if rank in (0, 4):
+        assert len(capture_calls) == 1
+        assert owner.locator_catalog is catalog
+        assert window.catalog.entries == ()
+    else:
+        assert capture_calls == []
+        assert owner.locator_catalog.entries == ()
+    owner.abort()
+    assert owner._trusted_locator_catalog is None
+    assert runtime._d4_encoder_capture_owner is None
+
+
+def test_source_request_rejects_locator_window_and_releases_its_reference(monkeypatch):
+    runtime = _runtime(0)
+    source_window, _, locations = _source_window(0)
+    operations = capture_api._snapshot_d4_encoder_capture_operations(
+        _Adapter(), _Codec(source_window, locations)
+    )
+    catalog = _locator_catalog(0)
+    window, _ = _window(
+        monkeypatch, pixels={}, mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG, catalog=catalog
+    )
+
+    owner = capture_api._capture_d4_encoder_source(
+        runtime=runtime,
+        binding=_binding(0),
+        data_iterators=iter((object(),)),
+        num_microbatches=1,
+        operations=operations,
+    )
+
+    assert isinstance(owner.local_prepare_error, MdpStateError)
+    assert "requested mode" in str(owner.local_prepare_error)
+    assert owner.capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+    assert owner.locator_catalog.entries == ()
+    assert window.catalog.entries == ()
+    owner.abort(owner.local_prepare_error)
 
 
 def test_snapshotted_operations_ignore_later_live_adapter_and_codec_mutation(monkeypatch):

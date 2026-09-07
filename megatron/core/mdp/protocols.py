@@ -9,9 +9,11 @@ window), not in the adapter.
 """
 
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional, Protocol
 
-from megatron.core.mdp.errors import MdpStateError
+from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
+from megatron.core.mdp.vision_locator import VisionDataLocator
 
 if TYPE_CHECKING:
     import torch
@@ -78,6 +80,13 @@ class CapturedVisionItem:
     decoder_positions: tuple
 
 
+class VisionCaptureMode(IntEnum):
+    """Closed capture payload mode between a model adapter and core."""
+
+    SOURCE_PIXEL_SIDECAR = 1
+    STABLE_LOCATOR_CATALOG = 2
+
+
 @dataclass(frozen=True)
 class CapturedMicrobatch:
     """The single carrier type between the adapter and the iteration window.
@@ -94,6 +103,26 @@ class CapturedMicrobatch:
     vision_items: tuple
     flat_pixel_payload: Optional["Tensor"]
     model_payload: Mapping[str, Any]
+    vision_capture_mode: VisionCaptureMode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+    vision_locators: tuple = ()
+
+    def __post_init__(self) -> None:
+        if type(self.vision_capture_mode) is not VisionCaptureMode:
+            raise MdpConfigurationError("MDP: vision capture mode is an exact closed enum.")
+        if type(self.vision_locators) is not tuple or any(
+            type(locator) is not VisionDataLocator for locator in self.vision_locators
+        ):
+            raise MdpConfigurationError("MDP: captured vision locators are an exact tuple.")
+        has_pixels = self.flat_pixel_payload is not None
+        has_locators = bool(self.vision_locators)
+        if self.vision_capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR:
+            invalid = has_locators
+        else:
+            invalid = has_pixels or len(self.vision_locators) != len(self.vision_items)
+        if invalid:
+            raise MdpConfigurationError(
+                "MDP: capture mode selects exactly one pixel sidecar or aligned locator carrier."
+            )
 
 
 @dataclass(frozen=True)
