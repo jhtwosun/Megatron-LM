@@ -16,21 +16,36 @@ from examples.multimodal_dev.models.nemotron_omni.vision_encoder import (
     NemotronOmniVisionEncoder,
     _NemotronEncoderCpRADIOViTModel,
 )
+from examples.multimodal_dev.tests.mdp_actual_data_world8_support import (
+    RecordingAllocator,
+    assert_actual_gradients_close,
+    assert_world_check,
+    create_shared_fixture,
+    install_protocol_observers,
+    launch_args,
+    remove_shared_fixture,
+    run_actual_locator_parity_arm,
+    run_text_only_public,
+    storage_document,
+)
 from examples.multimodal_dev.tests.test_mdp_d4_public_qwen_world8 import _DomainEp4MoeDecoder
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.mdp import integration
 from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.bridge import ModalityBridge
 from megatron.core.mdp.config import MdpConfig
+from megatron.core.mdp.dynamic_cp import GlobalVisionItemId
 from megatron.core.mdp.dynamic_cp_d4_group_binding import _make_repeated_d4_group_binding
 from megatron.core.mdp.dynamic_encoder_adapter_capability import (
     claim_dynamic_encoder_adapter_capability,
     mint_dynamic_encoder_adapter_capability,
 )
 from megatron.core.mdp.encoder import EncoderDomain, build_encoder_pg_collection
+from megatron.core.mdp.errors import MdpPlanError
 from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
 from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
+from megatron.core.mdp.protocols import VisionCaptureMode
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 from megatron.core.mdp.runtime import MdpRuntime, MdpRuntimeState
 from megatron.core.mdp.storage import MdpEmbeddingStorage
@@ -75,6 +90,13 @@ def group_registry():
     registry = MdpGroupRegistry()
     yield registry
     registry.assert_no_leak()
+
+
+@pytest.fixture(scope="module")
+def actual_data_fixture():
+    fixture = create_shared_fixture()
+    yield fixture
+    remove_shared_fixture(fixture)
 
 
 @pytest.fixture(scope="module")
@@ -166,7 +188,14 @@ def _packed_batch(*, vision):
     }
 
 
-def _runtime(*, group_registry, encoder_capacity, expert_parallel_size):
+def _runtime(
+    *,
+    group_registry,
+    encoder_capacity,
+    expert_parallel_size,
+    vision_capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+    allocator=None,
+):
     rank = dist.get_rank()
     rank_map = build_rank_map(
         MdpRankSpec(world_size=8, tp=1, pp=1, cp=4, ep=expert_parallel_size, encoder_cp=4)
@@ -180,7 +209,7 @@ def _runtime(*, group_registry, encoder_capacity, expert_parallel_size):
     )
     encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=4, process_groups=groups)
     adapter = NemotronOmniMdpAdapter(_HIDDEN, language_config=_language_config())
-    capability = mint_dynamic_encoder_adapter_capability(adapter)
+    capability = mint_dynamic_encoder_adapter_capability(adapter, capture_mode=vision_capture_mode)
     operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
     torch.manual_seed(9876)
     model_parallel_cuda_manual_seed(9876)
@@ -200,7 +229,7 @@ def _runtime(*, group_registry, encoder_capacity, expert_parallel_size):
         module=encoder,
         pg_collection=encoder_pgs,
     )
-    allocator = DirectBufferAllocator()
+    allocator = DirectBufferAllocator() if allocator is None else allocator
     binding = _make_repeated_d4_group_binding(
         world_group=groups.world_group,
         domain_group=groups.encoder_cp_group,
@@ -235,6 +264,7 @@ def _runtime(*, group_registry, encoder_capacity, expert_parallel_size):
         dynamic_adapter_capability=capability,
         dynamic_adapter_owner=adapter,
         dynamic_group_binding=binding,
+        vision_capture_mode=vision_capture_mode,
     )
 
 
@@ -251,6 +281,29 @@ class _LeafDecoder(torch.nn.Module):
             value = value + vision_embeddings.float().square().mean()
         local_tokens = input_ids.shape[-1] // packed_seq_params.cp_group.size()
         return value.expand(input_ids.shape[0], local_tokens)
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+def test_public_nemotron_locator_text_only_has_zero_io_or_h2d(
+    monkeypatch, group_registry, actual_data_fixture, dynamic_decoder
+):
+    runtime = _runtime(
+        group_registry=group_registry,
+        encoder_capacity=8,
+        expert_parallel_size=1,
+        vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        allocator=RecordingAllocator(),
+    )
+    run_text_only_public(
+        monkeypatch,
+        runtime=runtime,
+        fixture=actual_data_fixture,
+        model_arch="nemotron_omni",
+        dynamic_decoder=dynamic_decoder,
+        decoder=_LeafDecoder(),
+        adapter_module=nemotron_mdp_module,
+        native_bind=nemotron_mdp_module._bind_dynamic_encoder_cp,
+    )
 
 
 def _moe_process_groups(runtime, expert_replica_group):
@@ -400,6 +453,332 @@ def _assert_gradients_close(actual, reference):
         assert cosine >= 0.999, diagnostic
         assert 0.97 <= norm_ratio <= 1.03, diagnostic
         torch.testing.assert_close(actual[name], reference[name], rtol=0.03, atol=0.03, msg=name)
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+@pytest.mark.parametrize(
+    ("expert_parallel_size", "encoder_capacity", "expected_encoder_cp"),
+    ((1, 32, 1), (1, 16, 2), (1, 8, 4), (4, 32, 1), (4, 16, 2), (4, 8, 4)),
+    ids=("ep1-ecp1", "ep1-ecp2", "ep1-ecp4", "ep4-ecp1", "ep4-ecp2", "ep4-ecp4"),
+)
+def test_public_nemotron_reads_actual_locator_storage_once_per_selected_rank(
+    monkeypatch,
+    group_registry,
+    expert_replica_group,
+    actual_data_fixture,
+    dynamic_decoder,
+    expert_parallel_size,
+    encoder_capacity,
+    expected_encoder_cp,
+):
+    """Exercise registered Nemotron v2 capture and RADIO patchification on shared files."""
+    from examples.multimodal_dev.data.energon import materializer as generic
+
+    allocator = RecordingAllocator()
+    runtime = _runtime(
+        group_registry=group_registry,
+        encoder_capacity=encoder_capacity,
+        expert_parallel_size=expert_parallel_size,
+        vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        allocator=allocator,
+    )
+    integration._RUNTIME = runtime
+    observed = install_protocol_observers(monkeypatch, dynamic_decoder=dynamic_decoder)
+    args = launch_args(actual_data_fixture, "nemotron_omni")
+    monkeypatch.setattr(forward_step, "get_args", lambda: args)
+    calls = []
+    lane = dist.get_rank() // 4
+    expected_locators = tuple(
+        runtime.adapter.freeze_vision_locator(
+            descriptor,
+            dataset_root=actual_data_fixture.root,
+            grid_thw=descriptor["grid_thw"],
+            declared_dimensions=(descriptor["height"], descriptor["width"]),
+        )
+        for descriptor in actual_data_fixture.descriptors("nemotron_omni", lane)
+    )
+    native_materialize = generic.vision_locator_image_bytes
+
+    def observe_materialize(locator):
+        calls.append(
+            (
+                runtime.iteration,
+                GlobalVisionItemId(dist.get_rank() // 4, len(calls)),
+                dist.get_rank(),
+                (locator.kind, locator.path, locator.member, locator.column, locator.index),
+            )
+        )
+        return native_materialize(locator)
+
+    monkeypatch.setattr(generic, "vision_locator_image_bytes", observe_materialize)
+    selected_encoder_cp = []
+    native_bind = nemotron_mdp_module._bind_dynamic_encoder_cp
+
+    def observe_encoder_cp(*bind_args, membership, **kwargs):
+        selected_encoder_cp.append(membership.group_size)
+        return native_bind(*bind_args, membership=membership, **kwargs)
+
+    monkeypatch.setattr(nemotron_mdp_module, "_bind_dynamic_encoder_cp", observe_encoder_cp)
+    decoder = (
+        _LeafDecoder()
+        if expert_parallel_size == 1
+        else _DomainEp4MoeDecoder(_moe_process_groups(runtime, expert_replica_group))
+        .bfloat16()
+        .cuda()
+    )
+    config = SimpleNamespace(
+        dynamic_context_parallel=dynamic_decoder,
+        min_dynamic_context_parallel_size=1,
+        max_seqlen_per_dp_cp_rank=16,
+        finalize_model_grads_func=lambda _model, tokens: dist.all_reduce(tokens),
+    )
+
+    def native_schedule(data_iterator, num_microbatches, forward_only):
+        assert num_microbatches == 1 and forward_only is False
+        output, output_loss_func = forward_step.forward_step(data_iterator, decoder)
+        loss, tokens, _ = output_loss_func(output)
+        loss.backward()
+        config.finalize_model_grads_func([], tokens)
+        return loss.detach()
+
+    document = storage_document(actual_data_fixture, "nemotron_omni", dist.get_rank())
+    wrapped = integration.maybe_wrap_forward_backward(native_schedule, config)
+    loss = wrapped(data_iterator=iter(([document],)), num_microbatches=1, forward_only=False)
+
+    assert torch.isfinite(loss)
+    selected = dist.get_rank() % 4 < expected_encoder_cp
+    assert len(calls) == (2 if selected else 0)
+    assert selected_encoder_cp == ([expected_encoder_cp] if selected else [])
+    locator_h2d = tuple(
+        event for event in allocator.events if event[0] == "dynamic_cp_gate0_locator_pixels"
+    )
+    assert len(locator_h2d) == (1 if selected else 0)
+    if selected:
+        assert locator_h2d[0][1:3] == (8, _PATCH_DIM)
+    assert not any(event[0] == "dynamic_cp_gate0_pixels" for event in allocator.events)
+    assert allocator._outstanding == 0
+    assert runtime.storage.get_leaf(0) is None
+    assert len(observed["projections"]) == len(observed["authorities"]) == 1
+    projection = observed["projections"][0]
+    authority = observed["authorities"][0]
+    assert projection.local_locator_catalog is not None
+    assert projection.local_locator_digest == projection.local_locator_catalog.digest
+    assert authority.locator_catalog_digest == projection.local_locator_digest
+    assert authority.joint_plan_digest is not None
+    assert observed["claims"] == [
+        (VisionCaptureMode.STABLE_LOCATOR_CATALOG, projection.local_locator_catalog, ())
+    ]
+    assert observed["broadcasts"] == (
+        [(torch.int64, (len(authority.global_manifest.items), 11))] if selected else []
+    )
+    expected_ids = tuple(item.item_id for item in authority.global_manifest.items)
+    assert observed["publications"] == ([expected_ids] if dist.get_rank() in (0, 4) else [()])
+    world_digests = [None] * dist.get_world_size()
+    local_digests = [None] * dist.get_world_size()
+    dist.all_gather_object(world_digests, projection.catalog.digest)
+    dist.all_gather_object(local_digests, projection.local_locator_digest)
+    assert len(set(world_digests)) == 1
+    assert len(set(local_digests[:4])) == len(set(local_digests[4:])) == 1
+    assert local_digests[0] != local_digests[4]
+    expected_calls = [
+        (
+            0,
+            GlobalVisionItemId(lane, ordinal),
+            dist.get_rank(),
+            (locator.kind, locator.path, locator.member, locator.column, locator.index),
+        )
+        for ordinal, locator in enumerate(expected_locators)
+    ]
+    assert calls == (expected_calls if selected else [])
+    gathered_calls = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered_calls, calls)
+    assert gathered_calls == [
+        (
+            [
+                (
+                    0,
+                    GlobalVisionItemId(rank // 4, ordinal),
+                    rank,
+                    (locator.kind, locator.path, locator.member, locator.column, locator.index),
+                )
+                for ordinal, locator in enumerate(
+                    tuple(
+                        runtime.adapter.freeze_vision_locator(
+                            descriptor,
+                            dataset_root=actual_data_fixture.root,
+                            grid_thw=descriptor["grid_thw"],
+                            declared_dimensions=(descriptor["height"], descriptor["width"]),
+                        )
+                        for descriptor in actual_data_fixture.descriptors(
+                            "nemotron_omni", rank // 4
+                        )
+                    )
+                )
+            ]
+            if rank % 4 < expected_encoder_cp
+            else []
+        )
+        for rank in range(8)
+    ]
+    gathered_counts = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered_counts, len(calls))
+    assert gathered_counts == [2 if rank % 4 < expected_encoder_cp else 0 for rank in range(8)]
+    assert runtime.iteration == 1 and runtime.state is MdpRuntimeState.EMPTY
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+@pytest.mark.parametrize(
+    ("encoder_capacity", "expected_encoder_cp"),
+    ((32, 1), (16, 2), (8, 4)),
+    ids=("ecp1", "ecp2", "ecp4"),
+)
+def test_public_nemotron_actual_locator_matches_fresh_ecp4_reference(
+    monkeypatch,
+    group_registry,
+    actual_data_fixture,
+    dynamic_decoder,
+    encoder_capacity,
+    expected_encoder_cp,
+):
+    native_bind = nemotron_mdp_module._bind_dynamic_encoder_cp
+
+    def run(capacity, ecp):
+        runtime = _runtime(
+            group_registry=group_registry,
+            encoder_capacity=capacity,
+            expert_parallel_size=1,
+            vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        )
+        return run_actual_locator_parity_arm(
+            monkeypatch,
+            runtime=runtime,
+            fixture=actual_data_fixture,
+            model_arch="nemotron_omni",
+            dynamic_decoder=dynamic_decoder,
+            decoder=_LeafDecoder(),
+            adapter_module=nemotron_mdp_module,
+            native_bind=native_bind,
+            expected_encoder_cp=ecp,
+        )
+
+    reference = run(8, 4)
+    candidate = run(encoder_capacity, expected_encoder_cp)
+
+    def validate_parity():
+        torch.testing.assert_close(candidate[0], reference[0], rtol=0.03, atol=0.03)
+        assert_actual_gradients_close(candidate[1], reference[1], rtol=0.03)
+        assert_actual_gradients_close(candidate[2], reference[2], rtol=0.03)
+        torch.testing.assert_close(candidate[3], reference[3], rtol=0.03, atol=0.03)
+
+    assert_world_check(validate_parity)
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+def test_public_nemotron_corrupt_locator_then_same_runtime_retry(
+    monkeypatch, group_registry, actual_data_fixture, dynamic_decoder
+):
+    from examples.multimodal_dev.data.energon import materializer as generic
+
+    runtime = _runtime(
+        group_registry=group_registry,
+        encoder_capacity=16,
+        expert_parallel_size=1,
+        vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        allocator=RecordingAllocator(),
+    )
+    integration._RUNTIME = runtime
+    monkeypatch.setattr(
+        forward_step, "get_args", lambda: launch_args(actual_data_fixture, "nemotron_omni")
+    )
+    reads = []
+    native_materialize = generic.vision_locator_image_bytes
+
+    def observe_materialize(locator):
+        reads.append(locator.path)
+        return native_materialize(locator)
+
+    monkeypatch.setattr(generic, "vision_locator_image_bytes", observe_materialize)
+    decoder = _LeafDecoder()
+    encoder_ddp = runtime.encoder_domain.encoder_ddp
+    encoder_ddp.zero_grad_buffer()
+    initial_encoder = {
+        name: value.detach().clone() for name, value in encoder_ddp.named_parameters()
+    }
+    initial_decoder = {name: value.detach().clone() for name, value in decoder.named_parameters()}
+    bind_calls = []
+    encoder_calls = []
+    publication_calls = []
+    native_bind = nemotron_mdp_module._bind_dynamic_encoder_cp
+    native_encoder_forward = encoder_ddp.forward
+    facade = (
+        __import__("megatron.core.mdp.dynamic_cp_d4_joint_facade", fromlist=["unused"])
+        if dynamic_decoder
+        else __import__("megatron.core.mdp.dynamic_cp_d4_fixed_facade", fromlist=["unused"])
+    )
+    native_publication = facade._forward.run_repeated_d4_encoder_publication
+    monkeypatch.setattr(
+        nemotron_mdp_module,
+        "_bind_dynamic_encoder_cp",
+        lambda *args, **kwargs: bind_calls.append(kwargs["membership"].group_size)
+        or native_bind(*args, **kwargs),
+    )
+    monkeypatch.setattr(
+        encoder_ddp,
+        "forward",
+        lambda *args, **kwargs: encoder_calls.append("encode")
+        or native_encoder_forward(*args, **kwargs),
+    )
+    monkeypatch.setattr(
+        facade._forward,
+        "run_repeated_d4_encoder_publication",
+        lambda owner, **kwargs: publication_calls.append("gate1")
+        or native_publication(owner, **kwargs),
+    )
+    schedule_calls = []
+    config = SimpleNamespace(
+        dynamic_context_parallel=dynamic_decoder,
+        min_dynamic_context_parallel_size=1,
+        max_seqlen_per_dp_cp_rank=16,
+        finalize_model_grads_func=lambda _model, tokens: dist.all_reduce(tokens),
+    )
+
+    def native_schedule(data_iterator, num_microbatches, forward_only):
+        schedule_calls.append("schedule")
+        output, output_loss_func = forward_step.forward_step(data_iterator, decoder)
+        loss, tokens, _ = output_loss_func(output)
+        loss.backward()
+        config.finalize_model_grads_func([], tokens)
+        return loss.detach()
+
+    wrapped = integration.maybe_wrap_forward_backward(native_schedule, config)
+    bad = storage_document(actual_data_fixture, "nemotron_omni", dist.get_rank())
+    if dist.get_rank() == 0:
+        descriptors = [dict(value) for value in bad["image_descriptors"]]
+        descriptors[0]["path"] = f"{actual_data_fixture.root}/nemotron_omni/table/images.parquet"
+        bad["image_descriptors"] = tuple(descriptors)
+    with pytest.raises(MdpPlanError) as raised:
+        wrapped(data_iterator=iter(([bad],)), num_microbatches=1, forward_only=False)
+    errors = [None] * 8
+    dist.all_gather_object(errors, (type(raised.value).__name__, str(raised.value)))
+    assert len(set(errors)) == 1
+    gathered_reads = [None] * 8
+    dist.all_gather_object(gathered_reads, tuple(reads))
+    fault_path = f"{actual_data_fixture.root}/nemotron_omni/table/images.parquet"
+    assert gathered_reads[0][0] == gathered_reads[1][0] == fault_path
+    assert schedule_calls == bind_calls == encoder_calls == publication_calls == []
+    assert runtime.iteration == 0 and runtime.state is MdpRuntimeState.EMPTY
+    assert runtime.storage.get_leaf(0) is None and runtime.allocator._outstanding == 0
+    torch.testing.assert_close(
+        {name: value.detach() for name, value in encoder_ddp.named_parameters()}, initial_encoder
+    )
+    torch.testing.assert_close(
+        {name: value.detach() for name, value in decoder.named_parameters()}, initial_decoder
+    )
+    good = storage_document(actual_data_fixture, "nemotron_omni", dist.get_rank())
+    loss = wrapped(data_iterator=iter(([good],)), num_microbatches=1, forward_only=False)
+    assert torch.isfinite(loss) and schedule_calls == ["schedule"]
+    assert runtime.iteration == 1 and runtime.state is MdpRuntimeState.EMPTY
+    assert runtime.storage.get_leaf(0) is None and runtime.allocator._outstanding == 0
 
 
 @pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
