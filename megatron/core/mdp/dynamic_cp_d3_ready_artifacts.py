@@ -207,7 +207,7 @@ def _validate_canonical_assignments(
             )
         try:
             size = actual.cp_group.size()
-            ranks = group_ranks_getter(actual.cp_group)
+            ranks = tuple(group_ranks_getter(actual.cp_group))
             local_rank = actual.cp_group.rank()
         except Exception as error:
             raise MdpConfigurationError(
@@ -216,7 +216,6 @@ def _validate_canonical_assignments(
         if (
             type(size) is not int
             or size != assignment.local_cp_size
-            or type(ranks) is not tuple
             or ranks != assignment.endpoint_ranks
             or type(local_rank) is not int
             or global_rank not in ranks
