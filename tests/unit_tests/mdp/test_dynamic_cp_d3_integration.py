@@ -97,7 +97,7 @@ def test_d3_mcore_factory_requires_model_codec():
 
 def test_dynamic_mdp_activates_one_reused_training_facade(monkeypatch):
     integration.reset_for_testing()
-    runtime = object()
+    runtime = SimpleNamespace(config=MdpConfig(enable=True))
     facade = object.__new__(_D3PrivateFacade)
     config = _config(finalize_model_grads_func=lambda *args: None)
     built = []
@@ -125,6 +125,7 @@ def test_dynamic_mdp_activates_one_reused_training_facade(monkeypatch):
     schedule_b = object()
 
     assert integration.d3_owns_data_schedule(config)
+    assert integration.mdp_owns_data_schedule(config)
     assert integration.maybe_wrap_forward_backward(schedule_a, config) == (
         "wrapped",
         schedule_a,
@@ -146,7 +147,7 @@ def test_dynamic_mdp_activates_one_reused_training_facade(monkeypatch):
     assert integration._D3_FACADE is None
 
 
-def test_training_loop_gives_d3_exclusive_data_schedule_ownership():
+def test_training_loop_gives_mdp_exclusive_data_schedule_ownership():
     training_path = Path(__file__).parents[3] / "megatron" / "training" / "training.py"
     tree = ast.parse(training_path.read_text())
     train_step = next(
@@ -159,7 +160,7 @@ def test_training_loop_gives_d3_exclusive_data_schedule_ownership():
         for node in ast.walk(train_step)
         if isinstance(node, ast.If)
         and "wrap_data_iterator" in ast.dump(node)
-        and "mdp_d3_owns_data_schedule" in ast.unparse(node.test)
+        and "mdp_owns_data_schedule" in ast.unparse(node.test)
     ]
     assert len(guarded_native_calls) == 1
 

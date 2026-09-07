@@ -32,7 +32,13 @@ from megatron.core.mdp.config import (
     validate_mdp_config,
 )
 from megatron.core.mdp.dynamic_cp_d3_composition import _build_d3_runtime_facade
+from megatron.core.mdp.dynamic_cp_d4_encoder_capture import (
+    _capture_d4_encoder_source,
+    _snapshot_d4_encoder_capture_operations,
+)
+from megatron.core.mdp.dynamic_cp_d4_fixed_facade import _run_repeated_d4_fixed_iteration
 from megatron.core.mdp.dynamic_cp_d4_group_binding import _make_repeated_d4_group_binding
+from megatron.core.mdp.dynamic_cp_d4_joint_facade import _run_repeated_d4_joint_iteration
 from megatron.core.mdp.dynamic_cp_d4_status import _make_repeated_d4_world_pre_gate
 from megatron.core.mdp.dynamic_encoder_adapter_capability import (
     claim_dynamic_encoder_adapter_capability,
@@ -52,6 +58,7 @@ from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 from megatron.core.mdp.runtime import MdpRuntime
 from megatron.core.mdp.schedule import (
     _wrap_d3_forward_backward,
+    _wrap_d4_forward_backward,
     wrap_finalize_model_grads,
     wrap_forward_backward,
 )
@@ -69,6 +76,12 @@ _RUNTIME: Optional[MdpRuntime] = None
 #: The one reusable training-only D3 facade, built lazily after model config
 #: and native Dynamic-CP groups are both available.
 _D3_FACADE = None
+
+#: The one reusable training-only repeated-D4 facade, built lazily after the
+#: native schedule configuration is final.
+_D4_FACADE = None
+_D4_FACADE_CONFIG = None
+_D4_FACADE_OPTIONS = None
 
 _D3_STATUS_TIMEOUT_SECONDS = 30.0
 _D4_STARTUP_TIMEOUT_SECONDS = 30.0
@@ -449,7 +462,18 @@ def maybe_build_mdp_domain(
 
 def d3_owns_data_schedule(config) -> bool:
     """Whether D3, rather than native ``wrap_data_iterator``, owns this batch."""
-    return _RUNTIME is not None and getattr(config, "dynamic_context_parallel", None) is True
+    return (
+        _RUNTIME is not None
+        and not _RUNTIME.config.dynamic_encoder_cp
+        and getattr(config, "dynamic_context_parallel", None) is True
+    )
+
+
+def mdp_owns_data_schedule(config) -> bool:
+    """Whether an installed D3 or D4 runtime owns training batch scheduling."""
+    return _RUNTIME is not None and (
+        d3_owns_data_schedule(config) or _RUNTIME.config.dynamic_encoder_cp
+    )
 
 
 def maybe_wrap_forward_backward(
@@ -464,6 +488,27 @@ def maybe_wrap_forward_backward(
         return forward_backward_func
     if type(training) is not bool:
         raise MdpConfigurationError("MDP: schedule purpose must be an exact bool.")
+    if _RUNTIME.config.dynamic_encoder_cp:
+        if not training:
+            raise MdpConfigurationError("MDP: repeated-D4 schedule is training-only.")
+        global _D4_FACADE, _D4_FACADE_CONFIG, _D4_FACADE_OPTIONS
+        facade_options = (
+            getattr(config, "dynamic_context_parallel", None),
+            getattr(config, "max_seqlen_per_dp_cp_rank", None),
+            getattr(config, "min_dynamic_context_parallel_size", None),
+        )
+        if _D4_FACADE is None:
+            _D4_FACADE = _build_d4_facade_from_mcore(_RUNTIME, config)
+            _D4_FACADE_CONFIG = config
+            _D4_FACADE_OPTIONS = facade_options
+        elif _D4_FACADE_CONFIG is not config or _D4_FACADE_OPTIONS != facade_options:
+            raise MdpConfigurationError(
+                "MDP: repeated-D4 schedule requires its exact finalized training config."
+            )
+        wrapped_schedule = _wrap_d4_forward_backward(forward_backward_func, _D4_FACADE)
+        if config is not None:
+            wrap_finalize_model_grads(config, _RUNTIME)
+        return wrapped_schedule
     if config is not None:
         wrap_finalize_model_grads(config, _RUNTIME)
     if d3_owns_data_schedule(config) and training:
@@ -472,6 +517,81 @@ def maybe_wrap_forward_backward(
             _D3_FACADE = _build_d3_facade_from_mcore(_RUNTIME, config)
         return _wrap_d3_forward_backward(forward_backward_func, _D3_FACADE)
     return wrap_forward_backward(forward_backward_func, _RUNTIME)
+
+
+def _build_d4_facade_from_mcore(runtime: MdpRuntime, config):
+    """Bind the private repeated-D4 facades to native MCore dependencies."""
+    if not runtime.config.dynamic_encoder_cp or runtime.dynamic_group_binding is None:
+        raise MdpConfigurationError("MDP: D4 requires its dynamic encoder runtime binding.")
+    max_seqlen = getattr(config, "max_seqlen_per_dp_cp_rank", None)
+    if type(max_seqlen) is not int or max_seqlen <= 0:
+        raise MdpConfigurationError("MDP: D4 max sequence length must be a positive integer.")
+
+    codec = runtime.adapter.build_dynamic_decoder_payload_codec()
+    rebuild_microbatch = getattr(codec, "rebuild_microbatch", None)
+    if not callable(rebuild_microbatch):
+        raise MdpConfigurationError("MDP: D4 model adapter must provide its decoder rebuild.")
+    capture_operations = _snapshot_d4_encoder_capture_operations(runtime.adapter, codec)
+
+    from megatron.core.datasets.data_schedule_utils import next_hdp_group_packing_aware
+
+    encoder_max_seqlen = runtime.config.encoder_max_payload_rows
+    if encoder_max_seqlen is None:
+        encoder_max_seqlen = max_seqlen
+    elif type(encoder_max_seqlen) is not int or encoder_max_seqlen <= 0:
+        raise MdpConfigurationError("MDP: D4 encoder capacity must be a positive integer.")
+    common = {
+        "decoder_max_seqlen_per_rank": max_seqlen,
+        "decoder_solver": next_hdp_group_packing_aware,
+        "encoder_max_seqlen_per_rank": encoder_max_seqlen,
+        "encoder_minimum_cp_size": runtime.config.min_dynamic_encoder_cp_size,
+        "encoder_workload_query": runtime.adapter.estimate_dynamic_encoder_workload,
+        "bridge_width": runtime.hidden_size,
+        "bridge_dtype": runtime.params_dtype,
+        "rebuild_microbatch": rebuild_microbatch,
+        "cp_partition_mode": "contiguous",
+    }
+    dynamic_decoder = getattr(config, "dynamic_context_parallel", None) is True
+    if dynamic_decoder:
+        minimum_cp = getattr(config, "min_dynamic_context_parallel_size", None)
+        if type(minimum_cp) is not int or minimum_cp <= 0:
+            raise MdpConfigurationError("MDP: D4 minimum decoder CP must be a positive integer.")
+        from megatron.core import parallel_state
+
+        common.update(
+            decoder_minimum_cp_size=minimum_cp,
+            decoder_group_getter=parallel_state.get_dynamic_data_context_parallel_groups,
+            decoder_group_ranks_getter=torch.distributed.get_process_group_ranks,
+        )
+        run_iteration = _run_repeated_d4_joint_iteration
+    else:
+        run_iteration = _run_repeated_d4_fixed_iteration
+
+    def facade(
+        *,
+        data_iterators,
+        num_microbatches,
+        forward_backward_func,
+        native_schedule_args,
+        native_schedule_kwargs,
+    ):
+        capture = _capture_d4_encoder_source(
+            runtime=runtime,
+            binding=runtime.dynamic_group_binding,
+            data_iterators=data_iterators,
+            num_microbatches=num_microbatches,
+            operations=capture_operations,
+        )
+        return run_iteration(
+            runtime,
+            capture,
+            forward_backward_func=forward_backward_func,
+            native_schedule_args=native_schedule_args,
+            native_schedule_kwargs=native_schedule_kwargs,
+            **common,
+        )
+
+    return facade
 
 
 def _build_d3_facade_from_mcore(runtime: MdpRuntime, config):
@@ -517,11 +637,15 @@ def _build_d3_facade_from_mcore(runtime: MdpRuntime, config):
 
 def reset_for_testing() -> None:
     """Drop module state between tests."""
-    global _RUNTIME, _ADAPTER_BUILDER, _D3_FACADE
+    global _RUNTIME, _ADAPTER_BUILDER, _D3_FACADE, _D4_FACADE
+    global _D4_FACADE_CONFIG, _D4_FACADE_OPTIONS
     runtime = _RUNTIME
     _RUNTIME = None
     _ADAPTER_BUILDER = None
     _D3_FACADE = None
+    _D4_FACADE = None
+    _D4_FACADE_CONFIG = None
+    _D4_FACADE_OPTIONS = None
     capability = getattr(runtime, "dynamic_adapter_capability", None)
     if capability is not None:
         retire_dynamic_encoder_adapter_capability(capability)

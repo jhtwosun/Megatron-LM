@@ -2941,11 +2941,11 @@ def train_step(
     args = get_args()
     timers = get_timers()
     num_microbatches = get_num_microbatches()
-    mdp_d3_owns_data_schedule = False
+    mdp_owns_data_schedule = False
     if getattr(args, "mdp_enable", False):
         from megatron.core.mdp import integration as mdp_integration
 
-        mdp_d3_owns_data_schedule = mdp_integration.d3_owns_data_schedule(config)
+        mdp_owns_data_schedule = mdp_integration.mdp_owns_data_schedule(config)
 
     offload_optimizer_states = getattr(args, 'offload_optimizer_states', False)
     if offload_optimizer_states:
@@ -3057,7 +3057,7 @@ def train_step(
             enable_dgrad_logging(model, args.save)
         if (
             getattr(config, 'sequence_packing_scheduler', None) is not None
-            and not mdp_d3_owns_data_schedule
+            and not mdp_owns_data_schedule
         ):
             # Dynamic-CP / sequence packing must happen after the rerun state machine has
             # observed the original RerunDataIterator. The scheduler returns another
@@ -3074,7 +3074,7 @@ def train_step(
             forward_backward_data_iterator = packed_data_iterator
         else:
             num_microbatches = get_num_microbatches()
-            if mdp_d3_owns_data_schedule:
+            if mdp_owns_data_schedule:
                 seqlen_sum_this_global_batch = None
                 seqlen_squared_sum_this_global_batch = None
             else:
@@ -4313,7 +4313,7 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
-    mdp_d3_owns_data_schedule = False
+    mdp_owns_data_schedule = False
     if getattr(args, "mdp_enable", False):
         # MDP phase machine around the native schedule; no-op when MDP is off.
         from megatron.core.mdp import integration as mdp_integration
@@ -4321,7 +4321,7 @@ def train(
         forward_backward_func = mdp_integration.maybe_wrap_forward_backward(
             forward_backward_func, config
         )
-        mdp_d3_owns_data_schedule = mdp_integration.d3_owns_data_schedule(config)
+        mdp_owns_data_schedule = mdp_integration.mdp_owns_data_schedule(config)
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -4679,7 +4679,7 @@ def train(
         args.skipped_train_samples += num_skipped_samples_in_batch
         if (
             getattr(config, 'sequence_packing_scheduler', None) is not None
-            and not mdp_d3_owns_data_schedule
+            and not mdp_owns_data_schedule
             and not args.skip_train
         ):
             # The scheduler computed these from the real sequence lengths before

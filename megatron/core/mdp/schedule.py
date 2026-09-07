@@ -19,11 +19,13 @@ The wrappers leave the native schedules unchanged:
   hold this lane's partial count.
 """
 
+from functools import wraps
 from inspect import signature
 from typing import Callable
 
 from megatron.core.mdp.dynamic_cp_d3_private_facade import _D3PrivateFacade
-from megatron.core.mdp.errors import MdpConfigurationError
+from megatron.core.mdp.dynamic_cp_d4_native_schedule import _wrap_d4_native_finalizer
+from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.runtime import MdpRuntime
 
 _WRAPPED_MARKER = "_mdp_wrapped"
@@ -113,6 +115,52 @@ def _wrap_d3_forward_backward(
     return wrapped
 
 
+def _wrap_d4_forward_backward(forward_backward_func: Callable, facade: Callable) -> Callable:
+    """Wrap one native VPP1 training schedule with a private J1 D4 facade."""
+    if getattr(forward_backward_func, _WRAPPED_MARKER, False):
+        raise MdpConfigurationError(
+            "MDP: forward_backward_func is already wrapped; a callable must not be "
+            "wrapped twice."
+        )
+    if not callable(facade):
+        raise MdpConfigurationError("MDP: D4 schedule wrapper requires its private facade.")
+    schedule_signature = signature(forward_backward_func)
+
+    def wrapped(*args, **kwargs):
+        bound = schedule_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        data_iterator = bound.arguments["data_iterator"]
+        if isinstance(data_iterator, (list, tuple)) and len(data_iterator) != 1:
+            raise MdpConfigurationError("MDP: D4 schedule wrapper supports VPP1 only.")
+        if bound.arguments["forward_only"] is not False:
+            raise MdpConfigurationError("MDP: D4 schedule wrapper is training-only.")
+
+        native_results = []
+
+        @wraps(forward_backward_func)
+        def record_native_result(*native_args, **native_kwargs):
+            if native_results:
+                raise MdpStateError("MDP: D4 facade invokes the native schedule exactly once.")
+            result = forward_backward_func(*native_args, **native_kwargs)
+            native_results.append(result)
+            return result
+
+        facade(
+            data_iterators=data_iterator,
+            num_microbatches=bound.arguments["num_microbatches"],
+            forward_backward_func=record_native_result,
+            native_schedule_args=bound.args,
+            native_schedule_kwargs=bound.kwargs,
+        )
+        if len(native_results) != 1:
+            raise MdpStateError("MDP: D4 facade must invoke the native schedule exactly once.")
+        return native_results[0]
+
+    setattr(wrapped, _WRAPPED_MARKER, True)
+    wrapped._mdp_inner = forward_backward_func
+    return wrapped
+
+
 def wrap_finalize_model_grads(config, runtime: MdpRuntime) -> None:
     """Install the token-count capture on ``config.finalize_model_grads_func``.
 
@@ -130,12 +178,16 @@ def wrap_finalize_model_grads(config, runtime: MdpRuntime) -> None:
             "be installed before MDP wraps it to source the global token count."
         )
 
-    def wrapped(model, num_tokens=None, *args, **kwargs):
-        result = native(model, num_tokens, *args, **kwargs)
-        # Post-call: the native finalizer reduced num_tokens in place, so the
-        # same tensor object now holds the global count on every rank.
-        runtime.capture_global_num_tokens(num_tokens)
-        return result
+    if getattr(getattr(runtime, "config", None), "dynamic_encoder_cp", False) is True:
+        wrapped = _wrap_d4_native_finalizer(native, runtime.capture_global_num_tokens)
+    else:
+
+        def wrapped(model, num_tokens=None, *args, **kwargs):
+            result = native(model, num_tokens, *args, **kwargs)
+            # Post-call: the native finalizer reduced num_tokens in place, so the
+            # same tensor object now holds the global count on every rank.
+            runtime.capture_global_num_tokens(num_tokens)
+            return result
 
     wrapped._mdp_native = native
     config.finalize_model_grads_func = wrapped
