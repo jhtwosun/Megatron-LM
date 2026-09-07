@@ -11,7 +11,7 @@ import torch
 
 from megatron.core.mdp import dynamic_cp_d3_metadata_transport as transport_api
 from megatron.core.mdp import dynamic_cp_d4_source_catalog as api
-from megatron.core.mdp.dynamic_cp import GlobalSampleId
+from megatron.core.mdp.dynamic_cp import GlobalSampleId, GlobalVisionItemId
 from megatron.core.mdp.dynamic_cp_d4_encoder_capture import _D4EncoderCaptureOwner
 from megatron.core.mdp.dynamic_cp_d4_group_binding import _make_repeated_d4_group_binding
 from megatron.core.mdp.dynamic_cp_execution import (
@@ -19,11 +19,21 @@ from megatron.core.mdp.dynamic_cp_execution import (
     DecoderPayloadHeaderV1,
     DecoderPayloadPacket,
     DecoderTensorFieldSpec,
+    DecoderVisionItemMetadata,
     build_decoder_global_manifest,
     finalize_decoder_source_window,
 )
-from megatron.core.mdp.dynamic_cp_plan import DecoderSampleMetadata
+from megatron.core.mdp.dynamic_cp_plan import DecoderSampleMetadata, EncoderVisionItemMetadata
 from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError, MdpStateError
+from megatron.core.mdp.protocols import VisionCaptureMode
+from megatron.core.mdp.vision_locator import (
+    VisionDataLocator,
+    VisionLocatorCatalogEntry,
+    VisionLocatorIndexSentinel,
+    VisionLocatorKind,
+    build_vision_locator_catalog,
+    encode_vision_locator_catalog,
+)
 
 
 class _Group:
@@ -46,9 +56,14 @@ def _binding(rank):
     )
 
 
-def _manifest(lane, *, dtype=torch.int64):
+def _manifest(lane, *, dtype=torch.int64, vision_count=0):
     sample_id = GlobalSampleId(lane, 0)
-    sample = DecoderSampleMetadata(sample_id, 4, 4, ())
+    item_ids = tuple(GlobalVisionItemId(lane, index) for index in range(vision_count))
+    encoder_items = tuple(
+        EncoderVisionItemMetadata(item_id, sample_id, index)
+        for index, item_id in enumerate(item_ids)
+    )
+    sample = DecoderSampleMetadata(sample_id, 4, 4, encoder_items)
     tensor = torch.arange(4, dtype=dtype).view(1, 4)
     fields = (DecoderTensorFieldSpec("input_ids", dtype, (1, 4), "cpu"),)
     header = DecoderPayloadHeaderV1(
@@ -71,17 +86,58 @@ def _manifest(lane, *, dtype=torch.int64):
         tensor_fields=MappingProxyType({"input_ids": tensor}),
         none_fields=("position_ids",),
     )
+    decoder_items = tuple(
+        DecoderVisionItemMetadata(item_id, sample_id, index, (1, 2, 2), 1, (index + 1,))
+        for index, item_id in enumerate(item_ids)
+    )
     return finalize_decoder_source_window(
-        source_dp_lane=lane, samples=(sample,), items=(), packets=(packet,)
+        source_dp_lane=lane, samples=(sample,), items=decoder_items, packets=(packet,)
     ).metadata_manifest()
 
 
-def _owner(monkeypatch, binding, manifest=None, error=None):
+def _locator_catalog(lane, *, zip_member=False, count=1, reverse=False, path_suffix=""):
+    item_ids = tuple(GlobalVisionItemId(lane, index) for index in range(count))
+    entries = tuple(
+        VisionLocatorCatalogEntry(
+            item_id,
+            VisionDataLocator(
+                VisionLocatorKind.ZIP_MEMBER if zip_member else VisionLocatorKind.SHARED_FILE,
+                (
+                    f"/datasets/domain-{lane}/images.zip"
+                    if zip_member
+                    else f"/datasets/domain-{lane}/{index}{path_suffix}.jpg"
+                ),
+                f"nested/{index}.jpg" if zip_member else None,
+                None,
+                VisionLocatorIndexSentinel.UNUSED,
+                (1, 2, 2),
+                (32, 32),
+            ),
+        )
+        for index, item_id in enumerate(item_ids)
+    )
+    ordered = tuple(reversed(entries)) if reverse else entries
+    return build_vision_locator_catalog(tuple(entry.item_id for entry in ordered), ordered)
+
+
+def _owner(
+    monkeypatch,
+    binding,
+    manifest=None,
+    error=None,
+    *,
+    capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+    locator_catalog=None,
+):
     monkeypatch.setattr(_D4EncoderCaptureOwner, "require", lambda self: self)
     owner = object.__new__(_D4EncoderCaptureOwner)
     owner._trusted_binding = binding
     owner._trusted_manifest = manifest
     owner._trusted_error = error
+    owner._trusted_capture_mode = capture_mode
+    owner._trusted_locator_catalog = (
+        build_vision_locator_catalog((), ()) if locator_catalog is None else locator_catalog
+    )
     return owner
 
 
@@ -106,10 +162,9 @@ def test_world_catalog_allows_domain_local_schema_and_projects_exact_lane(monkey
         api._D4SourceCatalogEntry(0, 0, manifests[0]),
         api._D4SourceCatalogEntry(1, 4, manifests[1]),
     )
-    assert all(
-        entry.manifest is manifest for entry, manifest in zip(result.catalog.entries, manifests)
-    )
     assert result.local_source_manifest is manifests[1]
+    assert result.local_locator_catalog is None
+    assert result.local_locator_digest is None
     assert result.metadata.global_manifest.samples is not manifests[1].samples
     assert result.metadata.global_manifest.samples == manifests[1].samples
     assert dict(result.metadata.source_rank_by_lane) == {1: 4}
@@ -117,6 +172,255 @@ def test_world_catalog_allows_domain_local_schema_and_projects_exact_lane(monkey
     assert calls[0][0] is manifests[1]
     assert calls[0][1]["expected_source_lanes"] == (0, 1)
     assert calls[0][1]["group"] is binding.world_group
+
+
+def test_locator_composite_codec_is_canonical_bounded_and_key_ordered(monkeypatch):
+    manifest = _manifest(0, vision_count=2)
+    catalog = _locator_catalog(0, count=2, path_suffix="x")
+
+    wire = api._encode_d4_locator_contributor(manifest, catalog)
+    decoded_manifest, decoded_catalog = api._decode_d4_locator_contributor(wire)
+
+    assert decoded_manifest == manifest
+    assert decoded_catalog == catalog
+    assert api._encode_d4_locator_contributor(decoded_manifest, decoded_catalog) == wire
+    empty = build_vision_locator_catalog((), ())
+    empty_manifest, empty_catalog = api._decode_d4_locator_contributor(
+        api._encode_d4_locator_contributor(_manifest(0), empty)
+    )
+    assert empty_manifest == _manifest(0)
+    assert empty_catalog == empty
+    assert empty_catalog.digest == empty.digest
+    with pytest.raises((MdpConfigurationError, MdpPlanError), match="order|item|key"):
+        api._encode_d4_locator_contributor(manifest, _locator_catalog(0, count=2, reverse=True))
+    with pytest.raises((MdpConfigurationError, MdpPlanError), match="trunc|trailing|canonical"):
+        api._decode_d4_locator_contributor(wire[:-1])
+
+    locator_size = len(encode_vision_locator_catalog(catalog))
+    padding = (-locator_size) % 8
+    assert padding
+    nonzero_padding = (*wire[:-1], wire[-1] ^ (1 << (8 * (locator_size % 8))))
+    with pytest.raises((MdpConfigurationError, MdpPlanError), match="padding|canonical"):
+        api._decode_d4_locator_contributor(nonzero_padding)
+
+    monkeypatch.setattr(api, "_MAX_LOCATOR_COMPOSITE_WORDS", len(wire) - 1)
+    with pytest.raises(MdpConfigurationError, match="bound|size"):
+        api._encode_d4_locator_contributor(manifest, catalog)
+
+
+def test_world_locator_catalog_projects_exact_domain_entry_and_distinct_digest(monkeypatch):
+    manifests = (
+        _manifest(0, dtype=torch.int64, vision_count=1),
+        _manifest(1, dtype=torch.int32, vision_count=1),
+    )
+    locators = (_locator_catalog(0), _locator_catalog(1, zip_member=True))
+    wires = tuple(
+        api._encode_d4_locator_contributor(manifest, catalog)
+        for manifest, catalog in zip(manifests, locators)
+    )
+    binding = _binding(4)
+    owner = _owner(
+        monkeypatch,
+        binding,
+        manifests[1],
+        capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        locator_catalog=locators[1],
+    )
+    statuses = []
+
+    def status_factory(**_kwargs):
+        def gather(value, *, timeout_seconds):
+            del timeout_seconds
+            statuses.append(value)
+            if len(statuses) == 1:
+                return tuple(
+                    (
+                        value[0],
+                        rank,
+                        0,
+                        int(rank in (0, 4)),
+                        rank // 4 if rank in (0, 4) else -1,
+                        len(wires[rank // 4]) if rank in (0, 4) else 0,
+                        value[-1],
+                    )
+                    for rank in range(8)
+                )
+            return tuple((value[0], rank, *value[2:]) for rank in range(8))
+
+        return gather
+
+    monkeypatch.setattr(transport_api, "make_precollective_status_gather", status_factory)
+    monkeypatch.setattr(
+        transport_api,
+        "_gather_body",
+        lambda *_args, **_kwargs: (wires[0], (), (), (), wires[1], (), (), ()),
+    )
+    result = api._gather_d4_source_catalog(owner, binding)
+
+    assert tuple(entry.contributor_rank for entry in result.catalog.entries) == (0, 4)
+    assert tuple(entry.locator_catalog for entry in result.catalog.entries) == locators
+    assert result.local_locator_catalog is result.catalog.entries[1].locator_catalog
+    assert result.local_locator_digest == result.local_locator_catalog.digest
+    assert result.catalog.entries[0].locator_catalog.digest != result.local_locator_digest
+    assert statuses[1][3:5] == struct.unpack("<qq", result.catalog.digest)
+
+
+def test_locator_text_only_projects_canonical_empty_catalog_not_source_none(monkeypatch):
+    manifest = _manifest(0)
+    empty = build_vision_locator_catalog((), ())
+    binding = _binding(0)
+    owner = _owner(
+        monkeypatch,
+        binding,
+        manifest,
+        capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        locator_catalog=empty,
+    )
+
+    def gather(local_body, **kwargs):
+        second_body = api._encode_d4_locator_contributor(_manifest(1), empty)
+        decoded = tuple(kwargs["body_decoder"](body)[1] for body in (local_body, second_body))
+        return kwargs["projector"](decoded, MappingProxyType({0: 0, 1: 4}))[0]
+
+    monkeypatch.setattr(api, "_gather_metadata_bodies", gather)
+    result = api._gather_d4_source_catalog(owner, binding)
+
+    assert result.local_locator_catalog is result.catalog.entries[0].locator_catalog
+    assert result.local_locator_catalog.entries == ()
+    assert result.local_locator_digest == empty.digest
+    assert result.local_locator_digest is not None
+
+
+def test_world_digest_changes_when_only_locator_metadata_changes():
+    manifest = _manifest(0, vision_count=1)
+    first = api._seal_catalog((api._D4SourceCatalogEntry(0, 0, manifest, _locator_catalog(0)),))
+    second = api._seal_catalog(
+        (api._D4SourceCatalogEntry(0, 0, manifest, _locator_catalog(0, zip_member=True)),)
+    )
+
+    assert first.entries[0].manifest.digest == second.entries[0].manifest.digest
+    assert first.digest != second.digest
+
+
+def test_locator_capture_error_converges_before_world_body(monkeypatch):
+    binding = _binding(0)
+    original = RuntimeError("rank-local locator catalog failure")
+    owner = _owner(
+        monkeypatch, binding, error=original, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    statuses = []
+    body_called = False
+
+    def status_factory(**_kwargs):
+        def gather(value, *, timeout_seconds):
+            del timeout_seconds
+            statuses.append(value)
+            return tuple((value[0], rank, int(rank == 0), 0, -1, 0, value[-1]) for rank in range(8))
+
+        return gather
+
+    def forbidden_body(*_args, **_kwargs):
+        nonlocal body_called
+        body_called = True
+
+    monkeypatch.setattr(transport_api, "make_precollective_status_gather", status_factory)
+    monkeypatch.setattr(transport_api, "_gather_body", forbidden_body)
+    with pytest.raises(MdpPlanError, match="preparation failed") as caught:
+        api._gather_d4_source_catalog(owner, binding)
+
+    assert caught.value.__cause__ is original
+    assert len(statuses) == 1
+    assert not body_called
+
+
+def test_tampered_local_locator_catalog_converges_before_world_body(monkeypatch):
+    binding = _binding(0)
+    manifest = _manifest(0, vision_count=1)
+    catalog = _locator_catalog(0)
+    object.__setattr__(catalog, "digest", bytes(reversed(catalog.digest)))
+    owner = _owner(
+        monkeypatch,
+        binding,
+        manifest,
+        capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        locator_catalog=catalog,
+    )
+    statuses = []
+    body_called = False
+
+    def status_factory(**_kwargs):
+        def gather(value, *, timeout_seconds):
+            del timeout_seconds
+            statuses.append(value)
+            return tuple((value[0], rank, int(rank == 0), 0, -1, 0, value[-1]) for rank in range(8))
+
+        return gather
+
+    def forbidden_body(*_args, **_kwargs):
+        nonlocal body_called
+        body_called = True
+
+    monkeypatch.setattr(transport_api, "make_precollective_status_gather", status_factory)
+    monkeypatch.setattr(transport_api, "_gather_body", forbidden_body)
+    with pytest.raises(MdpPlanError, match="preparation failed") as caught:
+        api._gather_d4_source_catalog(owner, binding)
+
+    assert type(caught.value.__cause__) is MdpConfigurationError
+    assert len(statuses) == 1
+    assert not body_called
+
+
+def test_remote_locator_decode_error_converges_at_post_body_status(monkeypatch):
+    manifests = (_manifest(0, vision_count=1), _manifest(1, vision_count=1))
+    locators = (_locator_catalog(0), _locator_catalog(1, zip_member=True))
+    wires = tuple(
+        api._encode_d4_locator_contributor(manifest, catalog)
+        for manifest, catalog in zip(manifests, locators)
+    )
+    malformed = wires[1][:-1]
+    binding = _binding(0)
+    owner = _owner(
+        monkeypatch,
+        binding,
+        manifests[0],
+        capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        locator_catalog=locators[0],
+    )
+    statuses = []
+
+    def status_factory(**_kwargs):
+        def gather(value, *, timeout_seconds):
+            del timeout_seconds
+            statuses.append(value)
+            if len(statuses) == 1:
+                return tuple(
+                    (
+                        value[0],
+                        rank,
+                        0,
+                        int(rank in (0, 4)),
+                        rank // 4 if rank in (0, 4) else -1,
+                        len(wires[0]) if rank == 0 else len(malformed) if rank == 4 else 0,
+                        value[-1],
+                    )
+                    for rank in range(8)
+                )
+            return tuple((value[0], rank, *value[2:]) for rank in range(8))
+
+        return gather
+
+    monkeypatch.setattr(transport_api, "make_precollective_status_gather", status_factory)
+    monkeypatch.setattr(
+        transport_api,
+        "_gather_body",
+        lambda *_args, **_kwargs: (wires[0], (), (), (), malformed, (), (), ()),
+    )
+    with pytest.raises(MdpPlanError, match="body decode") as caught:
+        api._gather_d4_source_catalog(owner, binding)
+
+    assert isinstance(caught.value.__cause__, (MdpConfigurationError, MdpPlanError))
+    assert len(statuses) == 2
+    assert statuses[1][2] == 1
 
 
 def test_catalog_rejects_wrong_world_contributor_inside_projection(monkeypatch):
@@ -177,6 +481,13 @@ def test_catalog_registry_rejects_entry_and_carrier_mutation_or_substitution():
     object.__setattr__(manifest, "digest", bytes(reversed(manifest.digest)))
     with pytest.raises(MdpStateError, match="exact sealed entries"):
         api._validate_d4_source_catalog(manifest_catalog)
+
+    locator_catalog = _locator_catalog(0)
+    locator_entry = api._D4SourceCatalogEntry(0, 0, _manifest(0, vision_count=1), locator_catalog)
+    locator_world = api._seal_catalog((locator_entry,))
+    object.__setattr__(locator_entry, "locator_catalog", _locator_catalog(0))
+    with pytest.raises(MdpStateError, match="exact sealed entries"):
+        api._validate_d4_source_catalog(locator_world)
 
 
 def test_non_source_owner_never_contributes_a_manifest(monkeypatch):
@@ -239,6 +550,9 @@ def test_d4_adapter_runs_one_world_status_body_post_status_protocol(monkeypatch)
     assert statuses[1][3:5] == struct.unpack("<qq", result.catalog.digest)
     assert tuple(entry.contributor_rank for entry in result.catalog.entries) == (0, 4)
     assert result.catalog.entries[0].manifest is result.local_source_manifest
+    assert body_calls[0][0] == wires[0]
+    assert result.local_locator_catalog is None
+    assert result.local_locator_digest is None
 
 
 @pytest.mark.parametrize("rank", (0, 1))

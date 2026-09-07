@@ -383,10 +383,15 @@ def _prepare_timeout(value: Any) -> tuple[float, timedelta]:
     return seconds, duration
 
 
-def _configuration_word(lanes: tuple[int, ...], maximum: int, timeout: float) -> int:
+def _configuration_word(
+    lanes: tuple[int, ...], maximum: int, timeout: float, namespace: bytes | None = None
+) -> int:
     digest = hashlib.blake2b(digest_size=8, person=b"mcore-mdp-meta")
     digest.update(struct.pack(f"<{len(lanes) + 2}q", len(lanes), *lanes, maximum))
     digest.update(struct.pack("<d", timeout))
+    if namespace is not None:
+        digest.update(struct.pack("<q", len(namespace)))
+        digest.update(namespace)
     return struct.unpack("<q", digest.digest())[0]
 
 
@@ -483,20 +488,23 @@ def _gather_body(
     )
 
 
-def _gather_decoder_source_metadata(
-    local_manifest: DecoderSourceManifest | None,
+def _gather_metadata_bodies(
+    local_body: tuple[int, ...],
     *,
+    local_source_lane: int | None,
     expected_source_lanes: tuple[int, ...],
     group: Any,
     group_ranks: tuple[int, ...],
     global_rank: int,
     device: torch.device,
     timeout_seconds: float,
-    max_manifest_words: int = _MAX_MANIFEST_WORDS,
+    max_body_words: int = _MAX_MANIFEST_WORDS,
     local_prepare_error: Exception | None = None,
-    projector: Callable[[tuple[DecoderSourceManifest, ...], Mapping[int, int]], tuple[Any, bytes]],
+    body_decoder: Callable[[tuple[int, ...]], tuple[int, Any]],
+    projector: Callable[[tuple[Any, ...], Mapping[int, int]], tuple[Any, bytes]],
+    configuration_namespace: bytes | None = None,
 ) -> Any:
-    """Gather one optional source manifest per expected lane after status consensus.
+    """Gather one optional bounded metadata body per lane after status consensus.
 
     ``group``, ``group_ranks``, ``global_rank``, and CUDA ``device`` are an
     already-agreed native collective context.  A rank-local mismatch there is
@@ -515,20 +523,32 @@ def _gather_decoder_source_metadata(
         lanes = _ordered_ranks("expected source lanes", expected_source_lanes)
         if lanes != tuple(sorted(lanes)):
             raise MdpConfigurationError("MDP: expected source lanes use canonical order.")
-        maximum = _nonnegative_integer("max_manifest_words", max_manifest_words, positive=True)
+        maximum = _nonnegative_integer("max_body_words", max_body_words, positive=True)
         if maximum > _MAX_MANIFEST_WORDS:
-            raise MdpConfigurationError("MDP: max_manifest_words fits the codec wire bound.")
+            raise MdpConfigurationError("MDP: max_body_words fits the metadata wire bound.")
         seconds, timeout = _prepare_timeout(timeout_seconds)
-        configuration = _configuration_word(lanes, maximum, seconds)
+        if configuration_namespace is not None and (
+            type(configuration_namespace) is not bytes
+            or not configuration_namespace
+            or len(configuration_namespace) > 256
+        ):
+            raise MdpConfigurationError(
+                "MDP: metadata configuration namespace is bounded exact bytes or None."
+            )
+        configuration = _configuration_word(lanes, maximum, seconds, configuration_namespace)
         if local_prepare_error is not None:
             if not isinstance(local_prepare_error, Exception):
                 raise MdpConfigurationError("MDP: local_prepare_error is an Exception or None.")
             raise local_prepare_error
-        if local_manifest is not None:
-            body = encode_decoder_source_manifest(local_manifest)
-            lane = local_manifest.source_dp_lane
+        if type(local_body) is not tuple or any(type(word) is not int for word in local_body):
+            raise MdpConfigurationError("MDP: local metadata body is an exact integer tuple.")
+        if local_body:
+            lane = _nonnegative_integer("local source lane", local_source_lane)
+            body = local_body
             if len(body) > maximum:
-                raise MdpConfigurationError("MDP: local source manifest fits max_manifest_words.")
+                raise MdpConfigurationError("MDP: local metadata body fits max_body_words.")
+        elif local_source_lane is not None:
+            raise MdpConfigurationError("MDP: absent metadata body has no source lane.")
     except Exception as error:
         local_error = error
         lanes, maximum, timeout, configuration = (
@@ -564,20 +584,22 @@ def _gather_decoder_source_metadata(
     result: Any = None
     body_error: Exception | None = None
     try:
-        manifests: dict[int, DecoderSourceManifest] = {}
+        values: dict[int, Any] = {}
         authority: dict[int, int] = {}
         for (rank, _, present, source_lane, length, _), row in zip(parsed, rows):
             if not present:
                 continue
-            manifest = decode_decoder_source_manifest(tuple(row[:length]))
-            if manifest.source_dp_lane != source_lane or source_lane in manifests:
-                raise MdpPlanError(
-                    "MDP: decoded source manifest matches a unique contributor lane."
-                )
-            manifests[source_lane] = manifest
+            decoded_lane, decoded_value = body_decoder(tuple(row[:length]))
+            if (
+                type(decoded_lane) is not int
+                or decoded_lane != source_lane
+                or source_lane in values
+            ):
+                raise MdpPlanError("MDP: decoded metadata body matches a unique contributor lane.")
+            values[source_lane] = decoded_value
             authority[source_lane] = rank
         result, result_digest = projector(
-            tuple(manifests[lane] for lane in lanes),
+            tuple(values[lane] for lane in lanes),
             MappingProxyType({lane: authority[lane] for lane in lanes}),
         )
         if not isinstance(result_digest, bytes) or len(result_digest) != 16:
@@ -608,6 +630,51 @@ def _gather_decoder_source_metadata(
         raise body_error
     assert result is not None
     return result
+
+
+def _gather_decoder_source_metadata(
+    local_manifest: DecoderSourceManifest | None,
+    *,
+    expected_source_lanes: tuple[int, ...],
+    group: Any,
+    group_ranks: tuple[int, ...],
+    global_rank: int,
+    device: torch.device,
+    timeout_seconds: float,
+    max_manifest_words: int = _MAX_MANIFEST_WORDS,
+    local_prepare_error: Exception | None = None,
+    projector: Callable[[tuple[DecoderSourceManifest, ...], Mapping[int, int]], tuple[Any, bytes]],
+) -> Any:
+    """Encode then gather one optional legacy source manifest per expected lane."""
+    body: tuple[int, ...] = ()
+    lane = None
+    prepare_error = local_prepare_error
+    if prepare_error is None and local_manifest is not None:
+        try:
+            body = encode_decoder_source_manifest(local_manifest)
+            lane = local_manifest.source_dp_lane
+        except Exception as error:
+            prepare_error = error
+
+    def decode(body_wire: tuple[int, ...]) -> tuple[int, DecoderSourceManifest]:
+        manifest = decode_decoder_source_manifest(body_wire)
+        return manifest.source_dp_lane, manifest
+
+    return _gather_metadata_bodies(
+        body,
+        local_source_lane=lane,
+        expected_source_lanes=expected_source_lanes,
+        group=group,
+        group_ranks=group_ranks,
+        global_rank=global_rank,
+        device=device,
+        timeout_seconds=timeout_seconds,
+        max_body_words=max_manifest_words,
+        local_prepare_error=prepare_error,
+        body_decoder=decode,
+        projector=projector,
+        configuration_namespace=None,
+    )
 
 
 def _project_decoder_metadata(

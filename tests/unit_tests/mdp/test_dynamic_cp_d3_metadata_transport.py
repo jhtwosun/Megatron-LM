@@ -406,6 +406,38 @@ def test_shared_metadata_core_preserves_legacy_projection_bytes(monkeypatch):
     assert statuses[1][3:5] == struct.unpack("<qq", public.global_manifest.digest)
 
 
+def test_legacy_manifest_wrapper_supplies_exact_wire_to_shared_bounded_body_core(monkeypatch):
+    api = _transport_api()
+    manifest = _source_manifest()
+    expected_wire = api.encode_decoder_source_manifest(manifest)
+    seen = []
+
+    def gather(local_body, **kwargs):
+        seen.append((local_body, kwargs))
+        lane, decoded = kwargs["body_decoder"](local_body)
+        assert lane == 0
+        result, _digest = kwargs["projector"]((decoded,), MappingProxyType({0: 0}))
+        return result
+
+    monkeypatch.setattr(api, "_gather_metadata_bodies", gather)
+    result = api._gather_decoder_source_metadata(
+        manifest,
+        expected_source_lanes=(0,),
+        group=object(),
+        group_ranks=(0,),
+        global_rank=0,
+        device=torch.device("cuda", 0),
+        timeout_seconds=1.0,
+        projector=api._project_decoder_metadata,
+    )
+
+    assert result.global_manifest.digest == api.build_decoder_global_manifest((manifest,)).digest
+    assert seen[0][0] == expected_wire
+    assert seen[0][1]["local_source_lane"] == 0
+    assert seen[0][1]["max_body_words"] == api._MAX_MANIFEST_WORDS
+    assert seen[0][1]["configuration_namespace"] is None
+
+
 def test_shared_metadata_projector_failure_converges_with_exact_local_cause(monkeypatch):
     api = _transport_api()
     manifest = _source_manifest()

@@ -492,9 +492,13 @@ def _validate_projection(value, binding):
     catalog = _validate_d4_source_catalog(value.catalog)
     group = _validate_repeated_d4_group_binding(binding)
     lane = group.world_ranks.index(group.domain_ranks[0]) // len(group.domain_ranks)
+    entry = catalog.entries[lane] if lane < len(catalog.entries) else None
     if (
-        lane >= len(catalog.entries)
-        or value.local_source_manifest is not catalog.entries[lane].manifest
+        entry is None
+        or value.local_source_manifest is not entry.manifest
+        or value.local_locator_catalog is not entry.locator_catalog
+        or value.local_locator_digest
+        != (None if entry.locator_catalog is None else entry.locator_catalog.digest)
     ):
         raise MdpStateError("MDP: D4 transaction retains exact projected source metadata.")
     expected = build_decoder_global_manifest((value.local_source_manifest,))
@@ -522,6 +526,8 @@ def _projection_snapshot(value, binding):
         catalog.entries,
         catalog.digest,
         value.local_source_manifest,
+        value.local_locator_catalog,
+        value.local_locator_digest,
         metadata,
         metadata.global_manifest,
         metadata.source_rank_by_lane,

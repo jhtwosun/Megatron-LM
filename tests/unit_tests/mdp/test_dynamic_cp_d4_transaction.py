@@ -36,6 +36,8 @@ from megatron.core.mdp.dynamic_cp_execution import (
 )
 from megatron.core.mdp.dynamic_cp_plan import DecoderSampleMetadata
 from megatron.core.mdp.errors import MdpStateError
+from megatron.core.mdp.protocols import VisionCaptureMode
+from megatron.core.mdp.vision_locator import build_vision_locator_catalog
 
 
 @pytest.fixture(autouse=True)
@@ -107,6 +109,8 @@ def _capture(monkeypatch, binding, events, manifest=None):
     owner._trusted_binding = binding
     owner._trusted_manifest = manifest
     owner._trusted_error = None
+    owner._trusted_capture_mode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+    owner._trusted_locator_catalog = build_vision_locator_catalog((), ())
     state = {"active": True}
 
     def require(self):
@@ -187,6 +191,28 @@ def test_real_source_projection_and_joint_authority_attach(monkeypatch):
     )
     object.__setattr__(projection, "metadata", equal_metadata)
     with pytest.raises(MdpStateError, match="projected source metadata"):
+        transaction.require()
+
+
+def test_transaction_rejects_equal_but_substituted_projected_locator_catalog(monkeypatch):
+    binding = _binding(0)
+    manifest = _manifest(0)
+    locator_catalog = build_vision_locator_catalog((), ())
+    entry = catalog_api._D4SourceCatalogEntry(0, 0, manifest, locator_catalog)
+    world_catalog = catalog_api._seal_catalog((entry,))
+    metadata = DecoderMetadataGatherResult(
+        catalog_api.build_decoder_global_manifest((manifest,)), MappingProxyType({0: 0})
+    )
+    projection = catalog_api._D4SourceCatalogProjection(
+        world_catalog, manifest, metadata, locator_catalog, locator_catalog.digest
+    )
+    capture, _state = _capture(monkeypatch, binding, [])
+    transaction = api._begin_d4_transaction(capture)
+    transaction.attach_source_catalog(projection)
+    assert transaction.require() is transaction
+
+    object.__setattr__(projection, "local_locator_catalog", build_vision_locator_catalog((), ()))
+    with pytest.raises(MdpStateError, match="projected source metadata|locator"):
         transaction.require()
 
 
