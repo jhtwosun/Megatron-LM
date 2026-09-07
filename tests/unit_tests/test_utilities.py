@@ -43,7 +43,7 @@ def clear_nvte_env_vars():
 class Utils:
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    rank = int(os.environ.get('LOCAL_RANK', '0'))
+    rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
     inited = False
     store = None
 
@@ -92,7 +92,7 @@ class Utils:
             torch.distributed.destroy_process_group()
 
         if rank is None:
-            Utils.rank = int(os.environ['LOCAL_RANK'])
+            Utils.rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
             if Utils.rank >= Utils.world_size:
                 Utils.rank = -1
         else:
