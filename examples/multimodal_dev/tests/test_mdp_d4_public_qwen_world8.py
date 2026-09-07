@@ -30,9 +30,12 @@ from megatron.core.mdp.planner import MdpPlanner
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 from megatron.core.mdp.runtime import MdpRuntime, MdpRuntimeState
 from megatron.core.mdp.storage import MdpEmbeddingStorage
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -74,6 +77,15 @@ def mdp_group_registry():
     registry.assert_no_leak()
 
 
+@pytest.fixture(scope="module")
+def expert_replica_group():
+    """Expert-DP replicas pair equal expert slots across the two D4 domains."""
+    groups = tuple(dist.new_group(ranks=(index, index + 4)) for index in range(4))
+    yield groups[dist.get_rank() % 4]
+    for group in reversed(groups):
+        dist.destroy_process_group(group)
+
+
 def _vision_config():
     return TransformerConfig(
         num_layers=1,
@@ -94,7 +106,7 @@ def _vision_config():
     )
 
 
-def _batch():
+def _batch(*, vision=True):
     device = torch.device("cuda", torch.cuda.current_device())
     boundaries = torch.tensor((0, _SEQ), dtype=torch.int32, device=device)
     packed = PackedSeqParams(
@@ -108,7 +120,7 @@ def _batch():
         total_tokens=_SEQ,
     )
     generator = torch.Generator(device=device).manual_seed(700 + dist.get_rank() // 4)
-    return {
+    batch = {
         "input_ids": torch.arange(_SEQ, dtype=torch.int64, device=device).view(1, -1),
         "labels": torch.arange(_SEQ, dtype=torch.int64, device=device).view(1, -1),
         "loss_mask": torch.ones((1, _SEQ), device=device),
@@ -123,11 +135,21 @@ def _batch():
         "vision_decoder_positions": torch.arange(16, dtype=torch.int64, device=device),
         "packed_seq_params": packed,
     }
+    if not vision:
+        batch.update(
+            image_grid_thw=torch.empty((0, 3), dtype=torch.int64, device=device),
+            pixel_values=torch.empty((0, _PATCH_DIM), dtype=torch.bfloat16, device=device),
+            vision_item_meta=torch.empty((0, 6), dtype=torch.int64, device=device),
+            vision_decoder_positions=torch.empty(0, dtype=torch.int64, device=device),
+        )
+    return batch
 
 
-def _runtime(*, group_registry, encoder_capacity=16):
+def _runtime(*, group_registry, encoder_capacity=16, expert_parallel_size=1):
     rank = dist.get_rank()
-    rank_map = build_rank_map(MdpRankSpec(world_size=8, tp=1, pp=1, cp=4, ep=1, encoder_cp=4))
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=8, tp=1, pp=1, cp=4, ep=expert_parallel_size, encoder_cp=4)
+    )
     groups = install_mdp_process_groups(
         rank_map,
         group_registry=group_registry,
@@ -174,9 +196,9 @@ def _runtime(*, group_registry, encoder_capacity=16):
     binding = _make_repeated_d4_group_binding(
         world_group=groups.world_group,
         domain_group=groups.encoder_cp_group,
-        expert_group=None,
+        expert_group=groups.encoder_cp_group if expert_parallel_size == 4 else None,
         global_rank=rank,
-        expert_parallel_size=1,
+        expert_parallel_size=expert_parallel_size,
         device=torch.device("cuda", torch.cuda.current_device()),
         timeout_seconds=30.0,
     )
@@ -290,6 +312,50 @@ class _OptimizerParityDecoder(torch.nn.Module):
         scalar = self.scale.float() * vision_embeddings.float().square().mean()
         local_tokens = input_ids.shape[-1] // packed_seq_params.cp_group.size()
         return scalar.expand(input_ids.shape[0], local_tokens)
+
+
+class _DomainEp4MoeDecoder(torch.nn.Module):
+    """Tiny native MCore MoE using one expert per rank in a D4 domain."""
+
+    vp_stage = None
+
+    def __init__(self, pg_collection):
+        super().__init__()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=_HIDDEN,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=256,
+            moe_token_dispatcher_type="alltoall",
+            moe_router_load_balancing_type="none",
+            moe_router_topk=2,
+            moe_grouped_gemm=False,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=1,
+            context_parallel_size=4,
+            expert_model_parallel_size=4,
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False).mlp
+        )
+        self.moe = MoELayer(config, submodules, layer_number=1, pg_collection=pg_collection)
+        with torch.no_grad():
+            self.moe.router.weight.zero_()
+            self.moe.router.weight[:, :4].copy_(
+                4 * torch.eye(4, dtype=self.moe.router.weight.dtype, device="cuda")
+            )
+
+    def forward(self, *, input_ids, vision_embeddings, packed_seq_params, **_kwargs):
+        probes = 4 * torch.eye(4, _HIDDEN, dtype=torch.bfloat16, device="cuda")
+        hidden = probes if vision_embeddings is None else torch.cat((vision_embeddings, probes))
+        hidden = hidden.unsqueeze(1)
+        output, _ = self.moe(hidden)
+        local_tokens = input_ids.shape[-1] // packed_seq_params.cp_group.size()
+        return output.float().square().mean().expand(input_ids.shape[0], local_tokens)
 
 
 def _clone_named_parameters(module):
@@ -650,3 +716,115 @@ def test_selected_encoder_cp_optimizer_matches_ecp4_reference(
     )
     assert integration.get_runtime() is None
     _assert_optimizer_parity(selected, reference, allow_partition_variance=True)
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+@pytest.mark.parametrize(
+    ("vision", "encoder_capacity", "expected_encoder_cp"),
+    ((True, 64, 1), (True, 32, 2), (True, 16, 4), (False, 16, None)),
+    ids=("vision-ecp1", "vision-ecp2", "vision-ecp4", "text-empty-plan"),
+)
+def test_domain_ep4_public_qwen_execution_uses_native_moe(
+    monkeypatch,
+    mdp_group_registry,
+    expert_replica_group,
+    dynamic_decoder,
+    vision,
+    encoder_capacity,
+    expected_encoder_cp,
+):
+    runtime = _runtime(
+        group_registry=mdp_group_registry, encoder_capacity=encoder_capacity, expert_parallel_size=4
+    )
+    integration._RUNTIME = runtime
+    domain_group = runtime.process_groups.encoder_cp_group
+    domain_ranks = tuple(dist.get_process_group_ranks(domain_group))
+    expected_domain = tuple(range((dist.get_rank() // 4) * 4, (dist.get_rank() // 4 + 1) * 4))
+    assert domain_ranks == expected_domain
+    assert runtime.dynamic_group_binding.expert_group is domain_group
+
+    moe_pgs = ProcessGroupCollection(
+        tp=runtime.process_groups.singleton_group,
+        cp=domain_group,
+        tp_cp=domain_group,
+        ep=domain_group,
+        expt_tp=runtime.process_groups.singleton_group,
+        tp_ep=domain_group,
+        expt_dp=expert_replica_group,
+        tp_dp_cp=dist.group.WORLD,
+    )
+    decoder = _DomainEp4MoeDecoder(moe_pgs).bfloat16().cuda()
+    assert decoder.moe.config.context_parallel_size == domain_group.size()
+    assert decoder.moe.local_expert_indices == [dist.get_rank() % 4]
+    assert (
+        tuple(dist.get_process_group_ranks(decoder.moe.token_dispatcher.ep_group)) == domain_ranks
+    )
+    assert tuple(dist.get_process_group_ranks(expert_replica_group)) == (
+        dist.get_rank() % 4,
+        dist.get_rank() % 4 + 4,
+    )
+
+    selected_encoder_cp = []
+    saw_vision_embeddings = []
+    native_bind = mdp_adapter_module._bind_dynamic_encoder_cp
+    native_decoder_forward = decoder.forward
+
+    def observe_encoder_cp(*args, membership, **kwargs):
+        selected_encoder_cp.append(membership.group_size)
+        return native_bind(*args, membership=membership, **kwargs)
+
+    def get_batch(iterator):
+        next(iterator)
+        return _batch(vision=vision)
+
+    def observe_decoder_forward(**kwargs):
+        saw_vision_embeddings.append(kwargs["vision_embeddings"] is not None)
+        return native_decoder_forward(**kwargs)
+
+    monkeypatch.setattr(forward_step, "get_batch", get_batch)
+    monkeypatch.setattr(mdp_adapter_module, "_bind_dynamic_encoder_cp", observe_encoder_cp)
+    monkeypatch.setattr(decoder, "forward", observe_decoder_forward)
+
+    def finalize(_model, tokens):
+        dist.all_reduce(tokens)
+
+    config = SimpleNamespace(
+        dynamic_context_parallel=dynamic_decoder,
+        min_dynamic_context_parallel_size=1,
+        max_seqlen_per_dp_cp_rank=16,
+        finalize_model_grads_func=finalize,
+    )
+
+    def native_schedule(data_iterator, num_microbatches, forward_only):
+        assert num_microbatches == 1 and forward_only is False
+        output, output_loss_func = forward_step.forward_step(data_iterator, decoder)
+        loss, tokens, _ = output_loss_func(output)
+        loss.backward()
+        config.finalize_model_grads_func([], tokens)
+        assert int(tokens) == 128
+        return loss.detach()
+
+    wrapped = integration.maybe_wrap_forward_backward(native_schedule, config)
+    loss = wrapped(data_iterator=iter((object(),)), num_microbatches=1, forward_only=False)
+
+    assert torch.isfinite(loss)
+    assert saw_vision_embeddings == [vision]
+    selected = vision and dist.get_rank() % 4 < expected_encoder_cp
+    assert selected_encoder_cp == ([expected_encoder_cp] if selected else [])
+    expert_parameters = tuple(decoder.moe.experts.local_experts[0].parameters())
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad)
+        for parameter in expert_parameters
+    )
+    encoder_gradients = tuple(
+        parameter.main_grad for parameter in runtime.encoder_domain.encoder_ddp.parameters()
+    )
+    assert (
+        any(
+            gradient is not None and torch.count_nonzero(gradient) for gradient in encoder_gradients
+        )
+        is vision
+    )
+    assert runtime.iteration == 1
+    assert runtime.state is MdpRuntimeState.EMPTY
+    assert runtime.storage.get_leaf(0) is None
