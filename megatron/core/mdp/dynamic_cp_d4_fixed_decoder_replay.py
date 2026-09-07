@@ -476,6 +476,32 @@ class _D4FixedDecoderReplayCursor(Iterator[MdpMicrobatchRecord]):
     def __iter__(self) -> "_D4FixedDecoderReplayCursor":
         return self
 
+    def _leaf_entry(self) -> tuple[Any, ...]:
+        entry = _ACTIVE_CURSORS.get(id(self))
+        if (
+            type(entry) is not tuple
+            or len(entry) != 4
+            or type(entry[0]) is not weakref.ReferenceType
+            or type(entry[1]) is not weakref.ReferenceType
+            or entry[0]() is not self
+            or self._state is not _ACTIVE
+            or entry[1]() is not self._owner
+            or entry[2] is not self._owner.records
+            or type(entry[3]) is not int
+            or entry[3] < 0
+            or entry[3] > len(entry[2])
+        ):
+            raise MdpStateError("MDP: fixed decoder replay cursor is the exact active cursor.")
+        self._owner.require()
+        escrow = _ACTIVE_OWNERS[id(self._owner)][-1]
+        if (
+            type(escrow) is not _OwnerEscrow
+            or escrow.cursor is not self
+            or _ACTIVE_CURSORS.get(id(self)) is not entry
+        ):
+            raise MdpStateError("MDP: fixed decoder replay cursor retains exact owner escrow.")
+        return entry
+
     def __next__(self) -> MdpMicrobatchRecord:
         entry = _ACTIVE_CURSORS.get(id(self))
         if (
@@ -492,6 +518,25 @@ class _D4FixedDecoderReplayCursor(Iterator[MdpMicrobatchRecord]):
             )
         _ACTIVE_CURSORS[id(self)] = (*entry[:3], index + 1)
         return records[index]
+
+    def vision_embedding_leaf(self, record: MdpMicrobatchRecord) -> Tensor | None:
+        """Return the leaf for the record most recently yielded to the decoder."""
+        entry = self._leaf_entry()
+        if (
+            type(record) is not MdpMicrobatchRecord
+            or entry[3] < 1
+            or entry[2][entry[3] - 1] is not record
+        ):
+            raise MdpStateError("MDP: fixed decoder leaf follows its just-yielded record.")
+        matches = tuple(
+            leaf
+            for key, leaf in self._owner.embedding_leaves.items()
+            if key.microbatch_index == record.microbatch_id
+        )
+        expected_count = 0 if record.text_only else 1
+        if len(matches) != expected_count:
+            raise MdpStateError("MDP: fixed decoder record owns its exact vision leaf count.")
+        return matches[0] if matches else None
 
 
 @dataclass(frozen=True, slots=True)

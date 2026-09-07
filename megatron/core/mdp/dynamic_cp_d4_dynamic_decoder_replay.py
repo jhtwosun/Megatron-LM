@@ -42,6 +42,7 @@ from megatron.core.mdp.errors import (
     MdpStateError,
     MdpTaskFatalError,
 )
+from megatron.core.mdp.window import MdpMicrobatchRecord
 
 __all__ = ()
 
@@ -156,7 +157,7 @@ class _D4DynamicDecoderReplayCursor:
     def __iter__(self):
         return self
 
-    def __next__(self):
+    def _active_entry(self) -> tuple[Any, ...]:
         entry = _ACTIVE_CURSORS.get(id(self))
         if (
             type(entry) is not tuple
@@ -188,6 +189,12 @@ class _D4DynamicDecoderReplayCursor:
         escrow = owner_entry[-3]
         if escrow.cursor is not self or escrow.cursor_entry is not entry:
             raise MdpStateError("MDP: dynamic decoder replay cursor retains exact owner escrow.")
+        return entry
+
+    def __next__(self):
+        entry = self._active_entry()
+        owner_entry = self._owner_entry
+        escrow = owner_entry[-3]
         records, index = entry[4], entry[5]
         if index >= len(records):
             raise MdpStateError(
@@ -198,6 +205,25 @@ class _D4DynamicDecoderReplayCursor:
         owner_entry[-4].cursor_entry = next_entry
         _ACTIVE_CURSORS[id(self)] = next_entry
         return records[index]
+
+    def vision_embedding_leaf(self, record: MdpMicrobatchRecord) -> Tensor | None:
+        """Return the leaf for the record most recently yielded to the decoder."""
+        entry = self._active_entry()
+        if (
+            type(record) is not MdpMicrobatchRecord
+            or entry[5] < 1
+            or entry[4][entry[5] - 1] is not record
+        ):
+            raise MdpStateError("MDP: dynamic decoder leaf follows its just-yielded record.")
+        matches = tuple(
+            leaf
+            for key, leaf in self._owner.embedding_leaves.items()
+            if key.microbatch_index == record.microbatch_id
+        )
+        expected_count = 0 if record.text_only else 1
+        if len(matches) != expected_count:
+            raise MdpStateError("MDP: dynamic decoder record owns its exact vision leaf count.")
+        return matches[0] if matches else None
 
 
 @dataclass(frozen=True, slots=True)

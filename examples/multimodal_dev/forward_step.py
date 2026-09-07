@@ -944,8 +944,9 @@ def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool =
 
     The iterator yields immutable ``MdpMicrobatchRecord`` objects captured in
     P1. Pixels never reach the decoder: the first PP stage receives the
-    pre-encoded detached leaf from endpoint storage instead.  The EP-overlap
-    path builds a decoder-only schedule plan from that same leaf.
+    pre-encoded detached leaf from endpoint storage or the active repeated-D4
+    replay owner. The EP-overlap path builds a decoder-only schedule plan from
+    that same leaf.
     """
     record = next(data_iterator)
     batch = dict(record.model_payload)
@@ -958,11 +959,17 @@ def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool =
 
     vision_embeddings = None
     if is_pipeline_first_stage() and not record.text_only:
-        vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
+        if runtime.config.dynamic_encoder_cp:
+            leaf_getter = getattr(data_iterator, "vision_embedding_leaf", None)
+            if not callable(leaf_getter):
+                raise RuntimeError("MDP: repeated-D4 replay iterator must expose its vision leaf")
+            vision_embeddings = leaf_getter(record)
+        else:
+            vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
         if vision_embeddings is None:
             raise RuntimeError(
                 f"MDP: microbatch {record.microbatch_id} has vision items but no "
-                "leaf in endpoint storage; P3 embedding routing did not complete"
+                "decoder leaf; embedding routing did not complete"
             )
 
     model_inputs = dict(
