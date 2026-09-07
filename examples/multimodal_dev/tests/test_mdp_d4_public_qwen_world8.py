@@ -66,6 +66,14 @@ def _reset_integration():
     integration.reset_for_testing()
 
 
+@pytest.fixture(scope="module")
+def mdp_group_registry():
+    """Reuse immutable startup groups while rebuilding every parity arm."""
+    registry = MdpGroupRegistry()
+    yield registry
+    registry.assert_no_leak()
+
+
 def _vision_config():
     return TransformerConfig(
         num_layers=1,
@@ -117,12 +125,12 @@ def _batch():
     }
 
 
-def _runtime():
+def _runtime(*, group_registry, encoder_capacity=16):
     rank = dist.get_rank()
     rank_map = build_rank_map(MdpRankSpec(world_size=8, tp=1, pp=1, cp=4, ep=1, encoder_cp=4))
     groups = install_mdp_process_groups(
         rank_map,
-        group_registry=MdpGroupRegistry(),
+        group_registry=group_registry,
         decoder_pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         dynamic_encoder_cp=True,
         min_dynamic_encoder_cp_size=1,
@@ -159,7 +167,7 @@ def _runtime():
     config = MdpConfig(
         enable=True,
         encoder_cp=4,
-        encoder_max_payload_rows=16,
+        encoder_max_payload_rows=encoder_capacity,
         dynamic_encoder_cp=True,
         min_dynamic_encoder_cp_size=1,
     )
@@ -195,10 +203,15 @@ def _runtime():
 
 
 @pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+@pytest.mark.parametrize(
+    ("encoder_capacity", "expected_encoder_cp"),
+    ((64, 1), (32, 2), (16, 4)),
+    ids=("ecp1", "ecp2", "ecp4"),
+)
 def test_public_repeated_d4_runs_actual_qwen_backward_finalize_and_commit(
-    monkeypatch, dynamic_decoder
+    monkeypatch, mdp_group_registry, dynamic_decoder, encoder_capacity, expected_encoder_cp
 ):
-    runtime = _runtime()
+    runtime = _runtime(group_registry=mdp_group_registry, encoder_capacity=encoder_capacity)
     integration._RUNTIME = runtime
     selected_encoder_cp = []
     native_bind = mdp_adapter_module._bind_dynamic_encoder_cp
@@ -255,8 +268,11 @@ def test_public_repeated_d4_runs_actual_qwen_backward_finalize_and_commit(
     assert runtime.iteration == 1
     assert runtime.state is MdpRuntimeState.EMPTY
     assert runtime.storage.get_leaf(0) is None
-    assert selected_encoder_cp == [4]
+    selected = dist.get_rank() % 4 < expected_encoder_cp
+    assert selected_encoder_cp == ([expected_encoder_cp] if selected else [])
     grads = [parameter.main_grad for parameter in runtime.encoder_domain.encoder_ddp.parameters()]
+    # Encoder parameters are WORLD-replicated. Gate6 synchronizes the selected
+    # subgroup's contribution onto selected and idle ranks alike.
     assert any(gradient is not None and torch.count_nonzero(gradient) for gradient in grads)
 
 
@@ -324,11 +340,20 @@ def _snapshot_batch(batch):
     }
 
 
-def _run_optimizer_parity_mode(monkeypatch, *, dynamic_decoder, native_bind):
+def _run_optimizer_parity_mode(
+    monkeypatch,
+    *,
+    dynamic_decoder,
+    native_bind,
+    group_registry,
+    encoder_capacity=16,
+    expected_encoder_cp=4,
+    adam_eps=1e-8,
+):
     from megatron.core.mdp.optimizer import build_mdp_composite_optimizer
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 
-    runtime = _runtime()
+    runtime = _runtime(group_registry=group_registry, encoder_capacity=encoder_capacity)
     integration._RUNTIME = runtime
     selected_encoder_cp = []
     captured_batches = []
@@ -359,7 +384,7 @@ def _run_optimizer_parity_mode(monkeypatch, *, dynamic_decoder, native_bind):
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     optimizer_config = OptimizerConfig(
-        optimizer="adam", lr=1e-2, bf16=True, clip_grad=0.1, weight_decay=0.0
+        optimizer="adam", lr=1e-2, adam_eps=adam_eps, bf16=True, clip_grad=0.1, weight_decay=0.0
     )
     decoder_optimizer = get_megatron_optimizer(
         optimizer_config, [decoder_ddp], use_gloo_process_groups=False
@@ -409,7 +434,8 @@ def _run_optimizer_parity_mode(monkeypatch, *, dynamic_decoder, native_bind):
         }
         success, grad_norm, _ = composite.step()
         assert success and grad_norm > optimizer_config.clip_grad
-        assert selected_encoder_cp == [4]
+        selected = dist.get_rank() % 4 < expected_encoder_cp
+        assert selected_encoder_cp == ([expected_encoder_cp] if selected else [])
         decoder_state = _clone_named_parameters(decoder_ddp)
         encoder_state = _clone_named_parameters(runtime.encoder_domain.encoder_ddp)
         assert any(
@@ -440,15 +466,99 @@ def _run_optimizer_parity_mode(monkeypatch, *, dynamic_decoder, native_bind):
         integration.reset_for_testing()
 
 
-def test_joint_dcp_one_step_optimizer_matches_fixed_cp4_reference(monkeypatch):
-    native_bind = mdp_adapter_module._bind_dynamic_encoder_cp
-    fixed = _run_optimizer_parity_mode(monkeypatch, dynamic_decoder=False, native_bind=native_bind)
-    assert integration.get_runtime() is None
-    joint = _run_optimizer_parity_mode(monkeypatch, dynamic_decoder=True, native_bind=native_bind)
-    assert integration.get_runtime() is None
+def _assert_gradient_parity(actual, reference, section):
+    assert actual.keys() == reference.keys(), section
+    for name in actual:
+        candidate = actual[name].float()
+        baseline = reference[name].float()
+        assert candidate.shape == baseline.shape, (section, name)
+        assert torch.isfinite(candidate).all(), (section, name)
+        assert torch.isfinite(baseline).all(), (section, name)
+        candidate_norm = float(candidate.norm())
+        baseline_norm = float(baseline.norm())
+        baseline_max = float(baseline.abs().max())
+        assert candidate_norm > 0 and baseline_norm > 0, (section, name)
+        delta = candidate - baseline
+        l2_relative = float(delta.norm()) / baseline_norm
+        max_abs_relative = float(delta.abs().max()) / baseline_max
+        cosine = float(
+            torch.nn.functional.cosine_similarity(candidate.flatten(), baseline.flatten(), dim=0)
+        )
+        norm_ratio = candidate_norm / baseline_norm
+        diagnostic = (
+            f"{section}.{name}: l2_relative={l2_relative}, "
+            f"max_abs_relative={max_abs_relative}, cosine={cosine}, "
+            f"norm_ratio={norm_ratio}"
+        )
+        assert l2_relative <= 0.01, diagnostic
+        assert max_abs_relative <= 0.015, diagnostic
+        assert cosine >= 0.999, diagnostic
+        assert 0.99 <= norm_ratio <= 1.01, diagnostic
 
-    assert torch.equal(joint["loss"], fixed["loss"])
-    assert abs(joint["grad_norm"] - fixed["grad_norm"]) / fixed["grad_norm"] < 1e-6
+
+def _vector_diagnostic(candidate, baseline):
+    candidate = candidate.double()
+    baseline = baseline.double()
+    delta = candidate - baseline
+    baseline_norm = float(baseline.norm())
+    candidate_norm = float(candidate.norm())
+    baseline_max = float(baseline.abs().max())
+    assert baseline_norm > 0 and candidate_norm > 0
+    return {
+        "l2_relative": float(delta.norm()) / baseline_norm,
+        "max_abs_relative": float(delta.abs().max()) / baseline_max,
+        "cosine": float(candidate.dot(baseline)) / (candidate_norm * baseline_norm),
+        "norm_ratio": candidate_norm / baseline_norm,
+    }
+
+
+def _tensor_leaves(value, path=()):
+    if torch.is_tensor(value):
+        return {path: value}
+    if isinstance(value, dict):
+        return {
+            key: tensor
+            for name, item in value.items()
+            for key, tensor in _tensor_leaves(item, (*path, name)).items()
+        }
+    if isinstance(value, (list, tuple)):
+        return {
+            key: tensor
+            for index, item in enumerate(value)
+            for key, tensor in _tensor_leaves(item, (*path, index)).items()
+        }
+    return {}
+
+
+def _assert_optimizer_state_parity(actual, reference):
+    actual_leaves = _tensor_leaves(actual)
+    reference_leaves = _tensor_leaves(reference)
+    assert actual_leaves.keys() == reference_leaves.keys()
+    assert _optimizer_steps(actual) == _optimizer_steps(reference)
+    for path, candidate in actual_leaves.items():
+        baseline = reference_leaves[path]
+        assert candidate.shape == baseline.shape, path
+        assert torch.isfinite(candidate).all(), path
+        assert torch.isfinite(baseline).all(), path
+        if torch.equal(candidate, baseline):
+            continue
+        diagnostic = _vector_diagnostic(candidate.flatten(), baseline.flatten())
+        message = f"optimizer_state{path}: {diagnostic}"
+        assert diagnostic["l2_relative"] <= 0.03, message
+        assert diagnostic["cosine"] >= 0.999, message
+        assert 0.97 <= diagnostic["norm_ratio"] <= 1.03, message
+
+
+def _assert_optimizer_parity(actual, reference, *, allow_partition_variance=False):
+    if not allow_partition_variance:
+        assert torch.equal(actual["loss"], reference["loss"]), (actual["loss"], reference["loss"])
+    else:
+        torch.testing.assert_close(actual["loss"], reference["loss"], rtol=8e-3, atol=2e-3)
+    relative_grad_norm_error = (
+        abs(actual["grad_norm"] - reference["grad_norm"]) / reference["grad_norm"]
+    )
+    grad_norm_tolerance = 0.01 if allow_partition_variance else 1e-6
+    assert relative_grad_norm_error < grad_norm_tolerance, relative_grad_norm_error
     for section in (
         "initial_decoder",
         "initial_encoder",
@@ -456,10 +566,87 @@ def test_joint_dcp_one_step_optimizer_matches_fixed_cp4_reference(monkeypatch):
         "initial_cpu_rng",
         "initial_cuda_rng",
         "captured_batches",
-        "decoder_grads",
-        "encoder_grads",
-        "decoder_state",
-        "encoder_state",
     ):
-        torch.testing.assert_close(joint[section], fixed[section], rtol=1e-6, atol=1e-7)
-    torch.testing.assert_close(joint["optimizer_state"], fixed["optimizer_state"])
+        torch.testing.assert_close(actual[section], reference[section], rtol=1e-6, atol=1e-7)
+    if allow_partition_variance:
+        for section in ("decoder_grads", "encoder_grads"):
+            _assert_gradient_parity(actual[section], reference[section], section)
+    else:
+        for section in ("decoder_grads", "encoder_grads"):
+            torch.testing.assert_close(actual[section], reference[section], rtol=1e-6, atol=1e-7)
+    relative_rtol = 8e-3 if allow_partition_variance else 1e-6
+    relative_atol = 2e-3 if allow_partition_variance else 1e-7
+    for section in ("decoder_state", "encoder_state"):
+        if allow_partition_variance and section == "encoder_state":
+            selected_update = torch.cat(
+                tuple(
+                    (actual[section][name] - actual["initial_encoder"][name]).flatten()
+                    for name in actual[section]
+                )
+            )
+            reference_update = torch.cat(
+                tuple(
+                    (reference[section][name] - reference["initial_encoder"][name]).flatten()
+                    for name in reference[section]
+                )
+            )
+            diagnostic = _vector_diagnostic(selected_update, reference_update)
+            message = f"encoder update: {diagnostic}"
+            assert diagnostic["l2_relative"] <= 0.01, message
+            assert diagnostic["cosine"] >= 0.999, message
+            assert 0.99 <= diagnostic["norm_ratio"] <= 1.01, message
+        torch.testing.assert_close(
+            actual[section], reference[section], rtol=relative_rtol, atol=relative_atol
+        )
+    if allow_partition_variance:
+        _assert_optimizer_state_parity(actual["optimizer_state"], reference["optimizer_state"])
+    else:
+        torch.testing.assert_close(actual["optimizer_state"], reference["optimizer_state"])
+
+
+def test_joint_dcp_one_step_optimizer_matches_fixed_cp4_reference(monkeypatch, mdp_group_registry):
+    native_bind = mdp_adapter_module._bind_dynamic_encoder_cp
+    fixed = _run_optimizer_parity_mode(
+        monkeypatch,
+        dynamic_decoder=False,
+        native_bind=native_bind,
+        group_registry=mdp_group_registry,
+    )
+    assert integration.get_runtime() is None
+    joint = _run_optimizer_parity_mode(
+        monkeypatch,
+        dynamic_decoder=True,
+        native_bind=native_bind,
+        group_registry=mdp_group_registry,
+    )
+    assert integration.get_runtime() is None
+    _assert_optimizer_parity(joint, fixed)
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+@pytest.mark.parametrize(
+    ("encoder_capacity", "expected_encoder_cp"), ((64, 1), (32, 2)), ids=("ecp1", "ecp2")
+)
+def test_selected_encoder_cp_optimizer_matches_ecp4_reference(
+    monkeypatch, mdp_group_registry, dynamic_decoder, encoder_capacity, expected_encoder_cp
+):
+    native_bind = mdp_adapter_module._bind_dynamic_encoder_cp
+    reference = _run_optimizer_parity_mode(
+        monkeypatch,
+        dynamic_decoder=dynamic_decoder,
+        adam_eps=1e-6,
+        native_bind=native_bind,
+        group_registry=mdp_group_registry,
+    )
+    assert integration.get_runtime() is None
+    selected = _run_optimizer_parity_mode(
+        monkeypatch,
+        dynamic_decoder=dynamic_decoder,
+        encoder_capacity=encoder_capacity,
+        expected_encoder_cp=expected_encoder_cp,
+        adam_eps=1e-6,
+        native_bind=native_bind,
+        group_registry=mdp_group_registry,
+    )
+    assert integration.get_runtime() is None
+    _assert_optimizer_parity(selected, reference, allow_partition_variance=True)

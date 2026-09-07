@@ -110,10 +110,20 @@ def _apply_rope_fp32_no_cp(
 def _apply_rope_fp32_encoder_cp_local(
     t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
 ):
-    """Apply materialized, already-partitioned RoPE as one local BSHD sequence."""
+    """Apply native ECP1 MRoPE or materialized encoder-CP-local RoPE."""
     if t.dim() != 3:
-        raise ValueError(
-            f"encoder-CP local RoPE expects a THD tensor, got {tuple(t.shape)}"
+        raise ValueError(f"encoder-CP local RoPE expects a THD tensor, got {tuple(t.shape)}")
+    if (
+        getattr(config, "context_parallel_size", None) == 1
+        and getattr(config, "mrope_section", None) is not None
+        and freqs.dim() == 4
+        and freqs.shape[:2] == (3, 1)
+        and freqs.shape[2] == t.shape[0]
+    ):
+        # ECP1 keeps Qwen's native axis-wise MRoPE representation. ECP2/4
+        # materialize and partition it row-wise before entering this wrapper.
+        return _apply_rope_fp32_no_cp(
+            t, freqs, config, cu_seqlens=cu_seqlens, mscale=mscale, max_seqlen=max_seqlen
         )
     if (
         freqs.dim() != 4
