@@ -12,9 +12,10 @@ not rediscover methods or dimensions through mutable instance attributes.
 import inspect
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, ClassVar
 
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
+from megatron.core.mdp.protocols import VisionCaptureMode
 
 __all__ = ()
 
@@ -36,6 +37,8 @@ class _AdapterRegistration:
     build_encoder: Callable[..., Any] = field(repr=False, compare=False)
     bind_dynamic_encoder_cp: Callable[..., Any] = field(repr=False, compare=False)
     encode: Callable[..., Any] = field(repr=False, compare=False)
+    freeze_vision_locator: Callable[..., Any] | None = field(repr=False, compare=False)
+    materialize_vision_locator: Callable[..., Any] | None = field(repr=False, compare=False)
     _seal: object = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -57,6 +60,7 @@ class _CapabilityRecord:
 class DynamicEncoderAdapterOperations:
     """Immutable calls and dimensions escrowed from one exact adapter instance."""
 
+    schema_version: ClassVar[int] = 1
     payload_width: int
     embedding_width: int
     spatial_merge_size: int
@@ -125,6 +129,43 @@ class DynamicEncoderAdapterOperations:
         return record.registration.encode(self._adapter(), encoder, payload, layout)
 
 
+@dataclass(frozen=True, slots=True)
+class DynamicEncoderLocatorAdapterOperations(DynamicEncoderAdapterOperations):
+    """Version-2 operation escrow with exact stable-locator operations."""
+
+    schema_version: ClassVar[int] = 2
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not DynamicEncoderLocatorAdapterOperations
+            or self._seal is not _OPERATIONS_SEAL
+        ):
+            raise MdpConfigurationError("MDP: core mints locator adapter operation escrows.")
+
+    def freeze_vision_locator(
+        self,
+        descriptor: Any,
+        *,
+        dataset_root: str,
+        grid_thw: tuple[int, int, int],
+        declared_dimensions: tuple[int, int] | None,
+    ) -> Any:
+        """Freeze one descriptor through the registered exact locator operation."""
+        record = self._record
+        return record.registration.freeze_vision_locator(
+            self._adapter(),
+            descriptor,
+            dataset_root=dataset_root,
+            grid_thw=grid_thw,
+            declared_dimensions=declared_dimensions,
+        )
+
+    def materialize_vision_locator(self, locator: Any) -> Any:
+        """Materialize one locator through the registered exact operation."""
+        record = self._record
+        return record.registration.materialize_vision_locator(self._adapter(), locator)
+
+
 class DynamicEncoderAdapterCapability:
     """Opaque, identity-bound, one-shot authority for a dynamic adapter."""
 
@@ -163,6 +204,8 @@ def register_dynamic_encoder_adapter_class(
     build_encoder: Callable[..., Any],
     bind_dynamic_encoder_cp: Callable[..., Any],
     encode: Callable[..., Any],
+    freeze_vision_locator: Callable[..., Any] | None = None,
+    materialize_vision_locator: Callable[..., Any] | None = None,
 ) -> None:
     """Register one exact adapter class and its explicitly chosen operations.
 
@@ -173,6 +216,19 @@ def register_dynamic_encoder_adapter_class(
         raise MdpConfigurationError("MDP: dynamic adapter registration uses an exact class.")
     if adapter_class in _ADAPTER_CLASSES:
         raise MdpConfigurationError("MDP: dynamic adapter class is already registered.")
+    has_freeze = freeze_vision_locator is not None
+    has_materialize = materialize_vision_locator is not None
+    if has_freeze != has_materialize:
+        raise MdpConfigurationError(
+            "MDP: dynamic adapter registration has complete locator operations or neither."
+        )
+    if has_freeze:
+        freeze_vision_locator = _require_unbound_method(
+            adapter_class, "freeze_vision_locator", freeze_vision_locator
+        )
+        materialize_vision_locator = _require_unbound_method(
+            adapter_class, "materialize_vision_locator", materialize_vision_locator
+        )
     registration = _AdapterRegistration(
         adapter_class=adapter_class,
         get_batch=_require_unbound_method(adapter_class, "get_batch", get_batch),
@@ -190,6 +246,8 @@ def register_dynamic_encoder_adapter_class(
             adapter_class, "bind_dynamic_encoder_cp", bind_dynamic_encoder_cp
         ),
         encode=_require_unbound_method(adapter_class, "encode", encode),
+        freeze_vision_locator=freeze_vision_locator,
+        materialize_vision_locator=materialize_vision_locator,
         _seal=_REGISTRATION_SEAL,
     )
     _ADAPTER_CLASSES[adapter_class] = registration
@@ -211,11 +269,22 @@ def _existing_record(adapter: Any) -> _CapabilityRecord | None:
     return None
 
 
-def mint_dynamic_encoder_adapter_capability(adapter: Any) -> DynamicEncoderAdapterCapability:
+def mint_dynamic_encoder_adapter_capability(
+    adapter: Any, *, capture_mode: VisionCaptureMode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+) -> DynamicEncoderAdapterCapability:
     """Mint one pending capability for an exact registered adapter instance."""
+    if type(capture_mode) is not VisionCaptureMode:
+        raise MdpConfigurationError("MDP: dynamic adapter capture mode is an exact closed enum.")
     registration = _ADAPTER_CLASSES.get(type(adapter))
     if registration is None:
         raise MdpConfigurationError("MDP: exact dynamic adapter class is not registered.")
+    if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG and (
+        registration.freeze_vision_locator is None
+        or registration.materialize_vision_locator is None
+    ):
+        raise MdpConfigurationError(
+            "MDP: stable locator capture requires complete locator operations."
+        )
     if _existing_record(adapter) is not None:
         raise MdpStateError("MDP: dynamic adapter instance already owns a capability.")
 
@@ -249,7 +318,12 @@ def mint_dynamic_encoder_adapter_capability(adapter: Any) -> DynamicEncoderAdapt
         ) from error
     record = _CapabilityRecord(identity, adapter_reference, registration, _PENDING)
     capability = DynamicEncoderAdapterCapability(record, _seal=_CAPABILITY_SEAL)
-    operations = DynamicEncoderAdapterOperations(
+    operations_class = (
+        DynamicEncoderLocatorAdapterOperations
+        if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        else DynamicEncoderAdapterOperations
+    )
+    operations = operations_class(
         payload_width=dimensions[0],
         embedding_width=dimensions[1],
         spatial_merge_size=dimensions[2],
@@ -282,7 +356,7 @@ def _capability_record(capability: Any) -> _CapabilityRecord:
 
 def claim_dynamic_encoder_adapter_capability(
     adapter: Any, capability: Any
-) -> DynamicEncoderAdapterOperations:
+) -> DynamicEncoderAdapterOperations | DynamicEncoderLocatorAdapterOperations:
     """Consume one pending capability and return its immutable operation escrow."""
     record = _capability_record(capability)
     identity = id(adapter)

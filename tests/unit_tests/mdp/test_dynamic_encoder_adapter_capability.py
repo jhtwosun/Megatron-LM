@@ -3,11 +3,14 @@
 """Pure contract tests for the dormant repeated-D4 adapter capability."""
 
 import dataclasses
+from enum import IntEnum
 
 import pytest
 
 from megatron.core.mdp.dynamic_encoder_adapter_capability import (
     DynamicEncoderAdapterCapability,
+    DynamicEncoderAdapterOperations,
+    DynamicEncoderLocatorAdapterOperations,
     _reset_dynamic_encoder_adapter_capabilities_for_tests,
     claim_dynamic_encoder_adapter_capability,
     mint_dynamic_encoder_adapter_capability,
@@ -15,6 +18,7 @@ from megatron.core.mdp.dynamic_encoder_adapter_capability import (
     retire_dynamic_encoder_adapter_capability,
 )
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
+from megatron.core.mdp.protocols import VisionCaptureMode
 
 
 class _Adapter:
@@ -53,6 +57,16 @@ class _Adapter:
         self.calls.append(("encode", encoder, payload, layout))
         return "output"
 
+    def freeze_vision_locator(self, descriptor, *, dataset_root, grid_thw, declared_dimensions):
+        self.calls.append(
+            ("freeze_locator", descriptor, dataset_root, grid_thw, declared_dimensions)
+        )
+        return "locator"
+
+    def materialize_vision_locator(self, locator):
+        self.calls.append(("materialize_locator", locator))
+        return b"encoded-image"
+
 
 class _Subclass(_Adapter):
     pass
@@ -65,7 +79,7 @@ def _isolated_registry():
     _reset_dynamic_encoder_adapter_capabilities_for_tests(registrations=(_Adapter, _Subclass))
 
 
-def _register(adapter_class=_Adapter, **overrides):
+def _register(adapter_class=_Adapter, *, locator=False, **overrides):
     operations = dict(
         get_batch=adapter_class.get_batch,
         estimate_cost=adapter_class.estimate_cost,
@@ -75,8 +89,182 @@ def _register(adapter_class=_Adapter, **overrides):
         bind_dynamic_encoder_cp=adapter_class.bind_dynamic_encoder_cp,
         encode=adapter_class.encode,
     )
+    if locator:
+        operations.update(
+            freeze_vision_locator=adapter_class.freeze_vision_locator,
+            materialize_vision_locator=adapter_class.materialize_vision_locator,
+        )
     operations.update(overrides)
     register_dynamic_encoder_adapter_class(adapter_class, **operations)
+
+
+def test_source_pixel_schema_and_operation_bytes_remain_exactly_v1():
+    _register()
+    adapter = _Adapter()
+    operations = claim_dynamic_encoder_adapter_capability(
+        adapter, mint_dynamic_encoder_adapter_capability(adapter)
+    )
+
+    assert type(operations) is DynamicEncoderAdapterOperations
+    assert operations.schema_version == 1
+    assert tuple(field.name for field in dataclasses.fields(operations)) == (
+        "payload_width",
+        "embedding_width",
+        "spatial_merge_size",
+        "_record",
+        "_seal",
+    )
+    assert repr(operations) == (
+        "DynamicEncoderAdapterOperations(payload_width=12, embedding_width=24, "
+        "spatial_merge_size=2)"
+    )
+
+    explicit_adapter = _Adapter()
+    explicit = claim_dynamic_encoder_adapter_capability(
+        explicit_adapter,
+        mint_dynamic_encoder_adapter_capability(
+            explicit_adapter, capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+        ),
+    )
+    assert type(explicit) is type(operations)
+    assert repr(explicit) == repr(operations)
+    assert tuple(field.name for field in dataclasses.fields(explicit)) == tuple(
+        field.name for field in dataclasses.fields(operations)
+    )
+
+
+def test_locator_schema_escrows_complete_operations_before_live_mutation(monkeypatch):
+    _register(locator=True)
+    adapter = _Adapter()
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    adapter.freeze_vision_locator = lambda *args, **kwargs: pytest.fail(
+        "read mutated live adapter freeze operation"
+    )
+    adapter.materialize_vision_locator = lambda *args, **kwargs: pytest.fail(
+        "read mutated live adapter materialize operation"
+    )
+    monkeypatch.setattr(
+        _Adapter,
+        "freeze_vision_locator",
+        lambda *args, **kwargs: pytest.fail("read mutated live freeze operation"),
+    )
+    monkeypatch.setattr(
+        _Adapter,
+        "materialize_vision_locator",
+        lambda *args, **kwargs: pytest.fail("read mutated live materialize operation"),
+    )
+
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+
+    assert type(operations) is DynamicEncoderLocatorAdapterOperations
+    assert operations.schema_version == 2
+    assert tuple(field.name for field in dataclasses.fields(operations)) == (
+        "payload_width",
+        "embedding_width",
+        "spatial_merge_size",
+        "_record",
+        "_seal",
+    )
+    assert repr(operations) == (
+        "DynamicEncoderLocatorAdapterOperations(payload_width=12, embedding_width=24, "
+        "spatial_merge_size=2)"
+    )
+    assert (
+        operations.freeze_vision_locator(
+            "descriptor", dataset_root="/datasets", grid_thw=(1, 2, 2), declared_dimensions=(16, 32)
+        )
+        == "locator"
+    )
+    assert operations.materialize_vision_locator("locator") == b"encoded-image"
+    assert adapter.calls == [
+        ("freeze_locator", "descriptor", "/datasets", (1, 2, 2), (16, 32)),
+        ("materialize_locator", "locator"),
+    ]
+    clone = dataclasses.replace(operations)
+    with pytest.raises(MdpStateError, match="inactive or stale"):
+        clone.freeze_vision_locator(
+            "descriptor", dataset_root="/datasets", grid_thw=(1, 2, 2), declared_dimensions=None
+        )
+    with pytest.raises(MdpStateError, match="inactive or stale"):
+        clone.materialize_vision_locator("locator")
+
+    retire_dynamic_encoder_adapter_capability(capability)
+    with pytest.raises(MdpStateError, match="retired"):
+        operations.freeze_vision_locator(
+            "descriptor", dataset_root="/datasets", grid_thw=(1, 2, 2), declared_dimensions=None
+        )
+    with pytest.raises(MdpStateError, match="retired"):
+        operations.materialize_vision_locator("locator")
+
+
+def test_locator_mint_requires_complete_registered_operations_without_fallback():
+    _register()
+    adapter = _Adapter()
+
+    with pytest.raises(MdpConfigurationError, match="complete locator operations"):
+        mint_dynamic_encoder_adapter_capability(
+            adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        )
+
+    source = claim_dynamic_encoder_adapter_capability(
+        adapter, mint_dynamic_encoder_adapter_capability(adapter)
+    )
+    assert type(source) is DynamicEncoderAdapterOperations
+
+
+@pytest.mark.parametrize(
+    "locator_operations",
+    [
+        {"freeze_vision_locator": _Adapter.freeze_vision_locator},
+        {"materialize_vision_locator": _Adapter.materialize_vision_locator},
+    ],
+)
+def test_registration_rejects_incomplete_locator_operation_pair(locator_operations):
+    with pytest.raises(MdpConfigurationError, match="complete locator operations"):
+        _register(**locator_operations)
+
+    _register(locator=True)
+    adapter = _Adapter()
+    operations = claim_dynamic_encoder_adapter_capability(
+        adapter,
+        mint_dynamic_encoder_adapter_capability(
+            adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        ),
+    )
+    assert type(operations) is DynamicEncoderLocatorAdapterOperations
+
+
+@pytest.mark.parametrize(
+    ("name", "operation"),
+    [
+        ("freeze_vision_locator", _Adapter().freeze_vision_locator),
+        ("freeze_vision_locator", lambda self, descriptor, **kwargs: None),
+        ("freeze_vision_locator", _Adapter.materialize_vision_locator),
+        ("materialize_vision_locator", _Adapter.get_batch),
+    ],
+)
+def test_locator_registration_requires_exact_named_unbound_methods(name, operation):
+    with pytest.raises(MdpConfigurationError, match=name):
+        _register(locator=True, **{name: operation})
+
+
+@pytest.mark.parametrize("mode", [2, None, IntEnum("ForeignMode", {"LOCATOR": 2}).LOCATOR])
+def test_invalid_capture_mode_fails_before_pending_ownership(mode):
+    _register(locator=True)
+    adapter = _Adapter()
+
+    with pytest.raises(MdpConfigurationError, match="capture mode"):
+        mint_dynamic_encoder_adapter_capability(adapter, capture_mode=mode)
+
+    operations = claim_dynamic_encoder_adapter_capability(
+        adapter,
+        mint_dynamic_encoder_adapter_capability(
+            adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        ),
+    )
+    assert type(operations) is DynamicEncoderLocatorAdapterOperations
 
 
 def test_claimed_operations_are_snapshotted_and_delegate_exact_calls(monkeypatch):
