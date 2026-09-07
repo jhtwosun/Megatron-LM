@@ -44,6 +44,8 @@ def _options(**overrides):
         checkpoint_mode="torch_dist",
         save_requested=False,
         load_requested=False,
+        min_dynamic_context_parallel_size=1,
+        sequence_parallel=False,
     )
     base.update(overrides)
     return MdpCompatibilityOptions(**base)
@@ -96,6 +98,157 @@ def test_dynamic_cp_rejects_encoder_cp_and_overlap_capture_at_startup():
         validate_mdp_config(
             MdpConfig(enable=True, overlap_window_capture=True),
             _options(pipeline_parallel_size=1, dynamic_context_parallel=True),
+        )
+
+
+def test_dynamic_encoder_cp_defaults_are_inert():
+    config = MdpConfig()
+    assert config.dynamic_encoder_cp is False
+    assert config.min_dynamic_encoder_cp_size == 1
+
+
+@pytest.mark.parametrize("decoder_dynamic", (False, True))
+@pytest.mark.parametrize("decoder_minimum", (1, 2, 4))
+@pytest.mark.parametrize("encoder_minimum", (1, 2, 4))
+@pytest.mark.parametrize("expert_parallel_size", (1, 4))
+def test_repeated_d4_modes_accept_only_the_locked_topology(
+    decoder_dynamic, decoder_minimum, encoder_minimum, expert_parallel_size
+):
+    validate_mdp_config(
+        MdpConfig(
+            enable=True,
+            encoder_cp=4,
+            dynamic_encoder_cp=True,
+            min_dynamic_encoder_cp_size=encoder_minimum,
+        ),
+        _options(
+            world_size=4 * expert_parallel_size,
+            pipeline_parallel_size=1,
+            context_parallel_size=4,
+            expert_parallel_size=expert_parallel_size,
+            dynamic_context_parallel=decoder_dynamic,
+            min_dynamic_context_parallel_size=decoder_minimum,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("config_overrides", "option_overrides", "match"),
+    (
+        ({"dynamic_encoder_cp": 1}, {}, "dynamic_encoder_cp"),
+        ({}, {"dynamic_context_parallel": 1}, "dynamic_context_parallel"),
+        ({"min_dynamic_encoder_cp_size": True}, {}, "min_dynamic_encoder_cp_size"),
+        ({"min_dynamic_encoder_cp_size": 2}, {}, "min_dynamic_encoder_cp_size"),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4, "min_dynamic_encoder_cp_size": 0},
+            {"pipeline_parallel_size": 1, "context_parallel_size": 4},
+            "min_dynamic_encoder_cp_size",
+        ),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4, "min_dynamic_encoder_cp_size": 3},
+            {"pipeline_parallel_size": 1, "context_parallel_size": 4},
+            "min_dynamic_encoder_cp_size",
+        ),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4, "min_dynamic_encoder_cp_size": 5},
+            {"pipeline_parallel_size": 1, "context_parallel_size": 4},
+            "min_dynamic_encoder_cp_size",
+        ),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4},
+            {
+                "context_parallel_size": 4,
+                "pipeline_parallel_size": 1,
+                "dynamic_context_parallel": True,
+                "min_dynamic_context_parallel_size": True,
+            },
+            "min_dynamic_context_parallel_size",
+        ),
+        ({"dynamic_encoder_cp": True, "encoder_cp": 2}, {}, "dynamic_encoder_cp"),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4},
+            {"tensor_parallel_size": 2, "pipeline_parallel_size": 1, "context_parallel_size": 4},
+            "dynamic_encoder_cp",
+        ),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4},
+            {"pipeline_parallel_size": 2, "context_parallel_size": 4},
+            "dynamic_encoder_cp",
+        ),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4},
+            {"pipeline_parallel_size": 1, "context_parallel_size": 2},
+            "dynamic_encoder_cp",
+        ),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4},
+            {
+                "pipeline_parallel_size": 1,
+                "context_parallel_size": 4,
+                "virtual_pipeline_parallel_size": 2,
+            },
+            "dynamic_encoder_cp",
+        ),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4},
+            {"pipeline_parallel_size": 1, "context_parallel_size": 4, "expert_parallel_size": 2},
+            "dynamic_encoder_cp",
+        ),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4},
+            {"pipeline_parallel_size": 1, "context_parallel_size": 4, "sequence_parallel": True},
+            "sequence_parallel",
+        ),
+    ),
+)
+def test_repeated_d4_rejects_invalid_types_and_neighboring_topologies(
+    config_overrides, option_overrides, match
+):
+    with pytest.raises(MdpConfigurationError, match=match):
+        validate_mdp_config(
+            MdpConfig(enable=True, **config_overrides), _options(**option_overrides)
+        )
+
+
+@pytest.mark.parametrize(
+    ("config_overrides", "option_overrides", "match"),
+    (
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4, "overlap_window_capture": True},
+            {"pipeline_parallel_size": 1, "context_parallel_size": 4},
+            "overlap_window_capture",
+        ),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4},
+            {"pipeline_parallel_size": 1, "context_parallel_size": 4, "overlap_grad_reduce": True},
+            "overlap_grad_reduce",
+        ),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4},
+            {
+                "pipeline_parallel_size": 1,
+                "context_parallel_size": 4,
+                "overlap_grad_reduce": True,
+                "overlap_param_gather": True,
+            },
+            "overlap_grad_reduce",
+        ),
+        (
+            {"dynamic_encoder_cp": True, "encoder_cp": 4},
+            {
+                "pipeline_parallel_size": 1,
+                "context_parallel_size": 4,
+                "expert_parallel_size": 4,
+                "overlap_moe_expert_parallel_comm": True,
+            },
+            "overlap_moe_expert_parallel_comm",
+        ),
+    ),
+)
+def test_repeated_d4_rejects_overlap_modes(config_overrides, option_overrides, match):
+    with pytest.raises(MdpConfigurationError, match=match):
+        validate_mdp_config(
+            MdpConfig(enable=True, **config_overrides), _options(**option_overrides)
         )
 
 

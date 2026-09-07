@@ -42,6 +42,8 @@ class MdpConfig:
     debug_plan_payload_check: bool = False
     pixel_locality: bool = False
     overlap_window_capture: bool = False
+    dynamic_encoder_cp: bool = False
+    min_dynamic_encoder_cp_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,8 @@ class MdpCompatibilityOptions:
     # validate_mdp_config for the composite-optimizer mechanism.
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     dynamic_context_parallel: bool = False
+    min_dynamic_context_parallel_size: int = 1
+    sequence_parallel: bool = False
 
 
 def _reject(option: str, value: Any, condition: str, why: str, suggestion: str = "") -> None:
@@ -183,6 +187,94 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "plan mismatch degrades from a diagnosable error into a collective hang.",
             "1",
         )
+    if type(config.dynamic_encoder_cp) is not bool:
+        _reject(
+            "dynamic_encoder_cp",
+            config.dynamic_encoder_cp,
+            "an exact bool",
+            "Dynamic encoder-CP activation must not use truthy aliases.",
+            "False",
+        )
+    if type(options.dynamic_context_parallel) is not bool:
+        _reject(
+            "dynamic_context_parallel",
+            options.dynamic_context_parallel,
+            "an exact bool",
+            "Dynamic decoder-CP activation must not use truthy aliases.",
+            "False",
+        )
+    if type(config.min_dynamic_encoder_cp_size) is not int:
+        _reject(
+            "min_dynamic_encoder_cp_size",
+            config.min_dynamic_encoder_cp_size,
+            "an exact integer",
+            "Dynamic encoder-CP planning requires an unambiguous group size.",
+            "1",
+        )
+    if not config.dynamic_encoder_cp and config.min_dynamic_encoder_cp_size != 1:
+        _reject(
+            "min_dynamic_encoder_cp_size",
+            config.min_dynamic_encoder_cp_size,
+            "1 when dynamic_encoder_cp == False",
+            "A disabled dynamic encoder has no selectable minimum group size.",
+            "1",
+        )
+    if config.dynamic_encoder_cp:
+        if config.min_dynamic_encoder_cp_size not in (1, 2, 4):
+            _reject(
+                "min_dynamic_encoder_cp_size",
+                config.min_dynamic_encoder_cp_size,
+                "one of (1, 2, 4) when dynamic_encoder_cp == True",
+                "Repeated-D4 exposes only its nested E1, E2, and E4 encoder groups.",
+            )
+        if options.dynamic_context_parallel and (
+            type(options.min_dynamic_context_parallel_size) is not int
+            or options.min_dynamic_context_parallel_size not in (1, 2, 4)
+        ):
+            _reject(
+                "min_dynamic_context_parallel_size",
+                options.min_dynamic_context_parallel_size,
+                "one of (1, 2, 4) for joint repeated-D4",
+                "The decoder may select only the nested CP1, CP2, and CP4 groups.",
+            )
+        topology = (
+            options.tensor_parallel_size,
+            options.pipeline_parallel_size,
+            options.context_parallel_size,
+            config.encoder_cp,
+            options.virtual_pipeline_parallel_size,
+            options.expert_parallel_size,
+        )
+        if topology[:5] != (1, 1, 4, 4, None) or topology[5] not in (1, 4):
+            _reject(
+                "dynamic_encoder_cp",
+                config.dynamic_encoder_cp,
+                "TP1/PP1/CP4/ECP4, VPP disabled, and EP1 or EP4",
+                "Repeated-D4 public construction is locked to one four-rank domain.",
+            )
+        if options.sequence_parallel:
+            _reject(
+                "sequence_parallel",
+                options.sequence_parallel,
+                "False for repeated-D4",
+                "Contiguous decoder Dynamic-CP plus sequence parallelism is not validated.",
+                "False",
+            )
+        overlaps = {
+            "overlap_window_capture": config.overlap_window_capture,
+            "overlap_grad_reduce": options.overlap_grad_reduce,
+            "overlap_param_gather": options.overlap_param_gather,
+            "overlap_moe_expert_parallel_comm": options.overlap_moe_expert_parallel_comm,
+        }
+        for option, value in overlaps.items():
+            if value:
+                _reject(
+                    option,
+                    value,
+                    "False for repeated-D4",
+                    "Repeated-D4 has not established collective ordering with overlap.",
+                    "False",
+                )
     if config.overlap_window_capture and (
         options.tensor_parallel_size != 1 or config.encoder_cp != 1
     ):
@@ -195,7 +287,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "False",
         )
 
-    if options.dynamic_context_parallel:
+    if options.dynamic_context_parallel and not config.dynamic_encoder_cp:
         topology = (
             options.tensor_parallel_size,
             options.expert_parallel_size,
