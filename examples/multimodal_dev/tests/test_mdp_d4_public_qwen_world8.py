@@ -145,6 +145,57 @@ def _batch(*, vision=True):
     return batch
 
 
+def _native_qwen_batch():
+    """One syntactically valid Qwen MRoPE image record for the native decoder."""
+    batch = _batch()
+    batch["input_ids"][0, 0] = 8
+    batch["input_ids"][0, 1:17] = 7
+    batch["vision_decoder_positions"] = torch.arange(
+        1, 17, dtype=torch.int64, device=batch["input_ids"].device
+    )
+    # Let the actual Qwen facade derive three-axis MRoPE positions.
+    batch["position_ids"] = None
+    return batch
+
+
+def _native_qwen_decoder():
+    """Build the smallest Qwen facade backed by a native MCore GPT decoder."""
+    from examples.multimodal_dev.models.qwen35_vl.configuration import get_qwen35_vl_language_config
+    from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
+    from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_language_spec
+
+    config = get_qwen35_vl_language_config(
+        "0.8b",
+        num_layers=1,
+        hidden_size=_HIDDEN,
+        ffn_hidden_size=256,
+        num_attention_heads=4,
+        num_query_groups=4,
+        kv_channels=32,
+        mrope_section=[2, 1, 1],
+        linear_attention_freq=[0],
+        tensor_model_parallel_size=1,
+        context_parallel_size=4,
+        sequence_parallel=False,
+        calculate_per_token_loss=True,
+        apply_rope_fusion=False,
+    )
+    model = Qwen35VLModel(
+        language_config=config,
+        language_spec=get_qwen35_vl_language_spec(config),
+        vision_config=_vision_config(),
+        build_vision_encoder=False,
+        vocab_size=128,
+        max_sequence_length=_SEQ,
+        image_token_id=7,
+        video_token_id=9,
+        vision_start_token_id=8,
+        parallel_output=False,
+        share_embeddings_and_output_weights=False,
+    )
+    return model.bfloat16().cuda(), config
+
+
 def _runtime(*, group_registry, encoder_capacity=16, expert_parallel_size=1):
     rank = dist.get_rank()
     rank_map = build_rank_map(
@@ -937,3 +988,116 @@ def test_domain_ep4_ecp2_one_rank_post_forward_failure_then_same_runtime_retry(
         parameter.grad is not None and torch.count_nonzero(parameter.grad)
         for parameter in decoder.parameters()
     )
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+def test_public_qwen_native_decoder_finalizer_scaler_and_one_step(
+    monkeypatch, mdp_group_registry, dynamic_decoder
+):
+    """Close the public ECP4 cell with a native Qwen/GPT decoder and training semantics."""
+    from functools import partial
+
+    from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+    from megatron.core.mdp.optimizer import build_mdp_composite_optimizer
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+
+    runtime = _runtime(group_registry=mdp_group_registry, encoder_capacity=16)
+    integration._RUNTIME = runtime
+    selected_encoder_cp = []
+    native_bind = mdp_adapter_module._bind_dynamic_encoder_cp
+
+    def observe_encoder_cp(*args, membership, **kwargs):
+        selected_encoder_cp.append(membership.group_size)
+        return native_bind(*args, membership=membership, **kwargs)
+
+    def get_batch(iterator):
+        next(iterator)
+        return _native_qwen_batch()
+
+    monkeypatch.setattr(forward_step, "get_batch", get_batch)
+    monkeypatch.setattr(mdp_adapter_module, "_bind_dynamic_encoder_cp", observe_encoder_cp)
+    decoder, config = _native_qwen_decoder()
+    decoder_pgs = ProcessGroupCollection.use_mpu_process_groups()
+    decoder_ddp = DistributedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_distributed_optimizer=False,
+            overlap_grad_reduce=False,
+            overlap_param_gather=False,
+            grad_reduce_in_fp32=True,
+        ),
+        module=decoder,
+        pg_collection=decoder_pgs,
+    )
+    optimizer_config = OptimizerConfig(
+        optimizer="adam", lr=1e-2, bf16=True, clip_grad=0.1, weight_decay=0.0
+    )
+    decoder_optimizer = get_megatron_optimizer(
+        optimizer_config, [decoder_ddp], use_gloo_process_groups=False
+    )
+    encoder_optimizer = get_megatron_optimizer(
+        optimizer_config, [runtime.encoder_domain.encoder_ddp], use_gloo_process_groups=False
+    )
+    composite = build_mdp_composite_optimizer(decoder_optimizer, encoder_optimizer)
+    decoder_ddp.zero_grad_buffer()
+    runtime.encoder_domain.encoder_ddp.zero_grad_buffer()
+    initial_decoder = _clone_named_parameters(decoder_ddp)
+    initial_encoder = _clone_named_parameters(runtime.encoder_domain.encoder_ddp)
+    initial_scale = composite.get_loss_scale().detach().clone()
+
+    config.dynamic_context_parallel = dynamic_decoder
+    config.min_dynamic_context_parallel_size = 1
+    config.max_seqlen_per_dp_cp_rank = 16
+    config.finalize_model_grads_func = partial(finalize_model_grads, pg_collection=decoder_pgs)
+    evidence = {}
+
+    def native_schedule(data_iterator, num_microbatches, forward_only):
+        assert num_microbatches == 1 and forward_only is False
+        output, output_loss_func = forward_step.forward_step(data_iterator, decoder_ddp)
+        assert output.shape == (1, _SEQ // 4) and torch.isfinite(output).all()
+        loss, tokens, _ = output_loss_func(output)
+        scaled_loss = composite.scale_loss(loss)
+        torch.testing.assert_close(scaled_loss, loss * initial_scale)
+        scaled_loss.backward()
+        config.finalize_model_grads_func([decoder_ddp], tokens)
+        evidence.update(loss=loss.detach(), tokens=tokens.detach().clone())
+        return loss.detach()
+
+    wrapped = integration.maybe_wrap_forward_backward(native_schedule, config)
+    loss = wrapped(data_iterator=iter((object(),)), num_microbatches=1, forward_only=False)
+
+    assert torch.isfinite(loss)
+    assert int(evidence["tokens"]) == 128
+    assert selected_encoder_cp == [4]
+    assert runtime.iteration == 1 and runtime.state is MdpRuntimeState.EMPTY
+    assert runtime.storage.get_leaf(0) is None
+    decoder_grads = {
+        name: parameter.main_grad
+        for name, parameter in decoder_ddp.named_parameters()
+        if parameter.main_grad is not None
+    }
+    assert any(
+        "embedding" in name and torch.count_nonzero(grad) for name, grad in decoder_grads.items()
+    )
+    assert any(
+        "self_attention" in name and torch.count_nonzero(grad)
+        for name, grad in decoder_grads.items()
+    )
+    assert any("mlp" in name and torch.count_nonzero(grad) for name, grad in decoder_grads.items())
+    assert any(
+        parameter.main_grad is not None and torch.count_nonzero(parameter.main_grad)
+        for parameter in runtime.encoder_domain.encoder_ddp.parameters()
+    )
+    success, grad_norm, _ = composite.step()
+    assert success and torch.isfinite(torch.as_tensor(grad_norm))
+    torch.testing.assert_close(composite.get_loss_scale(), initial_scale)
+    assert any(
+        not torch.equal(value, initial_decoder[name])
+        for name, value in _clone_named_parameters(decoder_ddp).items()
+    )
+    assert any(
+        not torch.equal(value, initial_encoder[name])
+        for name, value in _clone_named_parameters(runtime.encoder_domain.encoder_ddp).items()
+    )
+    steps = _optimizer_steps(composite.state_dict())
+    assert len(steps) >= 2 and all(step == 1 for step in steps)
