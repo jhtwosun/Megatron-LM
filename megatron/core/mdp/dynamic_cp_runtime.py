@@ -84,6 +84,8 @@ DYNAMIC_EXECUTION_CONFIG_WIRE_WIDTH = 20
 _DYNAMIC_EXECUTION_CONFIG_DOMAIN = b"megatron.mdp.dynamic-cp.runtime-config-v2"
 _JOINT_PLAN_DIGEST_DOMAIN = b"megatron.mdp.dynamic-cp.joint-plan"
 _JOINT_PLAN_DIGEST_SCHEMA_VERSION = 1
+_LOCATOR_JOINT_DIGEST_DOMAIN = b"megatron.mdp.dynamic-cp.locator-joint-plan"
+_LOCATOR_JOINT_DIGEST_SCHEMA_VERSION = 1
 _PARTITION_MODE_IDS = {"contiguous": 1, "zigzag": 2}
 _EMBEDDING_DTYPE_IDS = frozenset((2, 3))
 
@@ -586,6 +588,33 @@ def _joint_dynamic_plan_digest(
     return digest.digest()
 
 
+def _effective_joint_plan_digest(
+    decoder_plan: DecoderDynamicPlan,
+    encoder_plan: EncoderDynamicPlan,
+    locator_catalog_digest: bytes | None,
+) -> bytes:
+    """Bind optional domain-local locator authority without changing SOURCE bytes."""
+    joint_digest = _joint_dynamic_plan_digest(decoder_plan, encoder_plan)
+    if locator_catalog_digest is None:
+        return joint_digest
+    if type(locator_catalog_digest) is not bytes or len(locator_catalog_digest) != 16:
+        raise MdpConfigurationError(
+            "MDP: locator catalog digest is exactly 16 bytes or None."
+        )
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(
+        struct.pack(
+            "<2q",
+            len(_LOCATOR_JOINT_DIGEST_DOMAIN),
+            _LOCATOR_JOINT_DIGEST_SCHEMA_VERSION,
+        )
+    )
+    digest.update(_LOCATOR_JOINT_DIGEST_DOMAIN)
+    digest.update(joint_digest)
+    digest.update(locator_catalog_digest)
+    return digest.digest()
+
+
 @dataclass(frozen=True)
 class _DynamicIterationAuthority:
     """Global immutable D3 authority consumed by later runtime composition."""
@@ -603,6 +632,7 @@ class _DynamicIterationAuthority:
     bridge_dtype: torch.dtype
     encoder_plan: EncoderDynamicPlan | None = None
     joint_plan_digest: bytes | None = None
+    locator_catalog_digest: bytes | None = None
 
     def __post_init__(self) -> None:
         for name in ("source_rank_by_lane", "producer_rank_by_item", "output_rows_by_item"):
@@ -648,16 +678,23 @@ class _DynamicIterationAuthority:
         validate_decoder_dynamic_plan(self.plan)
         encoder_plan = self.encoder_plan
         joint_plan_digest = self.joint_plan_digest
+        locator_catalog_digest = self.locator_catalog_digest
         if (encoder_plan is None) != (joint_plan_digest is None):
             raise MdpConfigurationError(
                 "MDP: dynamic iteration authority carries encoder plan and joint digest together."
+            )
+        if locator_catalog_digest is not None and encoder_plan is None:
+            raise MdpConfigurationError(
+                "MDP: dynamic iteration locator digest requires encoder and joint authority."
             )
         if encoder_plan is not None:
             if type(encoder_plan) is not EncoderDynamicPlan:
                 raise MdpConfigurationError(
                     "MDP: dynamic iteration authority encoder plan has its exact typed carrier."
                 )
-            expected_joint_digest = _joint_dynamic_plan_digest(self.plan, encoder_plan)
+            expected_joint_digest = _effective_joint_plan_digest(
+                self.plan, encoder_plan, locator_catalog_digest
+            )
             if encoder_plan.pool_ranks != participants:
                 raise MdpPlanError(
                     "MDP: dynamic iteration encoder plan pool matches exact participant ranks."
@@ -694,11 +731,18 @@ def _dynamic_iteration_plan_digest(authority: Any) -> bytes:
         raise MdpConfigurationError("MDP: plan digest requires exact iteration authority.")
     encoder_plan = authority.encoder_plan
     joint_plan_digest = authority.joint_plan_digest
+    locator_catalog_digest = authority.locator_catalog_digest
     if encoder_plan is None and joint_plan_digest is None:
+        if locator_catalog_digest is not None:
+            raise MdpStateError(
+                "MDP: decoder-only iteration authority cannot retain locator authority."
+            )
         return authority.plan.digest
     if encoder_plan is None or joint_plan_digest is None:
         raise MdpStateError("MDP: iteration authority retains paired encoder plan authority.")
-    expected = _joint_dynamic_plan_digest(authority.plan, encoder_plan)
+    expected = _effective_joint_plan_digest(
+        authority.plan, encoder_plan, locator_catalog_digest
+    )
     if encoder_plan.pool_ranks != authority.participant_ranks or joint_plan_digest != expected:
         raise MdpStateError("MDP: iteration authority retains exact joint plan authority.")
     return joint_plan_digest

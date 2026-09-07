@@ -93,6 +93,7 @@ def _run_repeated_d4_joint_iteration(
             encoder_workload_query=encoder_workload_query,
             bridge_width=bridge_width,
             bridge_dtype=bridge_dtype,
+            locator_catalog_digest=projection.local_locator_digest,
         )
         transaction.attach_authority(authority)
     except BaseException as error:

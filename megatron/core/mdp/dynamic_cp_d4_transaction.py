@@ -541,6 +541,7 @@ def _validate_authority(binding, projection, authority):
     if (
         authority.global_manifest is not projection.metadata.global_manifest
         or dict(authority.source_rank_by_lane) != dict(projection.metadata.source_rank_by_lane)
+        or authority.locator_catalog_digest != projection.local_locator_digest
         or authority.encoder_plan is None
         or authority.joint_plan_digest is None
     ):

@@ -18,7 +18,7 @@ from megatron.core.mdp.dynamic_cp_d4_group_binding import (
 from megatron.core.mdp.dynamic_cp_plan import EncoderWorkUnit, build_encoder_dynamic_plan
 from megatron.core.mdp.dynamic_cp_runtime import (
     _DynamicIterationAuthority,
-    _joint_dynamic_plan_digest,
+    _effective_joint_plan_digest,
 )
 from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError
 
@@ -82,6 +82,7 @@ def build_repeated_d4_joint_iteration_authority(
     encoder_workload_query: Any,
     bridge_width: int,
     bridge_dtype: Any,
+    locator_catalog_digest: bytes | None = None,
 ) -> _DynamicIterationAuthority:
     """Build decoder and encoder plans from one exact domain-local catalog."""
     authority = build_repeated_d4_iteration_authority(
@@ -128,5 +129,8 @@ def build_repeated_d4_joint_iteration_authority(
     return replace(
         authority,
         encoder_plan=encoder_plan,
-        joint_plan_digest=_joint_dynamic_plan_digest(authority.plan, encoder_plan),
+        joint_plan_digest=_effective_joint_plan_digest(
+            authority.plan, encoder_plan, locator_catalog_digest
+        ),
+        locator_catalog_digest=locator_catalog_digest,
     )

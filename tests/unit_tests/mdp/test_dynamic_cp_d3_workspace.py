@@ -568,8 +568,16 @@ def test_workspace_validation_snapshot_preserves_joint_encoder_plan_authority():
         max_seqlen_per_rank=8,
         workload_query=lambda _items, _size: EncoderWorkEstimate(1, 1),
     )
-    joint_digest = runtime._joint_dynamic_plan_digest(authority.plan, encoder_plan)
-    authority = replace(authority, encoder_plan=encoder_plan, joint_plan_digest=joint_digest)
+    locator_digest = b"l" * 16
+    joint_digest = runtime._effective_joint_plan_digest(
+        authority.plan, encoder_plan, locator_digest
+    )
+    authority = replace(
+        authority,
+        encoder_plan=encoder_plan,
+        locator_catalog_digest=locator_digest,
+        joint_plan_digest=joint_digest,
+    )
     allocator = _RecordingAllocator()
     workspace = _workspace_api()._DynamicIterationWorkspace(
         authority=authority,
@@ -581,6 +589,7 @@ def test_workspace_validation_snapshot_preserves_joint_encoder_plan_authority():
     try:
         assert workspace.authority is authority
         assert workspace._validated_authority.encoder_plan is encoder_plan
+        assert workspace._validated_authority.locator_catalog_digest is locator_digest
         assert workspace._validated_authority.joint_plan_digest == joint_digest
         assert runtime._dynamic_iteration_plan_digest(workspace._validated_authority) == joint_digest
     finally:

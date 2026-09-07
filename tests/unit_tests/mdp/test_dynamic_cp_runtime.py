@@ -598,6 +598,64 @@ def test_dynamic_iteration_authority_binds_exact_encoder_plan_and_joint_digest()
         runtime._dynamic_iteration_plan_digest(joint)
 
 
+def test_dynamic_iteration_authority_binds_exact_domain_locator_digest():
+    runtime = _runtime()
+    state = _state()
+    authority = _dynamic_authority(runtime)
+    encoder_plan = _encoder_plan(state)
+    legacy = runtime._joint_dynamic_plan_digest(state.plan, encoder_plan)
+    locator_digest = b"l" * 16
+    effective = runtime._effective_joint_plan_digest(
+        state.plan, encoder_plan, locator_digest
+    )
+    located = replace(
+        authority,
+        encoder_plan=encoder_plan,
+        locator_catalog_digest=locator_digest,
+        joint_plan_digest=effective,
+    )
+
+    assert runtime._effective_joint_plan_digest(state.plan, encoder_plan, None) == legacy
+    assert located.locator_catalog_digest is locator_digest
+    assert runtime._dynamic_iteration_plan_digest(located) == effective
+    assert effective not in (legacy, locator_digest)
+    assert (
+        runtime._effective_joint_plan_digest(state.plan, encoder_plan, b"e" * 16)
+        != effective
+    )
+    with pytest.raises(MdpPlanError, match="joint plan digest matches"):
+        replace(
+            authority,
+            encoder_plan=encoder_plan,
+            locator_catalog_digest=locator_digest,
+            joint_plan_digest=b"w" * 16,
+        )
+    with pytest.raises(MdpConfigurationError, match="locator.*encoder|joint"):
+        replace(authority, locator_catalog_digest=locator_digest)
+    object.__setattr__(authority, "locator_catalog_digest", locator_digest)
+    with pytest.raises(MdpStateError, match="paired encoder|locator"):
+        runtime._dynamic_iteration_plan_digest(authority)
+
+    object.__setattr__(located, "locator_catalog_digest", b"x" * 16)
+    with pytest.raises(MdpStateError, match="exact joint plan authority"):
+        runtime._dynamic_iteration_plan_digest(located)
+
+
+@pytest.mark.parametrize("digest", (b"short", bytearray(b"l" * 16), 1, False))
+def test_dynamic_iteration_authority_rejects_invalid_locator_digest_pairing(digest):
+    runtime = _runtime()
+    state = _state()
+    authority = _dynamic_authority(runtime)
+    encoder_plan = _encoder_plan(state)
+    with pytest.raises(MdpConfigurationError, match="locator.*digest|16 bytes"):
+        replace(
+            authority,
+            encoder_plan=encoder_plan,
+            locator_catalog_digest=digest,
+            joint_plan_digest=b"j" * 16,
+        )
+
+
 def test_dynamic_iteration_authority_rejects_encoder_catalog_and_digest_mutation():
     runtime = _runtime()
     state = _state()

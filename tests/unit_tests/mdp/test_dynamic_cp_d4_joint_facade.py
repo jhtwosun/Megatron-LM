@@ -105,12 +105,18 @@ for _stage in (*_PHASES, "commit"):
     setattr(_Transaction, f"begin_{_stage}", lambda self, stage=_stage: self._begin(stage))
 
 
-def _install(monkeypatch, *, decoder_cp=2, encoder_cp=2, fail=None, role="source"):
+def _install(
+    monkeypatch, *, decoder_cp=2, encoder_cp=2, fail=None, role="source", locator_digest=None
+):
     events = []
     transactions = []
     binding = object()
     capture = SimpleNamespace(binding=binding, role=role)
-    projection = SimpleNamespace(metadata=object())
+    projection = SimpleNamespace(
+        metadata=object(),
+        local_locator_digest=locator_digest,
+        catalog=SimpleNamespace(digest=b"w" * 16),
+    )
     authority = object()
     objects = {name: SimpleNamespace(name=name, role=role) for name in _PHASES}
     objects["native_schedule"].completion = object()
@@ -158,7 +164,9 @@ def _install(monkeypatch, *, decoder_cp=2, encoder_cp=2, fail=None, role="source
             "encoder_workload_query": dependencies.workload_query,
             "bridge_width": 3,
             "bridge_dtype": dependencies.bridge_dtype,
+            "locator_catalog_digest": projection.local_locator_digest,
         }
+        assert kwargs["locator_catalog_digest"] != projection.catalog.digest
         events.append("authority")
         if fail == "build_authority":
             raise RuntimeError("build authority")
@@ -284,10 +292,17 @@ def _run(parts):
 @pytest.mark.parametrize("role", ("source", "follower", "nonmember", "text"))
 @pytest.mark.parametrize("decoder_cp", (1, 2, 4))
 @pytest.mark.parametrize("encoder_cp", (1, 2, 4))
+@pytest.mark.parametrize("locator_digest", (None, b"l" * 16))
 def test_joint_facade_sequences_one_metadata_protocol_and_gates_zero_through_seven(
-    monkeypatch, role, decoder_cp, encoder_cp
+    monkeypatch, role, decoder_cp, encoder_cp, locator_digest
 ):
-    parts = _install(monkeypatch, decoder_cp=decoder_cp, encoder_cp=encoder_cp, role=role)
+    parts = _install(
+        monkeypatch,
+        decoder_cp=decoder_cp,
+        encoder_cp=encoder_cp,
+        role=role,
+        locator_digest=locator_digest,
+    )
 
     assert _run(parts) is None
 

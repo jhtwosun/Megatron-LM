@@ -31,6 +31,7 @@ from megatron.core.mdp.dynamic_cp_plan import (
     EncoderWorkEstimate,
 )
 from megatron.core.mdp.errors import MdpPlanError, MdpStateError
+from megatron.core.mdp.vision_locator import build_vision_locator_catalog
 from tests.unit_tests.mdp.test_dynamic_cp_runtime import _joint_authority
 
 _WORLD8 = int(os.environ.get("WORLD_SIZE", "1")) == 8
@@ -256,6 +257,10 @@ def test_joint_authority_builds_empty_encoder_plan_for_text_only_catalog():
 
     first = api.build_repeated_d4_joint_iteration_authority(binding, metadata, **kwargs)
     second = api.build_repeated_d4_joint_iteration_authority(binding, metadata, **kwargs)
+    empty_locator_digest = build_vision_locator_catalog((), ()).digest
+    located = api.build_repeated_d4_joint_iteration_authority(
+        binding, metadata, locator_catalog_digest=empty_locator_digest, **kwargs
+    )
     legacy = api.build_repeated_d4_iteration_authority(
         binding,
         metadata,
@@ -271,8 +276,44 @@ def test_joint_authority_builds_empty_encoder_plan_for_text_only_catalog():
     assert first.encoder_plan.waves == ()
     assert first.joint_plan_digest == second.joint_plan_digest
     assert first.joint_plan_digest not in (first.plan.digest, first.encoder_plan.digest)
+    assert located.locator_catalog_digest is empty_locator_digest
+    assert located.joint_plan_digest != first.joint_plan_digest
     assert legacy.encoder_plan is None
     assert legacy.joint_plan_digest is None
+
+
+def test_joint_authority_binds_exact_projected_locator_digest():
+    api = _authority_api()
+    binding = _binding(2)
+    metadata = _metadata(0, 0)
+    locator_digest = b"d" * 16
+    kwargs = dict(
+        decoder_max_seqlen_per_rank=8,
+        decoder_minimum_cp_size=1,
+        decoder_solver=_FullGroupSolver(),
+        encoder_max_seqlen_per_rank=8,
+        encoder_minimum_cp_size=1,
+        encoder_workload_query=lambda _items, *, group_size: EncoderWorkEstimate(1, 1),
+        bridge_width=16,
+        bridge_dtype=torch.bfloat16,
+    )
+
+    legacy = api.build_repeated_d4_joint_iteration_authority(binding, metadata, **kwargs)
+    located = api.build_repeated_d4_joint_iteration_authority(
+        binding, metadata, locator_catalog_digest=locator_digest, **kwargs
+    )
+
+    assert legacy.locator_catalog_digest is None
+    assert located.locator_catalog_digest is locator_digest
+    assert located.joint_plan_digest == api._effective_joint_plan_digest(
+        located.plan, located.encoder_plan, locator_digest
+    )
+    assert located.joint_plan_digest != legacy.joint_plan_digest
+    snapshot = import_module(
+        "megatron.core.mdp.dynamic_cp_d4_authority_collective"
+    )._snapshot_local_authority(binding, located)
+    assert snapshot.locator_catalog_digest is locator_digest
+    assert snapshot.joint_plan_digest == located.joint_plan_digest
 
 
 @pytest.mark.parametrize(("rank", "ep"), ((2, 1), (6, 4)))

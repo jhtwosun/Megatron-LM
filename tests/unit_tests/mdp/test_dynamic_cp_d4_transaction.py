@@ -165,9 +165,7 @@ def test_real_source_projection_and_joint_authority_attach(monkeypatch):
     capture, _state = _capture(monkeypatch, binding, [], manifests[0])
     projection = catalog_api._gather_d4_source_catalog(capture, binding)
     metadata = projection.metadata
-    authority = authority_api.build_repeated_d4_joint_iteration_authority(
-        binding,
-        metadata,
+    authority_kwargs = dict(
         decoder_max_seqlen_per_rank=8,
         decoder_minimum_cp_size=1,
         decoder_solver=_Solver(),
@@ -177,8 +175,16 @@ def test_real_source_projection_and_joint_authority_attach(monkeypatch):
         bridge_width=16,
         bridge_dtype=torch.bfloat16,
     )
+    authority = authority_api.build_repeated_d4_joint_iteration_authority(
+        binding, metadata, **authority_kwargs
+    )
+    located = authority_api.build_repeated_d4_joint_iteration_authority(
+        binding, metadata, locator_catalog_digest=b"l" * 16, **authority_kwargs
+    )
     transaction = api._begin_d4_transaction(capture)
     assert transaction.attach_source_catalog(projection) is transaction
+    with pytest.raises(MdpStateError, match="locator|joint authority"):
+        transaction.attach_authority(located)
     assert transaction.attach_authority(authority) is transaction
     assert transaction.require() is transaction
     assert len(statuses) == 2
@@ -209,6 +215,30 @@ def test_transaction_rejects_equal_but_substituted_projected_locator_catalog(mon
     capture, _state = _capture(monkeypatch, binding, [])
     transaction = api._begin_d4_transaction(capture)
     transaction.attach_source_catalog(projection)
+    assert transaction.require() is transaction
+
+    kwargs = dict(
+        decoder_max_seqlen_per_rank=8,
+        decoder_minimum_cp_size=1,
+        decoder_solver=_Solver(),
+        encoder_max_seqlen_per_rank=8,
+        encoder_minimum_cp_size=1,
+        encoder_workload_query=lambda *_args, **_kwargs: pytest.fail("text-only queried"),
+        bridge_width=16,
+        bridge_dtype=torch.bfloat16,
+    )
+    foreign = authority_api.build_repeated_d4_joint_iteration_authority(
+        binding, metadata, locator_catalog_digest=b"x" * 16, **kwargs
+    )
+    with pytest.raises(MdpStateError, match="locator|joint authority"):
+        transaction.attach_authority(foreign)
+    source = authority_api.build_repeated_d4_joint_iteration_authority(binding, metadata, **kwargs)
+    with pytest.raises(MdpStateError, match="locator|joint authority"):
+        transaction.attach_authority(source)
+    authority = authority_api.build_repeated_d4_joint_iteration_authority(
+        binding, metadata, locator_catalog_digest=locator_catalog.digest, **kwargs
+    )
+    assert transaction.attach_authority(authority) is transaction
     assert transaction.require() is transaction
 
     object.__setattr__(projection, "local_locator_catalog", build_vision_locator_catalog((), ()))

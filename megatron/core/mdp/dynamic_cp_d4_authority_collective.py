@@ -42,6 +42,7 @@ def _snapshot_local_authority(
         bridge_dtype=authority.bridge_dtype,
         encoder_plan=authority.encoder_plan,
         joint_plan_digest=authority.joint_plan_digest,
+        locator_catalog_digest=authority.locator_catalog_digest,
     )
     domain_ranks = group_authority.domain_ranks
     source_lane = group_authority.world_ranks.index(domain_ranks[0]) // _DOMAIN_WIDTH
