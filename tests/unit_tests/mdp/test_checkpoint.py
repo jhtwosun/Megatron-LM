@@ -55,6 +55,128 @@ def test_exact_resume_flags_are_accepted():
     assert_supported_checkpoint_config(no_ckpt)
 
 
+def _checkpoint_args(*, save="/tmp/x", load="/tmp/x", **overrides):
+    values = dict(
+        save=save,
+        load=load,
+        mdp_enable=True,
+        mdp_dynamic_encoder_cp=True,
+        dynamic_context_parallel=False,
+        no_save_optim=True,
+        no_load_optim=True,
+        no_save_rng=True,
+        no_load_rng=True,
+        ckpt_fully_parallel_save=False,
+        ckpt_fully_parallel_load=False,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("save", "load"),
+    (("/tmp/x", None), (None, "/tmp/x"), ("/tmp/x", "/tmp/x")),
+    ids=("save-only", "load-only", "save-and-load"),
+)
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+def test_repeated_d4_accepts_only_explicit_weight_only_checkpoint_policy(
+    save, load, dynamic_decoder
+):
+    args = _checkpoint_args(save=save, load=load, dynamic_context_parallel=dynamic_decoder)
+    before = vars(args).copy()
+    assert_supported_checkpoint_config(args)
+    assert vars(args) == before
+
+
+@pytest.mark.parametrize(
+    ("field", "flag"),
+    (
+        ("no_save_optim", "--no-save-optim"),
+        ("no_load_optim", "--no-load-optim"),
+        ("no_save_rng", "--no-save-rng"),
+        ("no_load_rng", "--no-load-rng"),
+    ),
+)
+@pytest.mark.parametrize("value", (None, False, 0, 1, "yes"), ids=repr)
+@pytest.mark.parametrize(
+    ("save", "load"),
+    (("/tmp/x", None), (None, "/tmp/x"), ("/tmp/x", "/tmp/x")),
+    ids=("save-only", "load-only", "save-and-load"),
+)
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+def test_repeated_d4_rejects_non_exact_weight_only_flags(
+    field, flag, value, save, load, dynamic_decoder
+):
+    args = _checkpoint_args(
+        save=save, load=load, dynamic_context_parallel=dynamic_decoder, **{field: value}
+    )
+    before = vars(args).copy()
+    with pytest.raises(MdpCheckpointError, match=flag):
+        assert_supported_checkpoint_config(args)
+    assert vars(args) == before
+
+
+@pytest.mark.parametrize(
+    ("field", "flag"),
+    (
+        ("no_save_optim", "--no-save-optim"),
+        ("no_load_optim", "--no-load-optim"),
+        ("no_save_rng", "--no-save-rng"),
+        ("no_load_rng", "--no-load-rng"),
+    ),
+)
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+def test_repeated_d4_rejects_absent_weight_only_flags(field, flag, dynamic_decoder):
+    args = _checkpoint_args(dynamic_context_parallel=dynamic_decoder)
+    delattr(args, field)
+    with pytest.raises(MdpCheckpointError, match=flag):
+        assert_supported_checkpoint_config(args)
+
+
+@pytest.mark.parametrize("predicate", (None, False, 0, 1, "yes"), ids=repr)
+def test_non_repeated_d4_checkpoint_modes_keep_exact_resume_compatibility(predicate):
+    args = SimpleNamespace(
+        save="/tmp/x",
+        load="/tmp/x",
+        mdp_enable=True,
+        mdp_dynamic_encoder_cp=predicate,
+        no_save_optim=False,
+        no_load_optim=False,
+        no_save_rng=False,
+        no_load_rng=False,
+        ckpt_fully_parallel_save=False,
+        ckpt_fully_parallel_load=False,
+    )
+    assert_supported_checkpoint_config(args)
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("static-mdp", "decoder-only-d3"))
+def test_static_mdp_and_decoder_only_d3_keep_full_state_resume(dynamic_decoder):
+    # This helper is called only after _setup_mdp validates mdp_enable. The
+    # policy discriminator is deliberately encoder D4, never decoder DCP.
+    args = SimpleNamespace(
+        save="/tmp/x",
+        load="/tmp/x",
+        mdp_enable=True,
+        mdp_dynamic_encoder_cp=False,
+        dynamic_context_parallel=dynamic_decoder,
+        no_save_optim=False,
+        no_load_optim=False,
+        no_save_rng=False,
+        no_load_rng=False,
+        ckpt_fully_parallel_save=False,
+        ckpt_fully_parallel_load=False,
+    )
+    assert_supported_checkpoint_config(args)
+
+
+def test_checkpoint_free_repeated_d4_does_not_force_or_validate_weight_only_flags():
+    args = SimpleNamespace(save=None, load=None, mdp_enable=True, mdp_dynamic_encoder_cp=True)
+    before = vars(args).copy()
+    assert_supported_checkpoint_config(args)
+    assert vars(args) == before
+
+
 def test_fully_parallel_modes_are_rejected():
     # Megatron defaults ckpt_fully_parallel_save=True: it must be rejected
     # when saving (the fully-parallel path shards over one DP-CP group for

@@ -9,14 +9,17 @@ replica metadata — one logical copy replicated on every rank. Plans, leaves,
 forward handles, autograd graphs, and communication handles are never
 persisted.
 
-Optimizer, LR-scheduler, and RNG state round-trip through the native paths, so
-a resume is exact rather than weight-only; the composite optimizer keeps the
-two sharding domains apart with a fixed encoder key (see
-:mod:`megatron.core.mdp.optimizer`). What remains rejected are the *execution
-modes* that cannot work here: the fully-parallel save/load wrappers (they
-reshard every child over a single DP-CP group, which is wrong for the encoder's
-WORLD domain), asynchronous and non-persistent saves, and constant-structure
-caching (MDP rebuilds its plan-derived structures every iteration).
+For static MDP and decoder-only Dynamic-CP, optimizer, LR-scheduler, and RNG
+state round-trip through the native paths, so a resume is exact rather than
+weight-only; the composite optimizer keeps the two sharding domains apart with
+a fixed encoder key (see :mod:`megatron.core.mdp.optimizer`). Repeated-D4
+dynamic encoder CP is provisionally weight-only and therefore requires all
+native optimizer and RNG save/load paths to be disabled explicitly. What
+remains rejected for every MDP checkpoint are the *execution modes* that cannot
+work here: the fully-parallel save/load wrappers (they reshard every child over
+a single DP-CP group, which is wrong for the encoder's WORLD domain),
+asynchronous and non-persistent saves, and constant-structure caching (MDP
+rebuilds its plan-derived structures every iteration).
 """
 
 from typing import Mapping
@@ -135,9 +138,10 @@ def load_encoder_state(state_dict: Mapping, encoder_ddp, *, strict: bool = True)
 def assert_supported_checkpoint_config(args) -> None:
     """Reject checkpoint configurations MDP cannot honor, at startup.
 
-    Optimizer, LR-scheduler, and RNG state round-trip normally; what is left is
-    the set of execution modes that are structurally incompatible with the
-    two-sharding-domain checkpoint (see the module docstring).
+    Static MDP and decoder-only Dynamic-CP retain full-state resume. Repeated-D4
+    dynamic encoder CP currently accepts weight-only checkpoints, in addition
+    to the execution-mode restrictions shared by every MDP checkpoint (see the
+    module docstring). The caller has already validated and enabled MDP.
     """
     problems = []
     save_or_load = (
@@ -159,6 +163,23 @@ def assert_supported_checkpoint_config(args) -> None:
                 "no --ckpt-assume-constant-structure (MDP's plan-derived "
                 "structures change per iteration; a cached structure goes stale)"
             )
+        if getattr(args, "mdp_dynamic_encoder_cp", None) is True:
+            required_weight_only_flags = (
+                ("no_save_optim", "--no-save-optim"),
+                ("no_load_optim", "--no-load-optim"),
+                ("no_save_rng", "--no-save-rng"),
+                ("no_load_rng", "--no-load-rng"),
+            )
+            missing = [
+                flag
+                for attribute, flag in required_weight_only_flags
+                if getattr(args, attribute, None) is not True
+            ]
+            if missing:
+                problems.append(
+                    "repeated-D4 dynamic encoder CP is provisionally weight-only; require "
+                    + " ".join(missing)
+                )
     if getattr(args, "save", None) is not None:
         # Megatron defaults ckpt_fully_parallel_save=True; the fully-parallel
         # path shards across one DP-CP group for every child, which is wrong
@@ -171,6 +192,5 @@ def assert_supported_checkpoint_config(args) -> None:
             problems.append("--no-ckpt-fully-parallel-load (or omit --ckpt-fully-parallel-load)")
     if problems:
         raise MdpCheckpointError(
-            "MDP: the checkpoint facade supports the synchronous, persistent, global "
-            "torch_dist mode only; run with " + " ".join(problems) + "."
+            "MDP: unsupported checkpoint configuration; run with " + " ".join(problems) + "."
         )
