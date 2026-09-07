@@ -17,6 +17,8 @@ from megatron.core.mdp.dynamic_cp_runtime import (
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups
 from megatron.core.mdp.plan import EncoderThdLayout, EncoderThdSegment
+from megatron.core.mdp.protocols import VisionCaptureMode
+from megatron.core.mdp.vision_locator import VisionLocatorCatalog
 
 __all__ = ()
 
@@ -40,6 +42,8 @@ class _D4EncoderExecutionClaim:
         "is_selected",
         "is_leader",
         "text_only",
+        "capture_mode",
+        "locator_catalog",
         "source_window",
         "local_manifest",
         "sample_locations",
@@ -60,9 +64,13 @@ class _D4EncoderExecutionClaim:
         is_selected: bool,
         is_leader: bool,
         text_only: bool,
+        capture_mode: VisionCaptureMode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+        locator_catalog: VisionLocatorCatalog | None = None,
         _factory_seal: object,
     ) -> None:
         values = (authority, binding, selected_ranks, membership, layout)
+        if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG:
+            values += (locator_catalog,)
         if _PENDING.pop(_factory_seal, None) != tuple(id(value) for value in values):
             raise MdpConfigurationError(
                 "MDP: D4 encoder execution claim is minted by its private factory."
@@ -75,6 +83,8 @@ class _D4EncoderExecutionClaim:
         self.is_selected = is_selected
         self.is_leader = is_leader
         self.text_only = text_only
+        self.capture_mode = capture_mode
+        self.locator_catalog = locator_catalog
         self.source_window = None
         self.local_manifest = None
         self.sample_locations = MappingProxyType({})
@@ -84,9 +94,24 @@ class _D4EncoderExecutionClaim:
         self._state = _ACTIVE
 
     def _activate(self, transfer: tuple[Any, ...]) -> None:
-        runtime, binding, source_window, manifest, locations, pixels = transfer
+        if len(transfer) == 6:
+            runtime, binding, source_window, manifest, locations, pixels = transfer
+            capture_mode, locator_catalog = VisionCaptureMode.SOURCE_PIXEL_SIDECAR, None
+        else:
+            (
+                runtime,
+                binding,
+                source_window,
+                manifest,
+                locations,
+                pixels,
+                capture_mode,
+                locator_catalog,
+            ) = transfer
         if binding is not self.binding or type(pixels) is not dict:
             raise MdpStateError("MDP: encoder execution receives its exact capture transfer.")
+        if capture_mode is not self.capture_mode or locator_catalog is not self.locator_catalog:
+            raise MdpStateError("MDP: encoder execution receives its exact capture mode authority.")
         self._runtime = runtime
         self.source_window = source_window
         self.local_manifest = manifest
@@ -117,6 +142,8 @@ class _D4EncoderExecutionClaim:
             self.is_selected,
             self.is_leader,
             self.text_only,
+            self.capture_mode,
+            self.locator_catalog,
         )
 
     def require(self) -> "_D4EncoderExecutionClaim":
@@ -142,6 +169,8 @@ class _D4EncoderExecutionClaim:
             self.is_selected,
             self.is_leader,
             self.text_only,
+            self.capture_mode,
+            self.locator_catalog,
         )
         if self._state is not _ACTIVE or any(
             actual is not expected for actual, expected in zip(current, entry[1:], strict=True)
@@ -174,6 +203,8 @@ class _D4EncoderExecutionClaim:
             "local_manifest",
             "sample_locations",
             "pixel_sidecar",
+            "capture_mode",
+            "locator_catalog",
             "_runtime",
             "_pixels",
         ):
@@ -181,14 +212,20 @@ class _D4EncoderExecutionClaim:
         pixels.clear()
 
 
-def _source_layout(authority: _DynamicIterationAuthority, owner: _D4EncoderCaptureOwner):
+def _source_layout(
+    authority: _DynamicIterationAuthority,
+    owner: _D4EncoderCaptureOwner,
+    capture_mode: VisionCaptureMode,
+):
     items = authority.global_manifest.items
     locations = owner.sample_locations
     source_window = owner.source_window
     if tuple(item.item_id for item in source_window.items) != tuple(item.item_id for item in items):
         raise MdpStateError("MDP: encoder execution source items match manifest order.")
     pixels = owner.pixel_sidecar
-    if tuple(pixels) != tuple(item.item_id.local_item_id for item in items):
+    if capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR and tuple(pixels) != tuple(
+        item.item_id.local_item_id for item in items
+    ):
         raise MdpStateError("MDP: encoder execution source pixels match manifest item order.")
     payload_start = 0
     output_start = 0
@@ -220,13 +257,13 @@ def _source_layout(authority: _DynamicIterationAuthority, owner: _D4EncoderCaptu
     return EncoderThdLayout(producer_worker_id=0, segments=tuple(segments))
 
 
-def claim_d4_encoder_execution(
-    owner: _D4EncoderCaptureOwner, authority: _DynamicIterationAuthority
-) -> _D4EncoderExecutionClaim:
+def _claim_d4_encoder_execution(owner, authority, *, capture_mode, locator_catalog):
     """Purely select one E1/E2/E4 execution and consume its capture owner."""
     if type(owner) is not _D4EncoderCaptureOwner:
         raise MdpConfigurationError("MDP: encoder execution uses an exact capture owner.")
     owner.require()
+    if owner.capture_mode is not capture_mode:
+        raise MdpStateError("MDP: encoder execution claim matches exact capture mode.")
     if type(authority) is not _DynamicIterationAuthority:
         raise MdpConfigurationError("MDP: encoder execution uses exact iteration authority.")
     binding = owner.binding
@@ -284,8 +321,10 @@ def claim_d4_encoder_execution(
                 raise MdpStateError("MDP: encoder execution selects its exact E1b membership.")
             membership = matches[0]
         if is_leader:
-            layout = _source_layout(authority, owner)
+            layout = _source_layout(authority, owner, capture_mode)
     values = (authority, binding, selected_ranks, membership, layout)
+    if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG:
+        values += (locator_catalog,)
     token = object()
     _PENDING[token] = tuple(id(value) for value in values)
     claim = _D4EncoderExecutionClaim(
@@ -297,8 +336,33 @@ def claim_d4_encoder_execution(
         is_selected=is_selected,
         is_leader=is_leader,
         text_only=text_only,
+        capture_mode=capture_mode,
+        locator_catalog=locator_catalog,
         _factory_seal=token,
     )
-    transfer = owner._claim_for_execution(authority)
+    transfer = owner._claim_for_execution(authority, locator_catalog)
     claim._activate(transfer)
     return claim
+
+
+def claim_d4_encoder_execution(
+    owner: _D4EncoderCaptureOwner, authority: _DynamicIterationAuthority
+) -> _D4EncoderExecutionClaim:
+    """Select SOURCE_PIXEL_SIDECAR execution with the legacy two-argument API."""
+    return _claim_d4_encoder_execution(
+        owner, authority, capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR, locator_catalog=None
+    )
+
+
+def claim_d4_locator_encoder_execution(
+    owner: _D4EncoderCaptureOwner,
+    authority: _DynamicIterationAuthority,
+    locator_catalog: VisionLocatorCatalog,
+) -> _D4EncoderExecutionClaim:
+    """Select locator execution bound to the exact projected domain catalog."""
+    return _claim_d4_encoder_execution(
+        owner,
+        authority,
+        capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        locator_catalog=locator_catalog,
+    )

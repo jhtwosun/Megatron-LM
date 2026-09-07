@@ -98,11 +98,13 @@ def _run_repeated_d4_fixed_iteration(
         transaction.abort(error)
         raise
 
-    execution = _advance(
-        transaction,
-        transaction.begin_execution,
-        lambda: _execution.claim_d4_encoder_execution(capture_owner, authority),
-    )
+    if projection.local_locator_catalog is None:
+        execution_adapter = lambda: _execution.claim_d4_encoder_execution(capture_owner, authority)
+    else:
+        execution_adapter = lambda: _execution.claim_d4_locator_encoder_execution(
+            capture_owner, authority, projection.local_locator_catalog
+        )
+    execution = _advance(transaction, transaction.begin_execution, execution_adapter)
     forward = _advance(
         transaction,
         transaction.begin_forward,

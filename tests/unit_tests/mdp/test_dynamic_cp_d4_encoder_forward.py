@@ -18,7 +18,14 @@ from megatron.core.mdp.errors import (
     MdpTaskFatalError,
 )
 from megatron.core.mdp.plan import EncoderThdLayout, EncoderThdSegment
-from megatron.core.mdp.protocols import DynamicEncoderCpBinding
+from megatron.core.mdp.protocols import DynamicEncoderCpBinding, VisionCaptureMode
+from megatron.core.mdp.vision_locator import (
+    VisionDataLocator,
+    VisionLocatorCatalogEntry,
+    VisionLocatorIndexSentinel,
+    VisionLocatorKind,
+    build_vision_locator_catalog,
+)
 
 
 class _Allocator:
@@ -86,6 +93,10 @@ class _Adapter:
             .requires_grad_()
         )
         return leaf * 2
+
+    def prepare_materialized_vision_payloads(self, locators, payloads):
+        self.events.append(("prepare-locator-payloads", locators, payloads))
+        return torch.arange(16.0).view(4, 4)
 
 
 def _layout():
@@ -177,6 +188,61 @@ def _claim(*, rank=0, selected=True, leader=True, text_only=False, runtime=None)
         )
     )
     return runtime, authority, claim, events
+
+
+def _locator_claim(*, rank=0, selected=True, leader=True, text_only=False):
+    runtime, authority, _source_claim, events = _claim(
+        rank=rank, selected=selected, leader=leader, text_only=text_only
+    )
+    _source_claim.abort()
+    entries = ()
+    item_ids = ()
+    if not text_only:
+        item_id = authority.global_manifest.items[0].item_id
+        locator = VisionDataLocator(
+            VisionLocatorKind.SHARED_FILE,
+            "/datasets/image.jpg",
+            None,
+            None,
+            VisionLocatorIndexSentinel.UNUSED,
+            (1, 2, 2),
+        )
+        item_ids = (item_id,)
+        entries = (VisionLocatorCatalogEntry(item_id, locator),)
+    catalog = build_vision_locator_catalog(item_ids, entries)
+    binding = SimpleNamespace(global_rank=rank, domain_group=object())
+    membership = SimpleNamespace(group=object()) if selected and not text_only else None
+    layout = _layout() if leader and not text_only else None
+    selected_ranks = () if text_only else (0, 1)
+    token = object()
+    values = (authority, binding, selected_ranks, membership, layout, catalog)
+    execution_api._PENDING[token] = tuple(id(value) for value in values)
+    claim = execution_api._D4EncoderExecutionClaim(
+        authority=authority,
+        binding=binding,
+        selected_ranks=selected_ranks,
+        membership=membership,
+        layout=layout,
+        is_selected=selected and not text_only,
+        is_leader=leader and not text_only,
+        text_only=text_only,
+        capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        locator_catalog=catalog,
+        _factory_seal=token,
+    )
+    claim._activate(
+        (
+            runtime,
+            binding,
+            object() if rank == 0 else None,
+            object() if rank == 0 else None,
+            MappingProxyType({}),
+            {},
+            VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+            catalog,
+        )
+    )
+    return runtime, authority, claim, catalog, events
 
 
 def _install_gate0(monkeypatch, events, *, reject=None, physical_error=None):
@@ -333,6 +399,163 @@ def test_gate0_begins_before_prepare_then_layout_pixels_and_encode(monkeypatch):
     assert len(runtime.allocator.released) == len(runtime.allocator.acquired)
 
 
+def test_locator_gate0_materializes_prepares_and_copies_before_world_then_skips_pixels(monkeypatch):
+    runtime, authority, claim, catalog, events = _locator_claim()
+    _install_gate0(monkeypatch, events)
+
+    class Materialized:
+        def _claim_for_gate0(self):
+            events.append("claim-locator-bytes")
+            return (b"encoded-image",)
+
+    monkeypatch.setattr(
+        api,
+        "materialize_d4_selected_locator_catalog",
+        lambda actual_runtime, actual_authority, actual_catalog: (
+            events.append(("materialize", actual_runtime, actual_authority, actual_catalog))
+            or Materialized()
+        ),
+        raising=False,
+    )
+    broadcasts = []
+
+    owner = api.run_repeated_d4_encoder_forward(
+        runtime,
+        claim,
+        authority,
+        broadcast=lambda tensor, **_kwargs: broadcasts.append(tensor.dtype),
+    )
+
+    assert events[0] == ("gate", 0, None)
+    materialize_index = next(
+        i
+        for i, event in enumerate(events)
+        if isinstance(event, tuple) and event[0] == "materialize"
+    )
+    prepare_index = next(
+        i
+        for i, event in enumerate(events)
+        if isinstance(event, tuple) and event[0] == "prepare-locator-payloads"
+    )
+    world_index = events.index("world0")
+    bind_index = next(
+        i for i, event in enumerate(events) if isinstance(event, tuple) and event[0] == "bind"
+    )
+    assert materialize_index < prepare_index < world_index < bind_index
+    assert events[materialize_index][1:] == (runtime, authority, catalog)
+    assert broadcasts == [torch.int64]
+    assert events.count("zero") == 1
+    locator_buffers = tuple(
+        tensor
+        for tag, tensor in runtime.allocator.acquired
+        if tag == "dynamic_cp_gate0_locator_pixels"
+    )
+    assert len(locator_buffers) == 1
+    assert locator_buffers[0].shape == (4, 4)
+    torch.testing.assert_close(locator_buffers[0], torch.arange(16.0).view(4, 4))
+    encode_event = next(
+        event for event in events if isinstance(event, tuple) and event[0] == "encode"
+    )
+    assert encode_event[1] is locator_buffers[0]
+    owner.abort()
+
+
+@pytest.mark.parametrize(("rank", "text_only"), ((3, False), (0, True)))
+def test_locator_gate0_clears_all_rank_grads_before_world_without_nonselected_work(
+    monkeypatch, rank, text_only
+):
+    runtime, authority, claim, _catalog, events = _locator_claim(
+        rank=rank, selected=False, leader=False, text_only=text_only
+    )
+    _install_gate0(monkeypatch, events)
+
+    class EmptyMaterialized:
+        def _claim_for_gate0(self):
+            return ()
+
+    monkeypatch.setattr(
+        api,
+        "materialize_d4_selected_locator_catalog",
+        lambda *_args: EmptyMaterialized(),
+        raising=False,
+    )
+
+    owner = api.run_repeated_d4_encoder_forward(runtime, claim, authority)
+
+    assert events.index("zero") < events.index("world0")
+    assert events.count("zero") == 1
+    assert not any(
+        isinstance(event, tuple) and event[0] in ("bind", "encode", "prepare-locator-payloads")
+        for event in events
+    )
+    assert not any(
+        tag == "dynamic_cp_gate0_locator_pixels" for tag, _tensor in runtime.allocator.acquired
+    )
+    owner.abort()
+
+
+def test_locator_gate0_h2d_allocation_error_converges_before_world(monkeypatch):
+    runtime, authority, claim, _catalog, events = _locator_claim()
+
+    class Materialized:
+        def _claim_for_gate0(self):
+            return (b"encoded-image",)
+
+    monkeypatch.setattr(
+        api, "materialize_d4_selected_locator_catalog", lambda *_args: Materialized(), raising=False
+    )
+    runtime.allocator.fail_at = 0
+
+    def converge(_binding, _authority, **kwargs):
+        with pytest.raises(RuntimeError, match="allocator failed"):
+            kwargs["prepare"]()
+        events.append("first-world-error")
+        raise MdpPlanError("common Gate0 preparation error")
+
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", converge)
+
+    with pytest.raises(MdpPlanError, match="common Gate0"):
+        api.run_repeated_d4_encoder_forward(runtime, claim, authority)
+
+    assert events[-1] == "first-world-error"
+    assert "world0" not in events and "zero" not in events
+    assert not any(isinstance(event, tuple) and event[0] in ("bind", "encode") for event in events)
+
+
+def test_locator_gate0_local_read_error_converges_before_zero_bind_or_encode(monkeypatch):
+    runtime, authority, claim, catalog, events = _locator_claim()
+    original = OSError("missing image")
+    monkeypatch.setattr(
+        api,
+        "materialize_d4_selected_locator_catalog",
+        lambda *_args: (_ for _ in ()).throw(original),
+        raising=False,
+    )
+
+    def converge(_binding, _authority, **kwargs):
+        try:
+            kwargs["prepare"]()
+        except OSError as error:
+            assert error is original
+            events.append("first-world-error")
+            raise MdpPlanError("common Gate0 preparation error") from error
+        pytest.fail("locator read unexpectedly succeeded")
+
+    monkeypatch.setattr(api, "run_repeated_d4_authority_collective", converge)
+
+    with pytest.raises(MdpPlanError, match="common Gate0"):
+        api.run_repeated_d4_encoder_forward(runtime, claim, authority)
+
+    assert "first-world-error" in events
+    assert not any(
+        event == "zero" or (isinstance(event, tuple) and event[0] in ("bind", "encode"))
+        for event in events
+    )
+    assert runtime.allocator.acquired == []
+    with pytest.raises(MdpStateError, match="retired"):
+        claim.require()
+
+
 def test_selected_follower_receives_source_layout_without_fabricating_locations(monkeypatch):
     runtime, authority, claim, events = _claim(rank=1, selected=True, leader=False)
     _install_gate0(monkeypatch, events)
@@ -467,6 +690,8 @@ def test_partial_payload_buffer_acquire_failure_releases_first_buffer(monkeypatc
         api.run_repeated_d4_encoder_forward(runtime, claim, authority)
     assert len(runtime.allocator.acquired) == 1
     assert runtime.allocator.released == [runtime.allocator.acquired[0][1]]
+    with pytest.raises(MdpStateError, match="retired"):
+        claim.require()
 
 
 def test_physical_callback_reentry_is_taskfatal_without_second_collective(monkeypatch):

@@ -25,11 +25,14 @@ from megatron.core.mdp.dynamic_cp_d4_payload_transport import (
     _execute_repeated_d4_decoder_payload,
     _prepare_repeated_d4_decoder_payload,
 )
+from megatron.core.mdp.dynamic_cp_d4_selected_materialization import (
+    materialize_d4_selected_locator_catalog,
+)
 from megatron.core.mdp.dynamic_cp_routing import decoder_payload_split_sizes
 from megatron.core.mdp.dynamic_cp_runtime import _DynamicIterationAuthority
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError, MdpTaskFatalError
 from megatron.core.mdp.plan import EncoderThdLayout, EncoderThdSegment
-from megatron.core.mdp.protocols import DynamicEncoderCpBinding
+from megatron.core.mdp.protocols import DynamicEncoderCpBinding, VisionCaptureMode
 
 __all__ = ()
 
@@ -71,6 +74,7 @@ class _D4EncoderForwardOperations:
     bridge_width: int
     bridge_dtype: torch.dtype
     _seal: object = field(repr=False, compare=False)
+    prepare_materialized_vision_payloads: Any = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if type(self) is not _D4EncoderForwardOperations or self._seal is not _OPERATIONS_SEAL:
@@ -79,7 +83,9 @@ class _D4EncoderForwardOperations:
             )
 
 
-def _snapshot_operations(runtime: Any, authority: _DynamicIterationAuthority):
+def _snapshot_operations(
+    runtime: Any, authority: _DynamicIterationAuthority, capture_mode: VisionCaptureMode
+):
     try:
         allocator = runtime.allocator
         acquire = allocator.acquire
@@ -93,6 +99,11 @@ def _snapshot_operations(runtime: Any, authority: _DynamicIterationAuthority):
         adapter = runtime.adapter
         bind = adapter.bind_dynamic_encoder_cp
         encode = adapter.encode
+        prepare_materialized_vision_payloads = (
+            adapter.prepare_materialized_vision_payloads
+            if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+            else None
+        )
         payload_width = adapter.payload_width
         bridge_width = authority.bridge_width
         bridge_dtype = authority.bridge_dtype
@@ -114,6 +125,10 @@ def _snapshot_operations(runtime: Any, authority: _DynamicIterationAuthority):
         or not callable(encode)
         or getattr(encode, "__self__", None) is not adapter
         or raw_encoder is None
+        or (
+            capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+            and not callable(prepare_materialized_vision_payloads)
+        )
         or type(payload_width) is not int
         or payload_width < 1
         or type(bridge_width) is not int
@@ -135,6 +150,7 @@ def _snapshot_operations(runtime: Any, authority: _DynamicIterationAuthority):
         zero_grad=zero_grad,
         bind=bind,
         encode=encode,
+        prepare_materialized_vision_payloads=prepare_materialized_vision_payloads,
         payload_width=payload_width,
         bridge_width=bridge_width,
         bridge_dtype=bridge_dtype,
@@ -253,6 +269,8 @@ class _D4EncoderForwardOwner:
         "_trusted_buffers",
         "_pixels",
         "_source_window",
+        "capture_mode",
+        "locator_catalog",
         "_operations",
         "_state",
         "_prepare_started",
@@ -277,6 +295,8 @@ class _D4EncoderForwardOwner:
             is_leader,
             pixels,
             source_window,
+            capture_mode,
+            locator_catalog,
             operations,
         ) = trusted
         self.authority = authority
@@ -299,6 +319,8 @@ class _D4EncoderForwardOwner:
         self._trusted_buffers = ()
         self._pixels = pixels
         self._source_window = source_window
+        self.capture_mode = capture_mode
+        self.locator_catalog = locator_catalog
         self._operations = operations
         self._state = _ACTIVE
         self._prepare_started = False
@@ -349,6 +371,8 @@ class _D4EncoderForwardOwner:
             self.is_leader,
             self._pixels,
             self._source_window,
+            self.capture_mode,
+            self.locator_catalog,
             self._operations,
         )
         if (
@@ -431,6 +455,8 @@ class _D4EncoderForwardOwner:
         self._trusted_binding_owner = None
         self._pixels = None
         self._source_window = None
+        self.capture_mode = None
+        self.locator_catalog = None
         self._operations = None
         self.payload_bundle = None
         self.output = None
@@ -1002,6 +1028,8 @@ def _transfer_to_publication(
         "_trusted_buffers",
         "_pixels",
         "_source_window",
+        "capture_mode",
+        "locator_catalog",
         "_operations",
         "_trusted_output",
         "_trusted_item_outputs",
@@ -1105,6 +1133,24 @@ def _prepare_pixels(owner: _D4EncoderForwardOwner) -> torch.Tensor | None:
     return packed
 
 
+def _prepare_locator_pixels(
+    owner: _D4EncoderForwardOwner, prepared: torch.Tensor
+) -> torch.Tensor | None:
+    if not owner.is_selected:
+        return None
+    operations = owner._operations
+    packed = operations.acquire(
+        rows=prepared.shape[0],
+        width=operations.payload_width,
+        dtype=operations.params_dtype,
+        device=operations.device,
+        tag="dynamic_cp_gate0_locator_pixels",
+    )
+    owner._install_buffer(packed)
+    packed.copy_(prepared)
+    return packed
+
+
 def run_repeated_d4_encoder_forward(
     runtime: Any,
     claim: _D4EncoderExecutionClaim,
@@ -1126,6 +1172,8 @@ def run_repeated_d4_encoder_forward(
         raise MdpConfigurationError("MDP: D4 encoder forward collective operations are callable.")
     pixels = dict(claim.pixel_sidecar)
     source_window = claim.source_window
+    capture_mode = claim.capture_mode
+    locator_catalog = claim.locator_catalog
     trusted = (
         runtime,
         authority,
@@ -1138,6 +1186,8 @@ def run_repeated_d4_encoder_forward(
         claim.is_leader,
         pixels,
         source_window,
+        capture_mode,
+        locator_catalog,
         None,
     )
     owner = _D4EncoderForwardOwner(trusted=trusted)
@@ -1146,31 +1196,47 @@ def run_repeated_d4_encoder_forward(
     try:
         payload_buffers = None
         packed_pixels = None
+        materialization_owner = None
 
         def prepare_gate0():
-            nonlocal payload_buffers, packed_pixels
+            nonlocal payload_buffers, packed_pixels, materialization_owner
             owner.require()
             if owner._prepare_started is not False:
                 raise MdpStateError("MDP: D4 encoder forward preparation is one-shot.")
             owner._prepare_started = True
-            operations = _snapshot_operations(runtime, authority)
+            operations = _snapshot_operations(runtime, authority, capture_mode)
             owner._install_operations(operations)
             claim.abort()
-            payload_buffers = _payload_buffers(owner)
-            operations.zero_grad()
-            if not owner.text_only:
-                if owner.is_leader:
-                    _validate_layout(authority, owner.layout)
-                packed_pixels = _prepare_pixels(owner)
+            if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG:
+                materialization_owner = materialize_d4_selected_locator_catalog(
+                    runtime, authority, locator_catalog
+                )
+                payloads = materialization_owner._claim_for_gate0()
+                materialization_owner = None
                 if owner.is_selected:
-                    binding_owner = operations.bind(
-                        operations.raw_encoder,
-                        membership=owner.membership,
-                        global_rank=owner.binding.global_rank,
+                    prepared = operations.prepare_materialized_vision_payloads(
+                        tuple(entry.locator for entry in locator_catalog.entries), payloads
                     )
-                    if type(binding_owner) is not DynamicEncoderCpBinding:
-                        raise MdpStateError("MDP: D4 encoder forward receives an exact CP binding.")
-                    owner._install_binding(binding_owner)
+                    packed_pixels = _prepare_locator_pixels(owner, prepared)
+                operations.zero_grad()
+            payload_buffers = _payload_buffers(owner)
+            if capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR:
+                operations.zero_grad()
+                if not owner.text_only:
+                    if owner.is_leader:
+                        _validate_layout(authority, owner.layout)
+                    packed_pixels = _prepare_pixels(owner)
+                    if owner.is_selected:
+                        binding_owner = operations.bind(
+                            operations.raw_encoder,
+                            membership=owner.membership,
+                            global_rank=owner.binding.global_rank,
+                        )
+                        if type(binding_owner) is not DynamicEncoderCpBinding:
+                            raise MdpStateError(
+                                "MDP: D4 encoder forward receives an exact CP binding."
+                            )
+                        owner._install_binding(binding_owner)
             owner.payload_bundle = _prepare_repeated_d4_decoder_payload(
                 owner.binding,
                 authority,
@@ -1192,8 +1258,19 @@ def run_repeated_d4_encoder_forward(
             if owner.text_only:
                 return owner
             if owner.is_selected:
-                rows = len(authority.global_manifest.items)
                 operations = owner._operations
+                if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG:
+                    binding_owner = operations.bind(
+                        operations.raw_encoder,
+                        membership=owner.membership,
+                        global_rank=owner.binding.global_rank,
+                    )
+                    if type(binding_owner) is not DynamicEncoderCpBinding:
+                        raise MdpTaskFatalError(
+                            "MDP: D4 encoder forward receives an exact CP binding."
+                        )
+                    owner._install_binding(binding_owner)
+                rows = len(authority.global_manifest.items)
                 layout_wire = operations.acquire(
                     rows=rows,
                     width=_LAYOUT_FIELDS,
@@ -1219,7 +1296,10 @@ def run_repeated_d4_encoder_forward(
                 updated[5] = received_layout
                 owner._trusted = tuple(updated)
                 _ACTIVE_OWNERS[id(owner)] = (_ACTIVE_OWNERS[id(owner)][0], owner._trusted)
-                broadcast(packed_pixels, src=owner.selected_ranks[0], group=owner.membership.group)
+                if capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR:
+                    broadcast(
+                        packed_pixels, src=owner.selected_ranks[0], group=owner.membership.group
+                    )
                 output = operations.encode(operations.encoder_ddp, packed_pixels, received_layout)
                 expected_rows = sum(segment.output_rows for segment in received_layout.segments)
                 if (
@@ -1268,6 +1348,13 @@ def run_repeated_d4_encoder_forward(
             raise MdpTaskFatalError("MDP: D4 encoder forward runner returned its exact owner.")
         return owner.require()
     except BaseException as error:
+        if materialization_owner is not None:
+            try:
+                materialization_owner.abort()
+            except BaseException as cleanup_error:
+                _add_cleanup_note(
+                    error, f"suppressed locator materialization abort: {cleanup_error!r}"
+                )
         if owner._physical_started is True and not isinstance(error, MdpTaskFatalError):
             fatal = MdpTaskFatalError("MDP: D4 encoder forward physical execution failed.")
             owner._retire(fatal, poisoned=True)

@@ -115,6 +115,7 @@ def _install(monkeypatch, *, fail=None, role="source", locator_digest=None):
     projection = SimpleNamespace(
         metadata=object(),
         local_locator_digest=locator_digest,
+        local_locator_catalog=None,
         catalog=SimpleNamespace(digest=b"w" * 16),
     )
     authority = object()
@@ -258,11 +259,38 @@ def _install(monkeypatch, *, fail=None, role="source", locator_digest=None):
     monkeypatch.setattr(api._gate7, "run_repeated_d4_encoder_iteration_commit", commit)
     return SimpleNamespace(
         capture=capture,
+        projection=projection,
         events=events,
         transactions=transactions,
         objects=objects,
         dependencies=dependencies,
     )
+
+
+def test_locator_facade_passes_exact_projected_catalog_to_distinct_execution_claim(monkeypatch):
+    parts = _install(monkeypatch, locator_digest=b"l" * 16)
+    parts.projection.local_locator_catalog = object()
+    expected = parts.objects["execution"]
+    seen = []
+    monkeypatch.setattr(
+        api._execution,
+        "claim_d4_encoder_execution",
+        lambda *_args: pytest.fail("locator facade used the SOURCE execution claim"),
+    )
+    monkeypatch.setattr(
+        api._execution,
+        "claim_d4_locator_encoder_execution",
+        lambda capture, authority, catalog: (
+            seen.append((capture, authority, catalog)) or expected
+        ),
+        raising=False,
+    )
+
+    _run(parts)
+
+    assert seen == [
+        (parts.capture, parts.transactions[0].authority, parts.projection.local_locator_catalog)
+    ]
 
 
 def _run(parts):

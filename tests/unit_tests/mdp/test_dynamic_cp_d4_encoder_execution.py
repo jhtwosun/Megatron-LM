@@ -11,7 +11,7 @@ import torch
 from examples.multimodal_dev.mdp_adapter import MultimodalDecoderPayloadCodec
 from megatron.core.mdp import dynamic_cp_d4_encoder_capture as capture_api
 from megatron.core.mdp import dynamic_cp_d4_encoder_execution as execution_api
-from megatron.core.mdp.dynamic_cp import DynamicCpGroupMembership
+from megatron.core.mdp.dynamic_cp import DynamicCpGroupMembership, GlobalVisionItemId
 from megatron.core.mdp.dynamic_cp_d3_metadata_transport import DecoderMetadataGatherResult
 from megatron.core.mdp.dynamic_cp_d4_authority_construction import (
     build_repeated_d4_joint_iteration_authority,
@@ -30,6 +30,13 @@ from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError, MdpS
 from megatron.core.mdp.groups import MdpProcessGroups
 from megatron.core.mdp.protocols import VisionCaptureMode
 from megatron.core.mdp.runtime import MdpRuntimeState
+from megatron.core.mdp.vision_locator import (
+    VisionDataLocator,
+    VisionLocatorCatalogEntry,
+    VisionLocatorIndexSentinel,
+    VisionLocatorKind,
+    build_vision_locator_catalog,
+)
 from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
 from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -115,7 +122,7 @@ def _runtime(rank):
     return runtime
 
 
-def _authority(binding, source_window, selected_size):
+def _authority(binding, source_window, selected_size, *, locator_catalog=None):
     metadata = DecoderMetadataGatherResult(
         global_manifest=build_decoder_global_manifest((source_window.metadata_manifest(),)),
         source_rank_by_lane={source_window.source_dp_lane: binding.domain_ranks[0]},
@@ -135,6 +142,7 @@ def _authority(binding, source_window, selected_size):
         encoder_workload_query=workload,
         bridge_width=16,
         bridge_dtype=torch.bfloat16,
+        locator_catalog_digest=(None if locator_catalog is None else locator_catalog.digest),
     )
 
 
@@ -190,14 +198,22 @@ def _source_window(lane, *, num_items=1, microbatch_ids=(3,)):
     return source_window, source_window.metadata_manifest(), locations
 
 
-def _owner(monkeypatch, rank, source_window, locations, *, pixels=None):
+def _owner(monkeypatch, rank, source_window, locations, *, pixels=None, locator_catalog=None):
     runtime = _runtime(rank)
     binding = _binding(rank)
     pixels = {0: torch.ones(4, 4)} if pixels is None else pixels
+    mode = (
+        VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+        if locator_catalog is None
+        else VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    empty_catalog = build_vision_locator_catalog((), ())
     window = SimpleNamespace(
         records=lambda: (object(),),
         payload_sidecar=lambda: dict(pixels),
-        capture_payload_mode=lambda: VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+        capture_payload_mode=lambda: mode,
+        locator_catalog=lambda: empty_catalog if locator_catalog is None else locator_catalog,
+        release_capture_payload=lambda: pixels.clear(),
         release_pixels=lambda: pixels.clear(),
     )
     monkeypatch.setattr(capture_api.MdpIterationWindow, "capture", lambda *_a, **_k: window)
@@ -226,8 +242,29 @@ def _owner(monkeypatch, rank, source_window, locations, *, pixels=None):
         data_iterators=iter((object(),)),
         num_microbatches=len(source_window.packets),
         operations=operations,
+        capture_mode=mode,
     )
     return runtime, binding, owner
+
+
+def _locator_catalog(lane):
+    item_id = GlobalVisionItemId(lane, 0)
+    return build_vision_locator_catalog(
+        (item_id,),
+        (
+            VisionLocatorCatalogEntry(
+                item_id,
+                VisionDataLocator(
+                    VisionLocatorKind.SHARED_FILE,
+                    "/datasets/image.jpg",
+                    None,
+                    None,
+                    VisionLocatorIndexSentinel.UNUSED,
+                    (1, 2, 2),
+                ),
+            ),
+        ),
+    )
 
 
 @pytest.mark.parametrize("selected_size", (1, 2, 4))
@@ -276,6 +313,23 @@ def test_claim_derives_prefix_membership_and_source_only_exact_layout(
     claim.abort()
     with pytest.raises(MdpStateError, match="retired"):
         claim.require()
+
+
+def test_locator_claim_retains_exact_projected_catalog_without_source_pixels(monkeypatch):
+    source_window, _, locations = _source_window(0)
+    catalog = _locator_catalog(0)
+    runtime, binding, owner = _owner(
+        monkeypatch, 0, source_window, locations, pixels={}, locator_catalog=catalog
+    )
+    authority = _authority(binding, source_window, 2, locator_catalog=catalog)
+
+    claim = execution_api.claim_d4_locator_encoder_execution(owner, authority, catalog)
+
+    assert claim.capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    assert claim.locator_catalog is catalog
+    assert claim.pixel_sidecar == {}
+    assert claim.layout is not None
+    claim.abort()
 
 
 def _text_only_source_window(lane):

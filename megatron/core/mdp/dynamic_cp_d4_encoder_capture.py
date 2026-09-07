@@ -351,7 +351,9 @@ class _D4EncoderCaptureOwner:
                 error, f"suppressed D4 encoder pixel release error: {cleanup_error!r}"
             )
 
-    def _claim_for_execution(self, authority: Any, /) -> tuple[Any, ...]:
+    def _claim_for_execution(
+        self, authority: Any, locator_catalog: VisionLocatorCatalog | None = None, /
+    ) -> tuple[Any, ...]:
         """Transfer exact capture resources after joint-authority validation."""
         from megatron.core.mdp.dynamic_cp_runtime import (
             _dynamic_iteration_plan_digest,
@@ -371,10 +373,18 @@ class _D4EncoderCaptureOwner:
             raise MdpStateError("MDP: encoder execution authority matches its exact D4 domain.")
         if self._trusted_error is not None:
             raise MdpStateError("MDP: failed encoder source capture cannot be claimed.")
-        if self._trusted_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG:
-            raise MdpStateError(
-                "MDP: stable locator capture cannot enter execution before materialization."
-            )
+        if self._trusted_capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR:
+            if locator_catalog is not None or authority.locator_catalog_digest is not None:
+                raise MdpStateError("MDP: source-pixel execution retains no locator authority.")
+        else:
+            try:
+                locator_catalog = validate_vision_locator_catalog(locator_catalog)
+            except MdpConfigurationError as error:
+                raise MdpStateError(
+                    "MDP: locator execution retains an exact projected catalog."
+                ) from error
+            if authority.locator_catalog_digest != locator_catalog.digest:
+                raise MdpStateError("MDP: locator execution catalog matches joint authority.")
         is_source = binding.global_rank == binding.domain_ranks[0]
         metadata = (self._trusted_source_window, self._trusted_manifest, self._trusted_locations)
         if is_source:
@@ -405,6 +415,13 @@ class _D4EncoderCaptureOwner:
                 raise MdpStateError(
                     "MDP: encoder execution source retains exact authority metadata."
                 )
+            if self._trusted_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG and (
+                self._trusted_locator_catalog != locator_catalog
+                or self._trusted_locator_catalog.digest != locator_catalog.digest
+            ):
+                raise MdpStateError(
+                    "MDP: locator execution source catalog matches projected authority."
+                )
         elif (
             self._trusted_source_window is not None
             or self._trusted_manifest is not None
@@ -421,6 +438,8 @@ class _D4EncoderCaptureOwner:
             self._trusted_manifest,
             self._trusted_locations,
             self._trusted_pixels,
+            self._trusted_capture_mode,
+            locator_catalog,
         )
         runtime._retire_d4_encoder_capture_owner(self)
         self._state = _RETIRED_OWNER

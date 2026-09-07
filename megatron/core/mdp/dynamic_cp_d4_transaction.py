@@ -29,6 +29,7 @@ from megatron.core.mdp.dynamic_cp_execution import (
 )
 from megatron.core.mdp.dynamic_cp_runtime import _DynamicIterationAuthority
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
+from megatron.core.mdp.protocols import VisionCaptureMode
 
 __all__ = ()
 
@@ -133,7 +134,13 @@ class _D4TransactionTransitionLease:
             raise
         try:
             _validate_capability(
-                successor_stage, capability, owner.binding, owner.authority, completion, ready
+                successor_stage,
+                capability,
+                owner.binding,
+                owner.authority,
+                owner.projection,
+                completion,
+                ready,
             )
             owner_entry = _ACTIVE_TRANSACTIONS.get(id(owner))
             if owner_entry is not entry.owner_entry or owner_entry.reference() is not owner:
@@ -190,6 +197,7 @@ class _D4TransactionTransitionLease:
             (entry.prior, ready),
             owner.binding,
             owner.authority,
+            owner.projection,
             owner.completion,
             ready,
         )
@@ -286,7 +294,13 @@ class _D4TransactionOwner:
         if self.authority is not None:
             _validate_authority(self.binding, self.projection, self.authority)
         _validate_capability(
-            self.stage, self.capability, self.binding, self.authority, self.completion, self.ready
+            self.stage,
+            self.capability,
+            self.binding,
+            self.authority,
+            self.projection,
+            self.completion,
+            self.ready,
         )
         return self
 
@@ -549,7 +563,7 @@ def _validate_authority(binding, projection, authority):
     return authority
 
 
-def _validate_capability(stage, capability, binding, authority, completion, ready):
+def _validate_capability(stage, capability, binding, authority, projection, completion, ready):
     value = capability[0]
     if stage is _CAPTURE:
         value.require()
@@ -563,6 +577,17 @@ def _validate_capability(stage, capability, binding, authority, completion, read
         value.require()
     if value.authority is not authority or value.binding is not binding:
         raise MdpStateError("MDP: D4 transaction capability matches exact authority and binding.")
+    if stage is _EXECUTION:
+        locator_catalog = projection.local_locator_catalog
+        expected_mode = (
+            VisionCaptureMode.STABLE_LOCATOR_CATALOG
+            if locator_catalog is not None
+            else VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+        )
+        if value.capture_mode is not expected_mode or value.locator_catalog is not locator_catalog:
+            raise MdpStateError(
+                "MDP: D4 execution claim retains the exact projected locator catalog."
+            )
 
 
 def _begin_d4_transaction(capture_owner, /):

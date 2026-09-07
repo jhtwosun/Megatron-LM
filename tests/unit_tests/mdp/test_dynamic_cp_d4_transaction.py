@@ -246,13 +246,20 @@ def test_transaction_rejects_equal_but_substituted_projected_locator_catalog(mon
         transaction.require()
 
 
-def _fake_parts(monkeypatch):
+def _fake_parts(monkeypatch, *, locator=False):
     events = []
     binding = object()
     capture, capture_state = _capture(monkeypatch, binding, events)
     catalog = SimpleNamespace(entries=(), digest=b"catalog")
     metadata = SimpleNamespace(global_manifest=object(), source_rank_by_lane=object())
-    projection = catalog_api._D4SourceCatalogProjection(catalog, object(), metadata)
+    locator_catalog = build_vision_locator_catalog((), ()) if locator else None
+    projection = catalog_api._D4SourceCatalogProjection(
+        catalog,
+        object(),
+        metadata,
+        locator_catalog,
+        None if locator_catalog is None else locator_catalog.digest,
+    )
     authority = object.__new__(runtime_api._DynamicIterationAuthority)
     monkeypatch.setattr(api, "_validate_projection", lambda value, actual: value)
     monkeypatch.setattr(api, "_validate_authority", lambda actual, value, candidate: candidate)
@@ -265,6 +272,7 @@ def _fake_parts(monkeypatch):
         capture=capture,
         capture_state=capture_state,
         events=events,
+        projection=projection,
     )
 
 
@@ -274,6 +282,14 @@ def _install(monkeypatch, cls, label, parts, *, completion=None):
     for name, item in (("authority", parts.authority), ("binding", parts.binding)):
         if name in getattr(cls, "__slots__", ()):
             setattr(value, name, item)
+    if "capture_mode" in getattr(cls, "__slots__", ()):
+        value.capture_mode = (
+            VisionCaptureMode.STABLE_LOCATOR_CATALOG
+            if parts.projection.local_locator_catalog is not None
+            else VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+        )
+    if "locator_catalog" in getattr(cls, "__slots__", ()):
+        value.locator_catalog = parts.projection.local_locator_catalog
     if "completion" in getattr(cls, "__slots__", ()):
         value.completion = completion
 
@@ -292,6 +308,21 @@ def _install(monkeypatch, cls, label, parts, *, completion=None):
     monkeypatch.setattr(cls, "require", require)
     monkeypatch.setattr(cls, "abort", abort)
     return value, state
+
+
+def test_execution_adoption_binds_exact_projected_locator_catalog(monkeypatch):
+    parts = _fake_parts(monkeypatch, locator=True)
+    assert "locator_catalog" in execution_api._D4EncoderExecutionClaim.__slots__
+    execution, _state = _install(
+        monkeypatch, execution_api._D4EncoderExecutionClaim, "execution", parts
+    )
+    foreign = build_vision_locator_catalog((), ())
+    assert foreign == parts.projection.local_locator_catalog
+    assert foreign is not parts.projection.local_locator_catalog
+    execution.locator_catalog = foreign
+
+    with pytest.raises(MdpStateError, match="locator|projected|catalog"):
+        parts.transaction.begin_execution().adopt(execution)
 
 
 def _adopt_to_replay(monkeypatch, parts, *, dynamic):
