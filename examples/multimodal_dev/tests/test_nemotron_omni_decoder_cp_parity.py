@@ -11,16 +11,12 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from examples.multimodal_dev.models.base import (
-    split_multimodal_inputs_for_context_parallel,
-)
+from examples.multimodal_dev.models.base import split_multimodal_inputs_for_context_parallel
 from examples.multimodal_dev.models.nemotron_omni.configuration import IMAGE_TOKEN_ID
 from examples.multimodal_dev.models.nemotron_omni.model import NemotronOmniModel
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed.distributed_data_parallel_config import (
-    DistributedDataParallelConfig,
-)
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -31,7 +27,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-
 
 _WORLD_SIZE = 4
 _TOTAL_ROWS = 16
@@ -52,9 +47,7 @@ def _require_world4():
 def _initialize_parallel(cp_size):
     Utils.destroy_model_parallel()
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        context_parallel_size=cp_size,
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp_size
     )
     model_parallel_cuda_manual_seed(_SEED)
     return ProcessGroupCollection.use_mpu_process_groups()
@@ -123,9 +116,7 @@ def _build_model(cp_size, pattern, pg_collection, state=None):
     ddp = DistributedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
-            use_distributed_optimizer=False,
-            overlap_grad_reduce=False,
-            overlap_param_gather=False,
+            use_distributed_optimizer=False, overlap_grad_reduce=False, overlap_param_gather=False
         ),
         module=model,
         pg_collection=pg_collection,
@@ -162,9 +153,11 @@ def _batch(case, cp_size, cp_group):
     vision_embeddings = None
     if case == "image":
         input_ids[0, (1, 3, 9)] = IMAGE_TOKEN_ID
-        vision_embeddings = torch.randn(
-            (3, 128), generator=generator, dtype=torch.float32
-        ).cuda().to(torch.bfloat16)
+        vision_embeddings = (
+            torch.randn((3, 128), generator=generator, dtype=torch.float32)
+            .cuda()
+            .to(torch.bfloat16)
+        )
         vision_embeddings.requires_grad_(True)
     else:
         assert not torch.any(input_ids == IMAGE_TOKEN_ID)
@@ -179,9 +172,7 @@ def _batch(case, cp_size, cp_group):
 
 
 def _projected_rows(batch):
-    row_ids = torch.arange(_TOTAL_ROWS, device="cuda", dtype=torch.int64).view(
-        _TOTAL_ROWS, 1, 1
-    )
+    row_ids = torch.arange(_TOTAL_ROWS, device="cuda", dtype=torch.int64).view(_TOTAL_ROWS, 1, 1)
     local, *_ = split_multimodal_inputs_for_context_parallel(
         decoder_input=row_ids,
         input_ids=None,
@@ -219,9 +210,7 @@ def _run_schedule(model, batch, pg_collection):
 
     def capture_layer_group(module, _inputs, kwargs):
         packed = kwargs["packed_seq_params"]
-        captured["layer_groups"].append(
-            (type(module), module.pg_collection.cp, packed.cp_group)
-        )
+        captured["layer_groups"].append((type(module), module.pg_collection.cp, packed.cp_group))
 
     for module in model.module.modules():
         if type(module) in (SelfAttention, GatedDeltaNet):
@@ -328,10 +317,7 @@ def test_nemotron_omni_native_schedule_cp4_matches_independently_reset_cp1(patte
         assert trial_batch["packed_seq_params"].cu_seqlens_q_padded.tolist() == [0, 8, 16]
         trial_result = _run_schedule(trial, trial_batch, trial_pgs)
 
-        for result, group in (
-            (reference_result, reference_pgs.cp),
-            (trial_result, trial_pgs.cp),
-        ):
+        for result, group in ((reference_result, reference_pgs.cp), (trial_result, trial_pgs.cp)):
             assert [kind for kind, _module_group, _packed_group in result["layer_groups"]] == [
                 GatedDeltaNet if kind == "G" else SelfAttention for kind in pattern
             ]
@@ -352,19 +338,14 @@ def test_nemotron_omni_native_schedule_cp4_matches_independently_reset_cp1(patte
         assert torch.count_nonzero(trial_result["decoder_input_grad"])
         expected_input_grad = reference_result["decoder_input_grad"].index_select(0, rows)
         torch.testing.assert_close(
-            trial_result["decoder_input_grad"],
-            expected_input_grad,
-            atol=7.0e-2,
-            rtol=8.0e-2,
+            trial_result["decoder_input_grad"], expected_input_grad, atol=7.0e-2, rtol=8.0e-2
         )
         assert reference_result["token_value_before_finalize"] == 11
         assert trial_result["token_value_before_finalize"] == (4, 1, 4, 2)[dist.get_rank()]
         assert int(reference_result["num_tokens"].item()) == 44
         assert int(trial_result["num_tokens"].item()) == 11
 
-        assert trial_result["parameter_grads"].keys() == reference_result[
-            "parameter_grads"
-        ].keys()
+        assert trial_result["parameter_grads"].keys() == reference_result["parameter_grads"].keys()
         for name, expected in reference_result["parameter_grads"].items():
             actual = trial_result["parameter_grads"][name]
             assert torch.isfinite(actual).all(), name
