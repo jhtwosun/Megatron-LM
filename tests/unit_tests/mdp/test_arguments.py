@@ -1,16 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""CLI contract tests for multimodal encoder recompute."""
+"""CLI contract tests for multimodal MDP and encoder recompute."""
 
+import argparse
 from types import SimpleNamespace
 
 import pytest
 
 from examples.multimodal_dev.arguments import (
+    add_multimodal_args,
     encoder_recompute_overrides_from_args,
     validate_encoder_recompute_args,
 )
-
 
 _DEFAULTS = {
     "encoder_recompute_granularity": None,
@@ -24,6 +25,29 @@ def _args(*, mdp_enable, **overrides):
     values = dict(_DEFAULTS)
     values.update(overrides)
     return SimpleNamespace(mdp_enable=mdp_enable, **values)
+
+
+def test_dynamic_encoder_cp_cli_defaults_are_inert_and_overrides_are_independent():
+    parser = argparse.ArgumentParser()
+    add_multimodal_args(parser)
+
+    defaults = parser.parse_args([])
+    selected = parser.parse_args(
+        [
+            "--mdp-dynamic-encoder-cp",
+            "--mdp-min-dynamic-encoder-cp-size",
+            "2",
+            "--mdp-encoder-cp",
+            "4",
+        ]
+    )
+
+    assert defaults.mdp_dynamic_encoder_cp is False
+    assert defaults.mdp_min_dynamic_encoder_cp_size == 1
+    assert selected.mdp_dynamic_encoder_cp is True
+    assert selected.mdp_min_dynamic_encoder_cp_size == 2
+    assert selected.mdp_encoder_cp == 4
+    assert selected.mdp_enable is False
 
 
 @pytest.mark.parametrize(

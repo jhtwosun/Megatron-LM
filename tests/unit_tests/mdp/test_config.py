@@ -638,6 +638,26 @@ def test_snapshot_reports_repeated_d4_options_without_boolean_coercion():
     assert options.sequence_parallel is True
 
 
+def test_snapshot_keeps_dynamic_encoder_cli_defaults_independent():
+    from megatron.core.mdp.integration import mdp_config_from_args
+
+    defaults = mdp_config_from_args(_fake_args(mdp_enable=True))
+    selected = mdp_config_from_args(
+        _fake_args(
+            mdp_enable=True,
+            mdp_encoder_cp=4,
+            mdp_dynamic_encoder_cp=True,
+            mdp_min_dynamic_encoder_cp_size=2,
+        )
+    )
+
+    assert defaults.dynamic_encoder_cp is False
+    assert defaults.min_dynamic_encoder_cp_size == 1
+    assert selected.encoder_cp == 4
+    assert selected.dynamic_encoder_cp is True
+    assert selected.min_dynamic_encoder_cp_size == 2
+
+
 @pytest.mark.parametrize(
     "flag", ["overlap_param_gather_with_optimizer_step", "reuse_grad_buf_for_mxfp8_param_ag"]
 )

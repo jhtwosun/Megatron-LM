@@ -204,6 +204,18 @@ def add_multimodal_args(parser):
         help="MDP encoder context-parallel width, independent of decoder CP.",
     )
     group.add_argument(
+        "--mdp-dynamic-encoder-cp",
+        action="store_true",
+        default=False,
+        help="Dynamically select encoder CP within the configured MDP encoder-CP width.",
+    )
+    group.add_argument(
+        "--mdp-min-dynamic-encoder-cp-size",
+        type=int,
+        default=1,
+        help="Minimum encoder CP size considered by dynamic MDP planning.",
+    )
+    group.add_argument(
         "--mdp-encoder-max-payload-rows",
         type=int,
         default=None,
