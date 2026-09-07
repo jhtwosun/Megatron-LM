@@ -1154,3 +1154,43 @@ def _run_repeated_d4_encoder_gradient_from_replay(
                     primary, f"suppressed fixed decoder replay cleanup error: {cleanup_error!r}"
                 )
         raise
+
+
+def _run_repeated_d4_dynamic_encoder_gradient_from_replay(
+    replay: _dynamic_replay._D4DynamicDecoderReplayOwner,
+    authority: _DynamicIterationAuthority,
+    completion: _dynamic_replay._D4DynamicDecoderCompletion,
+    *,
+    all_to_all_single: Callable[..., Any] = dist.all_to_all_single,
+    byte_generator: Callable[[int], Any] | None = None,
+) -> _D4EncoderGradientRouteOwner:
+    """Atomically claim completed dynamic replay and return its exact Gate3 successor."""
+    if type(replay) is not _dynamic_replay._D4DynamicDecoderReplayOwner:
+        raise MdpConfigurationError(
+            "MDP: encoder gradient replay route uses an exact dynamic decoder owner."
+        )
+    handoff = None
+    try:
+        replay.require()
+        if authority is not replay.authority:
+            raise MdpStateError(
+                "MDP: encoder gradient replay route uses its exact iteration authority."
+            )
+        replay.require_completion(completion)
+        handoff = replay._claim_for_gradient(authority, completion)
+        return run_repeated_d4_dynamic_encoder_gradient(
+            handoff,
+            authority,
+            completion,
+            all_to_all_single=all_to_all_single,
+            byte_generator=byte_generator,
+        )
+    except BaseException as primary:
+        if handoff is None:
+            try:
+                replay.abort(primary)
+            except BaseException as cleanup_error:
+                _add_cleanup_note(
+                    primary, f"suppressed dynamic decoder replay cleanup error: {cleanup_error!r}"
+                )
+        raise

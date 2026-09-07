@@ -341,7 +341,7 @@ def _parts(
     token = torch.tensor(4.0)
     replay_trusted = (runtime, authority, binding, records, leaves, handoff_resources, leaf_bases)
     monkeypatch.setattr(replay_api, "_snapshot_local_authority", lambda b, a: a)
-    if replay_owner:
+    if replay_owner and not dynamic:
         replay = replay_api._D4FixedDecoderReplayOwner(
             trusted=replay_trusted, seal=replay_api._OWNER_SEAL
         )
@@ -433,7 +433,7 @@ def _parts(
         returned = replay.mark_schedule_returned(cursor)
         completion = replay.prepare_completion(cursor, returned)
         monkeypatch.setattr(dynamic_replay_api, "_snapshot_local_authority", lambda b, a: a)
-        handoff = replay._claim_for_gradient(authority, completion)
+        handoff = None if replay_owner else replay._claim_for_gradient(authority, completion)
     events = []
     prepared_calls = []
     physical_calls = []
@@ -547,6 +547,16 @@ def _run_from_replay(parts, *, byte_generator=None):
     )
 
 
+def _run_dynamic_from_replay(parts, *, byte_generator=None):
+    return api._run_repeated_d4_dynamic_encoder_gradient_from_replay(
+        parts.replay,
+        parts.authority,
+        parts.completion,
+        all_to_all_single=lambda *_args, **_kwargs: None,
+        byte_generator=byte_generator,
+    )
+
+
 def test_replay_gradient_claim_and_successor_transfer_are_atomic(monkeypatch):
     parts = _parts(monkeypatch, replay_owner=True)
     generator = object()
@@ -583,6 +593,90 @@ def test_replay_gradient_preclaim_failure_retires_once_and_retries(monkeypatch, 
 
     fresh = _parts(monkeypatch, runtime=parts.runtime, replay_owner=True)
     owner = _run_from_replay(fresh)
+    owner.abort()
+
+
+def test_dynamic_replay_gradient_claim_and_successor_transfer_are_atomic(monkeypatch):
+    parts = _parts(monkeypatch, replay_owner=True, dynamic=True, decoder_cp_size=4)
+    generator = object()
+
+    owner = _run_dynamic_from_replay(parts, byte_generator=generator)
+
+    assert owner.require() is owner
+    assert parts.events == [("gate", 3, generator), "world0", "domain", "world1", "physical"]
+    assert replay_api._forward._ACTIVE_RUNTIME_OWNERS[id(parts.runtime)][1]() is owner
+    with pytest.raises(MdpStateError, match="dynamic decoder replay owner is retired"):
+        parts.replay.require()
+    owner.abort()
+    assert parts.handle.calls == 1
+    assert parts.binding_owner.calls == 1
+
+
+@pytest.mark.parametrize("mutated", (False, True))
+def test_dynamic_replay_gradient_preclaim_failure_retires_once_and_retries(monkeypatch, mutated):
+    parts = _parts(monkeypatch, replay_owner=True, dynamic=True, decoder_cp_size=4)
+    if mutated:
+        parts.replay.records = ()
+        authority = parts.authority
+        message = "retains sealed fields"
+    else:
+        authority = copy.copy(parts.authority)
+        message = "exact iteration authority"
+
+    with pytest.raises(MdpStateError, match=message):
+        api._run_repeated_d4_dynamic_encoder_gradient_from_replay(
+            parts.replay, authority, parts.completion
+        )
+    assert parts.handle.calls == 1
+    assert parts.binding_owner.calls == 1
+    expected_releases = (*parts.leaves.values(), *parts.predecessor_buffers)
+    assert len(parts.allocator.released) == len(expected_releases)
+    assert all(
+        sum(released is expected for released in parts.allocator.released) == 1
+        for expected in expected_releases
+    )
+    assert replay_api._forward._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+
+    fresh = _parts(
+        monkeypatch, runtime=parts.runtime, replay_owner=True, dynamic=True, decoder_cp_size=4
+    )
+    owner = _run_dynamic_from_replay(fresh)
+    owner.abort()
+
+
+@pytest.mark.parametrize("stage", ("world", "physical"))
+def test_dynamic_replay_gradient_postclaim_failure_cleans_successor_and_retries(monkeypatch, stage):
+    parts = _parts(monkeypatch, replay_owner=True, dynamic=True, decoder_cp_size=4)
+    if stage == "world":
+        primary = MdpPlanError("first WORLD rejected")
+        monkeypatch.setattr(
+            api,
+            "run_repeated_d4_authority_collective",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(primary),
+        )
+        expected = MdpPlanError
+    else:
+        monkeypatch.setattr(
+            api,
+            "_execute_validated_dynamic_bridge_exchange",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("physical failed")),
+        )
+        expected = MdpTaskFatalError
+
+    with pytest.raises(expected):
+        _run_dynamic_from_replay(parts)
+    with pytest.raises(MdpStateError, match="dynamic decoder replay owner is retired"):
+        parts.replay.require()
+    assert parts.handle.calls == 1
+    assert parts.binding_owner.calls == 1
+    assert dynamic_replay_api._ACTIVE_GRADIENT_HANDOFFS == {}
+    assert dynamic_replay_api._ACTIVE_COMPLETIONS == {}
+    assert replay_api._forward._ACTIVE_RUNTIME_OWNERS.get(id(parts.runtime)) is None
+
+    fresh = _parts(
+        monkeypatch, runtime=parts.runtime, replay_owner=True, dynamic=True, decoder_cp_size=4
+    )
+    owner = _run_dynamic_from_replay(fresh)
     owner.abort()
 
 
