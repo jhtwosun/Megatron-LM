@@ -21,6 +21,11 @@ from megatron.core.mdp.dynamic_cp import (
 )
 from megatron.core.mdp.dynamic_cp_execution import DecoderVisionItemMetadata
 from megatron.core.mdp.dynamic_cp_plan import EncoderWorkEstimate
+from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+    claim_dynamic_encoder_adapter_capability,
+    mint_dynamic_encoder_adapter_capability,
+    retire_dynamic_encoder_adapter_capability,
+)
 from megatron.core.mdp.encoder_cp import build_encoder_cp_plan
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.models.vision.radio import RADIOViTModel
@@ -81,6 +86,20 @@ def test_workload_query_matches_radio_class_token_geometry(group_size, rows):
     )
 
     assert estimate == EncoderWorkEstimate(rows, 48)
+
+
+def test_exact_nemotron_adapter_claims_registered_dynamic_capability():
+    adapter = mdp.NemotronOmniMdpAdapter(8)
+    capability = mint_dynamic_encoder_adapter_capability(adapter)
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+
+    assert operations.payload_width == adapter.payload_width
+    assert operations.embedding_width == 8
+    assert operations.spatial_merge_size == adapter.spatial_merge_size
+    assert operations.estimate_dynamic_encoder_workload(
+        _ITEMS, group_size=4
+    ) == EncoderWorkEstimate(14, 48)
+    retire_dynamic_encoder_adapter_capability(capability)
 
 
 @pytest.mark.parametrize("group_size", (1, 2, 4))

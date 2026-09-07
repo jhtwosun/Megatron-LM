@@ -47,6 +47,9 @@ from megatron.core.mdp.dynamic_cp_plan import (
     EncoderVisionItemMetadata,
     EncoderWorkEstimate,
 )
+from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+    register_dynamic_encoder_adapter_class,
+)
 from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError, MdpStateError
 from megatron.core.mdp.protocols import (
     CapturedMicrobatch,
@@ -1089,6 +1092,18 @@ class Qwen35VLMdpAdapter:
         # (QWEN35_VL_GRID_CACHE=0) fallback paths that do tensor math on it.
         grid_thw = torch.tensor([segment.grid_thw for segment in layout.segments], dtype=torch.long)
         return encoder(payload, grid_thw)
+
+
+register_dynamic_encoder_adapter_class(
+    Qwen35VLMdpAdapter,
+    get_batch=Qwen35VLMdpAdapter.get_batch,
+    estimate_cost=Qwen35VLMdpAdapter.estimate_cost,
+    build_dynamic_decoder_payload_codec=Qwen35VLMdpAdapter.build_dynamic_decoder_payload_codec,
+    estimate_dynamic_encoder_workload=Qwen35VLMdpAdapter.estimate_dynamic_encoder_workload,
+    build_encoder=Qwen35VLMdpAdapter.build_encoder,
+    bind_dynamic_encoder_cp=Qwen35VLMdpAdapter.bind_dynamic_encoder_cp,
+    encode=Qwen35VLMdpAdapter.encode,
+)
 
 
 def build_mdp_adapter(args, language_config) -> Qwen35VLMdpAdapter:

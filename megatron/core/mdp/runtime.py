@@ -38,6 +38,11 @@ from megatron.core.mdp.bridge import (
     ModalityBridge,
 )
 from megatron.core.mdp.config import MdpConfig
+from megatron.core.mdp.dynamic_cp_d4_group_binding import _validate_repeated_d4_group_binding
+from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+    DynamicEncoderAdapterCapability,
+    DynamicEncoderAdapterOperations,
+)
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
@@ -84,7 +89,43 @@ class MdpRuntime:
         params_dtype: torch.dtype,
         num_vpp_chunks: int = 1,
         device: Optional[torch.device] = None,
+        dynamic_adapter_capability: DynamicEncoderAdapterCapability | None = None,
+        dynamic_adapter_owner: Any = None,
+        dynamic_group_binding: Any = None,
     ) -> None:
+        if config.dynamic_encoder_cp:
+            if (
+                type(dynamic_adapter_capability) is not DynamicEncoderAdapterCapability
+                or type(adapter) is not DynamicEncoderAdapterOperations
+                or dynamic_adapter_owner is None
+                or dynamic_group_binding is None
+            ):
+                raise MdpConfigurationError(
+                    "MDP: repeated-D4 runtime retains its exact adapter and group capability."
+                )
+            try:
+                capability_record = dynamic_adapter_capability._record
+                active_adapter = adapter._adapter()
+                _validate_repeated_d4_group_binding(dynamic_group_binding)
+            except (AttributeError, MdpConfigurationError, MdpStateError) as error:
+                raise MdpConfigurationError(
+                    "MDP: repeated-D4 runtime requires one active exact adapter capability."
+                ) from error
+            if (
+                capability_record.capability is not dynamic_adapter_capability
+                or capability_record.operations is not adapter
+                or active_adapter is not dynamic_adapter_owner
+            ):
+                raise MdpConfigurationError(
+                    "MDP: repeated-D4 runtime retains its exact adapter and group capability."
+                )
+        elif any(
+            value is not None
+            for value in (dynamic_adapter_capability, dynamic_adapter_owner, dynamic_group_binding)
+        ):
+            raise MdpConfigurationError(
+                "MDP: static/D3 runtime does not accept repeated-D4 capabilities."
+            )
         self.config = config
         self.rank_map = rank_map
         self.rank_view = rank_view
@@ -99,6 +140,9 @@ class MdpRuntime:
         self.params_dtype = params_dtype
         self.num_vpp_chunks = num_vpp_chunks
         self.device = device or torch.device("cuda", torch.cuda.current_device())
+        self.dynamic_adapter_capability = dynamic_adapter_capability
+        self.dynamic_group_binding = dynamic_group_binding
+        self._dynamic_adapter_owner = dynamic_adapter_owner
 
         self._state = MdpRuntimeState.EMPTY
         self._iteration = 0

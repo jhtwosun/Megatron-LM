@@ -616,6 +616,28 @@ def test_snapshot_reports_dynamic_context_parallel():
     assert options.dynamic_context_parallel is True
 
 
+def test_snapshot_reports_repeated_d4_options_without_boolean_coercion():
+    from megatron.core.mdp.integration import compatibility_options_from_args, mdp_config_from_args
+
+    marker = object()
+    config = mdp_config_from_args(
+        _fake_args(mdp_dynamic_encoder_cp=True, mdp_min_dynamic_encoder_cp_size=2)
+    )
+    options = compatibility_options_from_args(
+        _fake_args(
+            dynamic_context_parallel=marker,
+            min_dynamic_context_parallel_size=2,
+            sequence_parallel=True,
+        )
+    )
+
+    assert config.dynamic_encoder_cp is True
+    assert config.min_dynamic_encoder_cp_size == 2
+    assert options.dynamic_context_parallel is marker
+    assert options.min_dynamic_context_parallel_size == 2
+    assert options.sequence_parallel is True
+
+
 @pytest.mark.parametrize(
     "flag", ["overlap_param_gather_with_optimizer_step", "reuse_grad_buf_for_mxfp8_param_ag"]
 )

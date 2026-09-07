@@ -13,17 +13,24 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 import torch
 
+import megatron.core.mdp.runtime as mdp_runtime_module
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.bridge import BridgePhase, ModalityBridge
 from megatron.core.mdp.config import MdpConfig
+from megatron.core.mdp.dynamic_cp import GlobalSampleId
+from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+    claim_dynamic_encoder_adapter_capability,
+    mint_dynamic_encoder_adapter_capability,
+    register_dynamic_encoder_adapter_class,
+    retire_dynamic_encoder_adapter_capability,
+)
 from megatron.core.mdp.encoder import (
     build_encoder_domain,
     build_encoder_pg_collection,
     finalize_encoder_grads,
 )
-from megatron.core.mdp.dynamic_cp import GlobalSampleId
-from megatron.core.mdp.errors import MdpStateError
+from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
 from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
@@ -177,6 +184,97 @@ class _StubAdapter:
 
             output.register_hook(_record_output_grad)
         return output
+
+
+class _DynamicStubAdapter(_StubAdapter):
+    embedding_width = WIDTH
+
+    def build_dynamic_decoder_payload_codec(self):
+        return object()
+
+    def estimate_dynamic_encoder_workload(self, items, *, group_size):
+        return items, group_size
+
+    def bind_dynamic_encoder_cp(self, encoder, *, membership, global_rank):
+        return encoder, membership, global_rank
+
+
+register_dynamic_encoder_adapter_class(
+    _DynamicStubAdapter,
+    get_batch=_StubAdapter.get_batch,
+    estimate_cost=_StubAdapter.estimate_cost,
+    build_dynamic_decoder_payload_codec=_DynamicStubAdapter.build_dynamic_decoder_payload_codec,
+    estimate_dynamic_encoder_workload=_DynamicStubAdapter.estimate_dynamic_encoder_workload,
+    build_encoder=_StubAdapter.build_encoder,
+    bind_dynamic_encoder_cp=_DynamicStubAdapter.bind_dynamic_encoder_cp,
+    encode=_StubAdapter.encode,
+)
+
+
+def _minimal_dynamic_runtime(adapter, capability, operations):
+    return MdpRuntime(
+        config=MdpConfig(enable=True, encoder_cp=4, dynamic_encoder_cp=True),
+        rank_map=SimpleNamespace(spec=SimpleNamespace(tp=1)),
+        rank_view=object(),
+        process_groups=SimpleNamespace(decoder_tp_group=None),
+        adapter=operations,
+        encoder_domain=object(),
+        planner=object(),
+        bridge=object(),
+        storage=object(),
+        allocator=object(),
+        hidden_size=WIDTH,
+        params_dtype=torch.bfloat16,
+        device=torch.device("cuda", torch.cuda.current_device()),
+        dynamic_adapter_capability=capability,
+        dynamic_adapter_owner=adapter,
+        dynamic_group_binding=object(),
+    )
+
+
+def test_dynamic_runtime_retains_exact_claimed_adapter_capability(monkeypatch):
+    monkeypatch.setattr(
+        mdp_runtime_module, "_validate_repeated_d4_group_binding", lambda binding: object()
+    )
+    adapter = _DynamicStubAdapter(None)
+    capability = mint_dynamic_encoder_adapter_capability(adapter)
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+
+    runtime = _minimal_dynamic_runtime(adapter, capability, operations)
+
+    assert runtime.adapter is operations
+    assert runtime.dynamic_adapter_capability is capability
+    assert runtime._dynamic_adapter_owner is adapter
+    retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_dynamic_runtime_rejects_mismatched_capability_and_operations(monkeypatch):
+    monkeypatch.setattr(
+        mdp_runtime_module, "_validate_repeated_d4_group_binding", lambda binding: object()
+    )
+    first = _DynamicStubAdapter(None)
+    first_capability = mint_dynamic_encoder_adapter_capability(first)
+    first_operations = claim_dynamic_encoder_adapter_capability(first, first_capability)
+    second = _DynamicStubAdapter(None)
+    second_capability = mint_dynamic_encoder_adapter_capability(second)
+    claim_dynamic_encoder_adapter_capability(second, second_capability)
+
+    with pytest.raises(MdpConfigurationError, match="exact adapter and group capability"):
+        _minimal_dynamic_runtime(first, second_capability, first_operations)
+
+    retire_dynamic_encoder_adapter_capability(first_capability)
+    retire_dynamic_encoder_adapter_capability(second_capability)
+
+
+def test_dynamic_runtime_rejects_unsealed_group_binding():
+    adapter = _DynamicStubAdapter(None)
+    capability = mint_dynamic_encoder_adapter_capability(adapter)
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+
+    with pytest.raises(MdpConfigurationError, match="active exact adapter capability"):
+        _minimal_dynamic_runtime(adapter, capability, operations)
+
+    retire_dynamic_encoder_adapter_capability(capability)
 
 
 class _TrackingAllocator(DirectBufferAllocator):

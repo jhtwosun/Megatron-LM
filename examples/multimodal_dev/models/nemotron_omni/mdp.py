@@ -25,6 +25,9 @@ from examples.multimodal_dev.models.nemotron_omni.vision_encoder import (
 )
 from megatron.core.mdp.dynamic_cp_execution import DecoderVisionItemMetadata
 from megatron.core.mdp.dynamic_cp_plan import EncoderWorkEstimate
+from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+    register_dynamic_encoder_adapter_class,
+)
 from megatron.core.mdp.errors import MdpConfigurationError
 
 
@@ -232,6 +235,18 @@ class NemotronOmniMdpAdapter(Qwen35VLMdpAdapter):
     def encode(self, encoder, payload, layout):
         grids = torch.tensor([segment.grid_thw for segment in layout.segments], dtype=torch.long)
         return encode_nemotron_omni_images(encoder, payload, grids)
+
+
+register_dynamic_encoder_adapter_class(
+    NemotronOmniMdpAdapter,
+    get_batch=NemotronOmniMdpAdapter.get_batch,
+    estimate_cost=Qwen35VLMdpAdapter.estimate_cost,
+    build_dynamic_decoder_payload_codec=Qwen35VLMdpAdapter.build_dynamic_decoder_payload_codec,
+    estimate_dynamic_encoder_workload=NemotronOmniMdpAdapter.estimate_dynamic_encoder_workload,
+    build_encoder=NemotronOmniMdpAdapter.build_encoder,
+    bind_dynamic_encoder_cp=NemotronOmniMdpAdapter.bind_dynamic_encoder_cp,
+    encode=NemotronOmniMdpAdapter.encode,
+)
 
 
 def build_mdp_adapter(args, language_config):

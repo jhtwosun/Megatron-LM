@@ -32,12 +32,19 @@ from megatron.core.mdp.config import (
     validate_mdp_config,
 )
 from megatron.core.mdp.dynamic_cp_d3_composition import _build_d3_runtime_facade
+from megatron.core.mdp.dynamic_cp_d4_group_binding import _make_repeated_d4_group_binding
+from megatron.core.mdp.dynamic_cp_d4_status import _make_repeated_d4_world_pre_gate
+from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+    claim_dynamic_encoder_adapter_capability,
+    mint_dynamic_encoder_adapter_capability,
+    retire_dynamic_encoder_adapter_capability,
+)
 from megatron.core.mdp.encoder import (
     assert_parameter_disjointness,
     build_encoder_domain,
     build_encoder_pg_collection,
 )
-from megatron.core.mdp.errors import MdpConfigurationError
+from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError, MdpTaskFatalError
 from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
 from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
@@ -64,6 +71,8 @@ _RUNTIME: Optional[MdpRuntime] = None
 _D3_FACADE = None
 
 _D3_STATUS_TIMEOUT_SECONDS = 30.0
+_D4_STARTUP_TIMEOUT_SECONDS = 30.0
+_ZERO_DIGEST = b"\0" * 16
 
 
 def set_adapter_builder(builder: Callable) -> None:
@@ -103,6 +112,8 @@ def mdp_config_from_args(args) -> MdpConfig:
         debug_plan_payload_check=getattr(args, "mdp_debug_plan_payload_check", False),
         pixel_locality=getattr(args, "mdp_pixel_locality", False),
         overlap_window_capture=getattr(args, "mdp_overlap_window_capture", False),
+        dynamic_encoder_cp=getattr(args, "mdp_dynamic_encoder_cp", False),
+        min_dynamic_encoder_cp_size=getattr(args, "mdp_min_dynamic_encoder_cp_size", 1),
     )
 
 
@@ -161,7 +172,9 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         overlap_moe_expert_parallel_comm=bool(
             getattr(args, "overlap_moe_expert_parallel_comm", False)
         ),
-        dynamic_context_parallel=bool(getattr(args, "dynamic_context_parallel", False)),
+        dynamic_context_parallel=getattr(args, "dynamic_context_parallel", False),
+        min_dynamic_context_parallel_size=getattr(args, "min_dynamic_context_parallel_size", 1),
+        sequence_parallel=getattr(args, "sequence_parallel", False),
         checkpoint_mode=getattr(args, "ckpt_format", "torch_dist"),
         save_requested=getattr(args, "save", None) is not None,
         load_requested=getattr(args, "load", None) is not None,
@@ -171,6 +184,73 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
 def validate_from_args(args) -> None:
     """Run the full support-matrix validation from the parsed args."""
     validate_mdp_config(mdp_config_from_args(args), compatibility_options_from_args(args))
+
+
+def _converge_repeated_d4_adapter_prevalidation(local_error: BaseException | None) -> None:
+    world = torch.distributed.group.WORLD
+    world_ranks = tuple(torch.distributed.get_process_group_ranks(world))
+    global_rank = torch.distributed.get_rank()
+    gate = _make_repeated_d4_world_pre_gate(
+        group=world,
+        world_ranks=world_ranks,
+        global_rank=global_rank,
+        device=torch.device("cuda", torch.cuda.current_device()),
+        timeout_seconds=_D4_STARTUP_TIMEOUT_SECONDS,
+    )
+    gate(
+        global_manifest_digest=_ZERO_DIGEST,
+        plan_digest=_ZERO_DIGEST,
+        gate_id=0,
+        local_error=local_error,
+    )
+
+
+def _retire_rejected_dynamic_adapter(capability, error: BaseException) -> None:
+    """Best-effort cleanup without replacing the rank-converged rejection."""
+    if capability is None:
+        return
+    try:
+        retire_dynamic_encoder_adapter_capability(capability)
+    except BaseException as cleanup_error:
+        try:
+            error.add_note(f"MDP adapter capability cleanup also failed: {cleanup_error!r}")
+        except BaseException:
+            pass
+
+
+def _prepare_repeated_d4_adapter(args):
+    adapter = None
+    vision_config = None
+    capability = None
+    operations = None
+    local_error = None
+    try:
+        adapter, vision_config = _ADAPTER_BUILDER(args)
+        capability = mint_dynamic_encoder_adapter_capability(adapter)
+        operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    except BaseException as error:
+        local_error = error
+
+    try:
+        _converge_repeated_d4_adapter_prevalidation(local_error)
+    except MdpConfigurationError as error:
+        _retire_rejected_dynamic_adapter(capability, error)
+        raise
+    except MdpPlanError as error:
+        _retire_rejected_dynamic_adapter(capability, error)
+        raise MdpConfigurationError(
+            "MDP: repeated-D4 adapter prevalidation rejected one or more WORLD ranks."
+        ) from (local_error or error)
+    except BaseException as error:
+        raise MdpTaskFatalError(
+            "MDP: repeated-D4 adapter prevalidation collective did not complete."
+        ) from error
+    if local_error is not None:
+        _retire_rejected_dynamic_adapter(capability, local_error)
+        raise MdpConfigurationError(
+            "MDP: repeated-D4 adapter prevalidation did not preserve its local rejection."
+        ) from local_error
+    return adapter, vision_config, capability, operations
 
 
 def maybe_build_mdp_domain(
@@ -191,6 +271,8 @@ def maybe_build_mdp_domain(
     global _RUNTIME
     if not mdp_enabled(args) or optimizer is None:
         return optimizer
+    if _RUNTIME is not None:
+        raise MdpConfigurationError("MDP: runtime setup may run only once per process.")
     if _ADAPTER_BUILDER is None:
         raise MdpConfigurationError(
             "MDP: --mdp-enable is set but no adapter builder was registered. The "
@@ -216,28 +298,78 @@ def maybe_build_mdp_domain(
         )
     )
     rank_view = rank_map.view(torch.distributed.get_rank())
-    process_groups = install_mdp_process_groups(
-        rank_map,
-        group_registry=MdpGroupRegistry(),
-        decoder_pg_collection=decoder_pg_collection,
-    )
-    encoder_pgs = build_encoder_pg_collection(
-        rank_map, encoder_cp=mdp_config.encoder_cp, process_groups=process_groups
-    )
+    if mdp_config.dynamic_encoder_cp:
+        adapter, vision_config, capability, adapter_operations = _prepare_repeated_d4_adapter(args)
+    else:
+        adapter = vision_config = capability = adapter_operations = None
 
-    adapter, vision_config = _ADAPTER_BUILDER(args)
-    embedding_width = getattr(adapter, "embedding_width", args.hidden_size)
+    group_options = {}
+    if mdp_config.dynamic_encoder_cp:
+        group_options = {
+            "dynamic_encoder_cp": True,
+            "min_dynamic_encoder_cp_size": mdp_config.min_dynamic_encoder_cp_size,
+        }
+    try:
+        process_groups = install_mdp_process_groups(
+            rank_map,
+            group_registry=MdpGroupRegistry(),
+            decoder_pg_collection=decoder_pg_collection,
+            **group_options,
+        )
+        encoder_pgs = build_encoder_pg_collection(
+            rank_map, encoder_cp=mdp_config.encoder_cp, process_groups=process_groups
+        )
+    except BaseException as error:
+        if mdp_config.dynamic_encoder_cp:
+            raise MdpTaskFatalError(
+                "MDP: repeated-D4 process-group construction started and cannot retry."
+            ) from error
+        raise
+
+    if not mdp_config.dynamic_encoder_cp:
+        adapter, vision_config = _ADAPTER_BUILDER(args)
+        adapter_operations = adapter
+    dynamic_group_binding = None
+    if mdp_config.dynamic_encoder_cp:
+        try:
+            dynamic_group_binding = _make_repeated_d4_group_binding(
+                world_group=process_groups.world_group,
+                domain_group=process_groups.encoder_cp_group,
+                expert_group=(
+                    None
+                    if getattr(args, "expert_model_parallel_size", 1) == 1
+                    else getattr(decoder_pg_collection, "ep", None)
+                ),
+                global_rank=torch.distributed.get_rank(),
+                expert_parallel_size=getattr(args, "expert_model_parallel_size", 1),
+                device=torch.device("cuda", torch.cuda.current_device()),
+                timeout_seconds=_D4_STARTUP_TIMEOUT_SECONDS,
+            )
+        except BaseException as error:
+            raise MdpTaskFatalError(
+                "MDP: repeated-D4 native group binding failed after group construction."
+            ) from error
+    embedding_width = getattr(adapter_operations, "embedding_width", args.hidden_size)
     if type(embedding_width) is not int or embedding_width <= 0:
-        raise MdpConfigurationError("MDP: model adapter embedding_width must be a positive integer.")
-    encoder_domain = build_encoder_domain(
-        adapter=adapter,
-        model_config=vision_config,
-        mdp_config=mdp_config,
-        ddp_config=ddp_config,
-        optimizer_config=optimizer_config,
-        encoder_pgs=encoder_pgs,
-    )
-    assert_parameter_disjointness(encoder_domain.encoder_ddp, model)
+        raise MdpConfigurationError(
+            "MDP: model adapter embedding_width must be a positive integer."
+        )
+    try:
+        encoder_domain = build_encoder_domain(
+            adapter=adapter_operations,
+            model_config=vision_config,
+            mdp_config=mdp_config,
+            ddp_config=ddp_config,
+            optimizer_config=optimizer_config,
+            encoder_pgs=encoder_pgs,
+        )
+        assert_parameter_disjointness(encoder_domain.encoder_ddp, model)
+    except BaseException as error:
+        if mdp_config.dynamic_encoder_cp:
+            raise MdpTaskFatalError(
+                "MDP: repeated-D4 encoder/model construction started and cannot retry."
+            ) from error
+        raise
 
     if mdp_config.encoder_max_payload_rows is not None:
         logger.warning(
@@ -254,26 +386,50 @@ def maybe_build_mdp_domain(
     else:
         params_dtype = torch.float32
     allocator = DirectBufferAllocator()
-    _RUNTIME = MdpRuntime(
-        config=mdp_config,
-        rank_map=rank_map,
-        rank_view=rank_view,
-        process_groups=process_groups,
-        adapter=adapter,
-        encoder_domain=encoder_domain,
-        planner=MdpPlanner(
-            rank_view,
-            locality_slack_permille=mdp_config.locality_slack_permille,
-            capacity_policy=RowCapacityPolicy(mdp_config.row_alignment),
-            pixel_locality=mdp_config.pixel_locality,
-        ),
-        bridge=ModalityBridge(allocator),
-        storage=MdpEmbeddingStorage(allocator),
-        allocator=allocator,
-        hidden_size=embedding_width,
-        params_dtype=params_dtype,
-        num_vpp_chunks=len(model),
-    )
+    try:
+        runtime = MdpRuntime(
+            config=mdp_config,
+            rank_map=rank_map,
+            rank_view=rank_view,
+            process_groups=process_groups,
+            adapter=adapter_operations,
+            encoder_domain=encoder_domain,
+            planner=MdpPlanner(
+                rank_view,
+                locality_slack_permille=mdp_config.locality_slack_permille,
+                capacity_policy=RowCapacityPolicy(mdp_config.row_alignment),
+                pixel_locality=mdp_config.pixel_locality,
+            ),
+            bridge=ModalityBridge(allocator),
+            storage=MdpEmbeddingStorage(allocator),
+            allocator=allocator,
+            hidden_size=embedding_width,
+            params_dtype=params_dtype,
+            num_vpp_chunks=len(model),
+            dynamic_adapter_capability=capability,
+            dynamic_adapter_owner=adapter if mdp_config.dynamic_encoder_cp else None,
+            dynamic_group_binding=dynamic_group_binding,
+        )
+
+    except BaseException as error:
+        if mdp_config.dynamic_encoder_cp:
+            raise MdpTaskFatalError(
+                "MDP: repeated-D4 runtime construction started and cannot retry."
+            ) from error
+        raise
+
+    if mdp_config.dynamic_encoder_cp:
+        try:
+            from megatron.core.mdp.optimizer import build_mdp_composite_optimizer
+
+            composite_optimizer = build_mdp_composite_optimizer(
+                optimizer, encoder_domain.encoder_optimizer
+            )
+        except BaseException as error:
+            raise MdpTaskFatalError(
+                "MDP: repeated-D4 optimizer construction started and cannot retry."
+            ) from error
+    _RUNTIME = runtime
     logger.info(
         "MDP: runtime installed (outer_dp_rank=%d, worker_id=%s, endpoint=%d, "
         "workers=%d, encoder_recompute_granularity=%s)",
@@ -283,6 +439,8 @@ def maybe_build_mdp_domain(
         len(rank_view.worker_ids),
         mdp_config.encoder_recompute_granularity,
     )
+    if mdp_config.dynamic_encoder_cp:
+        return composite_optimizer
 
     from megatron.core.mdp.optimizer import build_mdp_composite_optimizer
 
@@ -360,6 +518,10 @@ def _build_d3_facade_from_mcore(runtime: MdpRuntime, config):
 def reset_for_testing() -> None:
     """Drop module state between tests."""
     global _RUNTIME, _ADAPTER_BUILDER, _D3_FACADE
+    runtime = _RUNTIME
     _RUNTIME = None
     _ADAPTER_BUILDER = None
     _D3_FACADE = None
+    capability = getattr(runtime, "dynamic_adapter_capability", None)
+    if capability is not None:
+        retire_dynamic_encoder_adapter_capability(capability)

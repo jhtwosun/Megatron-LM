@@ -18,6 +18,11 @@ from megatron.core.mdp.dynamic_cp import (
 )
 from megatron.core.mdp.dynamic_cp_execution import DecoderVisionItemMetadata
 from megatron.core.mdp.dynamic_cp_plan import EncoderWorkEstimate
+from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+    claim_dynamic_encoder_adapter_capability,
+    mint_dynamic_encoder_adapter_capability,
+    retire_dynamic_encoder_adapter_capability,
+)
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.protocols import DynamicEncoderCpBinding
 
@@ -44,6 +49,27 @@ def test_workload_query_matches_qwen_per_frame_padding(group_size, rows):
     )
 
     assert estimate == EncoderWorkEstimate(rows, 28)
+
+
+def test_exact_qwen_adapter_claims_registered_dynamic_capability():
+    adapter = Qwen35VLMdpAdapter(out_hidden_size=8)
+    capability = mint_dynamic_encoder_adapter_capability(adapter)
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+
+    assert operations.payload_width == adapter.payload_width
+    assert operations.embedding_width == 8
+    assert operations.spatial_merge_size == adapter.spatial_merge_size
+    assert operations.estimate_dynamic_encoder_workload(
+        _ITEMS, group_size=2
+    ) == EncoderWorkEstimate(14, 28)
+    retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_qwen3_vl_subclass_is_not_registered_by_qwen35_registration():
+    from examples.multimodal_dev.models.qwen3_vl.mdp import Qwen3VLMdpAdapter
+
+    with pytest.raises(MdpConfigurationError, match="exact dynamic adapter class"):
+        mint_dynamic_encoder_adapter_capability(Qwen3VLMdpAdapter(out_hidden_size=8))
 
 
 def test_workload_query_is_metadata_only_and_rank_independent():
