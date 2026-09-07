@@ -233,6 +233,7 @@ register_dynamic_encoder_adapter_class(
     encode=_StubAdapter.encode,
     freeze_vision_locator=_DynamicLocatorStubAdapter.freeze_vision_locator,
     materialize_vision_locator=_DynamicLocatorStubAdapter.materialize_vision_locator,
+    locator_model_arch="test_runtime",
 )
 
 

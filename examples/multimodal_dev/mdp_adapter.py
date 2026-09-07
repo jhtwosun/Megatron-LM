@@ -902,10 +902,15 @@ class Qwen35VLMdpAdapter:
     # Capture
     # ------------------------------------------------------------------
 
-    def get_batch(
-        self, data_iterator: Iterator, *, locator_operations=None
+    def _capture_batch(
+        self,
+        data_iterator: Iterator,
+        *,
+        locator_operations,
+        expected_locator_arch: str,
+        raw_batch_validator=None,
     ) -> Optional[CapturedMicrobatch]:
-        """One microbatch through the native THD collation path.
+        """Shared one-microbatch capture with model-owned pre-pack validation.
 
         Requires the vision sidecar (``--mdp-enable`` makes the collator emit
         it), from which the per-item records and decoder positions are cut.
@@ -914,11 +919,27 @@ class Qwen35VLMdpAdapter:
         """
         from examples.multimodal_dev.forward_step import get_batch
 
+        capture_iterator = data_iterator
+        if raw_batch_validator is not None:
+
+            def validated_iterator():
+                try:
+                    raw_batch = next(data_iterator)
+                except StopIteration:
+                    return
+                raw_batch_validator(raw_batch)
+                yield raw_batch
+
+            capture_iterator = validated_iterator()
         if locator_operations is None:
-            batch = get_batch(data_iterator)
+            batch = get_batch(capture_iterator)
             capture_mode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR
         else:
-            batch = get_batch(data_iterator, locator_operations=locator_operations)
+            batch = get_batch(
+                capture_iterator,
+                locator_operations=locator_operations,
+                expected_locator_arch=expected_locator_arch,
+            )
             capture_mode = VisionCaptureMode.STABLE_LOCATOR_CATALOG
         if batch is None:
             return None
@@ -973,6 +994,16 @@ class Qwen35VLMdpAdapter:
             model_payload=MappingProxyType(batch),
             vision_capture_mode=capture_mode,
             vision_locators=locators,
+        )
+
+    def get_batch(
+        self, data_iterator: Iterator, *, locator_operations=None
+    ) -> Optional[CapturedMicrobatch]:
+        """Capture Qwen through the shared native THD sidecar path."""
+        return self._capture_batch(
+            data_iterator,
+            locator_operations=locator_operations,
+            expected_locator_arch="qwen35_vl",
         )
 
     def freeze_vision_locator(
@@ -1140,6 +1171,7 @@ register_dynamic_encoder_adapter_class(
     encode=Qwen35VLMdpAdapter.encode,
     freeze_vision_locator=Qwen35VLMdpAdapter.freeze_vision_locator,
     materialize_vision_locator=Qwen35VLMdpAdapter.materialize_vision_locator,
+    locator_model_arch="qwen35_vl",
 )
 
 

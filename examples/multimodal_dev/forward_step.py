@@ -832,7 +832,7 @@ def _prepare_energon_batch(data, args):
     )
 
 
-def _locator_capture_root(args, group, locator_operations):
+def _locator_capture_root(args, group, locator_operations, expected_locator_arch):
     """Validate the exact locator launch/escrow pair before dataset advance."""
     from examples.multimodal_dev.data.energon.materializer import validate_locator_dataset_root
     from megatron.core.mdp.dynamic_encoder_adapter_capability import (
@@ -861,8 +861,15 @@ def _locator_capture_root(args, group, locator_operations):
         raise MdpConfigurationError("MDP: stable locator capture requires mdp_enable exact True.")
     if getattr(args, "dataset_provider", None) != "energon":
         raise MdpConfigurationError("MDP: stable locator capture requires exact energon data.")
-    if getattr(args, "model_arch", None) != "qwen35_vl":
-        raise MdpConfigurationError("MDP: this locator capture path requires exact qwen35_vl.")
+    if (
+        type(expected_locator_arch) is not str
+        or not expected_locator_arch
+        or getattr(args, "model_arch", None) != expected_locator_arch
+        or locator_operations.locator_model_arch != expected_locator_arch
+    ):
+        raise MdpConfigurationError(
+            "MDP: locator launch, adapter, and operation escrow model arch must match exactly."
+        )
     if getattr(args, "use_packed_sequence", None) is not True:
         raise MdpConfigurationError("MDP: stable locator capture requires packed THD batches.")
     if torch.distributed.get_world_size(group=group) != 1:
@@ -899,14 +906,19 @@ def _freeze_batch_vision_locators(data, *, dataset_root, locator_operations):
 
 
 def get_batch(
-    data_iterator: Iterator[list[Dict[str, Any]]], *, locator_operations=None
+    data_iterator: Iterator[list[Dict[str, Any]]],
+    *,
+    locator_operations=None,
+    expected_locator_arch=None,
 ):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
 
     group = get_tensor_model_parallel_group()
-    locator_root = _locator_capture_root(args, group, locator_operations)
+    locator_root = _locator_capture_root(
+        args, group, locator_operations, expected_locator_arch
+    )
     vision_locators = ()
     # Single-member TP group: skip the device flag tensor and the broadcast
     # entirely. Behavior-identical, and it keeps the MDP window-capture

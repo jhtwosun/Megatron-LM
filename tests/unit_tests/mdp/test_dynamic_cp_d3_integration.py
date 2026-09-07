@@ -235,6 +235,7 @@ register_dynamic_encoder_adapter_class(
     encode=_DynamicAdapter.encode,
     freeze_vision_locator=_DynamicAdapter.freeze_vision_locator,
     materialize_vision_locator=_DynamicAdapter.materialize_vision_locator,
+    locator_model_arch="test_dynamic_adapter",
 )
 
 

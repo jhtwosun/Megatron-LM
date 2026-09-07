@@ -79,8 +79,10 @@ def test_qwen_source_capture_keeps_forward_call_and_pixel_carrier_unchanged(monk
     operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
     pixels = torch.ones(4, adapter.payload_width, dtype=torch.bfloat16)
 
+    next_calls = []
+
     def get_batch(iterator):
-        assert iterator == "iterator"
+        next_calls.append(next(iterator))
         return {
             "vision_item_meta": torch.tensor([[0, 0, 1, 2, 2, 0]], dtype=torch.long),
             "vision_decoder_positions": torch.tensor([3], dtype=torch.long),
@@ -90,7 +92,8 @@ def test_qwen_source_capture_keeps_forward_call_and_pixel_carrier_unchanged(monk
 
     monkeypatch.setattr(forward_step, "get_batch", get_batch)
     try:
-        captured = operations.get_batch("iterator")
+        captured = operations.get_batch(iter(("source-batch",)))
+        assert next_calls == ["source-batch"]
         assert captured.vision_capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR
         assert captured.vision_locators == ()
         assert captured.flat_pixel_payload is pixels
@@ -116,8 +119,8 @@ def test_qwen_locator_capability_reaches_adapter_before_capture_and_emits_no_pix
     )
     seen = []
 
-    def get_batch(iterator, *, locator_operations=None):
-        seen.append((iterator, locator_operations))
+    def get_batch(iterator, *, locator_operations=None, expected_locator_arch=None):
+        seen.append((iterator, locator_operations, expected_locator_arch))
         return {
             "vision_item_meta": torch.tensor([[0, 0, 1, 2, 2, 0]], dtype=torch.long),
             "vision_decoder_positions": torch.tensor([3], dtype=torch.long),
@@ -129,7 +132,8 @@ def test_qwen_locator_capability_reaches_adapter_before_capture_and_emits_no_pix
     try:
         captured = operations.get_batch("iterator")
         assert type(operations) is DynamicEncoderLocatorAdapterOperations
-        assert seen == [("iterator", operations)]
+        assert operations.locator_model_arch == "qwen35_vl"
+        assert seen == [("iterator", operations, "qwen35_vl")]
         assert captured.vision_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
         assert captured.vision_locators == (locator,)
         assert captured.flat_pixel_payload is None
@@ -171,7 +175,9 @@ def test_qwen_locator_adapter_rejects_ambiguous_or_misaligned_carriers(
     }
     batch.update(batch_change)
     monkeypatch.setattr(
-        forward_step, "get_batch", lambda iterator, *, locator_operations=None: dict(batch)
+        forward_step,
+        "get_batch",
+        lambda iterator, *, locator_operations=None, expected_locator_arch=None: dict(batch),
     )
 
     try:

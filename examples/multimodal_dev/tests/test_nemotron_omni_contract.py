@@ -614,6 +614,7 @@ def test_adapter_capture_uses_literal_unequal_multi_image_geometry(monkeypatch):
     generic_pack_calls = []
 
     def generic_pack(_iterator):
+        next(_iterator)
         generic_pack_calls.append("pack")
         return dict(prepared)
 
@@ -645,6 +646,245 @@ def test_adapter_capture_uses_literal_unequal_multi_image_geometry(monkeypatch):
     assert len(first.decoder_positions) == len(second.decoder_positions) == 6
 
 
+def _locator_operations(adapter):
+    from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+        claim_dynamic_encoder_adapter_capability,
+        mint_dynamic_encoder_adapter_capability,
+    )
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    return capability, claim_dynamic_encoder_adapter_capability(adapter, capability)
+
+
+def _locator(grid=(1, 4, 6)):
+    from megatron.core.mdp.vision_locator import (
+        VisionDataLocator,
+        VisionLocatorIndexSentinel,
+        VisionLocatorKind,
+    )
+
+    return VisionDataLocator(
+        VisionLocatorKind.SHARED_FILE,
+        "/datasets/train/image.jpg",
+        None,
+        None,
+        VisionLocatorIndexSentinel.UNUSED,
+        grid,
+        (grid[1] * 16, grid[2] * 16),
+    )
+
+
+def test_locator_capability_passes_exact_nemotron_arch_and_returns_no_pixel_carrier(monkeypatch):
+    mdp_module = _load("mdp")
+    from examples.multimodal_dev import forward_step
+    from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+        retire_dynamic_encoder_adapter_capability,
+    )
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    adapter = mdp_module.NemotronOmniMdpAdapter(out_hidden_size=8)
+    capability, operations = _locator_operations(adapter)
+    adapter.locator_model_arch = "mutated-instance"
+    monkeypatch.setattr(type(adapter), "locator_model_arch", "mutated-class", raising=False)
+    locator = _locator()
+    positions = (1, 3, 5, 7, 9, 11)
+    prepared = _packed_sidecar_batch(((7, 0, 1, 4, 6, 0),), positions, None)
+    prepared["vision_locators"] = (locator,)
+    calls = []
+
+    def generic(iterator, *, locator_operations=None, expected_locator_arch=None):
+        calls.append((next(iterator), locator_operations, expected_locator_arch))
+        return dict(prepared)
+
+    monkeypatch.setattr(forward_step, "get_batch", generic)
+    raw = _OneShotIterator([{"input_ids": torch.tensor([1, 2, 3])}])
+    try:
+        captured = operations.get_batch(raw)
+        assert operations.locator_model_arch == "nemotron_omni"
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+    assert raw.next_calls == 1
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0][0][0]["input_ids"], torch.tensor([1, 2, 3]))
+    assert calls[0][1:] == (operations, "nemotron_omni")
+    assert captured.vision_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    assert captured.vision_locators == (locator,)
+    assert captured.flat_pixel_payload is None
+    assert captured.vision_items[0].grid_thw == (1, 4, 6)
+    assert len(captured.vision_items[0].decoder_positions) == 6
+
+
+@pytest.mark.parametrize("adapter_arch", ["qwen35_vl", "nemotron_omni"])
+def test_locator_launch_arch_mismatch_rejects_before_iterator(monkeypatch, adapter_arch):
+    mdp_module = _load("mdp")
+    from examples.multimodal_dev import forward_step
+    from examples.multimodal_dev.mdp_adapter import Qwen35VLMdpAdapter
+    from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+        retire_dynamic_encoder_adapter_capability,
+    )
+    from megatron.core.mdp.errors import MdpConfigurationError
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    adapter = (
+        Qwen35VLMdpAdapter(out_hidden_size=8)
+        if adapter_arch == "qwen35_vl"
+        else mdp_module.NemotronOmniMdpAdapter(out_hidden_size=8)
+    )
+    capability, operations = _locator_operations(adapter)
+    args = SimpleNamespace(
+        model_arch="nemotron_omni" if adapter_arch == "qwen35_vl" else "qwen35_vl",
+        dataset_provider="energon",
+        energon_path="/datasets/train",
+        use_packed_sequence=True,
+        seq_length=32,
+        mdp_enable=True,
+        mdp_vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+    )
+    monkeypatch.setattr(forward_step, "get_args", lambda: args)
+    monkeypatch.setattr(forward_step, "get_tensor_model_parallel_group", lambda: object())
+    monkeypatch.setattr(forward_step.torch.distributed, "get_world_size", lambda group=None: 1)
+
+    class _ForbiddenIterator:
+        def __next__(self):
+            pytest.fail("crossed locator arch advanced the iterator")
+
+    try:
+        with pytest.raises(MdpConfigurationError, match="arch|model|qwen|nemotron"):
+            operations.get_batch(_ForbiddenIterator())
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
+@pytest.mark.parametrize("target_arch", ["qwen35_vl", "nemotron_omni"])
+def test_crossed_model_locator_escrow_rejects_before_iterator(monkeypatch, target_arch):
+    mdp_module = _load("mdp")
+    from examples.multimodal_dev import forward_step
+    from examples.multimodal_dev.mdp_adapter import Qwen35VLMdpAdapter
+    from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+        retire_dynamic_encoder_adapter_capability,
+    )
+    from megatron.core.mdp.errors import MdpConfigurationError
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    adapters = {
+        "qwen35_vl": Qwen35VLMdpAdapter(out_hidden_size=8),
+        "nemotron_omni": mdp_module.NemotronOmniMdpAdapter(out_hidden_size=8),
+    }
+    foreign_arch = "nemotron_omni" if target_arch == "qwen35_vl" else "qwen35_vl"
+    target = adapters[target_arch]
+    foreign_capability, foreign_operations = _locator_operations(adapters[foreign_arch])
+    args = SimpleNamespace(
+        model_arch=target_arch,
+        dataset_provider="energon",
+        energon_path="/datasets/train",
+        use_packed_sequence=True,
+        seq_length=32,
+        mdp_enable=True,
+        mdp_vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+    )
+    monkeypatch.setattr(forward_step, "get_args", lambda: args)
+    monkeypatch.setattr(forward_step, "get_tensor_model_parallel_group", lambda: object())
+    monkeypatch.setattr(forward_step.torch.distributed, "get_world_size", lambda group=None: 1)
+
+    class _ForbiddenIterator:
+        def __next__(self):
+            pytest.fail("crossed model locator escrow advanced the iterator")
+
+    try:
+        with pytest.raises(MdpConfigurationError, match="arch|model|qwen|nemotron"):
+            target.get_batch(_ForbiddenIterator(), locator_operations=foreign_operations)
+    finally:
+        retire_dynamic_encoder_adapter_capability(foreign_capability)
+
+
+def test_nemotron_locator_raw_modality_rejects_before_generic_prepare_or_pack(monkeypatch):
+    mdp_module = _load("mdp")
+    from examples.multimodal_dev import forward_step
+    from examples.multimodal_dev.data.energon import materializer as generic
+    from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+        retire_dynamic_encoder_adapter_capability,
+    )
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    adapter = mdp_module.NemotronOmniMdpAdapter(out_hidden_size=8)
+    capability, operations = _locator_operations(adapter)
+    args = SimpleNamespace(
+        model_arch="nemotron_omni",
+        dataset_provider="energon",
+        energon_path="/datasets/train",
+        use_packed_sequence=True,
+        seq_length=32,
+        mdp_enable=True,
+        mdp_vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+    )
+    monkeypatch.setattr(forward_step, "get_args", lambda: args)
+    monkeypatch.setattr(forward_step, "get_tensor_model_parallel_group", lambda: object())
+    monkeypatch.setattr(forward_step.torch.distributed, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(
+        generic,
+        "prepare_energon_batch",
+        lambda *args, **kwargs: pytest.fail("invalid modality reached generic prepare"),
+    )
+    monkeypatch.setattr(
+        forward_step,
+        "pack_or_pad_batch",
+        lambda *args, **kwargs: pytest.fail("invalid modality reached generic pack"),
+    )
+    raw = _OneShotIterator([{"input_ids": torch.tensor([1]), "audio": object()}])
+    try:
+        with pytest.raises(ValueError, match="image-only|audio|sound"):
+            operations.get_batch(raw)
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+    assert raw.next_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("meta", "positions", "locator_grid", "expected_exception", "message"),
+    [
+        (((7, 0, 2, 4, 6, 0),), tuple(range(12)), (2, 4, 6), ValueError, "image-only|t=1"),
+        (((7, 0, 1, 3, 4, 0),), (1, 2), (1, 3, 4), ValueError, "even"),
+        (
+            ((7, 0, 1, 4, 6, 0),),
+            (1, 2, 3, 4, 5),
+            (1, 4, 6),
+            RuntimeError,
+            "sidecar mismatch|consumed",
+        ),
+    ],
+)
+def test_locator_capture_preserves_nemotron_radio_geometry_validation(
+    monkeypatch, meta, positions, locator_grid, expected_exception, message
+):
+    mdp_module = _load("mdp")
+    from examples.multimodal_dev import forward_step
+    from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+        retire_dynamic_encoder_adapter_capability,
+    )
+
+    adapter = mdp_module.NemotronOmniMdpAdapter(out_hidden_size=8)
+    capability, operations = _locator_operations(adapter)
+    prepared = _packed_sidecar_batch(meta, positions, None)
+    prepared["vision_locators"] = (_locator(locator_grid),)
+
+    def generic(iterator, *, locator_operations=None, expected_locator_arch=None):
+        next(iterator)
+        assert locator_operations is operations
+        assert expected_locator_arch == "nemotron_omni"
+        return dict(prepared)
+
+    monkeypatch.setattr(forward_step, "get_batch", generic)
+    try:
+        with pytest.raises(expected_exception, match=message):
+            operations.get_batch(_OneShotIterator([{"input_ids": torch.tensor([1])}]))
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
 def test_pixel_owner_shard_accepts_metadata_only_only_inside_suppressed_capture(monkeypatch):
     mdp_module = _load("mdp")
     from examples.multimodal_dev import forward_step
@@ -657,6 +897,7 @@ def test_pixel_owner_shard_accepts_metadata_only_only_inside_suppressed_capture(
     calls = []
 
     def owner_aware_pack(_iterator):
+        next(_iterator)
         suppressed = pixel_capture_suppressed()
         calls.append(suppressed)
         return _packed_sidecar_batch(meta, positions, None if suppressed else pixels)
@@ -689,6 +930,7 @@ def test_pixel_owner_shard_accepts_metadata_only_only_inside_suppressed_capture(
 
     # The same metadata-only capture is malformed outside the ownership context.
     def unsuppressed_metadata_only_pack(_iterator):
+        next(_iterator)
         suppressed = pixel_capture_suppressed()
         calls.append(suppressed)
         return _packed_sidecar_batch(meta, positions, None)
@@ -733,6 +975,7 @@ def test_malformed_capture_fails_before_radio(monkeypatch, failure, match):
     radio_calls = []
 
     def generic_pack(_iterator):
+        next(_iterator)
         generic_pack_calls.append("pack")
         return dict(prepared)
 
@@ -791,8 +1034,12 @@ def test_raw_sound_or_video_fails_before_generic_packing_or_planning(monkeypatch
         reached.append("generic-pack")
         raise AssertionError("generic packing was reached")
 
+    def capture_entry(iterator):
+        next(iterator)
+        unexpected_pack()
+
     monkeypatch.setattr(Qwen35VLMdpAdapter, "get_batch", unexpected_pack)
-    monkeypatch.setattr(forward_step, "get_batch", unexpected_pack)
+    monkeypatch.setattr(forward_step, "get_batch", capture_entry)
     raw = _OneShotIterator(batch)
     adapter = mdp_module.NemotronOmniMdpAdapter(out_hidden_size=4)
     with pytest.raises(ValueError, match=match):

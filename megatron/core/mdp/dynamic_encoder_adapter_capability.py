@@ -39,6 +39,7 @@ class _AdapterRegistration:
     encode: Callable[..., Any] = field(repr=False, compare=False)
     freeze_vision_locator: Callable[..., Any] | None = field(repr=False, compare=False)
     materialize_vision_locator: Callable[..., Any] | None = field(repr=False, compare=False)
+    locator_model_arch: str | None
     _seal: object = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -142,6 +143,13 @@ class DynamicEncoderLocatorAdapterOperations(DynamicEncoderAdapterOperations):
         ):
             raise MdpConfigurationError("MDP: core mints locator adapter operation escrows.")
 
+    @property
+    def locator_model_arch(self) -> str:
+        """Return the exact model identity frozen in this active escrow."""
+        record = self._record
+        self._adapter()
+        return record.registration.locator_model_arch
+
     def get_batch(self, data_iterator: Any) -> Any:
         """Capture through the registered operation with this exact v2 escrow."""
         record = self._record
@@ -213,6 +221,7 @@ def register_dynamic_encoder_adapter_class(
     encode: Callable[..., Any],
     freeze_vision_locator: Callable[..., Any] | None = None,
     materialize_vision_locator: Callable[..., Any] | None = None,
+    locator_model_arch: str | None = None,
 ) -> None:
     """Register one exact adapter class and its explicitly chosen operations.
 
@@ -225,10 +234,14 @@ def register_dynamic_encoder_adapter_class(
         raise MdpConfigurationError("MDP: dynamic adapter class is already registered.")
     has_freeze = freeze_vision_locator is not None
     has_materialize = materialize_vision_locator is not None
-    if has_freeze != has_materialize:
+    has_model_arch = locator_model_arch is not None
+    if has_freeze != has_materialize or has_freeze != has_model_arch:
         raise MdpConfigurationError(
-            "MDP: dynamic adapter registration has complete locator operations or neither."
+            "MDP: dynamic adapter registration has complete locator operations and "
+            "locator model arch, or none of them."
         )
+    if has_model_arch and (type(locator_model_arch) is not str or not locator_model_arch):
+        raise MdpConfigurationError("MDP: locator model arch is an exact non-empty string.")
     get_batch = _require_unbound_method(adapter_class, "get_batch", get_batch)
     if has_freeze:
         try:
@@ -279,6 +292,7 @@ def register_dynamic_encoder_adapter_class(
         encode=_require_unbound_method(adapter_class, "encode", encode),
         freeze_vision_locator=freeze_vision_locator,
         materialize_vision_locator=materialize_vision_locator,
+        locator_model_arch=locator_model_arch,
         _seal=_REGISTRATION_SEAL,
     )
     _ADAPTER_CLASSES[adapter_class] = registration

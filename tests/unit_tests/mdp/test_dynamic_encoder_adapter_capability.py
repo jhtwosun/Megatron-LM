@@ -99,6 +99,10 @@ class _HostileSignatureLocatorAdapter(_Adapter):
 _HostileSignatureLocatorAdapter.get_batch.__signature__ = object()
 
 
+class _StringSubclass(str):
+    pass
+
+
 @pytest.fixture(autouse=True)
 def _isolated_registry():
     registrations = (
@@ -128,6 +132,7 @@ def _register(adapter_class=_Adapter, *, locator=False, **overrides):
         operations.update(
             freeze_vision_locator=adapter_class.freeze_vision_locator,
             materialize_vision_locator=adapter_class.materialize_vision_locator,
+            locator_model_arch="test_adapter",
         )
     operations.update(overrides)
     register_dynamic_encoder_adapter_class(adapter_class, **operations)
@@ -201,6 +206,7 @@ def test_locator_schema_escrows_complete_operations_before_live_mutation(monkeyp
 
     assert type(operations) is DynamicEncoderLocatorAdapterOperations
     assert operations.schema_version == 2
+    assert operations.locator_model_arch == "test_adapter"
     assert tuple(field.name for field in dataclasses.fields(operations)) == (
         "payload_width",
         "embedding_width",
@@ -278,6 +284,40 @@ def test_registration_rejects_incomplete_locator_operation_pair(locator_operatio
         ),
     )
     assert type(operations) is DynamicEncoderLocatorAdapterOperations
+
+
+@pytest.mark.parametrize(
+    ("locator", "overrides"),
+    [
+        (
+            False,
+            {
+                "freeze_vision_locator": _Adapter.freeze_vision_locator,
+                "materialize_vision_locator": _Adapter.materialize_vision_locator,
+            },
+        ),
+        (False, {"locator_model_arch": "test_adapter"}),
+        (True, {"locator_model_arch": None}),
+        (True, {"locator_model_arch": ""}),
+        (True, {"locator_model_arch": 1}),
+        (True, {"locator_model_arch": _StringSubclass("test_adapter")}),
+    ],
+)
+def test_registration_requires_exact_locator_model_arch_with_complete_operations(
+    locator, overrides
+):
+    with pytest.raises(MdpConfigurationError, match="locator.*model.*arch|model.*arch"):
+        _register(locator=locator, **overrides)
+
+    _register(locator=True)
+    adapter = _Adapter()
+    operations = claim_dynamic_encoder_adapter_capability(
+        adapter,
+        mint_dynamic_encoder_adapter_capability(
+            adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        ),
+    )
+    assert operations.locator_model_arch == "test_adapter"
 
 
 @pytest.mark.parametrize(

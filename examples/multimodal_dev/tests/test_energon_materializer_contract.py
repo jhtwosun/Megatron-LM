@@ -105,7 +105,7 @@ def test_mock_batch_is_byte_for_byte_untouched(monkeypatch):
         ("mdp_false", "MDP|mdp"),
         ("mdp_nonbool", "exact|True"),
         ("provider", "energon"),
-        ("model", "qwen35_vl|Qwen"),
+        ("model", "model arch|match"),
         ("unpacked", "packed|THD"),
         ("tp", "TP=1|tensor"),
         ("missing_root", "root|path"),
@@ -182,7 +182,11 @@ def test_locator_forward_prerequisites_reject_before_iterator(monkeypatch, fault
 
     try:
         with pytest.raises(MdpConfigurationError, match=message):
-            forward_step.get_batch(_ForbiddenIterator(), locator_operations=operations)
+            forward_step.get_batch(
+                _ForbiddenIterator(),
+                locator_operations=operations,
+                expected_locator_arch="qwen35_vl",
+            )
     finally:
         if extra_capability is not None:
             retire_dynamic_encoder_adapter_capability(extra_capability)
@@ -265,7 +269,9 @@ def test_locator_forward_freezes_multi_document_cpu_sidecar_through_escrow(monke
     monkeypatch.setattr(generic, "load_descriptor_image", forbidden_live)
 
     try:
-        batch = forward_step.get_batch(iter((documents,)), locator_operations=operations)
+        batch = forward_step.get_batch(
+            iter((documents,)), locator_operations=operations, expected_locator_arch="qwen35_vl"
+        )
     finally:
         retire_dynamic_encoder_adapter_capability(capability)
 
@@ -345,7 +351,9 @@ def test_locator_forward_text_only_emits_exact_empty_locator_tuple(monkeypatch):
     )
 
     try:
-        batch = forward_step.get_batch(iter(([document],)), locator_operations=operations)
+        batch = forward_step.get_batch(
+            iter(([document],)), locator_operations=operations, expected_locator_arch="qwen35_vl"
+        )
     finally:
         retire_dynamic_encoder_adapter_capability(capability)
 
@@ -410,7 +418,9 @@ def test_locator_forward_invalid_second_descriptor_consumes_once_and_returns_not
 
     try:
         with pytest.raises((MdpConfigurationError, ValueError), match="bytes|inline|locator"):
-            forward_step.get_batch(_OneBatch(), locator_operations=operations)
+            forward_step.get_batch(
+                _OneBatch(), locator_operations=operations, expected_locator_arch="qwen35_vl"
+            )
     finally:
         retire_dynamic_encoder_adapter_capability(capability)
 

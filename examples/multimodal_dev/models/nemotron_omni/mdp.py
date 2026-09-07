@@ -29,6 +29,7 @@ from megatron.core.mdp.dynamic_encoder_adapter_capability import (
     register_dynamic_encoder_adapter_class,
 )
 from megatron.core.mdp.errors import MdpConfigurationError
+from megatron.core.mdp.protocols import VisionCaptureMode
 
 
 def validate_nemotron_omni_raw_batch(raw_batch) -> None:
@@ -147,14 +148,14 @@ class NemotronOmniMdpAdapter(Qwen35VLMdpAdapter):
             size_attribute=None,
         )
 
-    def get_batch(self, data_iterator):
+    def get_batch(self, data_iterator, *, locator_operations=None):
         """Validate the one raw batch, then reuse native packed sidecar capture."""
-        try:
-            raw_batch = next(data_iterator)
-        except StopIteration:
-            return None
-        validate_nemotron_omni_raw_batch(raw_batch)
-        captured = super().get_batch(iter((raw_batch,)))
+        captured = self._capture_batch(
+            data_iterator,
+            locator_operations=locator_operations,
+            expected_locator_arch="nemotron_omni",
+            raw_batch_validator=validate_nemotron_omni_raw_batch,
+        )
         if captured is None:
             return None
 
@@ -198,12 +199,32 @@ class NemotronOmniMdpAdapter(Qwen35VLMdpAdapter):
                     "Nemotron Omni payload row count does not match captured item metadata: "
                     f"expected {expected_payload_start}, got {pixels.shape[0]}."
                 )
-        elif expected_payload_start:
+        elif (
+            expected_payload_start
+            and captured.vision_capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+        ):
             from megatron.core.mdp.window import pixel_capture_suppressed
 
             if not pixel_capture_suppressed():
                 raise ValueError("Nemotron Omni captured image metadata without a pixel payload.")
         return captured
+
+    def freeze_vision_locator(self, descriptor, *, dataset_root, grid_thw, declared_dimensions):
+        """Freeze one Nemotron descriptor through its model-owned Energon contract."""
+        from examples.multimodal_dev.models.nemotron_omni.energon import freeze_vision_locator
+
+        return freeze_vision_locator(
+            descriptor,
+            dataset_root=dataset_root,
+            grid_thw=grid_thw,
+            declared_dimensions=declared_dimensions,
+        )
+
+    def materialize_vision_locator(self, locator):
+        """Materialize one locator through the model-owned Nemotron contract."""
+        from examples.multimodal_dev.models.nemotron_omni.energon import materialize_vision_locator
+
+        return materialize_vision_locator(locator)
 
     def build_encoder(self, model_config, *, pg_collection):
         if self._language_config is None:
@@ -246,6 +267,9 @@ register_dynamic_encoder_adapter_class(
     build_encoder=NemotronOmniMdpAdapter.build_encoder,
     bind_dynamic_encoder_cp=NemotronOmniMdpAdapter.bind_dynamic_encoder_cp,
     encode=NemotronOmniMdpAdapter.encode,
+    freeze_vision_locator=NemotronOmniMdpAdapter.freeze_vision_locator,
+    materialize_vision_locator=NemotronOmniMdpAdapter.materialize_vision_locator,
+    locator_model_arch="nemotron_omni",
 )
 
 
