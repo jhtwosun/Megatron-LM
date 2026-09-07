@@ -83,6 +83,10 @@ class _Adapter:
             raise OSError("one local image read failed")
         return locator.path.encode()
 
+    def prepare_materialized_vision_payloads(self, locators, encoded_payloads):
+        rows = sum(t * h * w for t, h, w in (locator.grid_thw for locator in locators))
+        return torch.empty(rows, self.payload_width)
+
 
 def _memberships(rank):
     domain_start = rank // 4 * 4
@@ -123,6 +127,7 @@ def _registered_adapter():
         encode=_Adapter.encode,
         freeze_vision_locator=_Adapter.freeze_vision_locator,
         materialize_vision_locator=_Adapter.materialize_vision_locator,
+        prepare_materialized_vision_payloads=_Adapter.prepare_materialized_vision_payloads,
         locator_model_arch="test_locator",
     )
     yield

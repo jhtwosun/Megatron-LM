@@ -223,6 +223,10 @@ class _DynamicAdapter:
     def materialize_vision_locator(self, locator):
         return locator
 
+    def prepare_materialized_vision_payloads(self, locators, encoded_payloads):
+        rows = sum(t * h * w for t, h, w in (locator.grid_thw for locator in locators))
+        return torch.empty(rows, self.payload_width)
+
 
 register_dynamic_encoder_adapter_class(
     _DynamicAdapter,
@@ -235,6 +239,7 @@ register_dynamic_encoder_adapter_class(
     encode=_DynamicAdapter.encode,
     freeze_vision_locator=_DynamicAdapter.freeze_vision_locator,
     materialize_vision_locator=_DynamicAdapter.materialize_vision_locator,
+    prepare_materialized_vision_payloads=_DynamicAdapter.prepare_materialized_vision_payloads,
     locator_model_arch="test_dynamic_adapter",
 )
 

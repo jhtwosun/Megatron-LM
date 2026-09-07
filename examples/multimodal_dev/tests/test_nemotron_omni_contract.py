@@ -718,6 +718,71 @@ def test_locator_capability_passes_exact_nemotron_arch_and_returns_no_pixel_carr
     assert len(captured.vision_items[0].decoder_positions) == 6
 
 
+def test_locator_payload_preparation_reuses_radio_materializer_and_escrow(monkeypatch):
+    mdp_module = _load("mdp")
+    energon = _load("energon")
+    from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+        retire_dynamic_encoder_adapter_capability,
+    )
+
+    adapter = mdp_module.NemotronOmniMdpAdapter(out_hidden_size=8)
+    capability, operations = _locator_operations(adapter)
+    prepared = torch.arange(24 * adapter.payload_width, dtype=torch.float32).reshape(
+        24, adapter.payload_width
+    )
+    calls = []
+    builds = []
+
+    def build_image_materializer(*, args):
+        assert args is None
+        builds.append(args)
+
+        def materialize(descriptors, grids):
+            calls.append((descriptors, grids))
+            return prepared if descriptors else torch.empty(0, adapter.payload_width)
+
+        return materialize
+
+    monkeypatch.setattr(energon, "build_image_materializer", build_image_materializer)
+    monkeypatch.setattr(
+        adapter,
+        "prepare_materialized_vision_payloads",
+        lambda *_args: pytest.fail("read mutated live RADIO payload preparation"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        type(adapter),
+        "prepare_materialized_vision_payloads",
+        lambda *_args: pytest.fail("read mutated class RADIO payload preparation"),
+        raising=False,
+    )
+    locator = _locator()
+    try:
+        actual = operations.prepare_materialized_vision_payloads(
+            (locator,), (b"encoded-radio-image",)
+        )
+        assert actual is prepared
+        descriptors, grids = calls.pop()
+        assert descriptors == (
+            {
+                "kind": "image_bytes",
+                "encoded_image": b"encoded-radio-image",
+                "grid_thw": (1, 4, 6),
+                "height": 64,
+                "width": 96,
+            },
+        )
+        torch.testing.assert_close(grids, torch.tensor(((1, 4, 6),)))
+        assert grids.dtype is torch.int64 and grids.device.type == "cpu"
+        assert grids.shape == (1, 3)
+        empty = operations.prepare_materialized_vision_payloads((), ())
+        assert empty.shape == (0, adapter.payload_width)
+        assert empty.dtype is torch.float32 and empty.device.type == "cpu"
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+    assert builds == [None, None]
+
+
 @pytest.mark.parametrize("adapter_arch", ["qwen35_vl", "nemotron_omni"])
 def test_locator_launch_arch_mismatch_rejects_before_iterator(monkeypatch, adapter_arch):
     mdp_module = _load("mdp")

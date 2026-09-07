@@ -226,6 +226,25 @@ class NemotronOmniMdpAdapter(Qwen35VLMdpAdapter):
 
         return materialize_vision_locator(locator)
 
+    def prepare_materialized_vision_payloads(self, locators, encoded_payloads):
+        """Decode and patchify exact in-memory payloads with RADIO's materializer."""
+        from examples.multimodal_dev.models.nemotron_omni.energon import build_image_materializer
+
+        descriptors = []
+        for locator, payload in zip(locators, encoded_payloads, strict=True):
+            descriptor = {
+                "kind": "image_bytes",
+                "encoded_image": payload,
+                "grid_thw": locator.grid_thw,
+            }
+            if locator.declared_dimensions is not None:
+                descriptor["height"], descriptor["width"] = locator.declared_dimensions
+            descriptors.append(descriptor)
+        grids = torch.tensor(
+            [locator.grid_thw for locator in locators], dtype=torch.int64, device="cpu"
+        ).reshape(-1, 3)
+        return build_image_materializer(args=None)(tuple(descriptors), grids)
+
     def build_encoder(self, model_config, *, pg_collection):
         if self._language_config is None:
             raise RuntimeError("Nemotron Omni encoder construction requires the language config.")
@@ -269,6 +288,9 @@ register_dynamic_encoder_adapter_class(
     encode=NemotronOmniMdpAdapter.encode,
     freeze_vision_locator=NemotronOmniMdpAdapter.freeze_vision_locator,
     materialize_vision_locator=NemotronOmniMdpAdapter.materialize_vision_locator,
+    prepare_materialized_vision_payloads=(
+        NemotronOmniMdpAdapter.prepare_materialized_vision_payloads
+    ),
     locator_model_arch="nemotron_omni",
 )
 

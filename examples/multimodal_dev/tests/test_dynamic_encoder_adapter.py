@@ -142,6 +142,90 @@ def test_qwen_locator_capability_reaches_adapter_before_capture_and_emits_no_pix
         retire_dynamic_encoder_adapter_capability(capability)
 
 
+def test_qwen_locator_payload_preparation_reuses_model_materializer_and_escrow(monkeypatch):
+    from examples.multimodal_dev.models.qwen35_vl import energon
+
+    adapter = Qwen35VLMdpAdapter(out_hidden_size=8)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    prepared = torch.arange(8 * adapter.payload_width, dtype=torch.float32).reshape(
+        8, adapter.payload_width
+    )
+    calls = []
+    builds = []
+
+    def build_image_materializer(*, args):
+        assert args is None
+        builds.append(args)
+
+        def materialize(descriptors, grids):
+            calls.append((descriptors, grids))
+            return prepared if descriptors else torch.empty(0, adapter.payload_width)
+
+        return materialize
+
+    monkeypatch.setattr(energon, "build_image_materializer", build_image_materializer)
+    monkeypatch.setattr(
+        adapter,
+        "prepare_materialized_vision_payloads",
+        lambda *_args: pytest.fail("read mutated live payload preparation"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        Qwen35VLMdpAdapter,
+        "prepare_materialized_vision_payloads",
+        lambda *_args: pytest.fail("read mutated class payload preparation"),
+        raising=False,
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    locators = (
+        VisionDataLocator(
+            VisionLocatorKind.SHARED_FILE,
+            "/datasets/first.jpg",
+            None,
+            None,
+            VisionLocatorIndexSentinel.UNUSED,
+            (1, 2, 2),
+            (32, 64),
+        ),
+        VisionDataLocator(
+            VisionLocatorKind.ZIP_MEMBER,
+            "/datasets/images.zip",
+            "second.jpg",
+            None,
+            VisionLocatorIndexSentinel.UNUSED,
+            (1, 2, 2),
+            None,
+        ),
+    )
+    try:
+        actual = operations.prepare_materialized_vision_payloads(
+            locators, (b"encoded-first", b"encoded-second")
+        )
+        assert actual is prepared
+        descriptors, grids = calls.pop()
+        assert descriptors == (
+            {
+                "kind": "image_bytes",
+                "encoded_image": b"encoded-first",
+                "grid_thw": (1, 2, 2),
+                "height": 32,
+                "width": 64,
+            },
+            {"kind": "image_bytes", "encoded_image": b"encoded-second", "grid_thw": (1, 2, 2)},
+        )
+        torch.testing.assert_close(grids, torch.tensor(((1, 2, 2), (1, 2, 2))))
+        assert grids.dtype is torch.int64 and grids.device.type == "cpu"
+        assert grids.shape == (2, 3)
+        empty = operations.prepare_materialized_vision_payloads((), ())
+        assert empty.shape == (0, adapter.payload_width)
+        assert empty.dtype is torch.float32 and empty.device.type == "cpu"
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+    assert builds == [None, None]
+
+
 @pytest.mark.parametrize(
     ("batch_change", "message"),
     [

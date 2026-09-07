@@ -6,6 +6,7 @@ import dataclasses
 from enum import IntEnum
 
 import pytest
+import torch
 
 from megatron.core.mdp.dynamic_encoder_adapter_capability import (
     DynamicEncoderAdapterCapability,
@@ -19,6 +20,11 @@ from megatron.core.mdp.dynamic_encoder_adapter_capability import (
 )
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.protocols import VisionCaptureMode
+from megatron.core.mdp.vision_locator import (
+    VisionDataLocator,
+    VisionLocatorIndexSentinel,
+    VisionLocatorKind,
+)
 
 
 class _Adapter:
@@ -28,6 +34,10 @@ class _Adapter:
 
     def __init__(self):
         self.calls = []
+        self.prepared_payload = None
+        self.prepare_failure = None
+        self.mutate_prepared_locators = False
+        self.mutate_operations = None
 
     def get_batch(self, iterator, *, locator_operations=None):
         self.calls.append(
@@ -70,6 +80,17 @@ class _Adapter:
     def materialize_vision_locator(self, locator):
         self.calls.append(("materialize_locator", locator))
         return b"encoded-image"
+
+    def prepare_materialized_vision_payloads(self, locators, encoded_payloads):
+        self.calls.append(("prepare_payloads", locators, encoded_payloads))
+        if self.mutate_prepared_locators:
+            object.__setattr__(locators[0], "grid_thw", (1, 1, 1))
+        if self.mutate_operations is not None:
+            object.__setattr__(self.mutate_operations, "payload_width", 99)
+        if self.prepare_failure is not None:
+            error, self.prepare_failure = self.prepare_failure, None
+            raise error
+        return self.prepared_payload
 
 
 class _Subclass(_Adapter):
@@ -132,6 +153,9 @@ def _register(adapter_class=_Adapter, *, locator=False, **overrides):
         operations.update(
             freeze_vision_locator=adapter_class.freeze_vision_locator,
             materialize_vision_locator=adapter_class.materialize_vision_locator,
+            prepare_materialized_vision_payloads=(
+                adapter_class.prepare_materialized_vision_payloads
+            ),
             locator_model_arch="test_adapter",
         )
     operations.update(overrides)
@@ -171,6 +195,8 @@ def test_source_pixel_schema_and_operation_bytes_remain_exactly_v1():
     assert tuple(field.name for field in dataclasses.fields(explicit)) == tuple(
         field.name for field in dataclasses.fields(operations)
     )
+    assert not hasattr(operations, "prepare_materialized_vision_payloads")
+    assert not hasattr(explicit, "prepare_materialized_vision_payloads")
 
 
 def test_locator_schema_escrows_complete_operations_before_live_mutation(monkeypatch):
@@ -184,6 +210,9 @@ def test_locator_schema_escrows_complete_operations_before_live_mutation(monkeyp
     )
     adapter.materialize_vision_locator = lambda *args, **kwargs: pytest.fail(
         "read mutated live adapter materialize operation"
+    )
+    adapter.prepare_materialized_vision_payloads = lambda *args, **kwargs: pytest.fail(
+        "read mutated live adapter payload preparation"
     )
     adapter.get_batch = lambda *args, **kwargs: pytest.fail("read mutated live get_batch")
     monkeypatch.setattr(
@@ -200,6 +229,11 @@ def test_locator_schema_escrows_complete_operations_before_live_mutation(monkeyp
         _Adapter,
         "materialize_vision_locator",
         lambda *args, **kwargs: pytest.fail("read mutated live materialize operation"),
+    )
+    monkeypatch.setattr(
+        _Adapter,
+        "prepare_materialized_vision_payloads",
+        lambda *args, **kwargs: pytest.fail("read mutated live payload preparation"),
     )
 
     operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
@@ -239,6 +273,8 @@ def test_locator_schema_escrows_complete_operations_before_live_mutation(monkeyp
         )
     with pytest.raises(MdpStateError, match="inactive or stale"):
         clone.materialize_vision_locator("locator")
+    with pytest.raises(MdpStateError, match="inactive or stale"):
+        clone.prepare_materialized_vision_payloads((), ())
 
     retire_dynamic_encoder_adapter_capability(capability)
     with pytest.raises(MdpStateError, match="retired"):
@@ -247,6 +283,236 @@ def test_locator_schema_escrows_complete_operations_before_live_mutation(monkeyp
         )
     with pytest.raises(MdpStateError, match="retired"):
         operations.materialize_vision_locator("locator")
+    with pytest.raises(MdpStateError, match="retired"):
+        operations.prepare_materialized_vision_payloads((), ())
+
+
+def _locator(path="/datasets/image.jpg", grid=(1, 2, 2), dimensions=(32, 32)):
+    return VisionDataLocator(
+        VisionLocatorKind.SHARED_FILE,
+        path,
+        None,
+        None,
+        VisionLocatorIndexSentinel.UNUSED,
+        grid,
+        dimensions,
+    )
+
+
+def test_locator_payload_preparation_is_escrowed_ordered_and_typed(monkeypatch):
+    _register(locator=True)
+    adapter = _Adapter()
+    adapter.prepared_payload = torch.arange(96.0).reshape(8, 12)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    monkeypatch.setattr(
+        _Adapter,
+        "prepare_materialized_vision_payloads",
+        lambda *_args, **_kwargs: pytest.fail("read mutated payload preparation"),
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    locators = (_locator(), _locator("/datasets/second.jpg"))
+    encoded = (b"first", b"second")
+
+    actual = operations.prepare_materialized_vision_payloads(locators, encoded)
+
+    assert actual is adapter.prepared_payload
+    assert adapter.calls == [("prepare_payloads", locators, encoded)]
+    retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_locator_payload_preparation_text_only_is_typed_empty():
+    _register(locator=True)
+    adapter = _Adapter()
+    adapter.prepared_payload = torch.empty(0, 12)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+
+    actual = operations.prepare_materialized_vision_payloads((), ())
+
+    assert actual.shape == (0, 12)
+    assert actual.dtype is torch.float32 and actual.device.type == "cpu"
+    retire_dynamic_encoder_adapter_capability(capability)
+
+
+@pytest.mark.parametrize(
+    ("locators", "payloads", "output", "message"),
+    (
+        ([_locator()], (b"x",), torch.empty(4, 12), "tuple|locator"),
+        ((_locator(),), [b"x"], torch.empty(4, 12), "tuple|payload"),
+        ((_locator(),), (), torch.empty(4, 12), "count|length|aligned"),
+        ((_locator(),), (bytearray(b"x"),), torch.empty(4, 12), "bytes"),
+        ((_locator(),), (b"x",), object(), "tensor"),
+        ((_locator(),), (b"x",), torch.empty(48), "rank|shape"),
+        ((_locator(),), (b"x",), torch.empty(3, 12), "row|shape"),
+        ((_locator(),), (b"x",), torch.empty(4, 11), "width|shape"),
+        ((_locator(),), (b"x",), torch.empty(4, 12, dtype=torch.bfloat16), "float32|dtype"),
+        ((_locator(),), (b"x",), torch.empty(4, 12, device="meta"), "CPU|device"),
+        ((_locator(),), (b"x",), torch.full((4, 12), float("nan")), "finite"),
+        ((_locator(),), (b"x",), torch.empty(12, 4).t(), "contiguous"),
+        (
+            (_locator(),),
+            (b"x",),
+            torch.sparse_coo_tensor(torch.empty((2, 0), dtype=torch.int64), [], (4, 12)),
+            "strided|layout",
+        ),
+        (
+            (_locator(),),
+            (b"x",),
+            torch.empty(4, 12, requires_grad=True),
+            "requires_grad|autograd",
+        ),
+    ),
+)
+def test_locator_payload_preparation_rejects_malformed_inputs_and_outputs(
+    locators, payloads, output, message
+):
+    _register(locator=True)
+    adapter = _Adapter()
+    adapter.prepared_payload = output
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    try:
+        with pytest.raises((MdpConfigurationError, MdpStateError), match=message):
+            operations.prepare_materialized_vision_payloads(locators, payloads)
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_locator_payload_preparation_revalidates_locators_before_dispatch():
+    _register(locator=True)
+    adapter = _Adapter()
+    adapter.prepared_payload = torch.empty(4, 12)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    locator = _locator()
+    object.__setattr__(locator, "path", "relative/forged.jpg")
+    try:
+        with pytest.raises(MdpConfigurationError, match="locator|path|canonical|absolute"):
+            operations.prepare_materialized_vision_payloads((locator,), (b"x",))
+        assert adapter.calls == []
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_locator_payload_callback_failure_preserves_same_escrow_for_retry():
+    _register(locator=True)
+    adapter = _Adapter()
+    adapter.prepared_payload = torch.empty(4, 12)
+    adapter.prepare_failure = OSError("decode failed once")
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    locator = _locator()
+    try:
+        with pytest.raises(OSError, match="decode failed once"):
+            operations.prepare_materialized_vision_payloads((locator,), (b"x",))
+        assert operations.prepare_materialized_vision_payloads((locator,), (b"x",)) is (
+            adapter.prepared_payload
+        )
+        assert adapter.calls == [
+            ("prepare_payloads", (locator,), (b"x",)),
+            ("prepare_payloads", (locator,), (b"x",)),
+        ]
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_locator_payload_preparation_rejects_mutated_escrow_width_before_dispatch():
+    _register(locator=True)
+    adapter = _Adapter()
+    adapter.prepared_payload = torch.empty(4, 12)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    object.__setattr__(operations, "payload_width", 99)
+    try:
+        with pytest.raises(MdpStateError, match="dimension|width|escrow"):
+            operations.prepare_materialized_vision_payloads((_locator(),), (b"x",))
+        assert adapter.calls == []
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_locator_payload_preparation_rejects_hostile_width_without_comparison_or_dispatch():
+    class ComparisonBomb:
+        compared = False
+
+        def __eq__(self, _other):
+            type(self).compared = True
+            raise AssertionError("compared hostile payload width")
+
+    _register(locator=True)
+    adapter = _Adapter()
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    object.__setattr__(operations, "payload_width", ComparisonBomb())
+    try:
+        with pytest.raises(MdpStateError, match="dimension|width|escrow"):
+            operations.prepare_materialized_vision_payloads((_locator(),), (b"x",))
+        assert not ComparisonBomb.compared
+        assert adapter.calls == []
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_locator_payload_preparation_snapshots_shape_before_model_callback_mutation():
+    _register(locator=True)
+    adapter = _Adapter()
+    adapter.prepared_payload = torch.empty(1, 12)
+    adapter.mutate_prepared_locators = True
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    try:
+        with pytest.raises(MdpStateError, match="row|shape"):
+            operations.prepare_materialized_vision_payloads((_locator(),), (b"x",))
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_locator_payload_preparation_uses_trusted_width_across_model_callback():
+    _register(locator=True)
+    adapter = _Adapter()
+    adapter.prepared_payload = torch.empty(4, 12)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    adapter.mutate_operations = operations
+    try:
+        assert operations.prepare_materialized_vision_payloads((_locator(),), (b"x",)) is (
+            adapter.prepared_payload
+        )
+        with pytest.raises(MdpStateError, match="dimension|width|escrow"):
+            operations.prepare_materialized_vision_payloads((_locator(),), (b"x",))
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_locator_payload_preparation_checks_lifecycle_before_input_shape():
+    _register(locator=True)
+    adapter = _Adapter()
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    retire_dynamic_encoder_adapter_capability(capability)
+
+    with pytest.raises(MdpStateError, match="retired"):
+        operations.prepare_materialized_vision_payloads([], [])
 
 
 def test_locator_mint_requires_complete_registered_operations_without_fallback():
@@ -269,6 +535,16 @@ def test_locator_mint_requires_complete_registered_operations_without_fallback()
     [
         {"freeze_vision_locator": _Adapter.freeze_vision_locator},
         {"materialize_vision_locator": _Adapter.materialize_vision_locator},
+        {
+            "prepare_materialized_vision_payloads": (
+                _Adapter.prepare_materialized_vision_payloads
+            )
+        },
+        {
+            "freeze_vision_locator": _Adapter.freeze_vision_locator,
+            "materialize_vision_locator": _Adapter.materialize_vision_locator,
+            "locator_model_arch": "test_adapter",
+        },
     ],
 )
 def test_registration_rejects_incomplete_locator_operation_pair(locator_operations):
@@ -327,6 +603,7 @@ def test_registration_requires_exact_locator_model_arch_with_complete_operations
         ("freeze_vision_locator", lambda self, descriptor, **kwargs: None),
         ("freeze_vision_locator", _Adapter.materialize_vision_locator),
         ("materialize_vision_locator", _Adapter.get_batch),
+        ("prepare_materialized_vision_payloads", _Adapter.materialize_vision_locator),
     ],
 )
 def test_locator_registration_requires_exact_named_unbound_methods(name, operation):

@@ -14,8 +14,11 @@ import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable, ClassVar
 
+import torch
+
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.protocols import VisionCaptureMode
+from megatron.core.mdp.vision_locator import VisionDataLocator
 
 __all__ = ()
 
@@ -39,6 +42,9 @@ class _AdapterRegistration:
     encode: Callable[..., Any] = field(repr=False, compare=False)
     freeze_vision_locator: Callable[..., Any] | None = field(repr=False, compare=False)
     materialize_vision_locator: Callable[..., Any] | None = field(repr=False, compare=False)
+    prepare_materialized_vision_payloads: Callable[..., Any] | None = field(
+        repr=False, compare=False
+    )
     locator_model_arch: str | None
     _seal: object = field(repr=False, compare=False)
 
@@ -52,6 +58,7 @@ class _CapabilityRecord:
     adapter_identity: int
     adapter_reference: weakref.ReferenceType[Any]
     registration: _AdapterRegistration
+    dimensions: tuple[int, int, int]
     state: object
     capability: Any = None
     operations: Any = None
@@ -86,6 +93,9 @@ class DynamicEncoderAdapterOperations:
         adapter = record.adapter_reference()
         if adapter is None or id(adapter) != record.adapter_identity:
             raise MdpStateError("MDP: dynamic adapter operation escrow lost its exact instance.")
+        dimensions = (self.payload_width, self.embedding_width, self.spatial_merge_size)
+        if any(type(value) is not int for value in dimensions) or dimensions != record.dimensions:
+            raise MdpStateError("MDP: dynamic adapter operation escrow dimensions were mutated.")
         return adapter
 
     def get_batch(self, data_iterator: Any) -> Any:
@@ -180,6 +190,66 @@ class DynamicEncoderLocatorAdapterOperations(DynamicEncoderAdapterOperations):
         record = self._record
         return record.registration.materialize_vision_locator(self._adapter(), locator)
 
+    def prepare_materialized_vision_payloads(
+        self, locators: tuple[VisionDataLocator, ...], encoded_payloads: tuple[bytes, ...]
+    ) -> torch.Tensor:
+        """Decode and patchify ordered encoded payloads through the model-owned operation."""
+        adapter = self._adapter()
+        if type(locators) is not tuple or type(encoded_payloads) is not tuple:
+            raise MdpConfigurationError(
+                "MDP: materialized vision locators and payloads are exact tuples."
+            )
+        if len(locators) != len(encoded_payloads):
+            raise MdpConfigurationError(
+                "MDP: materialized vision locator and payload counts are aligned."
+            )
+        validated_locators = []
+        for locator in locators:
+            if type(locator) is not VisionDataLocator:
+                raise MdpConfigurationError(
+                    "MDP: materialized vision payloads use exact locators."
+                )
+            validated_locators.append(
+                VisionDataLocator(
+                    locator.kind,
+                    locator.path,
+                    locator.member,
+                    locator.column,
+                    locator.index,
+                    locator.grid_thw,
+                    locator.declared_dimensions,
+                )
+            )
+        if any(type(payload) is not bytes for payload in encoded_payloads):
+            raise MdpConfigurationError(
+                "MDP: materialized vision payloads are exact encoded bytes."
+            )
+        expected_rows = sum(
+            locator.grid_thw[0] * locator.grid_thw[1] * locator.grid_thw[2]
+            for locator in validated_locators
+        )
+        record = self._record
+        expected_width = record.dimensions[0]
+        output = record.registration.prepare_materialized_vision_payloads(
+            adapter, tuple(validated_locators), encoded_payloads
+        )
+        if (
+            type(output) is not torch.Tensor
+            or output.ndim != 2
+            or output.shape != (expected_rows, expected_width)
+            or output.device.type != "cpu"
+            or output.dtype is not torch.float32
+            or output.layout is not torch.strided
+            or not output.is_contiguous()
+            or output.requires_grad
+            or not torch.isfinite(output).all()
+        ):
+            raise MdpStateError(
+                "MDP: model-owned vision payload is a finite contiguous strided CPU float32 "
+                "rank-2 tensor with exact rows and width and no autograd graph."
+            )
+        return output
+
 
 class DynamicEncoderAdapterCapability:
     """Opaque, identity-bound, one-shot authority for a dynamic adapter."""
@@ -221,6 +291,7 @@ def register_dynamic_encoder_adapter_class(
     encode: Callable[..., Any],
     freeze_vision_locator: Callable[..., Any] | None = None,
     materialize_vision_locator: Callable[..., Any] | None = None,
+    prepare_materialized_vision_payloads: Callable[..., Any] | None = None,
     locator_model_arch: str | None = None,
 ) -> None:
     """Register one exact adapter class and its explicitly chosen operations.
@@ -234,8 +305,9 @@ def register_dynamic_encoder_adapter_class(
         raise MdpConfigurationError("MDP: dynamic adapter class is already registered.")
     has_freeze = freeze_vision_locator is not None
     has_materialize = materialize_vision_locator is not None
+    has_prepare = prepare_materialized_vision_payloads is not None
     has_model_arch = locator_model_arch is not None
-    if has_freeze != has_materialize or has_freeze != has_model_arch:
+    if len({has_freeze, has_materialize, has_prepare, has_model_arch}) != 1:
         raise MdpConfigurationError(
             "MDP: dynamic adapter registration has complete locator operations and "
             "locator model arch, or none of them."
@@ -273,6 +345,11 @@ def register_dynamic_encoder_adapter_class(
         materialize_vision_locator = _require_unbound_method(
             adapter_class, "materialize_vision_locator", materialize_vision_locator
         )
+        prepare_materialized_vision_payloads = _require_unbound_method(
+            adapter_class,
+            "prepare_materialized_vision_payloads",
+            prepare_materialized_vision_payloads,
+        )
     registration = _AdapterRegistration(
         adapter_class=adapter_class,
         get_batch=get_batch,
@@ -292,6 +369,7 @@ def register_dynamic_encoder_adapter_class(
         encode=_require_unbound_method(adapter_class, "encode", encode),
         freeze_vision_locator=freeze_vision_locator,
         materialize_vision_locator=materialize_vision_locator,
+        prepare_materialized_vision_payloads=prepare_materialized_vision_payloads,
         locator_model_arch=locator_model_arch,
         _seal=_REGISTRATION_SEAL,
     )
@@ -326,6 +404,7 @@ def mint_dynamic_encoder_adapter_capability(
     if capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG and (
         registration.freeze_vision_locator is None
         or registration.materialize_vision_locator is None
+        or registration.prepare_materialized_vision_payloads is None
     ):
         raise MdpConfigurationError(
             "MDP: stable locator capture requires complete locator operations."
@@ -361,7 +440,9 @@ def mint_dynamic_encoder_adapter_capability(
         raise MdpConfigurationError(
             "MDP: dynamic adapter instance supports identity-safe weak references."
         ) from error
-    record = _CapabilityRecord(identity, adapter_reference, registration, _PENDING)
+    record = _CapabilityRecord(
+        identity, adapter_reference, registration, tuple(dimensions), _PENDING
+    )
     capability = DynamicEncoderAdapterCapability(record, _seal=_CAPABILITY_SEAL)
     operations_class = (
         DynamicEncoderLocatorAdapterOperations

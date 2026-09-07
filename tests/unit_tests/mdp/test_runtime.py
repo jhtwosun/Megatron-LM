@@ -210,6 +210,10 @@ class _DynamicLocatorStubAdapter(_DynamicStubAdapter):
     def materialize_vision_locator(self, locator):
         return locator
 
+    def prepare_materialized_vision_payloads(self, locators, encoded_payloads):
+        rows = sum(t * h * w for t, h, w in (locator.grid_thw for locator in locators))
+        return torch.empty(rows, self.payload_width)
+
 
 register_dynamic_encoder_adapter_class(
     _DynamicStubAdapter,
@@ -233,6 +237,9 @@ register_dynamic_encoder_adapter_class(
     encode=_StubAdapter.encode,
     freeze_vision_locator=_DynamicLocatorStubAdapter.freeze_vision_locator,
     materialize_vision_locator=_DynamicLocatorStubAdapter.materialize_vision_locator,
+    prepare_materialized_vision_payloads=(
+        _DynamicLocatorStubAdapter.prepare_materialized_vision_payloads
+    ),
     locator_model_arch="test_runtime",
 )
 
