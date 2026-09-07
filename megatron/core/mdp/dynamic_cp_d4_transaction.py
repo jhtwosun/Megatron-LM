@@ -6,6 +6,7 @@ import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
+from megatron.core.mdp import dynamic_cp_d4_dynamic_decoder_replay as _dynamic_replay
 from megatron.core.mdp import dynamic_cp_d4_encoder_backward_authorization as _gate4
 from megatron.core.mdp import dynamic_cp_d4_encoder_capture as _capture
 from megatron.core.mdp import dynamic_cp_d4_encoder_execution as _execution
@@ -97,6 +98,9 @@ def _retired_message(value_type: type) -> str | None:
         _forward._D4EncoderForwardOwner: "MDP: D4 encoder forward owner is retired.",
         _forward._D4EncoderPublicationOwner: "MDP: D4 encoder publication owner is retired.",
         _replay._D4FixedDecoderReplayOwner: "MDP: fixed decoder replay owner is retired.",
+        _dynamic_replay._D4DynamicDecoderReplayOwner: (
+            "MDP: dynamic decoder replay owner is retired."
+        ),
         _gradient._D4EncoderGradientRouteOwner: "MDP: encoder-only gradient route owner is retired.",
         _gate4._D4EncoderBackwardAuthorizationOwner: "MDP: encoder backward owner is retired.",
         _gate5._D4EncoderSelectedBackwardOwner: "MDP: Gate5 selected backward owner is retired.",
@@ -122,7 +126,7 @@ class _D4TransactionTransitionLease:
         owner = entry.owner
         successor_stage = entry.successor_stage
         try:
-            capability, completion, ready = _identify(successor_stage, successor)
+            capability, completion, ready = _identify(successor_stage, successor, entry.prior)
         except BaseException as error:
             prior = _retire(self, entry)
             _abort(prior, error)
@@ -437,18 +441,37 @@ def _scrub_lease(entry):
     entry.expected_stage = entry.successor_stage = _RETIRED
 
 
-def _identify(stage, value):
+def _identify(stage, value, prior):
     expected = {
         _EXECUTION: _execution._D4EncoderExecutionClaim,
         _FORWARD: _forward._D4EncoderForwardOwner,
         _PUBLICATION: _forward._D4EncoderPublicationOwner,
-        _REPLAY: _replay._D4FixedDecoderReplayOwner,
         _GRADIENT: _gradient._D4EncoderGradientRouteOwner,
         _AUTHORIZED: _gate4._D4EncoderBackwardAuthorizationOwner,
         _BACKWARD: _gate5._D4EncoderSelectedBackwardOwner,
     }
+    if stage is _REPLAY:
+        if type(value) is _replay._D4FixedDecoderReplayOwner:
+            return (value,), None, None
+        if type(value) is _dynamic_replay._D4DynamicDecoderReplayOwner:
+            return (value,), None, None
+        raise MdpStateError("MDP: D4 transaction receives the exact next phase owner.")
     if stage is _NATIVE:
-        if type(value) is not _native._D4NativeScheduleSuccess:
+        expected = {
+            _replay._D4FixedDecoderReplayOwner: (
+                _native._D4NativeScheduleSuccess,
+                _replay._D4FixedDecoderCompletion,
+            ),
+            _dynamic_replay._D4DynamicDecoderReplayOwner: (
+                _native._D4DynamicNativeScheduleSuccess,
+                _dynamic_replay._D4DynamicDecoderCompletion,
+            ),
+        }.get(type(prior))
+        if (
+            expected is None
+            or type(value) is not expected[0]
+            or type(value.completion) is not expected[1]
+        ):
             raise MdpStateError("MDP: D4 transaction receives exact native schedule success.")
         return (value.completion._owner,), value.completion, None
     if stage is _FINALIZED:

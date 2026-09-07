@@ -11,6 +11,7 @@ import torch
 
 from megatron.core.mdp import dynamic_cp_d3_metadata_transport as transport_api
 from megatron.core.mdp import dynamic_cp_d4_authority_construction as authority_api
+from megatron.core.mdp import dynamic_cp_d4_dynamic_decoder_replay as dynamic_replay_api
 from megatron.core.mdp import dynamic_cp_d4_encoder_backward_authorization as gate4
 from megatron.core.mdp import dynamic_cp_d4_encoder_capture as capture_api
 from megatron.core.mdp import dynamic_cp_d4_encoder_execution as execution_api
@@ -237,7 +238,7 @@ def _install(monkeypatch, cls, label, parts, *, completion=None):
     return value, state
 
 
-def _adopt_to_native(monkeypatch, parts):
+def _adopt_to_replay(monkeypatch, parts, *, dynamic):
     execution, execution_state = _install(
         monkeypatch, execution_api._D4EncoderExecutionClaim, "execution", parts
     )
@@ -248,14 +249,45 @@ def _adopt_to_native(monkeypatch, parts):
         monkeypatch, forward_api._D4EncoderPublicationOwner, "publication", parts
     )
     parts.transaction.begin_publication().adopt(publication)
-    replay, replay_state = _install(
-        monkeypatch, replay_api._D4FixedDecoderReplayOwner, "replay", parts
+    replay_type = (
+        dynamic_replay_api._D4DynamicDecoderReplayOwner
+        if dynamic
+        else replay_api._D4FixedDecoderReplayOwner
     )
+    replay, replay_state = _install(monkeypatch, replay_type, "replay", parts)
     parts.transaction.begin_replay().adopt(replay)
-    token = torch.tensor(1.0)
-    completion = replay_api._D4FixedDecoderCompletion(
-        parts.authority, token, replay, replay_api._COMPLETION_SEAL
+    return SimpleNamespace(
+        execution=execution,
+        execution_state=execution_state,
+        replay=replay,
+        replay_state=replay_state,
+        replay_type=replay_type,
     )
+
+
+def _completion(replay, authority, *, dynamic):
+    token = torch.tensor(1.0)
+    if dynamic:
+        completion = object.__new__(dynamic_replay_api._D4DynamicDecoderCompletion)
+        for name, value in (
+            ("authority", authority),
+            ("globally_reduced_num_tokens", token),
+            ("_owner", replay),
+            ("_owner_entry", object()),
+            ("_lifecycle", object()),
+            ("_seal", dynamic_replay_api._COMPLETION_SEAL),
+        ):
+            object.__setattr__(completion, name, value)
+    else:
+        completion = replay_api._D4FixedDecoderCompletion(
+            authority, token, replay, replay_api._COMPLETION_SEAL
+        )
+    return completion
+
+
+def _adopt_to_native(monkeypatch, parts, *, dynamic=False):
+    values = _adopt_to_replay(monkeypatch, parts, dynamic=dynamic)
+    completion = _completion(values.replay, parts.authority, dynamic=dynamic)
 
     def require_completion(self, actual):
         self.require()
@@ -263,18 +295,92 @@ def _adopt_to_native(monkeypatch, parts):
             raise MdpStateError("completion substituted")
         return actual
 
-    monkeypatch.setattr(
-        replay_api._D4FixedDecoderReplayOwner, "require_completion", require_completion
+    monkeypatch.setattr(values.replay_type, "require_completion", require_completion)
+    success_type = (
+        native_api._D4DynamicNativeScheduleSuccess
+        if dynamic
+        else native_api._D4NativeScheduleSuccess
     )
-    success = native_api._D4NativeScheduleSuccess(object(), completion, native_api._SUCCESS_SEAL)
+    success = success_type(object(), completion, native_api._SUCCESS_SEAL)
     parts.transaction.begin_native_schedule().adopt(success)
-    return SimpleNamespace(
-        execution=execution,
-        execution_state=execution_state,
-        replay=replay,
-        replay_state=replay_state,
-        completion=completion,
+    values.completion = completion
+    return values
+
+
+@pytest.mark.parametrize("dynamic", (False, True))
+def test_replay_and_native_transition_retain_exact_owner_and_completion(monkeypatch, dynamic):
+    parts = _fake_parts(monkeypatch)
+    values = _adopt_to_native(monkeypatch, parts, dynamic=dynamic)
+    entry = api._TRUSTED_TRANSACTIONS[id(parts.transaction)]
+    assert entry.capability == (values.replay,)
+    assert entry.completion is values.completion
+    assert parts.transaction.require() is parts.transaction
+
+
+@pytest.mark.parametrize(
+    "replay_type",
+    (replay_api._D4FixedDecoderReplayOwner, dynamic_replay_api._D4DynamicDecoderReplayOwner),
+)
+def test_replay_transition_rejects_subclasses(monkeypatch, replay_type):
+    parts = _fake_parts(monkeypatch)
+    execution, _ = _install(monkeypatch, execution_api._D4EncoderExecutionClaim, "execution", parts)
+    parts.transaction.begin_execution().adopt(execution)
+    forward, _ = _install(monkeypatch, forward_api._D4EncoderForwardOwner, "forward", parts)
+    parts.transaction.begin_forward().adopt(forward)
+    publication, publication_state = _install(
+        monkeypatch, forward_api._D4EncoderPublicationOwner, "publication", parts
     )
+    parts.transaction.begin_publication().adopt(publication)
+
+    class DerivedReplayOwner(replay_type):
+        pass
+
+    with pytest.raises(MdpStateError, match="exact next phase") as caught:
+        parts.transaction.begin_replay().adopt(object.__new__(DerivedReplayOwner))
+    assert publication_state["aborts"] == 1
+    assert parts.events[-1] == ("abort", "publication", caught.value)
+    assert api._ACTIVE_TRANSACTIONS == {}
+
+
+@pytest.mark.parametrize("dynamic", (False, True))
+def test_native_transition_rejects_other_replay_mode_and_allows_retry(monkeypatch, dynamic):
+    parts = _fake_parts(monkeypatch)
+    values = _adopt_to_replay(monkeypatch, parts, dynamic=dynamic)
+    fixed_completion = _completion(values.replay, parts.authority, dynamic=False)
+    dynamic_completion = _completion(values.replay, parts.authority, dynamic=True)
+    wrong = (
+        native_api._D4NativeScheduleSuccess(object(), fixed_completion, native_api._SUCCESS_SEAL)
+        if dynamic
+        else native_api._D4DynamicNativeScheduleSuccess(
+            object(), dynamic_completion, native_api._SUCCESS_SEAL
+        )
+    )
+    with pytest.raises(MdpStateError, match="exact native schedule success"):
+        parts.transaction.begin_native_schedule().adopt(wrong)
+    assert values.replay_state["aborts"] == 1
+    assert api._ACTIVE_TRANSACTIONS == {}
+    fresh = _fake_parts(monkeypatch)
+    assert fresh.transaction.require() is fresh.transaction
+
+
+@pytest.mark.parametrize("dynamic", (False, True))
+def test_native_transition_rejects_same_mode_completion_from_other_owner(monkeypatch, dynamic):
+    parts = _fake_parts(monkeypatch)
+    values = _adopt_to_replay(monkeypatch, parts, dynamic=dynamic)
+    other_owner = object.__new__(values.replay_type)
+    completion = _completion(other_owner, parts.authority, dynamic=dynamic)
+    monkeypatch.setattr(values.replay_type, "require_completion", lambda _self, actual: actual)
+    success_type = (
+        native_api._D4DynamicNativeScheduleSuccess
+        if dynamic
+        else native_api._D4NativeScheduleSuccess
+    )
+    success = success_type(object(), completion, native_api._SUCCESS_SEAL)
+
+    with pytest.raises(MdpStateError, match="exact replay owner"):
+        parts.transaction.begin_native_schedule().adopt(success)
+    assert values.replay_state["aborts"] == 1
+    assert api._ACTIVE_TRANSACTIONS == {}
 
 
 @pytest.mark.parametrize("gate7_state", ["active", "consumed", "corrupt"])
@@ -433,9 +539,10 @@ def test_wrong_successor_aborts_prior_and_replay_is_rejected(monkeypatch):
 
 
 @pytest.mark.parametrize("target", ("gradient", "authorized", "backward", "finalized"))
-def test_decoder_completion_lineage_cannot_be_spliced(monkeypatch, target):
+@pytest.mark.parametrize("dynamic", (False, True))
+def test_decoder_completion_lineage_cannot_be_spliced(monkeypatch, target, dynamic):
     parts = _fake_parts(monkeypatch)
-    values = _adopt_to_native(monkeypatch, parts)
+    values = _adopt_to_native(monkeypatch, parts, dynamic=dynamic)
     stages = (
         ("gradient", gradient_api._D4EncoderGradientRouteOwner, parts.transaction.begin_gradient),
         (
