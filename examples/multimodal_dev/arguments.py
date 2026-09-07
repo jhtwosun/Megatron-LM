@@ -2,6 +2,21 @@
 
 """Extra CLI arguments for multimodal_dev standalone training."""
 
+from megatron.core.mdp.protocols import VisionCaptureMode
+
+
+def _vision_capture_mode(value: str) -> VisionCaptureMode:
+    modes = {
+        "source-pixel-sidecar": VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+        "stable-locator-catalog": VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+    }
+    try:
+        return modes[value]
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            "vision capture mode must be source-pixel-sidecar or stable-locator-catalog"
+        ) from error
+
 
 def validate_encoder_recompute_args(args) -> None:
     """Validate the shared native/MDP encoder recompute argument matrix."""
@@ -195,6 +210,16 @@ def add_multimodal_args(parser):
             "items across each decoder replica's CP x PP encoder worker "
             "pool. Off by default; when absent, training is identical to "
             "the native path."
+        ),
+    )
+    group.add_argument(
+        "--mdp-vision-capture-mode",
+        type=_vision_capture_mode,
+        default=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+        metavar="MODE",
+        help=(
+            "Exact repeated-D4 vision carrier: source-pixel-sidecar (default) or "
+            "stable-locator-catalog."
         ),
     )
     group.add_argument(

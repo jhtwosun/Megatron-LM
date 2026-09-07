@@ -8,6 +8,7 @@ Run with::
 """
 
 import os
+from enum import IntEnum
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
@@ -34,7 +35,7 @@ from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
 from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
-from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
+from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem, VisionCaptureMode
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 from megatron.core.mdp.runtime import MdpRuntime, MdpRuntimeState
 from megatron.core.mdp.storage import MdpEmbeddingStorage
@@ -199,6 +200,17 @@ class _DynamicStubAdapter(_StubAdapter):
         return encoder, membership, global_rank
 
 
+class _DynamicLocatorStubAdapter(_DynamicStubAdapter):
+    def get_batch(self, iterator, *, locator_operations=None):
+        return super().get_batch(iterator), locator_operations
+
+    def freeze_vision_locator(self, descriptor, *, dataset_root, grid_thw, declared_dimensions):
+        return descriptor, dataset_root, grid_thw, declared_dimensions
+
+    def materialize_vision_locator(self, locator):
+        return locator
+
+
 register_dynamic_encoder_adapter_class(
     _DynamicStubAdapter,
     get_batch=_StubAdapter.get_batch,
@@ -210,9 +222,31 @@ register_dynamic_encoder_adapter_class(
     encode=_StubAdapter.encode,
 )
 
+register_dynamic_encoder_adapter_class(
+    _DynamicLocatorStubAdapter,
+    get_batch=_DynamicLocatorStubAdapter.get_batch,
+    estimate_cost=_StubAdapter.estimate_cost,
+    build_dynamic_decoder_payload_codec=_DynamicStubAdapter.build_dynamic_decoder_payload_codec,
+    estimate_dynamic_encoder_workload=_DynamicStubAdapter.estimate_dynamic_encoder_workload,
+    build_encoder=_StubAdapter.build_encoder,
+    bind_dynamic_encoder_cp=_DynamicStubAdapter.bind_dynamic_encoder_cp,
+    encode=_StubAdapter.encode,
+    freeze_vision_locator=_DynamicLocatorStubAdapter.freeze_vision_locator,
+    materialize_vision_locator=_DynamicLocatorStubAdapter.materialize_vision_locator,
+)
 
-def _minimal_dynamic_runtime(adapter, capability, operations):
-    return MdpRuntime(
+
+_OMIT_CAPTURE_MODE = object()
+
+
+def _minimal_dynamic_runtime(
+    adapter,
+    capability,
+    operations,
+    *,
+    vision_capture_mode=_OMIT_CAPTURE_MODE,
+):
+    kwargs = dict(
         config=MdpConfig(enable=True, encoder_cp=4, dynamic_encoder_cp=True),
         rank_map=SimpleNamespace(spec=SimpleNamespace(tp=1)),
         rank_view=object(),
@@ -230,6 +264,9 @@ def _minimal_dynamic_runtime(adapter, capability, operations):
         dynamic_adapter_owner=adapter,
         dynamic_group_binding=object(),
     )
+    if vision_capture_mode is not _OMIT_CAPTURE_MODE:
+        kwargs["vision_capture_mode"] = vision_capture_mode
+    return MdpRuntime(**kwargs)
 
 
 def test_dynamic_runtime_retains_exact_claimed_adapter_capability(monkeypatch):
@@ -243,9 +280,144 @@ def test_dynamic_runtime_retains_exact_claimed_adapter_capability(monkeypatch):
     runtime = _minimal_dynamic_runtime(adapter, capability, operations)
 
     assert runtime.adapter is operations
+    assert runtime.vision_capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR
     assert runtime.dynamic_adapter_capability is capability
     assert runtime._dynamic_adapter_owner is adapter
     retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_dynamic_runtime_retains_exact_locator_mode_and_v2_operations(monkeypatch):
+    monkeypatch.setattr(
+        mdp_runtime_module, "_validate_repeated_d4_group_binding", lambda binding: object()
+    )
+    adapter = _DynamicLocatorStubAdapter(None)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+
+    runtime = _minimal_dynamic_runtime(
+        adapter,
+        capability,
+        operations,
+        vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+    )
+
+    assert runtime.vision_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    retire_dynamic_encoder_adapter_capability(capability)
+
+
+@pytest.mark.parametrize(
+    ("operations_mode", "runtime_mode"),
+    [
+        (
+            VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+            VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        ),
+        (
+            VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+            VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+        ),
+    ],
+)
+def test_dynamic_runtime_rejects_capture_mode_and_operation_schema_mismatch(
+    monkeypatch, operations_mode, runtime_mode
+):
+    monkeypatch.setattr(
+        mdp_runtime_module, "_validate_repeated_d4_group_binding", lambda binding: object()
+    )
+    adapter = (
+        _DynamicStubAdapter(None)
+        if operations_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+        else _DynamicLocatorStubAdapter(None)
+    )
+    capability = mint_dynamic_encoder_adapter_capability(adapter, capture_mode=operations_mode)
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+
+    with pytest.raises(MdpConfigurationError, match="capture mode"):
+        _minimal_dynamic_runtime(
+            adapter,
+            capability,
+            operations,
+            vision_capture_mode=runtime_mode,
+        )
+
+    retire_dynamic_encoder_adapter_capability(capability)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (2, None, IntEnum("ForeignCaptureMode", {"LOCATOR": 2}).LOCATOR),
+)
+def test_dynamic_runtime_rejects_non_exact_capture_mode(monkeypatch, mode):
+    monkeypatch.setattr(
+        mdp_runtime_module, "_validate_repeated_d4_group_binding", lambda binding: object()
+    )
+    adapter = _DynamicStubAdapter(None)
+    capability = mint_dynamic_encoder_adapter_capability(adapter)
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+
+    with pytest.raises(MdpConfigurationError, match="capture mode"):
+        _minimal_dynamic_runtime(
+            adapter, capability, operations, vision_capture_mode=mode
+        )
+
+    retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_static_runtime_rejects_locator_capture_mode():
+    with pytest.raises(MdpConfigurationError, match="static|D3|capture mode"):
+        MdpRuntime(
+            config=MdpConfig(enable=True),
+            rank_map=object(),
+            rank_view=object(),
+            process_groups=object(),
+            adapter=object(),
+            encoder_domain=object(),
+            planner=object(),
+            bridge=object(),
+            storage=object(),
+            allocator=object(),
+            hidden_size=WIDTH,
+            params_dtype=torch.bfloat16,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        )
+
+
+def test_dynamic_runtime_rejects_pending_and_retired_locator_escrows(monkeypatch):
+    monkeypatch.setattr(
+        mdp_runtime_module, "_validate_repeated_d4_group_binding", lambda binding: object()
+    )
+    pending_adapter = _DynamicLocatorStubAdapter(None)
+    pending_capability = mint_dynamic_encoder_adapter_capability(
+        pending_adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    pending_operations = pending_capability._record.operations
+    with pytest.raises(MdpConfigurationError, match="active exact adapter capability"):
+        _minimal_dynamic_runtime(
+            pending_adapter,
+            pending_capability,
+            pending_operations,
+            vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        )
+    retire_dynamic_encoder_adapter_capability(pending_capability)
+
+    retired_adapter = _DynamicLocatorStubAdapter(None)
+    retired_capability = mint_dynamic_encoder_adapter_capability(
+        retired_adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    retired_operations = claim_dynamic_encoder_adapter_capability(
+        retired_adapter, retired_capability
+    )
+    retire_dynamic_encoder_adapter_capability(retired_capability)
+    with pytest.raises(MdpConfigurationError, match="active exact adapter capability"):
+        _minimal_dynamic_runtime(
+            retired_adapter,
+            retired_capability,
+            retired_operations,
+            vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        )
 
 
 def test_dynamic_runtime_rejects_mismatched_capability_and_operations(monkeypatch):

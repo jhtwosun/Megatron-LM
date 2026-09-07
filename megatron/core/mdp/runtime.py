@@ -42,6 +42,7 @@ from megatron.core.mdp.dynamic_cp_d4_group_binding import _validate_repeated_d4_
 from megatron.core.mdp.dynamic_encoder_adapter_capability import (
     DynamicEncoderAdapterCapability,
     DynamicEncoderAdapterOperations,
+    DynamicEncoderLocatorAdapterOperations,
 )
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
@@ -53,7 +54,7 @@ from megatron.core.mdp.observability import (
 )
 from megatron.core.mdp.plan import MdpBatchPlan, split_encoder_layout
 from megatron.core.mdp.planner import MdpPlanner, assert_consistent_plan
-from megatron.core.mdp.protocols import MdpModelAdapter
+from megatron.core.mdp.protocols import MdpModelAdapter, VisionCaptureMode
 from megatron.core.mdp.rank_mapping import MdpRankMap, MdpRankView
 from megatron.core.mdp.storage import MdpEmbeddingStorage
 from megatron.core.mdp.window import MdpIterationWindow
@@ -92,11 +93,24 @@ class MdpRuntime:
         dynamic_adapter_capability: DynamicEncoderAdapterCapability | None = None,
         dynamic_adapter_owner: Any = None,
         dynamic_group_binding: Any = None,
+        vision_capture_mode: VisionCaptureMode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
     ) -> None:
+        if type(vision_capture_mode) is not VisionCaptureMode:
+            raise MdpConfigurationError("MDP: runtime capture mode must be an exact closed enum.")
+        if not config.dynamic_encoder_cp and vision_capture_mode is not VisionCaptureMode.SOURCE_PIXEL_SIDECAR:
+            raise MdpConfigurationError("MDP: static/D3 runtime supports only source-pixel capture mode.")
         if config.dynamic_encoder_cp:
+            operations_type = (
+                DynamicEncoderLocatorAdapterOperations
+                if vision_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+                else DynamicEncoderAdapterOperations
+            )
+            if type(adapter) is not operations_type:
+                raise MdpConfigurationError(
+                    "MDP: repeated-D4 runtime capture mode requires its exact operation schema."
+                )
             if (
                 type(dynamic_adapter_capability) is not DynamicEncoderAdapterCapability
-                or type(adapter) is not DynamicEncoderAdapterOperations
                 or dynamic_adapter_owner is None
                 or dynamic_group_binding is None
             ):
@@ -142,6 +156,7 @@ class MdpRuntime:
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.dynamic_adapter_capability = dynamic_adapter_capability
         self.dynamic_group_binding = dynamic_group_binding
+        self.vision_capture_mode = vision_capture_mode
         self._dynamic_adapter_owner = dynamic_adapter_owner
 
         self._state = MdpRuntimeState.EMPTY

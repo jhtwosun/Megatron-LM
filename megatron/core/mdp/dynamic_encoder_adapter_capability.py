@@ -142,6 +142,13 @@ class DynamicEncoderLocatorAdapterOperations(DynamicEncoderAdapterOperations):
         ):
             raise MdpConfigurationError("MDP: core mints locator adapter operation escrows.")
 
+    def get_batch(self, data_iterator: Any) -> Any:
+        """Capture through the registered operation with this exact v2 escrow."""
+        record = self._record
+        return record.registration.get_batch(
+            self._adapter(), data_iterator, locator_operations=self
+        )
+
     def freeze_vision_locator(
         self,
         descriptor: Any,
@@ -222,7 +229,31 @@ def register_dynamic_encoder_adapter_class(
         raise MdpConfigurationError(
             "MDP: dynamic adapter registration has complete locator operations or neither."
         )
+    get_batch = _require_unbound_method(adapter_class, "get_batch", get_batch)
     if has_freeze:
+        try:
+            parameters = tuple(inspect.signature(get_batch).parameters.values())
+        except (TypeError, ValueError) as error:
+            raise MdpConfigurationError(
+                "MDP: locator adapter get_batch has an inspectable "
+                "locator_operations signature."
+            ) from error
+        locator_parameter = parameters[2] if len(parameters) == 3 else None
+        if (
+            len(parameters) != 3
+            or any(
+                parameter.kind
+                not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                for parameter in parameters[:2]
+            )
+            or locator_parameter.name != "locator_operations"
+            or locator_parameter.kind is not inspect.Parameter.KEYWORD_ONLY
+            or locator_parameter.default is not None
+        ):
+            raise MdpConfigurationError(
+                "MDP: locator adapter get_batch requires keyword-only "
+                "locator_operations=None."
+            )
         freeze_vision_locator = _require_unbound_method(
             adapter_class, "freeze_vision_locator", freeze_vision_locator
         )
@@ -231,7 +262,7 @@ def register_dynamic_encoder_adapter_class(
         )
     registration = _AdapterRegistration(
         adapter_class=adapter_class,
-        get_batch=_require_unbound_method(adapter_class, "get_batch", get_batch),
+        get_batch=get_batch,
         estimate_cost=_require_unbound_method(adapter_class, "estimate_cost", estimate_cost),
         build_dynamic_decoder_payload_codec=_require_unbound_method(
             adapter_class,

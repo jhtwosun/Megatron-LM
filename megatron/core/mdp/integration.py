@@ -54,6 +54,7 @@ from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError, MdpTas
 from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
 from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
+from megatron.core.mdp.protocols import VisionCaptureMode
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 from megatron.core.mdp.runtime import MdpRuntime
 from megatron.core.mdp.schedule import (
@@ -102,6 +103,24 @@ def get_runtime() -> Optional[MdpRuntime]:
 def mdp_enabled(args) -> bool:
     """Whether ``--mdp-enable`` is on for this run."""
     return bool(getattr(args, "mdp_enable", False))
+
+
+def _resolve_vision_capture_mode(args, config: MdpConfig) -> VisionCaptureMode:
+    """Resolve and validate the launch-wide repeated-D4 capture carrier."""
+    mode = getattr(args, "mdp_vision_capture_mode", VisionCaptureMode.SOURCE_PIXEL_SIDECAR)
+    if type(mode) is not VisionCaptureMode:
+        raise MdpConfigurationError("MDP: vision capture mode must be an exact closed enum.")
+    if mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR:
+        return mode
+    if getattr(args, "mdp_enable", None) is not True:
+        raise MdpConfigurationError("MDP: stable locator capture requires --mdp-enable.")
+    if config.dynamic_encoder_cp is not True:
+        raise MdpConfigurationError("MDP: stable locator capture requires dynamic encoder CP.")
+    if type(getattr(args, "dataset_provider", None)) is not str or args.dataset_provider != "energon":
+        raise MdpConfigurationError("MDP: stable locator capture requires exact energon input.")
+    if type(getattr(args, "tensor_model_parallel_size", None)) is not int or args.tensor_model_parallel_size != 1:
+        raise MdpConfigurationError("MDP: stable locator capture currently requires TP=1.")
+    return mode
 
 
 def mdp_config_from_args(args) -> MdpConfig:
@@ -196,7 +215,9 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
 
 def validate_from_args(args) -> None:
     """Run the full support-matrix validation from the parsed args."""
-    validate_mdp_config(mdp_config_from_args(args), compatibility_options_from_args(args))
+    config = mdp_config_from_args(args)
+    validate_mdp_config(config, compatibility_options_from_args(args))
+    _resolve_vision_capture_mode(args, config)
 
 
 def _converge_repeated_d4_adapter_prevalidation(local_error: BaseException | None) -> None:
@@ -231,7 +252,9 @@ def _retire_rejected_dynamic_adapter(capability, error: BaseException) -> None:
             pass
 
 
-def _prepare_repeated_d4_adapter(args):
+def _prepare_repeated_d4_adapter(
+    args, capture_mode: VisionCaptureMode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+):
     adapter = None
     vision_config = None
     capability = None
@@ -239,7 +262,7 @@ def _prepare_repeated_d4_adapter(args):
     local_error = None
     try:
         adapter, vision_config = _ADAPTER_BUILDER(args)
-        capability = mint_dynamic_encoder_adapter_capability(adapter)
+        capability = mint_dynamic_encoder_adapter_capability(adapter, capture_mode=capture_mode)
         operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
     except BaseException as error:
         local_error = error
@@ -282,8 +305,11 @@ def maybe_build_mdp_domain(
     when MDP is off.
     """
     global _RUNTIME
+    mdp_config = mdp_config_from_args(args)
+    vision_capture_mode = _resolve_vision_capture_mode(args, mdp_config)
     if not mdp_enabled(args) or optimizer is None:
         return optimizer
+    validate_mdp_config(mdp_config, compatibility_options_from_args(args))
     if _RUNTIME is not None:
         raise MdpConfigurationError("MDP: runtime setup may run only once per process.")
     if _ADAPTER_BUILDER is None:
@@ -293,8 +319,6 @@ def maybe_build_mdp_domain(
             "core cannot import the model package."
         )
 
-    mdp_config = mdp_config_from_args(args)
-    validate_mdp_config(mdp_config, compatibility_options_from_args(args))
     if decoder_pg_collection is not None and hasattr(
         decoder_pg_collection, "get_language_model_collection"
     ):
@@ -312,7 +336,9 @@ def maybe_build_mdp_domain(
     )
     rank_view = rank_map.view(torch.distributed.get_rank())
     if mdp_config.dynamic_encoder_cp:
-        adapter, vision_config, capability, adapter_operations = _prepare_repeated_d4_adapter(args)
+        adapter, vision_config, capability, adapter_operations = _prepare_repeated_d4_adapter(
+            args, vision_capture_mode
+        )
     else:
         adapter = vision_config = capability = adapter_operations = None
 
@@ -422,6 +448,7 @@ def maybe_build_mdp_domain(
             dynamic_adapter_capability=capability,
             dynamic_adapter_owner=adapter if mdp_config.dynamic_encoder_cp else None,
             dynamic_group_binding=dynamic_group_binding,
+            vision_capture_mode=vision_capture_mode,
         )
 
     except BaseException as error:
@@ -581,6 +608,7 @@ def _build_d4_facade_from_mcore(runtime: MdpRuntime, config):
             data_iterators=data_iterators,
             num_microbatches=num_microbatches,
             operations=capture_operations,
+            capture_mode=runtime.vision_capture_mode,
         )
         return run_iteration(
             runtime,

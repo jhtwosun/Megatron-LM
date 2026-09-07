@@ -29,8 +29,12 @@ class _Adapter:
     def __init__(self):
         self.calls = []
 
-    def get_batch(self, iterator):
-        self.calls.append(("get_batch", iterator))
+    def get_batch(self, iterator, *, locator_operations=None):
+        self.calls.append(
+            ("get_batch", iterator)
+            if locator_operations is None
+            else ("get_batch", iterator, locator_operations)
+        )
         return "capture"
 
     def estimate_cost(self, item):
@@ -72,11 +76,42 @@ class _Subclass(_Adapter):
     pass
 
 
+class _VariadicLocatorAdapter(_Adapter):
+    def get_batch(self, iterator, **kwargs):
+        return iterator, kwargs
+
+
+class _PositionalLocatorAdapter(_Adapter):
+    def get_batch(self, iterator, locator_operations=None):
+        return iterator, locator_operations
+
+
+class _RequiredLocatorAdapter(_Adapter):
+    def get_batch(self, iterator, *, locator_operations):
+        return iterator, locator_operations
+
+
+class _HostileSignatureLocatorAdapter(_Adapter):
+    def get_batch(self, iterator, *, locator_operations=None):
+        return iterator, locator_operations
+
+
+_HostileSignatureLocatorAdapter.get_batch.__signature__ = object()
+
+
 @pytest.fixture(autouse=True)
 def _isolated_registry():
-    _reset_dynamic_encoder_adapter_capabilities_for_tests(registrations=(_Adapter, _Subclass))
+    registrations = (
+        _Adapter,
+        _Subclass,
+        _VariadicLocatorAdapter,
+        _PositionalLocatorAdapter,
+        _RequiredLocatorAdapter,
+        _HostileSignatureLocatorAdapter,
+    )
+    _reset_dynamic_encoder_adapter_capabilities_for_tests(registrations=registrations)
     yield
-    _reset_dynamic_encoder_adapter_capabilities_for_tests(registrations=(_Adapter, _Subclass))
+    _reset_dynamic_encoder_adapter_capabilities_for_tests(registrations=registrations)
 
 
 def _register(adapter_class=_Adapter, *, locator=False, **overrides):
@@ -145,6 +180,12 @@ def test_locator_schema_escrows_complete_operations_before_live_mutation(monkeyp
     adapter.materialize_vision_locator = lambda *args, **kwargs: pytest.fail(
         "read mutated live adapter materialize operation"
     )
+    adapter.get_batch = lambda *args, **kwargs: pytest.fail("read mutated live get_batch")
+    monkeypatch.setattr(
+        _Adapter,
+        "get_batch",
+        lambda *args, **kwargs: pytest.fail("read mutated class get_batch"),
+    )
     monkeypatch.setattr(
         _Adapter,
         "freeze_vision_locator",
@@ -171,6 +212,8 @@ def test_locator_schema_escrows_complete_operations_before_live_mutation(monkeyp
         "DynamicEncoderLocatorAdapterOperations(payload_width=12, embedding_width=24, "
         "spatial_merge_size=2)"
     )
+    assert operations.get_batch("locator-iterator") == "capture"
+    assert adapter.calls == [("get_batch", "locator-iterator", operations)]
     assert (
         operations.freeze_vision_locator(
             "descriptor", dataset_root="/datasets", grid_thw=(1, 2, 2), declared_dimensions=(16, 32)
@@ -179,6 +222,7 @@ def test_locator_schema_escrows_complete_operations_before_live_mutation(monkeyp
     )
     assert operations.materialize_vision_locator("locator") == b"encoded-image"
     assert adapter.calls == [
+        ("get_batch", "locator-iterator", operations),
         ("freeze_locator", "descriptor", "/datasets", (1, 2, 2), (16, 32)),
         ("materialize_locator", "locator"),
     ]
@@ -248,6 +292,33 @@ def test_registration_rejects_incomplete_locator_operation_pair(locator_operatio
 def test_locator_registration_requires_exact_named_unbound_methods(name, operation):
     with pytest.raises(MdpConfigurationError, match=name):
         _register(locator=True, **{name: operation})
+
+
+@pytest.mark.parametrize(
+    "adapter_class",
+    (_VariadicLocatorAdapter, _PositionalLocatorAdapter, _RequiredLocatorAdapter),
+)
+def test_locator_registration_requires_exact_keyword_only_optional_get_batch_seam(adapter_class):
+    with pytest.raises(MdpConfigurationError, match="locator_operations"):
+        _register(adapter_class, locator=True)
+
+    with pytest.raises(MdpConfigurationError, match="not registered"):
+        mint_dynamic_encoder_adapter_capability(
+            adapter_class(), capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        )
+
+
+def test_locator_registration_contains_malformed_exact_python_signature():
+    with pytest.raises(
+        MdpConfigurationError, match="locator|get_batch|locator_operations"
+    ):
+        _register(_HostileSignatureLocatorAdapter, locator=True)
+
+    with pytest.raises(MdpConfigurationError, match="not registered"):
+        mint_dynamic_encoder_adapter_capability(
+            _HostileSignatureLocatorAdapter(),
+            capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        )
 
 
 @pytest.mark.parametrize("mode", [2, None, IntEnum("ForeignMode", {"LOCATOR": 2}).LOCATOR])

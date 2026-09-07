@@ -12,6 +12,7 @@ from examples.multimodal_dev.arguments import (
     encoder_recompute_overrides_from_args,
     validate_encoder_recompute_args,
 )
+from megatron.core.mdp.protocols import VisionCaptureMode
 
 _DEFAULTS = {
     "encoder_recompute_granularity": None,
@@ -48,6 +49,22 @@ def test_dynamic_encoder_cp_cli_defaults_are_inert_and_overrides_are_independent
     assert selected.mdp_min_dynamic_encoder_cp_size == 2
     assert selected.mdp_encoder_cp == 4
     assert selected.mdp_enable is False
+
+
+def test_vision_capture_mode_cli_parses_directly_to_exact_closed_enum():
+    parser = argparse.ArgumentParser()
+    add_multimodal_args(parser)
+
+    defaults = parser.parse_args([])
+    source = parser.parse_args(["--mdp-vision-capture-mode", "source-pixel-sidecar"])
+    locator = parser.parse_args(["--mdp-vision-capture-mode", "stable-locator-catalog"])
+
+    assert defaults.mdp_vision_capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+    assert source.mdp_vision_capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+    assert locator.mdp_vision_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    for invalid in ("locator", "SOURCE-PIXEL-SIDECAR", "stable_locator_catalog", "source"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--mdp-vision-capture-mode", invalid])
 
 
 @pytest.mark.parametrize(

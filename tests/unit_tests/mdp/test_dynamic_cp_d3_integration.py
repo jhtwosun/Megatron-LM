@@ -17,6 +17,7 @@ from megatron.core.mdp.dynamic_encoder_adapter_capability import (
     register_dynamic_encoder_adapter_class,
 )
 from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError, MdpTaskFatalError
+from megatron.core.mdp.protocols import VisionCaptureMode
 
 
 def _config(**overrides):
@@ -195,8 +196,8 @@ class _DynamicAdapter:
     embedding_width = 16
     spatial_merge_size = 2
 
-    def get_batch(self, iterator):
-        return iterator
+    def get_batch(self, iterator, *, locator_operations=None):
+        return iterator, locator_operations
 
     def estimate_cost(self, item):
         return item
@@ -216,6 +217,12 @@ class _DynamicAdapter:
     def encode(self, encoder, payload, layout):
         return encoder, payload, layout
 
+    def freeze_vision_locator(self, descriptor, *, dataset_root, grid_thw, declared_dimensions):
+        return descriptor, dataset_root, grid_thw, declared_dimensions
+
+    def materialize_vision_locator(self, locator):
+        return locator
+
 
 register_dynamic_encoder_adapter_class(
     _DynamicAdapter,
@@ -226,6 +233,8 @@ register_dynamic_encoder_adapter_class(
     build_encoder=_DynamicAdapter.build_encoder,
     bind_dynamic_encoder_cp=_DynamicAdapter.bind_dynamic_encoder_cp,
     encode=_DynamicAdapter.encode,
+    freeze_vision_locator=_DynamicAdapter.freeze_vision_locator,
+    materialize_vision_locator=_DynamicAdapter.materialize_vision_locator,
 )
 
 
@@ -241,6 +250,129 @@ def _dynamic_args():
         fp16=False,
         hidden_size=16,
     )
+
+
+def test_capture_mode_resolver_defaults_programmatic_callers_to_source_pixels():
+    args = _dynamic_args()
+    config = MdpConfig(enable=True, encoder_cp=4, dynamic_encoder_cp=True)
+
+    assert (
+        integration._resolve_vision_capture_mode(args, config)
+        is VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+    )
+
+
+def test_source_pixel_optimizer_none_preserves_historical_prevalidation_noop(monkeypatch):
+    integration.reset_for_testing()
+    args = _dynamic_args()
+    monkeypatch.setattr(
+        integration,
+        "compatibility_options_from_args",
+        lambda _args: pytest.fail("SOURCE optimizer=None built compatibility options"),
+    )
+    monkeypatch.setattr(
+        integration,
+        "validate_mdp_config",
+        lambda *_args: pytest.fail("SOURCE optimizer=None started MDP validation"),
+    )
+
+    assert (
+        integration.maybe_build_mdp_domain(
+            args=args,
+            model=[object()],
+            optimizer=None,
+            optimizer_config=object(),
+            ddp_config=object(),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"mdp_enable": False}, "--mdp-enable"),
+        ({"mdp_dynamic_encoder_cp": False}, "dynamic encoder CP"),
+        ({"dataset_provider": "mock"}, "energon"),
+        ({"dataset_provider": "energon", "tensor_model_parallel_size": 2}, "TP=1"),
+        ({"dataset_provider": "energon", "mdp_vision_capture_mode": "stable-locator-catalog"}, "exact"),
+    ],
+)
+def test_locator_mode_rejects_invalid_launch_before_builder_world_gate_or_groups(
+    monkeypatch, overrides, message
+):
+    integration.reset_for_testing()
+    args = _dynamic_args()
+    args.dataset_provider = "energon"
+    args.mdp_dynamic_encoder_cp = True
+    args.mdp_vision_capture_mode = VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    for name, value in overrides.items():
+        setattr(args, name, value)
+
+    config = MdpConfig(
+        enable=args.mdp_enable,
+        encoder_cp=4,
+        dynamic_encoder_cp=args.mdp_dynamic_encoder_cp,
+    )
+    monkeypatch.setattr(integration, "mdp_config_from_args", lambda selected: config)
+    monkeypatch.setattr(integration, "validate_mdp_config", lambda *_args: None)
+    integration.set_adapter_builder(lambda _args: pytest.fail("adapter builder started"))
+    monkeypatch.setattr(
+        integration,
+        "_converge_repeated_d4_adapter_prevalidation",
+        lambda _error: pytest.fail("WORLD pre-gate started"),
+    )
+    monkeypatch.setattr(
+        integration,
+        "install_mdp_process_groups",
+        lambda *_args, **_kwargs: pytest.fail("process-group construction started"),
+    )
+
+    with pytest.raises(MdpConfigurationError, match=message):
+        integration.maybe_build_mdp_domain(
+            args=args,
+            model=[object()],
+            optimizer=object(),
+            optimizer_config=object(),
+            ddp_config=object(),
+        )
+
+
+def test_locator_mode_handoff_preserves_one_exact_enum_through_mint_and_runtime(monkeypatch):
+    integration.reset_for_testing()
+    _reset_dynamic_encoder_adapter_capabilities_for_tests()
+    events = []
+    adapter, _, captured = _patch_dynamic_construction(monkeypatch, events)
+    args = _dynamic_args()
+    args.dataset_provider = "energon"
+    args.mdp_dynamic_encoder_cp = True
+    args.mdp_vision_capture_mode = VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    resolved = []
+    original_resolver = integration._resolve_vision_capture_mode
+
+    def resolve(selected_args, config):
+        mode = original_resolver(selected_args, config)
+        resolved.append(mode)
+        return mode
+
+    monkeypatch.setattr(integration, "_resolve_vision_capture_mode", resolve)
+
+    result = integration.maybe_build_mdp_domain(
+        args=args,
+        model=[object()],
+        optimizer="decoder-optimizer",
+        optimizer_config=object(),
+        ddp_config=object(),
+    )
+
+    assert result == ("decoder-optimizer", "encoder-optimizer")
+    assert resolved == [VisionCaptureMode.STABLE_LOCATOR_CATALOG]
+    assert events[:3] == ["builder", "consensus", "groups"]
+    assert captured["adapter"].get_batch("iterator") == ("iterator", captured["adapter"])
+    assert captured["adapter"]._adapter() is adapter
+    assert captured["vision_capture_mode"] is resolved[0]
+    integration.reset_for_testing()
+    _reset_dynamic_encoder_adapter_capabilities_for_tests()
 
 
 def _patch_dynamic_prefix(monkeypatch):

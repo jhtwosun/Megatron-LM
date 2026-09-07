@@ -9,6 +9,7 @@ import pytest
 from megatron.core.mdp import integration
 from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
+from megatron.core.mdp.protocols import VisionCaptureMode
 from megatron.core.mdp.schedule import _wrap_d4_forward_backward, wrap_finalize_model_grads
 
 
@@ -243,7 +244,13 @@ def test_runtime_requires_exact_bool_before_dispatch(monkeypatch):
 
 
 @pytest.mark.parametrize("dynamic_decoder", (False, True))
-def test_d4_mcore_factory_binds_fixed_or_joint_j1_facade(monkeypatch, dynamic_decoder):
+@pytest.mark.parametrize(
+    "capture_mode",
+    (VisionCaptureMode.SOURCE_PIXEL_SIDECAR, VisionCaptureMode.STABLE_LOCATOR_CATALOG),
+)
+def test_d4_mcore_factory_binds_fixed_or_joint_j1_facade(
+    monkeypatch, dynamic_decoder, capture_mode
+):
     binding = object()
     codec = SimpleNamespace(rebuild_microbatch=lambda *_args, **_kwargs: None)
     adapter = SimpleNamespace(
@@ -260,6 +267,7 @@ def test_d4_mcore_factory_binds_fixed_or_joint_j1_facade(monkeypatch, dynamic_de
         ),
         adapter=adapter,
         dynamic_group_binding=binding,
+        vision_capture_mode=capture_mode,
         hidden_size=4096,
         params_dtype=object(),
     )
@@ -313,6 +321,7 @@ def test_d4_mcore_factory_binds_fixed_or_joint_j1_facade(monkeypatch, dynamic_de
         "data_iterators": iterator,
         "num_microbatches": 7,
         "operations": capture_operations,
+        "capture_mode": capture_mode,
     }
     selected, args, kwargs = captured["run"]
     assert selected == ("joint" if dynamic_decoder else "fixed")
