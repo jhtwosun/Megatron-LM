@@ -427,6 +427,7 @@ def pack_or_pad_batch(
     device="cuda",
     pad_to_multiple: Optional[int] = None,
     with_vision_sidecar: bool = False,
+    include_vision_pixels: bool = True,
 ) -> Dict[str, Any]:
     """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD or ``[B, S]`` BSHD.
 
@@ -441,10 +442,12 @@ def pack_or_pad_batch(
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
     is_src = mpu.get_tensor_model_parallel_rank() == 0
+    if type(include_vision_pixels) is not bool:
+        raise ValueError("include_vision_pixels must be an exact bool")
     from megatron.core.mdp.window import pixel_capture_owner_state
 
     pixel_owner_state = pixel_capture_owner_state()
-    suppress_pixels = pixel_owner_state is False
+    suppress_pixels = pixel_owner_state is False or not include_vision_pixels
 
     # SP is an explicit runtime option; TP>1 does not imply SP is enabled.
     # get_args() itself raises in test contexts where megatron globals are
@@ -829,12 +832,82 @@ def _prepare_energon_batch(data, args):
     )
 
 
-def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
+def _locator_capture_root(args, group, locator_operations):
+    """Validate the exact locator launch/escrow pair before dataset advance."""
+    from examples.multimodal_dev.data.energon.materializer import validate_locator_dataset_root
+    from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+        DynamicEncoderLocatorAdapterOperations,
+    )
+    from megatron.core.mdp.errors import MdpConfigurationError
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    mode = getattr(
+        args, "mdp_vision_capture_mode", VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+    )
+    if locator_operations is None:
+        if mode is not VisionCaptureMode.SOURCE_PIXEL_SIDECAR:
+            raise MdpConfigurationError(
+                "MDP: stable locator capture requires its exact locator operation escrow."
+            )
+        return None
+    if (
+        type(locator_operations) is not DynamicEncoderLocatorAdapterOperations
+        or mode is not VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    ):
+        raise MdpConfigurationError(
+            "MDP: vision capture mode and locator operation escrow must be an exact pair."
+        )
+    if getattr(args, "mdp_enable", None) is not True:
+        raise MdpConfigurationError("MDP: stable locator capture requires mdp_enable exact True.")
+    if getattr(args, "dataset_provider", None) != "energon":
+        raise MdpConfigurationError("MDP: stable locator capture requires exact energon data.")
+    if getattr(args, "model_arch", None) != "qwen35_vl":
+        raise MdpConfigurationError("MDP: this locator capture path requires exact qwen35_vl.")
+    if getattr(args, "use_packed_sequence", None) is not True:
+        raise MdpConfigurationError("MDP: stable locator capture requires packed THD batches.")
+    if torch.distributed.get_world_size(group=group) != 1:
+        raise MdpConfigurationError("MDP: stable locator capture currently requires TP=1.")
+    try:
+        return validate_locator_dataset_root(getattr(args, "energon_path", None))
+    except ValueError as error:
+        raise MdpConfigurationError(f"MDP: invalid locator dataset root: {error}") from error
+
+
+def _freeze_batch_vision_locators(data, *, dataset_root, locator_operations):
+    """Freeze descriptors in native document/image order without materializing bytes."""
+    locators = []
+    for document in data:
+        descriptors = document.get("image_descriptors", ())
+        grids = document["image_grid_thw"].tolist()
+        for descriptor, grid in zip(descriptors, grids, strict=True):
+            height = descriptor.get("height")
+            width = descriptor.get("width")
+            if (height is None) != (width is None):
+                raise ValueError(
+                    "locator descriptor declares both decoded height and width or neither"
+                )
+            dimensions = None if height is None else (height, width)
+            locators.append(
+                locator_operations.freeze_vision_locator(
+                    descriptor,
+                    dataset_root=dataset_root,
+                    grid_thw=tuple(grid),
+                    declared_dimensions=dimensions,
+                )
+            )
+    return tuple(locators)
+
+
+def get_batch(
+    data_iterator: Iterator[list[Dict[str, Any]]], *, locator_operations=None
+):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
 
     group = get_tensor_model_parallel_group()
+    locator_root = _locator_capture_root(args, group, locator_operations)
+    vision_locators = ()
     # Single-member TP group: skip the device flag tensor and the broadcast
     # entirely. Behavior-identical, and it keeps the MDP window-capture
     # prefetch thread free of NCCL calls (--mdp-overlap-window-capture).
@@ -843,7 +916,15 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
             data = next(data_iterator)
         except StopIteration:
             return None
-        data = _prepare_energon_batch(data, args)
+        if locator_root is None:
+            data = _prepare_energon_batch(data, args)
+        else:
+            from examples.multimodal_dev.data.energon.materializer import prepare_energon_batch
+
+            data = prepare_energon_batch(data, args=args, materialize_pixels=False)
+            vision_locators = _freeze_batch_vision_locators(
+                data, dataset_root=locator_root, locator_operations=locator_operations
+            )
     else:
         if get_tensor_model_parallel_rank() == 0:
             source_error = None
@@ -888,6 +969,9 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
             raise RuntimeError(f"invalid TP source batch status {status_value}")
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
+    locator_pack_options = (
+        {"include_vision_pixels": False} if locator_root is not None else {}
+    )
     batch = pack_or_pad_batch(
         data,
         args.use_packed_sequence,
@@ -895,7 +979,17 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
         device=device,
         with_vision_sidecar=getattr(args, "mdp_enable", False),
         pad_to_multiple=quantized_row_alignment(args),
+        **locator_pack_options,
     )
+    if locator_root is not None:
+        pixel_values = batch.pop("pixel_values", None)
+        if pixel_values is not None and pixel_values.numel() != 0:
+            from megatron.core.mdp.errors import MdpConfigurationError
+
+            raise MdpConfigurationError(
+                "MDP: stable locator capture forbids an ambiguous pixel carrier."
+            )
+        batch["vision_locators"] = vision_locators
 
     # Fix shapes produced by default_collate.
     if "position_ids" in batch and batch["position_ids"] is not None:

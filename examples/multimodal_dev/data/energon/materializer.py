@@ -155,6 +155,11 @@ def _canonical_dataset_root(dataset_root: Any) -> str:
     return root
 
 
+def validate_locator_dataset_root(dataset_root: Any) -> str:
+    """Validate and return the canonical shared-filesystem locator root."""
+    return _canonical_dataset_root(dataset_root)
+
+
 def _locator_path(value: Any, *, dataset_root: str, owner: str) -> str:
     if type(value) is not str or not value:
         raise ValueError(f"{owner} must be path-backed in locator mode")

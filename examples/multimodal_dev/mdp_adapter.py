@@ -55,6 +55,7 @@ from megatron.core.mdp.protocols import (
     CapturedMicrobatch,
     CapturedVisionItem,
     DynamicEncoderCpBinding,
+    VisionCaptureMode,
 )
 from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -901,7 +902,9 @@ class Qwen35VLMdpAdapter:
     # Capture
     # ------------------------------------------------------------------
 
-    def get_batch(self, data_iterator: Iterator) -> Optional[CapturedMicrobatch]:
+    def get_batch(
+        self, data_iterator: Iterator, *, locator_operations=None
+    ) -> Optional[CapturedMicrobatch]:
         """One microbatch through the native THD collation path.
 
         Requires the vision sidecar (``--mdp-enable`` makes the collator emit
@@ -911,7 +914,12 @@ class Qwen35VLMdpAdapter:
         """
         from examples.multimodal_dev.forward_step import get_batch
 
-        batch = get_batch(data_iterator)
+        if locator_operations is None:
+            batch = get_batch(data_iterator)
+            capture_mode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+        else:
+            batch = get_batch(data_iterator, locator_operations=locator_operations)
+            capture_mode = VisionCaptureMode.STABLE_LOCATOR_CATALOG
         if batch is None:
             return None
         if "vision_item_meta" not in batch:
@@ -922,6 +930,7 @@ class Qwen35VLMdpAdapter:
         meta = batch.pop("vision_item_meta")
         positions = batch.pop("vision_decoder_positions")
         pixels = batch.pop("pixel_values", None)
+        locators = batch.pop("vision_locators", ())
         merge = self.spatial_merge_size
 
         items = []
@@ -962,7 +971,33 @@ class Qwen35VLMdpAdapter:
             vision_items=tuple(items),
             flat_pixel_payload=pixels,
             model_payload=MappingProxyType(batch),
+            vision_capture_mode=capture_mode,
+            vision_locators=locators,
         )
+
+    def freeze_vision_locator(
+        self,
+        descriptor: Any,
+        *,
+        dataset_root: str,
+        grid_thw: tuple[int, int, int],
+        declared_dimensions: tuple[int, int] | None,
+    ):
+        """Freeze one Energon descriptor into stable no-byte metadata."""
+        from examples.multimodal_dev.data.energon.materializer import freeze_descriptor_locator
+
+        return freeze_descriptor_locator(
+            descriptor,
+            dataset_root=dataset_root,
+            grid_thw=grid_thw,
+            declared_dimensions=declared_dimensions,
+        )
+
+    def materialize_vision_locator(self, locator: Any) -> bytes:
+        """Materialize one escrowed locator through the generic Energon contract."""
+        from examples.multimodal_dev.data.energon.materializer import vision_locator_image_bytes
+
+        return vision_locator_image_bytes(locator)
 
     # ------------------------------------------------------------------
     # Planning cost
@@ -1103,6 +1138,8 @@ register_dynamic_encoder_adapter_class(
     build_encoder=Qwen35VLMdpAdapter.build_encoder,
     bind_dynamic_encoder_cp=Qwen35VLMdpAdapter.bind_dynamic_encoder_cp,
     encode=Qwen35VLMdpAdapter.encode,
+    freeze_vision_locator=Qwen35VLMdpAdapter.freeze_vision_locator,
+    materialize_vision_locator=Qwen35VLMdpAdapter.materialize_vision_locator,
 )
 
 

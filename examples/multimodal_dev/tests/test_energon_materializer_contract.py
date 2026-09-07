@@ -14,9 +14,17 @@ import torch
 from PIL import Image
 
 from examples.multimodal_dev.forward_step import build_vision_sidecar
+from examples.multimodal_dev.mdp_adapter import Qwen35VLMdpAdapter
 from examples.multimodal_dev.models.qwen35_vl.configuration import QWEN35_VL_IMAGE_TOKEN_ID
 from megatron.core.mdp.dynamic_cp import GlobalVisionItemId
+from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+    DynamicEncoderLocatorAdapterOperations,
+    claim_dynamic_encoder_adapter_capability,
+    mint_dynamic_encoder_adapter_capability,
+    retire_dynamic_encoder_adapter_capability,
+)
 from megatron.core.mdp.errors import MdpConfigurationError
+from megatron.core.mdp.protocols import VisionCaptureMode
 from megatron.core.mdp.vision_locator import (
     VisionDataLocator,
     VisionLocatorCatalogEntry,
@@ -88,6 +96,326 @@ def test_mock_batch_is_byte_for_byte_untouched(monkeypatch):
         )[0]
         is document
     )
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("launch_mode", "mode|locator"),
+        ("mdp_false", "MDP|mdp"),
+        ("mdp_nonbool", "exact|True"),
+        ("provider", "energon"),
+        ("model", "qwen35_vl|Qwen"),
+        ("unpacked", "packed|THD"),
+        ("tp", "TP=1|tensor"),
+        ("missing_root", "root|path"),
+        ("relative_root", "absolute|canonical"),
+        ("noncanonical_root", "canonical"),
+        ("wrong_operations", "operations|escrow|locator"),
+        ("source_escrow", "mode|operations|locator"),
+    ],
+)
+def test_locator_forward_prerequisites_reject_before_iterator(monkeypatch, fault, message):
+    from examples.multimodal_dev import forward_step
+    from examples.multimodal_dev.data.energon import materializer as generic
+
+    adapter = Qwen35VLMdpAdapter(out_hidden_size=8)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    extra_capability = None
+    args = _args(
+        dataset_provider="energon",
+        energon_path="/datasets/train",
+        use_packed_sequence=True,
+        seq_length=8,
+        mdp_enable=True,
+        mdp_vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+    )
+    tp_size = 1
+    if fault == "launch_mode":
+        args.mdp_vision_capture_mode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+    elif fault == "mdp_false":
+        args.mdp_enable = False
+    elif fault == "mdp_nonbool":
+        args.mdp_enable = 1
+    elif fault == "provider":
+        args.dataset_provider = "mock"
+    elif fault == "model":
+        args.model_arch = "qwen3_vl"
+    elif fault == "unpacked":
+        args.use_packed_sequence = False
+    elif fault == "tp":
+        tp_size = 2
+    elif fault == "missing_root":
+        args.energon_path = None
+    elif fault == "relative_root":
+        args.energon_path = "datasets/train"
+    elif fault == "noncanonical_root":
+        args.energon_path = "/datasets/../train"
+    elif fault == "wrong_operations":
+        operations = object()
+    elif fault == "source_escrow":
+        source_adapter = Qwen35VLMdpAdapter(out_hidden_size=8)
+        extra_capability = mint_dynamic_encoder_adapter_capability(source_adapter)
+        operations = claim_dynamic_encoder_adapter_capability(source_adapter, extra_capability)
+    monkeypatch.setattr(forward_step, "get_args", lambda: args)
+    monkeypatch.setattr(forward_step, "get_tensor_model_parallel_group", lambda: object())
+    monkeypatch.setattr(
+        forward_step.torch.distributed, "get_world_size", lambda group=None: tp_size
+    )
+    monkeypatch.setattr(
+        generic,
+        "prepare_energon_batch",
+        lambda *args, **kwargs: pytest.fail("prerequisite failure prepared a batch"),
+    )
+    monkeypatch.setattr(
+        forward_step,
+        "pack_or_pad_batch",
+        lambda *args, **kwargs: pytest.fail("prerequisite failure packed a batch"),
+    )
+
+    class _ForbiddenIterator:
+        def __next__(self):
+            pytest.fail("locator prerequisite failure advanced the iterator")
+
+    try:
+        with pytest.raises(MdpConfigurationError, match=message):
+            forward_step.get_batch(_ForbiddenIterator(), locator_operations=operations)
+    finally:
+        if extra_capability is not None:
+            retire_dynamic_encoder_adapter_capability(extra_capability)
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_locator_forward_freezes_multi_document_cpu_sidecar_through_escrow(monkeypatch):
+    from examples.multimodal_dev import forward_step
+    from examples.multimodal_dev.data.energon import materializer as generic
+
+    adapter = Qwen35VLMdpAdapter(out_hidden_size=8)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    first = {"kind": "image_path", "path": "images/a.jpg", "grid_thw": (1, 2, 2)}
+    second = {
+        "kind": "image_path",
+        "path": "images/b.jpg",
+        "grid_thw": (1, 4, 2),
+        "height": 32,
+        "width": 48,
+    }
+    first_document = _document(descriptors=(first,), grids=((1, 2, 2),))
+    second_document = _document(descriptors=(second,), grids=((1, 4, 2),))
+    second_document["input_ids"] = torch.tensor(
+        [QWEN35_VL_IMAGE_TOKEN_ID, QWEN35_VL_IMAGE_TOKEN_ID, 13], dtype=torch.long
+    )
+    first_document["__restore_key__"] = ("must-not-be-a-locator", 7)
+    second_document["__restore_key__"] = ("different-identity-only-key", 8)
+    documents = [first_document, second_document]
+    args = _args(
+        energon_path="/datasets/train",
+        use_packed_sequence=True,
+        seq_length=8,
+        mdp_enable=True,
+        mdp_vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        sequence_parallel=False,
+        image_token_id=QWEN35_VL_IMAGE_TOKEN_ID,
+        vision_spatial_merge_size=2,
+    )
+    prepare_calls = []
+    freeze_calls = []
+    escrow_calls = []
+    broadcast_keys = []
+
+    def prepare(batch, *, args, materialize_pixels):
+        prepare_calls.append((batch, args, materialize_pixels))
+        return batch
+
+    original_escrow_freeze = DynamicEncoderLocatorAdapterOperations.freeze_vision_locator
+
+    def observed_escrow_freeze(self, descriptor, **kwargs):
+        escrow_calls.append((self, descriptor, kwargs))
+        return original_escrow_freeze(self, descriptor, **kwargs)
+
+    def forbidden_live(*args, **kwargs):
+        pytest.fail("capture consulted a mutable live adapter locator method")
+
+    def observe_broadcast(batch, device="cuda"):
+        broadcast_keys.append(tuple(sorted(batch)))
+        return batch
+
+    monkeypatch.setattr(forward_step, "get_args", lambda: args)
+    monkeypatch.setattr(forward_step, "get_tensor_model_parallel_group", lambda: object())
+    monkeypatch.setattr(forward_step.torch.distributed, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(forward_step.mpu, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(forward_step.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(forward_step.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(forward_step, "broadcast_data_batch", observe_broadcast)
+    monkeypatch.setattr(generic, "prepare_energon_batch", prepare)
+    monkeypatch.setattr(
+        DynamicEncoderLocatorAdapterOperations, "freeze_vision_locator", observed_escrow_freeze
+    )
+    monkeypatch.setattr(adapter, "freeze_vision_locator", forbidden_live)
+    monkeypatch.setattr(Qwen35VLMdpAdapter, "freeze_vision_locator", forbidden_live)
+    monkeypatch.setattr(generic, "_read_bytes", forbidden_live)
+    monkeypatch.setattr(generic.zipfile, "ZipFile", forbidden_live)
+    monkeypatch.setattr(generic, "vision_locator_image_bytes", forbidden_live)
+    monkeypatch.setattr(generic, "load_descriptor_image", forbidden_live)
+
+    try:
+        batch = forward_step.get_batch(iter((documents,)), locator_operations=operations)
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+    assert prepare_calls == [(documents, args, False)]
+    assert [call[0] for call in escrow_calls] == [operations, operations]
+    assert [call[1] for call in escrow_calls] == [first, second]
+    assert [call[2]["dataset_root"] for call in escrow_calls] == [
+        "/datasets/train",
+        "/datasets/train",
+    ]
+    assert [call[2]["grid_thw"] for call in escrow_calls] == [(1, 2, 2), (1, 4, 2)]
+    assert [call[2]["declared_dimensions"] for call in escrow_calls] == [None, (32, 48)]
+    assert tuple(locator.path for locator in batch["vision_locators"]) == (
+        "/datasets/train/images/a.jpg",
+        "/datasets/train/images/b.jpg",
+    )
+    assert all(type(locator) is VisionDataLocator for locator in batch["vision_locators"])
+    assert all(not torch.is_tensor(locator) for locator in batch["vision_locators"])
+    assert len(broadcast_keys) == 1
+    assert not {"vision_locators", "image_descriptors", "__restore_key__"}.intersection(
+        broadcast_keys[0]
+    )
+    assert batch["vision_item_meta"].tolist() == [[0, 0, 1, 2, 2, 0], [1, 0, 1, 4, 2, 4]]
+    assert batch.get("pixel_values") is None or batch["pixel_values"].numel() == 0
+
+
+def test_source_launch_with_no_locator_escrow_keeps_legacy_forward_contract(monkeypatch):
+    from examples.multimodal_dev import forward_step
+
+    document = _document(pixels=torch.ones(4, 2), grids=((1, 2, 2),))
+    args = _args(
+        use_packed_sequence=True,
+        seq_length=8,
+        mdp_enable=True,
+        mdp_vision_capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+    )
+    packed = {"pixel_values": document["pixel_values"]}
+    monkeypatch.setattr(forward_step, "get_args", lambda: args)
+    monkeypatch.setattr(forward_step, "get_tensor_model_parallel_group", lambda: object())
+    monkeypatch.setattr(forward_step.torch.distributed, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(forward_step, "_prepare_energon_batch", lambda data, args: data)
+    monkeypatch.setattr(forward_step, "pack_or_pad_batch", lambda *args, **kwargs: packed)
+
+    assert forward_step.get_batch(iter(([document],)), locator_operations=None) is packed
+
+
+def test_locator_forward_text_only_emits_exact_empty_locator_tuple(monkeypatch):
+    from examples.multimodal_dev import forward_step
+    from examples.multimodal_dev.data.energon import materializer as generic
+
+    adapter = Qwen35VLMdpAdapter(out_hidden_size=8)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    document = _document()
+    document["input_ids"] = torch.tensor([11, 12, 13], dtype=torch.long)
+    args = _args(
+        energon_path="/datasets/train",
+        use_packed_sequence=True,
+        seq_length=8,
+        mdp_enable=True,
+        mdp_vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+    )
+    monkeypatch.setattr(forward_step, "get_args", lambda: args)
+    monkeypatch.setattr(forward_step, "get_tensor_model_parallel_group", lambda: object())
+    monkeypatch.setattr(forward_step.torch.distributed, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(generic, "prepare_energon_batch", lambda data, **kwargs: data)
+    monkeypatch.setattr(
+        forward_step,
+        "pack_or_pad_batch",
+        lambda data, *args, **kwargs: {
+            "input_ids": torch.ones(1, 3, dtype=torch.long),
+            "vision_item_meta": torch.empty(0, 6, dtype=torch.long),
+            "vision_decoder_positions": torch.empty(0, dtype=torch.long),
+        },
+    )
+
+    try:
+        batch = forward_step.get_batch(iter(([document],)), locator_operations=operations)
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+    assert batch["vision_locators"] == ()
+    assert "pixel_values" not in batch
+
+
+def test_locator_forward_invalid_second_descriptor_consumes_once_and_returns_nothing(monkeypatch):
+    from examples.multimodal_dev import forward_step
+    from examples.multimodal_dev.data.energon import materializer as generic
+
+    adapter = Qwen35VLMdpAdapter(out_hidden_size=8)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    descriptors = (
+        {"kind": "image_path", "path": "images/good.jpg", "grid_thw": (1, 2, 2)},
+        {"kind": "image_bytes", "encoded_image": b"inline", "grid_thw": (1, 2, 2)},
+    )
+    document = _document(descriptors=descriptors, grids=((1, 2, 2), (1, 2, 2)))
+    args = _args(
+        energon_path="/datasets/train",
+        use_packed_sequence=True,
+        seq_length=8,
+        mdp_enable=True,
+        mdp_vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+    )
+    advances = []
+    freezes = []
+
+    class _OneBatch:
+        def __next__(self):
+            advances.append(True)
+            if len(advances) != 1:
+                raise StopIteration
+            return [document]
+
+    original_freeze = DynamicEncoderLocatorAdapterOperations.freeze_vision_locator
+
+    def observed_freeze(self, descriptor, **kwargs):
+        freezes.append(descriptor)
+        return original_freeze(self, descriptor, **kwargs)
+
+    monkeypatch.setattr(forward_step, "get_args", lambda: args)
+    monkeypatch.setattr(forward_step, "get_tensor_model_parallel_group", lambda: object())
+    monkeypatch.setattr(forward_step.torch.distributed, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(generic, "prepare_energon_batch", lambda data, **kwargs: data)
+    monkeypatch.setattr(
+        DynamicEncoderLocatorAdapterOperations, "freeze_vision_locator", observed_freeze
+    )
+    monkeypatch.setattr(
+        forward_step,
+        "pack_or_pad_batch",
+        lambda *args, **kwargs: pytest.fail("invalid locator batch reached packing"),
+    )
+    monkeypatch.setattr(
+        generic,
+        "vision_locator_image_bytes",
+        lambda *args, **kwargs: pytest.fail("locator validation performed I/O"),
+    )
+
+    try:
+        with pytest.raises((MdpConfigurationError, ValueError), match="bytes|inline|locator"):
+            forward_step.get_batch(_OneBatch(), locator_operations=operations)
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+    assert advances == [True]
+    assert freezes == list(descriptors)
 
 
 def test_metadata_only_sidecar_preserves_image_positions_without_pixels():

@@ -19,12 +19,18 @@ from megatron.core.mdp.dynamic_cp import (
 from megatron.core.mdp.dynamic_cp_execution import DecoderVisionItemMetadata
 from megatron.core.mdp.dynamic_cp_plan import EncoderWorkEstimate
 from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+    DynamicEncoderLocatorAdapterOperations,
     claim_dynamic_encoder_adapter_capability,
     mint_dynamic_encoder_adapter_capability,
     retire_dynamic_encoder_adapter_capability,
 )
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
-from megatron.core.mdp.protocols import DynamicEncoderCpBinding
+from megatron.core.mdp.protocols import DynamicEncoderCpBinding, VisionCaptureMode
+from megatron.core.mdp.vision_locator import (
+    VisionDataLocator,
+    VisionLocatorIndexSentinel,
+    VisionLocatorKind,
+)
 
 
 def _item(local_id, *, grid_thw, output_rows):
@@ -63,6 +69,116 @@ def test_exact_qwen_adapter_claims_registered_dynamic_capability():
         _ITEMS, group_size=2
     ) == EncoderWorkEstimate(14, 28)
     retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_qwen_source_capture_keeps_forward_call_and_pixel_carrier_unchanged(monkeypatch):
+    from examples.multimodal_dev import forward_step
+
+    adapter = Qwen35VLMdpAdapter(out_hidden_size=8)
+    capability = mint_dynamic_encoder_adapter_capability(adapter)
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    pixels = torch.ones(4, adapter.payload_width, dtype=torch.bfloat16)
+
+    def get_batch(iterator):
+        assert iterator == "iterator"
+        return {
+            "vision_item_meta": torch.tensor([[0, 0, 1, 2, 2, 0]], dtype=torch.long),
+            "vision_decoder_positions": torch.tensor([3], dtype=torch.long),
+            "pixel_values": pixels,
+            "input_ids": torch.ones(1, 8, dtype=torch.long),
+        }
+
+    monkeypatch.setattr(forward_step, "get_batch", get_batch)
+    try:
+        captured = operations.get_batch("iterator")
+        assert captured.vision_capture_mode is VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+        assert captured.vision_locators == ()
+        assert captured.flat_pixel_payload is pixels
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
+def test_qwen_locator_capability_reaches_adapter_before_capture_and_emits_no_pixels(monkeypatch):
+    from examples.multimodal_dev import forward_step
+
+    adapter = Qwen35VLMdpAdapter(out_hidden_size=8)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    locator = VisionDataLocator(
+        VisionLocatorKind.SHARED_FILE,
+        "/datasets/image.jpg",
+        None,
+        None,
+        VisionLocatorIndexSentinel.UNUSED,
+        (1, 2, 2),
+    )
+    seen = []
+
+    def get_batch(iterator, *, locator_operations=None):
+        seen.append((iterator, locator_operations))
+        return {
+            "vision_item_meta": torch.tensor([[0, 0, 1, 2, 2, 0]], dtype=torch.long),
+            "vision_decoder_positions": torch.tensor([3], dtype=torch.long),
+            "vision_locators": (locator,),
+            "input_ids": torch.ones(1, 8, dtype=torch.long),
+        }
+
+    monkeypatch.setattr(forward_step, "get_batch", get_batch)
+    try:
+        captured = operations.get_batch("iterator")
+        assert type(operations) is DynamicEncoderLocatorAdapterOperations
+        assert seen == [("iterator", operations)]
+        assert captured.vision_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        assert captured.vision_locators == (locator,)
+        assert captured.flat_pixel_payload is None
+        assert "vision_locators" not in captured.model_payload
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
+
+
+@pytest.mark.parametrize(
+    ("batch_change", "message"),
+    [
+        ({"pixel_values": torch.ones(4, 1536)}, "pixel|carrier"),
+        ({"vision_locators": ()}, "locator|aligned"),
+    ],
+)
+def test_qwen_locator_adapter_rejects_ambiguous_or_misaligned_carriers(
+    monkeypatch, batch_change, message
+):
+    from examples.multimodal_dev import forward_step
+
+    adapter = Qwen35VLMdpAdapter(out_hidden_size=8)
+    capability = mint_dynamic_encoder_adapter_capability(
+        adapter, capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    operations = claim_dynamic_encoder_adapter_capability(adapter, capability)
+    locator = VisionDataLocator(
+        VisionLocatorKind.SHARED_FILE,
+        "/datasets/image.jpg",
+        None,
+        None,
+        VisionLocatorIndexSentinel.UNUSED,
+        (1, 2, 2),
+    )
+    batch = {
+        "vision_item_meta": torch.tensor([[0, 0, 1, 2, 2, 0]], dtype=torch.long),
+        "vision_decoder_positions": torch.tensor([3], dtype=torch.long),
+        "vision_locators": (locator,),
+        "input_ids": torch.ones(1, 8, dtype=torch.long),
+    }
+    batch.update(batch_change)
+    monkeypatch.setattr(
+        forward_step, "get_batch", lambda iterator, *, locator_operations=None: dict(batch)
+    )
+
+    try:
+        with pytest.raises((MdpConfigurationError, RuntimeError), match=message):
+            operations.get_batch("iterator")
+    finally:
+        retire_dynamic_encoder_adapter_capability(capability)
 
 
 def test_qwen3_vl_subclass_is_not_registered_by_qwen35_registration():
