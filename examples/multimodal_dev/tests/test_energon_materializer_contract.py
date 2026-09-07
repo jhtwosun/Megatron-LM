@@ -6,6 +6,7 @@ import io
 import os
 import pickle
 import zipfile
+from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,15 @@ from PIL import Image
 
 from examples.multimodal_dev.forward_step import build_vision_sidecar
 from examples.multimodal_dev.models.qwen35_vl.configuration import QWEN35_VL_IMAGE_TOKEN_ID
+from megatron.core.mdp.dynamic_cp import GlobalVisionItemId
+from megatron.core.mdp.errors import MdpConfigurationError
+from megatron.core.mdp.vision_locator import (
+    VisionDataLocator,
+    VisionLocatorCatalogEntry,
+    VisionLocatorIndexSentinel,
+    VisionLocatorKind,
+    build_vision_locator_catalog,
+)
 
 _GENERIC = "examples.multimodal_dev.data.energon.materializer"
 _PIXEL_WIDTH = 1536
@@ -145,6 +155,539 @@ def test_bytes_path_jpgs_and_zip_preserve_exact_encoded_identity(tmp_path):
         )
         == first
     )
+
+
+def test_locator_freeze_is_no_io_and_normalizes_paths_against_dataset_root(monkeypatch):
+    generic = __import__(_GENERIC, fromlist=["freeze_descriptor_locator"])
+    pq = pytest.importorskip("pyarrow.parquet")
+    calls = []
+    monkeypatch.chdir("/")
+    monkeypatch.setattr("builtins.open", lambda *args: calls.append(("open", args)))
+    monkeypatch.setattr(generic.zipfile, "ZipFile", lambda *args: calls.append(("zip", args)))
+    monkeypatch.setattr(pq, "ParquetFile", lambda *args: calls.append(("parquet", args)))
+
+    cases = (
+        (
+            {
+                "kind": "image_path",
+                "path": "images/./nested/../image.jpg",
+                "grid_thw": (1, 2, 2),
+                "height": 256,
+                "width": 384,
+            },
+            VisionDataLocator(
+                VisionLocatorKind.SHARED_FILE,
+                "/datasets/train/images/image.jpg",
+                None,
+                None,
+                VisionLocatorIndexSentinel.UNUSED,
+                (1, 2, 2),
+                (256, 384),
+            ),
+        ),
+        (
+            {
+                "kind": "zip_image",
+                "zip_path": "archives/images.zip",
+                "candidate": "nested/image.jpg",
+                "grid_thw": (1, 4, 6),
+            },
+            VisionDataLocator(
+                VisionLocatorKind.ZIP_MEMBER,
+                "/datasets/train/archives/images.zip",
+                "nested/image.jpg",
+                None,
+                VisionLocatorIndexSentinel.UNUSED,
+                (1, 4, 6),
+            ),
+        ),
+        (
+            {
+                "kind": "parquet_column_image",
+                "parquet_path": "tables/images.parquet",
+                "column": "image",
+                "row_idx": 7,
+                "grid_thw": (2, 4, 4),
+            },
+            VisionDataLocator(
+                VisionLocatorKind.PARQUET_ROW,
+                "/datasets/train/tables/images.parquet",
+                None,
+                "image",
+                7,
+                (2, 4, 4),
+            ),
+        ),
+        (
+            {
+                "kind": "jpgs",
+                "path": "bundles/images.jpgs",
+                "encoded_image_index": 3,
+                "grid_thw": (1, 8, 8),
+            },
+            VisionDataLocator(
+                VisionLocatorKind.JPGS_IMAGE,
+                "/datasets/train/bundles/images.jpgs",
+                None,
+                None,
+                3,
+                (1, 8, 8),
+            ),
+        ),
+    )
+
+    for descriptor, expected in cases:
+        declared_dimensions = (
+            (descriptor["height"], descriptor["width"]) if "height" in descriptor else None
+        )
+        assert (
+            generic.freeze_descriptor_locator(
+                descriptor,
+                dataset_root="/datasets/train",
+                grid_thw=descriptor["grid_thw"],
+                declared_dimensions=declared_dimensions,
+            )
+            == expected
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("descriptor", "message"),
+    [
+        ({"kind": "image_path", "path": "../escape.jpg"}, "dataset root"),
+        ({"kind": "image_path", "path": "/other/image.jpg"}, "dataset root"),
+        ({"kind": "image_path", "path": "/datasets/train/a/../image.jpg"}, "already be canonical"),
+        (
+            {
+                "kind": "zip_image",
+                "zip_path": "images.zip",
+                "candidates": ("first.jpg", "second.jpg"),
+            },
+            "exactly one",
+        ),
+        (
+            {
+                "kind": "zip_image",
+                "zip_path": "images.zip",
+                "candidate": "first.jpg",
+                "path": "second.jpg",
+            },
+            "ambiguous",
+        ),
+        (
+            {"kind": "zip_image", "zip_path": "images.zip", "candidate": "a/../b.jpg"},
+            "safe canonical",
+        ),
+        ({"kind": "jpgs", "encoded_images": b"inline", "encoded_image_index": 0}, "inline"),
+        ({"kind": "jpgs", "path": "images.jpgs"}, "explicit"),
+        ({"__restore_key__": ("shard", 9)}, "restore"),
+        ({"kind": "zip_image", "zip_path": "a.zip", "candidate": "x", "bytes": b"x"}, "competing"),
+        (
+            {
+                "kind": "parquet_column_image",
+                "parquet_path": "a.parquet",
+                "column": "image",
+                "row_idx": 0,
+                "path": "other.jpg",
+            },
+            "competing",
+        ),
+    ],
+)
+def test_locator_freeze_rejects_ambiguous_or_non_exact_sources(descriptor, message):
+    generic = __import__(_GENERIC, fromlist=["freeze_descriptor_locator"])
+
+    with pytest.raises(ValueError, match=message):
+        generic.freeze_descriptor_locator(
+            descriptor, dataset_root="/datasets/train", grid_thw=(1, 2, 2), declared_dimensions=None
+        )
+
+
+def test_locator_freeze_rejects_in_memory_and_executable_values():
+    numpy = pytest.importorskip("numpy")
+    generic = __import__(_GENERIC, fromlist=["freeze_descriptor_locator"])
+    values = (
+        b"bytes",
+        bytearray(b"bytes"),
+        memoryview(b"bytes"),
+        Image.new("RGB", (2, 2)),
+        torch.zeros(1),
+        numpy.zeros(1),
+        lambda: b"bytes",
+        object(),
+    )
+
+    for key in ("encoded_image", "image_bytes", "bytes", "jpg", "image"):
+        for value in values:
+            with pytest.raises(ValueError, match="path-backed"):
+                generic.freeze_descriptor_locator(
+                    {"kind": "image_bytes", key: value},
+                    dataset_root="/datasets/train",
+                    grid_thw=(1, 2, 2),
+                    declared_dimensions=None,
+                )
+
+
+def test_locator_freeze_rejects_pathlike_without_executing_it():
+    generic = __import__(_GENERIC, fromlist=["freeze_descriptor_locator"])
+
+    class HostilePath:
+        def __fspath__(self):
+            raise AssertionError("locator freeze executed arbitrary __fspath__")
+
+    class HostileMapping(Mapping):
+        def __getitem__(self, key):
+            raise AssertionError("locator freeze executed an arbitrary mapping")
+
+        def __iter__(self):
+            raise AssertionError("locator freeze executed an arbitrary mapping")
+
+        def __len__(self):
+            raise AssertionError("locator freeze executed an arbitrary mapping")
+
+    class HostileKind:
+        def __eq__(self, other):
+            raise AssertionError("locator freeze executed arbitrary kind equality")
+
+    class HostileSequence(Sequence):
+        def __getitem__(self, index):
+            raise AssertionError("locator freeze executed an arbitrary sequence")
+
+        def __len__(self):
+            raise AssertionError("locator freeze executed an arbitrary sequence")
+
+    with pytest.raises(ValueError, match="exact metadata dictionary"):
+        generic.freeze_descriptor_locator(
+            HostileMapping(),
+            dataset_root="/datasets/train",
+            grid_thw=(1, 2, 2),
+            declared_dimensions=None,
+        )
+    for descriptor, message in (
+        ({"kind": HostileKind(), "path": "image.jpg"}, "kind"),
+        (
+            {"kind": "zip_image", "zip_path": "images.zip", "candidates": HostileSequence()},
+            "candidates",
+        ),
+    ):
+        with pytest.raises(ValueError, match=message):
+            generic.freeze_descriptor_locator(
+                descriptor,
+                dataset_root="/datasets/train",
+                grid_thw=(1, 2, 2),
+                declared_dimensions=None,
+            )
+
+    for descriptor, dataset_root in (
+        ({"kind": "image_path", "path": HostilePath()}, "/datasets/train"),
+        ({"kind": "image_path", "path": "image.jpg"}, HostilePath()),
+        (
+            {
+                "kind": "parquet_column_image",
+                "parquet_path": HostilePath(),
+                "column": "x",
+                "row_idx": 0,
+            },
+            "/datasets/train",
+        ),
+    ):
+        with pytest.raises(ValueError, match="path"):
+            generic.freeze_descriptor_locator(
+                descriptor, dataset_root=dataset_root, grid_thw=(1, 2, 2), declared_dimensions=None
+            )
+
+
+def test_locator_materialization_uses_exact_storage_identity(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    generic = __import__(_GENERIC, fromlist=["vision_locator_image_bytes"])
+    first = _jpeg_bytes(color=(20, 21, 22))
+    second = _jpeg_bytes(color=(30, 31, 32))
+    image_path = tmp_path / "tables" / "payloads" / "image.jpg"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(first)
+    zip_path = tmp_path / "images.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("nested/image.jpg", second)
+    bundle_path = tmp_path / "images.jpgs"
+    bundle_path.write_bytes(pickle.dumps([first, second], protocol=4))
+    parquet_path = tmp_path / "tables" / "images.parquet"
+    parquet_path.parent.mkdir(exist_ok=True)
+    pq.write_table(pa.table({"image": [{"path": "payloads/image.jpg"}]}), parquet_path)
+
+    locators = (
+        VisionDataLocator(
+            VisionLocatorKind.SHARED_FILE,
+            str(image_path),
+            None,
+            None,
+            VisionLocatorIndexSentinel.UNUSED,
+            (1, 2, 2),
+        ),
+        VisionDataLocator(
+            VisionLocatorKind.ZIP_MEMBER,
+            str(zip_path),
+            "nested/image.jpg",
+            None,
+            VisionLocatorIndexSentinel.UNUSED,
+            (1, 2, 2),
+        ),
+        VisionDataLocator(VisionLocatorKind.JPGS_IMAGE, str(bundle_path), None, None, 1, (1, 2, 2)),
+        VisionDataLocator(
+            VisionLocatorKind.PARQUET_ROW, str(parquet_path), None, "image", 0, (1, 2, 2)
+        ),
+    )
+
+    assert [generic.vision_locator_image_bytes(locator) for locator in locators] == [
+        first,
+        second,
+        second,
+        first,
+    ]
+
+
+def test_locator_digest_is_metadata_only_when_file_content_changes(tmp_path):
+    generic = __import__(_GENERIC, fromlist=["vision_locator_image_bytes"])
+    path = tmp_path / "image.jpg"
+    locator = VisionDataLocator(
+        VisionLocatorKind.SHARED_FILE,
+        str(path),
+        None,
+        None,
+        VisionLocatorIndexSentinel.UNUSED,
+        (1, 2, 2),
+    )
+    item_id = GlobalVisionItemId(0, 0)
+    digest = build_vision_locator_catalog(
+        (item_id,), (VisionLocatorCatalogEntry(item_id, locator),)
+    ).digest
+
+    path.write_bytes(b"first")
+    assert generic.vision_locator_image_bytes(locator) == b"first"
+    path.write_bytes(b"second")
+    assert generic.vision_locator_image_bytes(locator) == b"second"
+    assert (
+        build_vision_locator_catalog(
+            (item_id,), (VisionLocatorCatalogEntry(item_id, locator),)
+        ).digest
+        == digest
+    )
+
+
+def test_forged_locator_is_rejected_before_io(monkeypatch):
+    generic = __import__(_GENERIC, fromlist=["vision_locator_image_bytes"])
+    locator = VisionDataLocator(
+        VisionLocatorKind.SHARED_FILE,
+        "/datasets/train/image.jpg",
+        None,
+        None,
+        VisionLocatorIndexSentinel.UNUSED,
+        (1, 2, 2),
+    )
+    object.__setattr__(locator, "path", "relative.jpg")
+    calls = []
+    monkeypatch.setattr("builtins.open", lambda *args: calls.append(args))
+
+    with pytest.raises(MdpConfigurationError, match="canonical absolute"):
+        generic.vision_locator_image_bytes(locator)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "path", "member", "exception", "message"),
+    [
+        (VisionLocatorKind.ZIP_MEMBER, "/datasets/images.zip", "../image.jpg", ValueError, "safe"),
+        (
+            VisionLocatorKind.ZIP_MEMBER,
+            "/datasets/images.zip",
+            "a/../image.jpg",
+            ValueError,
+            "safe",
+        ),
+        (VisionLocatorKind.ZIP_MEMBER, "/datasets/images.zip", "a\\image.jpg", ValueError, "safe"),
+        (
+            VisionLocatorKind.ZIP_MEMBER,
+            "/datasets/images.zip",
+            "image\0.jpg",
+            MdpConfigurationError,
+            "NUL",
+        ),
+        (VisionLocatorKind.JPGS_IMAGE, "/datasets/images.bin", None, ValueError, r"\.jpgs"),
+    ],
+)
+def test_direct_locator_storage_invariants_fail_before_io(
+    monkeypatch, kind, path, member, exception, message
+):
+    generic = __import__(_GENERIC, fromlist=["vision_locator_image_bytes"])
+    calls = []
+    monkeypatch.setattr(generic.zipfile, "ZipFile", lambda *args: calls.append(("zip", args)))
+    monkeypatch.setattr(generic, "_jpgs_member", lambda *args: calls.append(("jpgs", args)))
+    with pytest.raises(exception, match=message):
+        locator = VisionDataLocator(
+            kind,
+            path,
+            member,
+            None,
+            0 if kind is VisionLocatorKind.JPGS_IMAGE else VisionLocatorIndexSentinel.UNUSED,
+            (1, 2, 2),
+        )
+        generic.vision_locator_image_bytes(locator)
+    assert calls == []
+
+
+def test_locator_materialization_rejects_ambiguous_zip_and_parquet_storage(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    generic = __import__(_GENERIC, fromlist=["vision_locator_image_bytes"])
+    zip_path = tmp_path / "duplicate.zip"
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("image.jpg", b"first")
+            archive.writestr("image.jpg", b"second")
+    zip_locator = VisionDataLocator(
+        VisionLocatorKind.ZIP_MEMBER,
+        str(zip_path),
+        "image.jpg",
+        None,
+        VisionLocatorIndexSentinel.UNUSED,
+        (1, 2, 2),
+    )
+    with pytest.raises(ValueError, match="exactly once"):
+        generic.vision_locator_image_bytes(zip_locator)
+
+    parquet_path = tmp_path / "table" / "images.parquet"
+    parquet_path.parent.mkdir()
+    pq.write_table(
+        pa.table(
+            {
+                "image": [
+                    {"bytes": b"inline", "path": "image.jpg"},
+                    {"bytes": None, "path": "../escape.jpg"},
+                ]
+            }
+        ),
+        parquet_path,
+    )
+    for row_index, message in ((0, "ambiguous"), (1, "remain within")):
+        locator = VisionDataLocator(
+            VisionLocatorKind.PARQUET_ROW, str(parquet_path), None, "image", row_index, (1, 2, 2)
+        )
+        with pytest.raises(ValueError, match=message):
+            generic.vision_locator_image_bytes(locator)
+
+
+def _patch_parquet_value(monkeypatch, pq, value):
+    class FakeParquetFile:
+        schema_arrow = SimpleNamespace(names=["image"])
+        num_row_groups = 1
+        metadata = SimpleNamespace(row_group=lambda _: SimpleNamespace(num_rows=1))
+
+        @staticmethod
+        def read_row_group(row_group, columns):
+            assert row_group == 0
+            assert columns == ["image"]
+            scalar = SimpleNamespace(as_py=lambda: value)
+            return SimpleNamespace(column=lambda _: (scalar,))
+
+    monkeypatch.setattr(pq, "ParquetFile", lambda _: FakeParquetFile())
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (b"inline", b"inline"),
+        ({"bytes": b"mapped", "path": None}, b"mapped"),
+        ("payloads/image.jpg", b"/datasets/train/payloads/image.jpg"),
+        ({"bytes": None, "path": "payloads/mapped.jpg"}, b"/datasets/train/payloads/mapped.jpg"),
+    ],
+)
+def test_parquet_locator_accepts_exact_bytes_or_confined_relative_path(
+    monkeypatch, value, expected
+):
+    pq = pytest.importorskip("pyarrow.parquet")
+    generic = __import__(_GENERIC, fromlist=["vision_locator_image_bytes"])
+    _patch_parquet_value(monkeypatch, pq, value)
+    monkeypatch.setattr(generic, "_read_bytes", lambda path, _: path.encode())
+    locator = VisionDataLocator(
+        VisionLocatorKind.PARQUET_ROW, "/datasets/train/images.parquet", None, "image", 0, (1, 2, 2)
+    )
+
+    assert generic.vision_locator_image_bytes(locator) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        bytearray(b"x"),
+        memoryview(b"x"),
+        object(),
+        "/datasets/train/absolute.jpg",
+        "../escape.jpg",
+        {"bytes": b"x", "path": "image.jpg"},
+        {"bytes": None, "path": None},
+        {"path": "image.jpg", "extra": "ambiguous"},
+    ],
+)
+def test_parquet_locator_rejects_non_exact_payload_values(monkeypatch, value):
+    pq = pytest.importorskip("pyarrow.parquet")
+    generic = __import__(_GENERIC, fromlist=["vision_locator_image_bytes"])
+    _patch_parquet_value(monkeypatch, pq, value)
+
+    locator = VisionDataLocator(
+        VisionLocatorKind.PARQUET_ROW, "/datasets/train/images.parquet", None, "image", 0, (1, 2, 2)
+    )
+
+    with pytest.raises(ValueError, match="payload|relative|remain within"):
+        generic.vision_locator_image_bytes(locator)
+
+
+def test_locator_mode_rejects_inline_bytes_without_changing_native_byte_path():
+    generic = __import__(_GENERIC, fromlist=["freeze_descriptor_locator"])
+    encoded = _jpeg_bytes()
+    descriptor = {"kind": "image_bytes", "encoded_image": encoded, "grid_thw": (1, 2, 2)}
+
+    assert generic.descriptor_image_bytes(descriptor) == encoded
+    with pytest.raises(ValueError, match="path-backed"):
+        generic.freeze_descriptor_locator(
+            descriptor, dataset_root="/datasets/train", grid_thw=(1, 2, 2), declared_dimensions=None
+        )
+
+
+def test_native_materialization_does_not_call_dormant_locator_apis(monkeypatch):
+    generic = __import__(_GENERIC, fromlist=["prepare_energon_batch"])
+    from examples.multimodal_dev.models import MODEL_REGISTRY
+
+    encoded = _jpeg_bytes()
+    direct = {"kind": "image_bytes", "encoded_image": encoded}
+    inline_jpgs = {
+        "kind": "jpgs",
+        "encoded_images": pickle.dumps([encoded], protocol=4),
+        "encoded_image_index": 0,
+    }
+    assert generic.descriptor_image_bytes(direct) == encoded
+    assert generic.descriptor_image_bytes(inline_jpgs) == encoded
+    monkeypatch.setattr(
+        generic,
+        "freeze_descriptor_locator",
+        lambda *args, **kwargs: pytest.fail("native path froze a locator"),
+    )
+    monkeypatch.setattr(
+        generic,
+        "vision_locator_image_bytes",
+        lambda *args, **kwargs: pytest.fail("native path materialized a locator"),
+    )
+    monkeypatch.setitem(
+        MODEL_REGISTRY["qwen35_vl"],
+        "energon_image_materializer_factory",
+        lambda *, args: lambda descriptors, grids: torch.ones(4, 2),
+    )
+    document = _document(descriptors=(direct,), grids=((1, 2, 2),))
+
+    prepared = generic.prepare_energon_batch([document], args=_args(), materialize_pixels=True)
+
+    assert prepared[0]["pixel_values"].shape == (4, 2)
 
 
 def test_jpgs_rejects_pickle_globals():

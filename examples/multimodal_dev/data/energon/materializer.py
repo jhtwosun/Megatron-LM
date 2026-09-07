@@ -7,12 +7,19 @@ from __future__ import annotations
 import io
 import os
 import pickle
+import posixpath
 import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 from typing import Any
 
 import torch
+
+from megatron.core.mdp.vision_locator import (
+    VisionDataLocator,
+    VisionLocatorIndexSentinel,
+    VisionLocatorKind,
+)
 
 from .provider import _resolve_callable
 
@@ -135,6 +142,238 @@ def _parquet_image_bytes(parquet_path: Any, column: str, row_index: int) -> byte
         else:
             raise ValueError("parquet_column_image value has neither bytes nor path")
     return _read_bytes(value, "parquet_column_image value")
+
+
+def _canonical_dataset_root(dataset_root: Any) -> str:
+    if type(dataset_root) is not str:
+        raise ValueError("locator dataset root must be a canonical absolute path")
+    root = dataset_root
+    if not root.startswith("/") or root.startswith("//"):
+        raise ValueError("locator dataset root must be a canonical absolute path")
+    if posixpath.normpath(root) != root:
+        raise ValueError("locator dataset root must be a canonical absolute path")
+    return root
+
+
+def _locator_path(value: Any, *, dataset_root: str, owner: str) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{owner} must be path-backed in locator mode")
+    path = value
+    if path.startswith("/") and posixpath.normpath(path) != path:
+        raise ValueError(f"{owner} absolute path must already be canonical")
+    candidate = posixpath.normpath(
+        path if path.startswith("/") else posixpath.join(dataset_root, path)
+    )
+    try:
+        confined = posixpath.commonpath((dataset_root, candidate)) == dataset_root
+    except ValueError:
+        confined = False
+    if not confined or candidate == dataset_root:
+        raise ValueError(f"{owner} must remain within the configured dataset root")
+    return candidate
+
+
+def _validate_exact_zip_member(member: Any) -> str:
+    if (
+        type(member) is not str
+        or not member
+        or member.startswith("/")
+        or posixpath.normpath(member) != member
+        or member == "."
+        or ".." in PurePosixPath(member).parts
+        or "\0" in member
+        or "\\" in member
+    ):
+        raise ValueError("zip locator requires one safe canonical relative member")
+    return member
+
+
+def _exact_zip_member(descriptor: Mapping[str, Any]) -> str:
+    values = []
+    for key in ("candidate", "path"):
+        if descriptor.get(key) is not None:
+            values.append(descriptor[key])
+    candidates = descriptor.get("candidates")
+    if candidates is not None:
+        if type(candidates) not in (tuple, list):
+            raise ValueError("zip locator candidates must contain exactly one member")
+        values.extend(candidates)
+    if len(values) != 1:
+        qualifier = "ambiguous" if len(values) > 1 else "missing"
+        raise ValueError(f"zip locator has an {qualifier} member; exactly one is required")
+    return _validate_exact_zip_member(values[0])
+
+
+def freeze_descriptor_locator(
+    descriptor: Mapping[str, Any],
+    *,
+    dataset_root: Any,
+    grid_thw: tuple[int, int, int],
+    declared_dimensions: tuple[int, int] | None,
+) -> VisionDataLocator:
+    """Freeze one descriptor into a no-byte, no-I/O shared-filesystem locator."""
+    if type(descriptor) is not dict:
+        raise ValueError("image descriptor must be an exact metadata dictionary")
+    root = _canonical_dataset_root(dataset_root)
+    kind = descriptor.get("kind")
+    if kind is not None and type(kind) is not str:
+        raise ValueError("image descriptor kind must be exact text or None")
+    direct_keys = tuple(
+        key
+        for key in ("encoded_image", "image_bytes", "bytes", "jpg", "image")
+        if descriptor.get(key) is not None
+    )
+    has_bundle = descriptor.get("encoded_images") is not None
+    has_path = descriptor.get("path") is not None
+
+    if kind == "zip_image":
+        if direct_keys or has_bundle or descriptor.get("parquet_path") is not None:
+            raise ValueError("zip locator has an ambiguous competing image source")
+        path = _locator_path(
+            descriptor.get("zip_path"), dataset_root=root, owner="zip locator path"
+        )
+        return VisionDataLocator(
+            VisionLocatorKind.ZIP_MEMBER,
+            path,
+            _exact_zip_member(descriptor),
+            None,
+            VisionLocatorIndexSentinel.UNUSED,
+            grid_thw,
+            declared_dimensions,
+        )
+
+    if kind == "parquet_column_image":
+        if (
+            direct_keys
+            or has_bundle
+            or has_path
+            or descriptor.get("zip_path") is not None
+            or descriptor.get("candidate") is not None
+            or descriptor.get("candidates") is not None
+        ):
+            raise ValueError("parquet locator has an ambiguous competing image source")
+        if type(descriptor.get("parquet_path")) is not str:
+            raise ValueError("parquet locator path must be path-backed in locator mode")
+        parquet_path, column, row_index = _parquet_descriptor_spec(descriptor)
+        path = _locator_path(parquet_path, dataset_root=root, owner="parquet locator path")
+        return VisionDataLocator(
+            VisionLocatorKind.PARQUET_ROW,
+            path,
+            None,
+            column,
+            row_index,
+            grid_thw,
+            declared_dimensions,
+        )
+
+    if kind not in (None, "image_bytes", "image_path", "raw_bytes", "raw_jpeg", "jpgs"):
+        raise ValueError(f"unsupported image descriptor kind {kind!r}")
+    if set(descriptor) == {"__restore_key__"}:
+        raise ValueError("a bare __restore_key__ is not a vision data locator")
+
+    if any(
+        descriptor.get(key) is not None
+        for key in ("zip_path", "candidate", "candidates", "parquet_path", "column", "row_idx")
+    ):
+        raise ValueError("image descriptor has an ambiguous competing locator source")
+    if len(direct_keys) + int(has_bundle) + int(has_path) != 1:
+        raise ValueError("image descriptor has an ambiguous or missing locator source")
+
+    path_value = descriptor.get("path")
+    path_is_jpgs = type(path_value) is str and path_value.lower().endswith(".jpgs")
+    if has_bundle or kind == "jpgs" or path_is_jpgs:
+        payload = descriptor.get("encoded_images") if has_bundle else descriptor.get("path")
+        if type(payload) is not str:
+            raise ValueError("inline .jpgs payloads are not allowed in locator mode")
+        payload_path = payload
+        if not payload_path.lower().endswith(".jpgs"):
+            raise ValueError(".jpgs locator must be backed by a .jpgs filesystem path")
+        if "encoded_image_index" not in descriptor:
+            raise ValueError(".jpgs locator requires an explicit image index")
+        index = _validate_jpgs_index(descriptor["encoded_image_index"])
+        path = _locator_path(payload_path, dataset_root=root, owner=".jpgs locator path")
+        return VisionDataLocator(
+            VisionLocatorKind.JPGS_IMAGE, path, None, None, index, grid_thw, declared_dimensions
+        )
+
+    key = "path" if has_path else direct_keys[0]
+    path = _locator_path(descriptor[key], dataset_root=root, owner=f"image descriptor {key}")
+    return VisionDataLocator(
+        VisionLocatorKind.SHARED_FILE,
+        path,
+        None,
+        None,
+        VisionLocatorIndexSentinel.UNUSED,
+        grid_thw,
+        declared_dimensions,
+    )
+
+
+def _parquet_locator_image_bytes(locator: VisionDataLocator) -> bytes:
+    import pyarrow.parquet as pq
+
+    parquet_file = pq.ParquetFile(locator.path)
+    if locator.column not in parquet_file.schema_arrow.names:
+        raise KeyError(f"parquet locator column {locator.column!r} is unavailable")
+    offset = 0
+    missing = object()
+    value = missing
+    for row_group in range(parquet_file.num_row_groups):
+        rows = parquet_file.metadata.row_group(row_group).num_rows
+        if locator.index < offset + rows:
+            table = parquet_file.read_row_group(row_group, columns=[locator.column])
+            value = table.column(locator.column)[locator.index - offset].as_py()
+            break
+        offset += rows
+    if value is missing:
+        raise ValueError(f"parquet locator row index {locator.index} is out of range")
+    if isinstance(value, Mapping):
+        if type(value) is not dict or not set(value).issubset({"bytes", "path"}):
+            raise ValueError("parquet locator value has unsupported payload fields")
+        present = tuple(key for key in ("bytes", "path") if value.get(key) is not None)
+        if len(present) != 1:
+            raise ValueError("parquet locator value has an ambiguous or missing payload")
+        value = value[present[0]]
+    if type(value) is str:
+        if value.startswith("/"):
+            raise ValueError("parquet locator payload path must be relative to its container")
+        container = posixpath.dirname(locator.path)
+        value = _locator_path(value, dataset_root=container, owner="parquet locator payload path")
+        return _read_bytes(value, "parquet locator value")
+    if type(value) is bytes:
+        return value
+    raise ValueError("parquet locator payload value must be exact bytes or a confined path")
+
+
+def vision_locator_image_bytes(locator: VisionDataLocator) -> bytes:
+    """Read exact encoded bytes named by one validated locator."""
+    if type(locator) is not VisionDataLocator:
+        raise ValueError("vision locator must use the exact VisionDataLocator type")
+    locator = VisionDataLocator(
+        locator.kind,
+        locator.path,
+        locator.member,
+        locator.column,
+        locator.index,
+        locator.grid_thw,
+        locator.declared_dimensions,
+    )
+    if locator.kind is VisionLocatorKind.SHARED_FILE:
+        return _read_bytes(locator.path, "shared-file locator")
+    if locator.kind is VisionLocatorKind.ZIP_MEMBER:
+        member = _validate_exact_zip_member(locator.member)
+        with zipfile.ZipFile(locator.path, "r") as archive:
+            matches = tuple(info for info in archive.infolist() if info.filename == member)
+            if len(matches) != 1:
+                raise ValueError("zip locator member must occur exactly once in the archive")
+            return archive.read(matches[0])
+    if locator.kind is VisionLocatorKind.JPGS_IMAGE:
+        if not locator.path.lower().endswith(".jpgs"):
+            raise ValueError(".jpgs locator must be backed by a .jpgs filesystem path")
+        return _jpgs_member(locator.path, locator.index)
+    if locator.kind is VisionLocatorKind.PARQUET_ROW:
+        return _parquet_locator_image_bytes(locator)
+    raise AssertionError("closed VisionLocatorKind was not handled")
 
 
 def _descriptor_source_spec(descriptor: Mapping[str, Any]) -> tuple[str, tuple[Any, ...]]:
