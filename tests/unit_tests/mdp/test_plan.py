@@ -3,6 +3,8 @@
 """Pure-compute tests for the MDP plan data model and digest. No distributed
 state, no CUDA."""
 
+import dataclasses
+
 import pytest
 
 from megatron.core.mdp.errors import MdpPlanError
@@ -90,6 +92,65 @@ def test_split_none_returns_single_chunk():
     assert split_encoder_layout(layout, max_payload_rows=None) == (layout,)
 
 
+def test_split_can_preserve_microbatch_boundaries_without_a_cap():
+    layout = _layout()
+    segments = tuple(
+        dataclasses.replace(segment, microbatch_id=0 if index < 2 else 1)
+        for index, segment in enumerate(layout.segments)
+    )
+    layout = dataclasses.replace(layout, segments=segments)
+
+    fused = split_encoder_layout(
+        layout, max_payload_rows=None, fuse_across_microbatches=True
+    )
+    bounded = split_encoder_layout(
+        layout, max_payload_rows=None, fuse_across_microbatches=False
+    )
+
+    assert fused == (layout,)
+    assert [[s.global_item_id for s in chunk.segments] for chunk in bounded] == [
+        [0, 1],
+        [2, 3],
+    ]
+    assert all(chunk.segments[0].payload_row_start == 0 for chunk in bounded)
+    assert all(chunk.segments[0].output_row_start == 0 for chunk in bounded)
+
+
+def test_split_combines_cap_and_microbatch_boundaries():
+    layout = _layout()
+    segments = tuple(
+        dataclasses.replace(segment, microbatch_id=0 if index < 3 else 1)
+        for index, segment in enumerate(layout.segments)
+    )
+    layout = dataclasses.replace(layout, segments=segments)
+
+    chunks = split_encoder_layout(
+        layout, max_payload_rows=80, fuse_across_microbatches=False
+    )
+
+    assert [[s.global_item_id for s in chunk.segments] for chunk in chunks] == [
+        [0, 1],
+        [2],
+        [3],
+    ]
+    assert chunks[1].segments[0].payload_row_start == 0
+    assert chunks[1].segments[0].output_row_start == 0
+
+
+def test_split_fusion_off_preserves_empty_and_oversized_contracts():
+    empty = EncoderThdLayout(producer_worker_id=3, segments=())
+    assert split_encoder_layout(
+        empty, max_payload_rows=None, fuse_across_microbatches=False
+    ) == (empty,)
+
+    chunks = split_encoder_layout(
+        _layout(), max_payload_rows=20, fuse_across_microbatches=False
+    )
+    assert [chunk.total_payload_rows for chunk in chunks] == [16, 64, 32, 16]
+    assert all(chunk.segments[0].payload_row_start == 0 for chunk in chunks)
+    assert all(chunk.segments[0].output_row_start == 0 for chunk in chunks)
+
+
 def test_split_at_item_boundaries_with_rebased_offsets():
     layout = _layout()  # payload rows: 16, 64, 32, 16
     chunks = split_encoder_layout(layout, max_payload_rows=80)
@@ -116,6 +177,14 @@ def test_split_allows_single_oversized_item():
 def test_split_rejects_nonpositive_cap():
     with pytest.raises(MdpPlanError):
         split_encoder_layout(_layout(), max_payload_rows=0)
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "yes"])
+def test_split_rejects_non_boolean_fusion_policy(value):
+    with pytest.raises(MdpPlanError, match="exact boolean"):
+        split_encoder_layout(
+            _layout(), max_payload_rows=None, fuse_across_microbatches=value
+        )
 
 
 # ------------------------- digest -------------------------

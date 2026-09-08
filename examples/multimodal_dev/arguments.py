@@ -2,6 +2,8 @@
 
 """Extra CLI arguments for multimodal_dev standalone training."""
 
+import argparse
+
 
 def validate_encoder_recompute_args(args) -> None:
     """Validate the shared native/MDP encoder recompute argument matrix."""
@@ -156,6 +158,15 @@ def add_multimodal_args(parser):
         help=(
             "Patch-row cap for one MDP encoder chunk; splitting happens "
             "only at complete vision-item boundaries."
+        ),
+    )
+    group.add_argument(
+        "--mdp-encoder-fuse-across-microbatches",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Allow MDP encoder chunks to fuse complete vision items across "
+            "decoder-microbatch boundaries (default: enabled)."
         ),
     )
     group.add_argument(

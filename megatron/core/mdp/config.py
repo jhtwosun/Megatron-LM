@@ -32,6 +32,7 @@ class MdpConfig:
     enable: bool = False
     encoder_cp: int = 1
     encoder_max_payload_rows: Optional[int] = None
+    encoder_fuse_across_microbatches: bool = True
     encoder_recompute_granularity: Optional[str] = None
     encoder_recompute_method: Optional[str] = None
     encoder_recompute_num_layers: Optional[int] = None
@@ -141,6 +142,14 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "None or a positive integer",
             "The chunk cap is measured in patch rows.",
             "None",
+        )
+    if type(config.encoder_fuse_across_microbatches) is not bool:
+        _reject(
+            "encoder_fuse_across_microbatches",
+            config.encoder_fuse_across_microbatches,
+            "a boolean",
+            "Encoder fusion boundaries must be deterministic across ranks.",
+            "True",
         )
     granularity = config.encoder_recompute_granularity
     if granularity not in ENCODER_RECOMPUTE_GRANULARITIES:

@@ -55,6 +55,41 @@ def test_valid_configuration_passes():
     validate_mdp_config(MdpConfig(enable=True), _options())
 
 
+def test_encoder_cross_microbatch_fusion_defaults_on_and_accepts_explicit_off():
+    assert MdpConfig().encoder_fuse_across_microbatches is True
+    validate_mdp_config(
+        MdpConfig(enable=True, encoder_fuse_across_microbatches=False), _options()
+    )
+
+
+@pytest.mark.parametrize("fuse", [True, False], ids=["fused", "microbatch-bounded"])
+@pytest.mark.parametrize("granularity", [None, "whole"], ids=["retain", "recompute"])
+def test_encoder_fusion_and_backward_modes_compose_with_payload_cap(fuse, granularity):
+    validate_mdp_config(
+        MdpConfig(
+            enable=True,
+            encoder_max_payload_rows=80,
+            encoder_fuse_across_microbatches=fuse,
+            encoder_recompute_granularity=granularity,
+        ),
+        _options(),
+    )
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "yes"])
+def test_encoder_cross_microbatch_fusion_requires_exact_bool_when_enabled(value):
+    with pytest.raises(MdpConfigurationError, match="encoder_fuse_across_microbatches"):
+        validate_mdp_config(
+            MdpConfig(enable=True, encoder_fuse_across_microbatches=value), _options()
+        )
+
+
+def test_disabled_mdp_ignores_encoder_cross_microbatch_fusion():
+    validate_mdp_config(
+        MdpConfig(enable=False, encoder_fuse_across_microbatches="unused"), _options()
+    )
+
+
 def test_decoder_ep_overlap_configuration_passes_with_vpp():
     validate_mdp_config(
         MdpConfig(enable=True),
@@ -638,3 +673,14 @@ def test_encoder_recompute_options_are_snapshotted_from_args(arg_overrides, expe
         config.encoder_recompute_modules,
     )
     assert actual == expected
+
+
+@pytest.mark.parametrize("args_value, expected", [(None, True), (False, False), (True, True)])
+def test_encoder_cross_microbatch_fusion_is_snapshotted_from_args(args_value, expected):
+    from megatron.core.mdp.integration import mdp_config_from_args
+
+    overrides = {}
+    if args_value is not None:
+        overrides["mdp_encoder_fuse_across_microbatches"] = args_value
+    config = mdp_config_from_args(_fake_args(mdp_enable=True, **overrides))
+    assert config.encoder_fuse_across_microbatches is expected

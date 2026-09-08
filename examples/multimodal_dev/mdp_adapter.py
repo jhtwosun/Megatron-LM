@@ -19,18 +19,44 @@ from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
 from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
 
+_SIGNED_INT64_MAX = (1 << 63) - 1
+
+
+def qwen_vision_lpt_cost(grid_thw: tuple, hidden_size: int) -> int:
+    """Return the integer Qwen vision attention-plus-FFN ordering proxy."""
+    if type(grid_thw) is not tuple or len(grid_thw) != 3:
+        raise ValueError("grid_thw must be an exact three-element tuple")
+    if any(type(value) is not int or value <= 0 for value in grid_thw):
+        raise ValueError("grid_thw elements must be positive integers")
+    if type(hidden_size) is not int or hidden_size <= 0:
+        raise ValueError("hidden_size must be a positive integer")
+    patches = grid_thw[0] * grid_thw[1] * grid_thw[2]
+    cost = patches * patches * hidden_size + patches * hidden_size * hidden_size
+    if cost > _SIGNED_INT64_MAX:
+        raise ValueError("Qwen vision LPT cost must fit signed int64")
+    return cost
+
 
 class Qwen35VLMdpAdapter:
     """MdpModelAdapter implementation for Qwen3.5-VL.
 
     Args:
         out_hidden_size: Language decoder hidden size (patch-merger output).
+        vision_hidden_size: Native vision-transformer hidden size for LPT cost.
         vision_kwargs: Optional override of the Qwen3.5-VL vision kwargs.
     """
 
-    def __init__(self, out_hidden_size: int, vision_kwargs: Optional[dict] = None):
+    def __init__(
+        self,
+        out_hidden_size: int,
+        vision_hidden_size: int,
+        vision_kwargs: Optional[dict] = None,
+    ):
         self._vision_kwargs = dict(vision_kwargs or VISION_KWARGS)
         self._vision_kwargs["out_hidden_size"] = out_hidden_size
+        if type(vision_hidden_size) is not int or vision_hidden_size <= 0:
+            raise ValueError("vision_hidden_size must be a positive integer")
+        self._vision_hidden_size = vision_hidden_size
         self.spatial_merge_size = self._vision_kwargs["spatial_merge_size"]
         self.payload_width = (
             self._vision_kwargs["in_channels"]
@@ -110,8 +136,8 @@ class Qwen35VLMdpAdapter:
     # ------------------------------------------------------------------
 
     def estimate_cost(self, item: CapturedVisionItem) -> int:
-        """Patch rows as the LPT ordering cost; never sizes any buffer."""
-        return item.payload_rows
+        """Qwen vision FLOP proxy for LPT ordering; never sizes any buffer."""
+        return qwen_vision_lpt_cost(item.grid_thw, self._vision_hidden_size)
 
     # ------------------------------------------------------------------
     # Encoder factory and forward
@@ -151,6 +177,9 @@ class Qwen35VLMdpAdapter:
         return encoder(payload, grid_thw)
 
 
-def build_mdp_adapter(args, language_config) -> Qwen35VLMdpAdapter:
+def build_mdp_adapter(args, language_config, vision_config) -> Qwen35VLMdpAdapter:
     """Adapter factory used by the pretrain entry point."""
-    return Qwen35VLMdpAdapter(out_hidden_size=language_config.hidden_size)
+    return Qwen35VLMdpAdapter(
+        out_hidden_size=language_config.hidden_size,
+        vision_hidden_size=vision_config.hidden_size,
+    )

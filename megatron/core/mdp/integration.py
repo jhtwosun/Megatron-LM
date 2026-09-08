@@ -80,6 +80,9 @@ def mdp_config_from_args(args) -> MdpConfig:
         enable=mdp_enabled(args),
         encoder_cp=getattr(args, "mdp_encoder_cp", 1),
         encoder_max_payload_rows=getattr(args, "mdp_encoder_max_payload_rows", None),
+        encoder_fuse_across_microbatches=getattr(
+            args, "mdp_encoder_fuse_across_microbatches", True
+        ),
         encoder_recompute_granularity=getattr(
             args, "encoder_recompute_granularity", None
         ),
@@ -249,7 +252,6 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
             "maximum grid).",
             mdp_config.encoder_max_payload_rows,
         )
-
     if args.bf16:
         params_dtype = torch.bfloat16
     elif args.fp16:
@@ -289,12 +291,14 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
     )
     logger.info(
         "MDP: runtime installed (outer_dp_rank=%d, worker_id=%s, endpoint=%d, "
-        "workers=%d, encoder_recompute_granularity=%s)",
+        "workers=%d, encoder_recompute_granularity=%s, "
+        "encoder_fuse_across_microbatches=%s)",
         rank_view.outer_dp_rank,
         rank_view.my_worker_id,
         rank_view.endpoint_rank,
         len(rank_view.worker_ids),
         mdp_config.encoder_recompute_granularity,
+        mdp_config.encoder_fuse_across_microbatches,
     )
 
     from megatron.core.mdp.optimizer import build_mdp_composite_optimizer
