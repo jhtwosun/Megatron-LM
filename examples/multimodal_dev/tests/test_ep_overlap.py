@@ -205,3 +205,49 @@ def test_mdp_forward_step_switches_only_when_overlap_scheduler_requests_plan(mon
     assert plan_model.inputs["vision_embeddings"] is vision_leaf
     assert plan_model.inputs["pixel_values"] is None
     assert plan_model.inputs["packed_seq_params"] is record.decoder_packed_seq_params
+
+
+def test_mdp_forward_step_reports_authoritative_dynamic_iteration_vision_work(monkeypatch):
+    authoritative_items = (object(), object())
+    local_items = ()
+    record = SimpleNamespace(
+        microbatch_id=5,
+        text_only=True,
+        vision_items=local_items,
+        decoder_packed_seq_params=object(),
+        model_payload={"input_ids": torch.tensor([[3]]), "loss_mask": torch.ones(1, 1)},
+    )
+
+    class _Iterator:
+        def __init__(self):
+            self._yielded = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            assert not self._yielded
+            self._yielded = True
+            return record
+
+        def iteration_vision_items(self, yielded):
+            assert yielded is record
+            return authoritative_items
+
+    observed = []
+    monkeypatch.setattr(
+        forward_step,
+        "_accumulate_workload_stats",
+        lambda model, packed, *, vision_items: observed.append((packed, vision_items)),
+    )
+    monkeypatch.setattr(forward_step, "is_pipeline_first_stage", lambda: False)
+    monkeypatch.setattr(forward_step, "is_pipeline_last_stage", lambda: False)
+
+    output, _ = forward_step.mdp_forward_step(
+        SimpleNamespace(config=SimpleNamespace(dynamic_encoder_cp=True)),
+        _Iterator(),
+        _ForwardModel(),
+    )
+
+    assert output == "eager-output"
+    assert observed == [(record.decoder_packed_seq_params, authoritative_items)]

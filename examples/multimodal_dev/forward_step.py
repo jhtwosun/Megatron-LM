@@ -1067,10 +1067,14 @@ def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool =
     record = next(data_iterator)
     batch = dict(record.model_payload)
 
+    vision_items = record.vision_items
+    iteration_vision_items = getattr(data_iterator, "iteration_vision_items", None)
+    if callable(iteration_vision_items):
+        vision_items = iteration_vision_items(record)
     _accumulate_workload_stats(
         model,
         record.decoder_packed_seq_params,
-        vision_items=record.vision_items,
+        vision_items=vision_items,
     )
 
     vision_embeddings = None

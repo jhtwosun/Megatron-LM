@@ -206,6 +206,19 @@ class _D4DynamicDecoderReplayCursor:
         _ACTIVE_CURSORS[id(self)] = next_entry
         return records[index]
 
+    def iteration_vision_items(self, record: MdpMicrobatchRecord) -> tuple[Any, ...]:
+        """Return domain-authoritative vision work once for FLOPs accounting."""
+        entry = self._active_entry()
+        if (
+            type(record) is not MdpMicrobatchRecord
+            or entry[5] < 1
+            or entry[4][entry[5] - 1] is not record
+        ):
+            raise MdpStateError("MDP: dynamic decoder statistics follow its just-yielded record.")
+        if entry[5] != 1:
+            return ()
+        return self._owner.authority.global_manifest.items
+
     def vision_embedding_leaf(self, record: MdpMicrobatchRecord) -> Tensor | None:
         """Return the leaf for the record most recently yielded to the decoder."""
         entry = self._active_entry()
@@ -1232,7 +1245,7 @@ class _D4DynamicDecoderReplayOwner:
             completion,
             self,
             lifecycle.token_descriptor,
-            all(record.text_only for record in entry[-1].records),
+            handoff_trusted[11],
             forward_handle is not None,
             entry[6],
             entry,

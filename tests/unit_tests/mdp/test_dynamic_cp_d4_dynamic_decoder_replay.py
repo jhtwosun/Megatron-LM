@@ -72,14 +72,17 @@ class _Solver:
         return lengths, sample_seqlens[count:], None, sample_ids
 
 
-def _source_window(*, text_only=False, sample_count=4):
+def _source_window(*, text_only=False, sample_count=4, vision_sample_count=None):
     samples = []
     items = []
     packets = []
     for index in range(sample_count):
         sample_id = GlobalSampleId(0, index)
         item_id = GlobalVisionItemId(0, index)
-        vision = () if text_only else (EncoderVisionItemMetadata(item_id, sample_id, 0),)
+        has_vision = not text_only and (
+            vision_sample_count is None or index < vision_sample_count
+        )
+        vision = (EncoderVisionItemMetadata(item_id, sample_id, 0),) if has_vision else ()
         samples.append(DecoderSampleMetadata(sample_id, 4, 4, vision))
         if vision:
             items.append(DecoderVisionItemMetadata(item_id, sample_id, 0, (1, 1, 1), 1, (1,)))
@@ -104,7 +107,9 @@ def _source_window(*, text_only=False, sample_count=4):
     )
 
 
-def _authority_and_binding(*, cp_size=2, rank=0, text_only=False, sample_count=4):
+def _authority_and_binding(
+    *, cp_size=2, rank=0, text_only=False, sample_count=4, vision_sample_count=None
+):
     binding = _make_repeated_d4_group_binding(
         world_group=_Group(tuple(range(8)), rank),
         domain_group=_Group((0, 1, 2, 3), rank),
@@ -116,7 +121,11 @@ def _authority_and_binding(*, cp_size=2, rank=0, text_only=False, sample_count=4
         group_ranks_getter=lambda group: group._ranks,
         status_gather_factory=lambda **_: lambda *_args, **_kwargs: None,
     )
-    source = _source_window(text_only=text_only, sample_count=sample_count)
+    source = _source_window(
+        text_only=text_only,
+        sample_count=sample_count,
+        vision_sample_count=vision_sample_count,
+    )
     metadata = DecoderMetadataGatherResult(
         build_decoder_global_manifest((source.metadata_manifest(),)), {0: 0}
     )
@@ -304,9 +313,23 @@ class _BindingOwner:
         self.calls.append(primary)
 
 
-def _parts(monkeypatch, *, runtime=None, cp_size=2, text_only=False, selected=True, sample_count=4):
+def _parts(
+    monkeypatch,
+    *,
+    runtime=None,
+    cp_size=2,
+    rank=0,
+    text_only=False,
+    selected=True,
+    sample_count=4,
+    vision_sample_count=None,
+):
     source, binding, authority = _authority_and_binding(
-        cp_size=cp_size, text_only=text_only, sample_count=sample_count
+        cp_size=cp_size,
+        rank=rank,
+        text_only=text_only,
+        sample_count=sample_count,
+        vision_sample_count=vision_sample_count,
     )
     rank = binding.global_rank
     payload, embedding = _transport(source, authority, rank=rank)
@@ -435,6 +458,22 @@ def _completed(parts):
         schedule_return=schedule_return,
         completion=completion,
     )
+
+
+def test_dynamic_cursor_reports_domain_authority_vision_work_once_on_locally_text_only_rank(
+    monkeypatch,
+):
+    parts = _parts(monkeypatch, rank=2, vision_sample_count=1)
+    owner = _run(parts)
+    cursor = owner.replay_cursor()
+
+    first = next(cursor)
+    assert first.text_only is True
+    assert cursor.iteration_vision_items(first) is parts.authority.global_manifest.items
+    second = next(cursor)
+    assert cursor.iteration_vision_items(second) == ()
+
+    owner.abort()
 
 
 @pytest.mark.parametrize("mutation", ("active_entry", "authority"))
@@ -576,6 +615,25 @@ def test_dynamic_replay_claims_exact_gradient_handoff_without_release(monkeypatc
         *(value for _, value in parts.allocator.acquired),
         *parts.old_buffers,
     ]
+
+
+def test_dynamic_gradient_handoff_retains_global_vision_role_for_locally_text_only_rank(
+    monkeypatch,
+):
+    parts = _parts(
+        monkeypatch,
+        cp_size=1,
+        rank=2,
+        selected=False,
+        vision_sample_count=1,
+    )
+    completed = _completed(parts)
+
+    assert all(record.text_only for record in completed.owner.records)
+    handoff = completed.owner._claim_for_gradient(parts.authority, completed.completion)
+
+    assert handoff.text_only is False
+    handoff.abort()
 
 
 @pytest.mark.parametrize(
