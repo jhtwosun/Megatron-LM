@@ -2,10 +2,12 @@
 
 """Public-integration boundary tests for the private repeated-D4 schedule."""
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
 
+from megatron.core.mdp import dynamic_cp_d4_transaction as transaction_api
 from megatron.core.mdp import integration
 from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
@@ -302,8 +304,15 @@ def test_d4_mcore_factory_binds_fixed_or_joint_j1_facade(
     monkeypatch.setattr(integration, "_capture_d4_encoder_source", capture)
     monkeypatch.setattr(integration, "_run_repeated_d4_fixed_iteration", fixed)
     monkeypatch.setattr(integration, "_run_repeated_d4_joint_iteration", joint)
+    monkeypatch.setattr(transaction_api, "_validate_repeated_d4_group_binding", lambda value: value)
+    lifecycle = transaction_api._bind_d4_checkpoint_lifecycle(runtime, binding)
+    monkeypatch.setattr(integration, "_RUNTIME", runtime)
+    monkeypatch.setattr(integration, "_D4_CHECKPOINT_LIFECYCLE", lifecycle)
 
     facade = integration._build_d4_facade_from_mcore(runtime, config)
+    initial = integration.get_d4_checkpoint_lifecycle_snapshot()
+    assert initial.state is transaction_api._INITIAL_IDLE
+    assert initial.may_load and not initial.may_save
     iterator = object()
     native_args = (object(),)
     native_kwargs = {"forward_only": False}
@@ -314,6 +323,11 @@ def test_d4_mcore_factory_binds_fixed_or_joint_j1_facade(
         native_schedule_args=native_args,
         native_schedule_kwargs=native_kwargs,
     )
+    committed = integration.get_d4_checkpoint_lifecycle_snapshot()
+    assert committed.state is transaction_api._COMMITTED_IDLE
+    assert committed.may_save and not committed.may_load
+    with pytest.raises(MdpStateError, match="stale|snapshot"):
+        initial.require()
 
     assert captured["capture"] == {
         "runtime": runtime,
@@ -335,3 +349,294 @@ def test_d4_mcore_factory_binds_fixed_or_joint_j1_facade(
     assert kwargs["native_schedule_args"] is native_args
     assert kwargs["native_schedule_kwargs"] is native_kwargs
     assert ("decoder_minimum_cp_size" in kwargs) is dynamic_decoder
+
+
+@pytest.mark.parametrize("failure_stage", ("begin", "capture", "run", "commit"))
+def test_d4_shared_facade_poison_preserves_primary(monkeypatch, failure_stage):
+    binding = object()
+    runtime = SimpleNamespace(
+        config=MdpConfig(
+            enable=True,
+            encoder_cp=4,
+            encoder_max_payload_rows=16,
+            dynamic_encoder_cp=True,
+            min_dynamic_encoder_cp_size=1,
+        ),
+        adapter=SimpleNamespace(
+            build_dynamic_decoder_payload_codec=lambda: SimpleNamespace(
+                rebuild_microbatch=lambda *_args, **_kwargs: None
+            ),
+            estimate_dynamic_encoder_workload=lambda *_args, **_kwargs: None,
+        ),
+        dynamic_group_binding=binding,
+        vision_capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+        hidden_size=8,
+        params_dtype=object(),
+    )
+    config = SimpleNamespace(
+        dynamic_context_parallel=False,
+        max_seqlen_per_dp_cp_rank=8,
+        min_dynamic_context_parallel_size=1,
+    )
+    primary = RuntimeError(f"{failure_stage} failed")
+    monkeypatch.setattr(transaction_api, "_validate_repeated_d4_group_binding", lambda value: value)
+    lifecycle = transaction_api._bind_d4_checkpoint_lifecycle(runtime, binding)
+    monkeypatch.setattr(integration, "_RUNTIME", runtime)
+    monkeypatch.setattr(integration, "_D4_CHECKPOINT_LIFECYCLE", lifecycle)
+    monkeypatch.setattr(
+        integration, "_snapshot_d4_encoder_capture_operations", lambda *_args: object()
+    )
+
+    def capture(**_kwargs):
+        assert failure_stage != "begin"
+        if failure_stage == "capture":
+            raise primary
+        return object()
+
+    def run(*_args, **_kwargs):
+        if failure_stage == "run":
+            raise primary
+
+    if failure_stage in ("begin", "commit"):
+        monkeypatch.setattr(
+            transaction_api._D4CheckpointLifecycleOwner,
+            f"{failure_stage}_iteration",
+            lambda *_args: (_ for _ in ()).throw(primary),
+        )
+
+    monkeypatch.setattr(integration, "_capture_d4_encoder_source", capture)
+    monkeypatch.setattr(integration, "_run_repeated_d4_fixed_iteration", run)
+    facade = integration._build_d4_facade_from_mcore(runtime, config)
+
+    with pytest.raises(RuntimeError, match=failure_stage) as raised:
+        facade(
+            data_iterators=iter((object(),)),
+            num_microbatches=1,
+            forward_backward_func=_native_schedule,
+            native_schedule_args=(),
+            native_schedule_kwargs={},
+        )
+    assert raised.value is primary
+    snapshot = integration.get_d4_checkpoint_lifecycle_snapshot()
+    assert snapshot.state is transaction_api._CHECKPOINT_POISONED
+    assert not snapshot.may_load and not snapshot.may_save
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True))
+def test_d4_facade_freezes_selected_iteration_runner(monkeypatch, dynamic_decoder):
+    binding = object()
+    codec = SimpleNamespace(rebuild_microbatch=lambda *_args, **_kwargs: None)
+    runtime = SimpleNamespace(
+        config=MdpConfig(
+            enable=True,
+            encoder_cp=4,
+            encoder_max_payload_rows=16,
+            dynamic_encoder_cp=True,
+            min_dynamic_encoder_cp_size=1,
+        ),
+        adapter=SimpleNamespace(
+            build_dynamic_decoder_payload_codec=lambda: codec,
+            estimate_dynamic_encoder_workload=lambda *_args, **_kwargs: None,
+        ),
+        dynamic_group_binding=binding,
+        vision_capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+        hidden_size=8,
+        params_dtype=object(),
+    )
+    config = SimpleNamespace(
+        dynamic_context_parallel=dynamic_decoder,
+        max_seqlen_per_dp_cp_rank=8,
+        min_dynamic_context_parallel_size=1,
+    )
+    calls = []
+    monkeypatch.setattr(transaction_api, "_validate_repeated_d4_group_binding", lambda value: value)
+    lifecycle = transaction_api._bind_d4_checkpoint_lifecycle(runtime, binding)
+    monkeypatch.setattr(integration, "_RUNTIME", runtime)
+    monkeypatch.setattr(integration, "_D4_CHECKPOINT_LIFECYCLE", lifecycle)
+    monkeypatch.setattr(
+        integration, "_snapshot_d4_encoder_capture_operations", lambda *_args: object()
+    )
+    monkeypatch.setattr(integration, "_capture_d4_encoder_source", lambda **_kwargs: object())
+
+    def selected(*_args, **_kwargs):
+        calls.append("selected")
+
+    selected_name = (
+        "_run_repeated_d4_joint_iteration"
+        if dynamic_decoder
+        else "_run_repeated_d4_fixed_iteration"
+    )
+    monkeypatch.setattr(integration, selected_name, selected)
+    facade = integration._build_d4_facade_from_mcore(runtime, config)
+    monkeypatch.setattr(
+        integration,
+        selected_name,
+        lambda *_args, **_kwargs: pytest.fail("late runner substitution was observed"),
+    )
+
+    facade(
+        data_iterators=iter((object(),)),
+        num_microbatches=1,
+        forward_backward_func=_native_schedule,
+        native_schedule_args=(),
+        native_schedule_kwargs={},
+    )
+    assert calls == ["selected"]
+
+
+def test_d4_lifecycle_mint_is_between_optimizer_success_and_runtime_publication():
+    source = inspect.getsource(integration.maybe_build_mdp_domain)
+    optimizer = source.index("build_mdp_composite_optimizer")
+    mint = source.index("_install_d4_checkpoint_lifecycle")
+    publication = source.index("_RUNTIME = runtime")
+    assert optimizer < mint < publication
+
+
+def test_d4_lifecycle_supports_second_iteration_and_reset_retires_snapshot(monkeypatch):
+    binding = object()
+    runtime = SimpleNamespace(
+        config=MdpConfig(enable=True, dynamic_encoder_cp=True),
+        dynamic_adapter_capability=None,
+        dynamic_group_binding=binding,
+    )
+    monkeypatch.setattr(transaction_api, "_validate_repeated_d4_group_binding", lambda value: value)
+    lifecycle = transaction_api._bind_d4_checkpoint_lifecycle(runtime, binding)
+    monkeypatch.setattr(integration, "_RUNTIME", runtime)
+    monkeypatch.setattr(integration, "_D4_CHECKPOINT_LIFECYCLE", lifecycle)
+
+    lifecycle.begin_iteration(runtime, binding)
+    lifecycle.commit_iteration(runtime, binding)
+    first = integration.get_d4_checkpoint_lifecycle_snapshot()
+    lifecycle.begin_iteration(runtime, binding)
+    lifecycle.commit_iteration(runtime, binding)
+    second = integration.get_d4_checkpoint_lifecycle_snapshot()
+    assert first.generation == 1 and second.generation == 2
+    with pytest.raises(MdpStateError, match="stale|snapshot"):
+        first.require()
+
+    integration.reset_for_testing()
+    assert integration.get_d4_checkpoint_lifecycle_snapshot() is None
+    with pytest.raises(MdpStateError, match="retired|stale"):
+        second.require()
+
+
+def test_static_runtime_has_no_repeated_d4_checkpoint_capability(monkeypatch):
+    integration.reset_for_testing()
+    monkeypatch.setattr(integration, "_RUNTIME", _runtime(dynamic_encoder_cp=False))
+    assert integration.get_d4_checkpoint_lifecycle_snapshot() is None
+
+
+@pytest.mark.parametrize(
+    "pairing", ("runtime-only-d4", "lifecycle-only", "static-lifecycle", "foreign-pair")
+)
+def test_checkpoint_snapshot_query_rejects_incomplete_runtime_lifecycle_pair(monkeypatch, pairing):
+    integration.reset_for_testing()
+    runtime = _runtime(dynamic_encoder_cp=pairing != "static-lifecycle")
+    lifecycle = object()
+    monkeypatch.setattr(integration, "_RUNTIME", None if pairing == "lifecycle-only" else runtime)
+    monkeypatch.setattr(
+        integration, "_D4_CHECKPOINT_LIFECYCLE", None if pairing == "runtime-only-d4" else lifecycle
+    )
+    with pytest.raises(MdpStateError, match="runtime|lifecycle|pair"):
+        integration.get_d4_checkpoint_lifecycle_snapshot()
+
+
+def test_checkpoint_lifecycle_install_is_atomic_on_stale_global_and_mint_failure(monkeypatch):
+    integration.reset_for_testing()
+    runtime = SimpleNamespace(dynamic_group_binding=object())
+    stale = object()
+    monkeypatch.setattr(integration, "_D4_CHECKPOINT_LIFECYCLE", stale)
+    active_before = dict(transaction_api._ACTIVE_CHECKPOINT_LIFECYCLES)
+    monkeypatch.setattr(
+        transaction_api,
+        "_bind_d4_checkpoint_lifecycle",
+        lambda *_args: pytest.fail("mint called with stale lifecycle installed"),
+    )
+    with pytest.raises(MdpStateError, match="installed once|lifecycle"):
+        integration._install_d4_checkpoint_lifecycle(runtime)
+    assert integration._D4_CHECKPOINT_LIFECYCLE is stale
+    assert transaction_api._ACTIVE_CHECKPOINT_LIFECYCLES == active_before
+
+    monkeypatch.setattr(integration, "_D4_CHECKPOINT_LIFECYCLE", None)
+    primary = RuntimeError("mint failed")
+    monkeypatch.setattr(
+        transaction_api,
+        "_bind_d4_checkpoint_lifecycle",
+        lambda *_args: (_ for _ in ()).throw(primary),
+    )
+    with pytest.raises(RuntimeError, match="mint failed") as raised:
+        integration._install_d4_checkpoint_lifecycle(runtime)
+    assert raised.value is primary
+    assert integration._RUNTIME is None
+    assert integration._D4_CHECKPOINT_LIFECYCLE is None
+    assert transaction_api._ACTIVE_CHECKPOINT_LIFECYCLES == active_before
+
+
+def test_d4_facade_rejects_method_compatible_fake_lifecycle_before_capture(monkeypatch):
+    binding = object()
+    runtime = SimpleNamespace(
+        config=MdpConfig(
+            enable=True,
+            encoder_cp=4,
+            encoder_max_payload_rows=16,
+            dynamic_encoder_cp=True,
+            min_dynamic_encoder_cp_size=1,
+        ),
+        adapter=SimpleNamespace(
+            build_dynamic_decoder_payload_codec=lambda: SimpleNamespace(
+                rebuild_microbatch=lambda *_args, **_kwargs: None
+            ),
+            estimate_dynamic_encoder_workload=lambda *_args, **_kwargs: None,
+        ),
+        dynamic_group_binding=binding,
+        vision_capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+        hidden_size=8,
+        params_dtype=object(),
+    )
+    config = SimpleNamespace(
+        dynamic_context_parallel=False,
+        max_seqlen_per_dp_cp_rank=8,
+        min_dynamic_context_parallel_size=1,
+    )
+    fake = SimpleNamespace(
+        snapshot=lambda *_args: pytest.fail("fake snapshot called"),
+        begin_iteration=lambda *_args: pytest.fail("fake begin called"),
+        commit_iteration=lambda *_args: pytest.fail("fake commit called"),
+        poison=lambda *_args: pytest.fail("fake poison called"),
+    )
+    monkeypatch.setattr(integration, "_RUNTIME", runtime)
+    monkeypatch.setattr(integration, "_D4_CHECKPOINT_LIFECYCLE", fake)
+    monkeypatch.setattr(
+        integration, "_snapshot_d4_encoder_capture_operations", lambda *_args: object()
+    )
+    monkeypatch.setattr(
+        integration, "_capture_d4_encoder_source", lambda **_kwargs: pytest.fail("capture entered")
+    )
+    monkeypatch.setattr(
+        integration,
+        "_run_repeated_d4_fixed_iteration",
+        lambda *_args, **_kwargs: pytest.fail("iteration entered"),
+    )
+
+    with pytest.raises(MdpStateError, match="exact checkpoint lifecycle pair"):
+        integration._build_d4_facade_from_mcore(runtime, config)
+
+
+def test_reset_retires_checkpoint_lifecycle_before_unpublishing_globals(monkeypatch):
+    integration.reset_for_testing()
+    runtime = SimpleNamespace(dynamic_adapter_capability=None, dynamic_group_binding=object())
+
+    class Lifecycle:
+        def retire(self, selected_runtime, selected_binding):
+            assert selected_runtime is runtime
+            assert selected_binding is runtime.dynamic_group_binding
+            assert integration._RUNTIME is runtime
+            assert integration._D4_CHECKPOINT_LIFECYCLE is self
+
+    lifecycle = Lifecycle()
+    monkeypatch.setattr(integration, "_RUNTIME", runtime)
+    monkeypatch.setattr(integration, "_D4_CHECKPOINT_LIFECYCLE", lifecycle)
+
+    integration.reset_for_testing()
+    assert integration._RUNTIME is None
+    assert integration._D4_CHECKPOINT_LIFECYCLE is None

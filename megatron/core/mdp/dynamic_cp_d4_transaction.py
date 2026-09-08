@@ -40,6 +40,14 @@ _BACKWARD, _FINALIZED, _PENDING = object(), object(), object()
 _LEASE_SEAL = object()
 _FACTORY_SEALS: dict[object, tuple[int, int]] = {}
 
+_INITIAL_IDLE = object()
+_CHECKPOINT_ACTIVE = object()
+_COMMITTED_IDLE = object()
+_CHECKPOINT_POISONED = object()
+_CHECKPOINT_RETIRED = object()
+_CHECKPOINT_FACTORY_SEALS: dict[object, tuple[int, int]] = {}
+_CHECKPOINT_SNAPSHOT_SEALS: dict[object, tuple[int, object, int]] = {}
+
 
 @dataclass(slots=True)
 class _TransactionEscrow:
@@ -70,6 +78,202 @@ _ACTIVE_TRANSACTIONS: dict[int, _TransactionEscrow] = {}
 _TRUSTED_TRANSACTIONS: dict[int, _TransactionEscrow] = {}
 _RETIRED_TRANSACTIONS: dict[int, weakref.ReferenceType[Any]] = {}
 _ACTIVE_LEASES: dict[int, _LeaseEscrow] = {}
+
+
+@dataclass(slots=True)
+class _CheckpointLifecycleEscrow:
+    reference: Any
+    runtime: Any
+    binding: Any
+    state: object
+    generation: int
+
+
+@dataclass(slots=True)
+class _CheckpointSnapshotEscrow:
+    reference: Any
+    owner: Any
+    state: object
+    generation: int
+    may_load: bool
+    may_save: bool
+
+
+_ACTIVE_CHECKPOINT_LIFECYCLES: dict[int, _CheckpointLifecycleEscrow] = {}
+_RETIRED_CHECKPOINT_LIFECYCLES: dict[int, weakref.ReferenceType[Any]] = {}
+_ACTIVE_CHECKPOINT_SNAPSHOTS: dict[int, _CheckpointSnapshotEscrow] = {}
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _D4CheckpointLifecycleSnapshot:
+    state: object
+    generation: int
+    may_load: bool
+    may_save: bool
+    _seal: object = field(compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        expected = _CHECKPOINT_SNAPSHOT_SEALS.pop(self._seal, None)
+        if (
+            type(self) is not _D4CheckpointLifecycleSnapshot
+            or expected != (id(self), self.state, self.generation)
+            or type(self.generation) is not int
+            or self.generation < 0
+            or type(self.may_load) is not bool
+            or type(self.may_save) is not bool
+            or (self.may_load, self.may_save)
+            != (self.state is _INITIAL_IDLE, self.state is _COMMITTED_IDLE)
+        ):
+            raise MdpConfigurationError("MDP: repeated-D4 checkpoint snapshot is privately minted.")
+
+    def require(self):
+        snapshot_entry = _ACTIVE_CHECKPOINT_SNAPSHOTS.get(id(self))
+        if (
+            type(snapshot_entry) is not _CheckpointSnapshotEscrow
+            or snapshot_entry.reference() is not self
+        ):
+            raise MdpStateError("MDP: repeated-D4 checkpoint snapshot is exact and active.")
+        entry = _require_checkpoint_lifecycle(snapshot_entry.owner)
+        if (
+            self.state is not snapshot_entry.state
+            or self.generation != snapshot_entry.generation
+            or self.may_load is not snapshot_entry.may_load
+            or self.may_save is not snapshot_entry.may_save
+            or snapshot_entry.state is not entry.state
+            or snapshot_entry.generation != entry.generation
+        ):
+            raise MdpStateError("MDP: repeated-D4 checkpoint snapshot is stale or not exact.")
+        return self
+
+
+class _D4CheckpointLifecycleOwner:
+    __slots__ = ("__weakref__", "_runtime", "_binding", "_state", "_generation")
+
+    def __init__(self, runtime, binding, seal) -> None:
+        if _CHECKPOINT_FACTORY_SEALS.pop(seal, None) != (id(runtime), id(binding)):
+            raise MdpConfigurationError(
+                "MDP: repeated-D4 checkpoint lifecycle is privately minted."
+            )
+        self._runtime = runtime
+        self._binding = binding
+        self._state = _INITIAL_IDLE
+        self._generation = 0
+
+    def snapshot(self, runtime, binding):
+        entry = _require_checkpoint_lifecycle(self, runtime, binding)
+        seal = object()
+        snapshot = object.__new__(_D4CheckpointLifecycleSnapshot)
+        _CHECKPOINT_SNAPSHOT_SEALS[seal] = (id(snapshot), entry.state, entry.generation)
+        _D4CheckpointLifecycleSnapshot.__init__(
+            snapshot,
+            state=entry.state,
+            generation=entry.generation,
+            may_load=entry.state is _INITIAL_IDLE,
+            may_save=entry.state is _COMMITTED_IDLE,
+            _seal=seal,
+        )
+        identity = id(snapshot)
+
+        def discard(reference, *, expected_identity=identity):
+            current = _ACTIVE_CHECKPOINT_SNAPSHOTS.get(expected_identity)
+            if current is not None and current.reference is reference:
+                _ACTIVE_CHECKPOINT_SNAPSHOTS.pop(expected_identity, None)
+
+        _ACTIVE_CHECKPOINT_SNAPSHOTS[id(snapshot)] = _CheckpointSnapshotEscrow(
+            weakref.ref(snapshot, discard),
+            self,
+            entry.state,
+            entry.generation,
+            snapshot.may_load,
+            snapshot.may_save,
+        )
+        return snapshot.require()
+
+    def begin_iteration(self, runtime, binding) -> None:
+        entry = _require_checkpoint_lifecycle(self, runtime, binding)
+        if entry.state not in (_INITIAL_IDLE, _COMMITTED_IDLE):
+            label = "poisoned" if entry.state is _CHECKPOINT_POISONED else "active"
+            raise MdpStateError(
+                f"MDP: repeated-D4 checkpoint lifecycle is {label}; iteration cannot begin."
+            )
+        self._state = entry.state = _CHECKPOINT_ACTIVE
+
+    def commit_iteration(self, runtime, binding) -> None:
+        entry = _require_checkpoint_lifecycle(self, runtime, binding)
+        if entry.state is not _CHECKPOINT_ACTIVE:
+            if entry.state is _CHECKPOINT_POISONED:
+                raise MdpStateError(
+                    "MDP: repeated-D4 checkpoint lifecycle is poisoned; iteration cannot commit."
+                )
+            raise MdpStateError(
+                "MDP: repeated-D4 checkpoint lifecycle commits only an active iteration."
+            )
+        self._generation = entry.generation = entry.generation + 1
+        self._state = entry.state = _COMMITTED_IDLE
+
+    def poison(self, primary, runtime, binding) -> None:
+        if not isinstance(primary, BaseException):
+            raise MdpConfigurationError(
+                "MDP: repeated-D4 checkpoint lifecycle poison carries an exception."
+            )
+        entry = _require_checkpoint_lifecycle(self, runtime, binding)
+        if entry.state not in (_INITIAL_IDLE, _COMMITTED_IDLE, _CHECKPOINT_ACTIVE):
+            raise MdpStateError("MDP: repeated-D4 checkpoint lifecycle is already poisoned.")
+        self._state = entry.state = _CHECKPOINT_POISONED
+
+    def retire(self, runtime, binding) -> None:
+        entry = _require_checkpoint_lifecycle(self, runtime, binding)
+        _ACTIVE_CHECKPOINT_LIFECYCLES.pop(id(self))
+        _RETIRED_CHECKPOINT_LIFECYCLES[id(self)] = entry.reference
+        self._runtime = self._binding = None
+        self._state = _CHECKPOINT_RETIRED
+        self._generation = -1
+        entry.runtime = entry.binding = None
+        entry.state = _CHECKPOINT_RETIRED
+        entry.generation = -1
+
+
+def _require_checkpoint_lifecycle(owner, runtime=None, binding=None):
+    entry = _ACTIVE_CHECKPOINT_LIFECYCLES.get(id(owner))
+    if type(entry) is not _CheckpointLifecycleEscrow or entry.reference() is not owner:
+        if id(owner) in _RETIRED_CHECKPOINT_LIFECYCLES:
+            raise MdpStateError("MDP: repeated-D4 checkpoint lifecycle is retired.")
+        raise MdpStateError("MDP: repeated-D4 checkpoint lifecycle is exact and active.")
+    expected_runtime = entry.runtime if runtime is None else runtime
+    expected_binding = entry.binding if binding is None else binding
+    if (
+        owner._runtime is not entry.runtime
+        or owner._binding is not entry.binding
+        or owner._state is not entry.state
+        or owner._generation != entry.generation
+        or expected_runtime is not entry.runtime
+        or expected_binding is not entry.binding
+        or getattr(entry.runtime, "dynamic_group_binding", None) is not entry.binding
+    ):
+        raise MdpStateError(
+            "MDP: repeated-D4 checkpoint lifecycle retains exact runtime, binding, and state."
+        )
+    _validate_repeated_d4_group_binding(entry.binding)
+    return entry
+
+
+def _bind_d4_checkpoint_lifecycle(runtime, binding):
+    if getattr(runtime, "dynamic_group_binding", None) is not binding:
+        raise MdpConfigurationError(
+            "MDP: repeated-D4 checkpoint lifecycle binds the exact runtime group binding."
+        )
+    _validate_repeated_d4_group_binding(binding)
+    for entry in _ACTIVE_CHECKPOINT_LIFECYCLES.values():
+        if entry.runtime is runtime or entry.binding is binding:
+            raise MdpConfigurationError(
+                "MDP: repeated-D4 checkpoint lifecycle binds each runtime and binding once."
+            )
+    seal = object()
+    _CHECKPOINT_FACTORY_SEALS[seal] = (id(runtime), id(binding))
+    owner = _D4CheckpointLifecycleOwner(runtime, binding, seal)
+    entry = _CheckpointLifecycleEscrow(weakref.ref(owner), runtime, binding, _INITIAL_IDLE, 0)
+    _ACTIVE_CHECKPOINT_LIFECYCLES[id(owner)] = entry
+    return owner
 
 
 def _note(primary: BaseException, error: BaseException) -> None:

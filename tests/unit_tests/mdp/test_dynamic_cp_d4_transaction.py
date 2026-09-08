@@ -35,7 +35,7 @@ from megatron.core.mdp.dynamic_cp_execution import (
     finalize_decoder_source_window,
 )
 from megatron.core.mdp.dynamic_cp_plan import DecoderSampleMetadata
-from megatron.core.mdp.errors import MdpStateError
+from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.protocols import VisionCaptureMode
 from megatron.core.mdp.vision_locator import build_vision_locator_catalog
 
@@ -47,12 +47,18 @@ def _clean():
     api._TRUSTED_TRANSACTIONS.clear()
     api._RETIRED_TRANSACTIONS.clear()
     api._ACTIVE_LEASES.clear()
+    api._ACTIVE_CHECKPOINT_LIFECYCLES.clear()
+    api._RETIRED_CHECKPOINT_LIFECYCLES.clear()
+    api._ACTIVE_CHECKPOINT_SNAPSHOTS.clear()
     yield
     api._FACTORY_SEALS.clear()
     api._ACTIVE_TRANSACTIONS.clear()
     api._TRUSTED_TRANSACTIONS.clear()
     api._RETIRED_TRANSACTIONS.clear()
     api._ACTIVE_LEASES.clear()
+    api._ACTIVE_CHECKPOINT_LIFECYCLES.clear()
+    api._RETIRED_CHECKPOINT_LIFECYCLES.clear()
+    api._ACTIVE_CHECKPOINT_SNAPSHOTS.clear()
 
 
 class _Group:
@@ -806,3 +812,107 @@ def test_retired_reconciliation_is_exact(monkeypatch, owner_type, variant):
     api._abort(value, primary)
     notes = getattr(primary, "__notes__", ())
     assert (notes == ()) is (variant == "canonical")
+
+
+class _CheckpointRuntime:
+    pass
+
+
+def _checkpoint_lifecycle(rank=0):
+    binding = _binding(rank)
+    runtime = _CheckpointRuntime()
+    runtime.dynamic_group_binding = binding
+    owner = api._bind_d4_checkpoint_lifecycle(runtime, binding)
+    return runtime, binding, owner
+
+
+def _assert_checkpoint_snapshot(snapshot, *, state, may_load, may_save):
+    assert type(snapshot) is api._D4CheckpointLifecycleSnapshot
+    assert not hasattr(snapshot, "_owner")
+    assert snapshot.state is state
+    assert snapshot.may_load is may_load
+    assert snapshot.may_save is may_save
+
+
+def test_checkpoint_lifecycle_has_closed_initial_commit_and_poison_states():
+    runtime, binding, owner = _checkpoint_lifecycle()
+    initial = owner.snapshot(runtime, binding)
+    _assert_checkpoint_snapshot(initial, state=api._INITIAL_IDLE, may_load=True, may_save=False)
+
+    owner.begin_iteration(runtime, binding)
+    _assert_checkpoint_snapshot(
+        owner.snapshot(runtime, binding),
+        state=api._CHECKPOINT_ACTIVE,
+        may_load=False,
+        may_save=False,
+    )
+    with pytest.raises(MdpStateError, match="active|iteration"):
+        owner.begin_iteration(runtime, binding)
+    _assert_checkpoint_snapshot(
+        owner.snapshot(runtime, binding),
+        state=api._CHECKPOINT_ACTIVE,
+        may_load=False,
+        may_save=False,
+    )
+
+    owner.commit_iteration(runtime, binding)
+    _assert_checkpoint_snapshot(
+        owner.snapshot(runtime, binding), state=api._COMMITTED_IDLE, may_load=False, may_save=True
+    )
+
+    owner.begin_iteration(runtime, binding)
+    primary = RuntimeError("capture failed")
+    owner.poison(primary, runtime, binding)
+    _assert_checkpoint_snapshot(
+        owner.snapshot(runtime, binding),
+        state=api._CHECKPOINT_POISONED,
+        may_load=False,
+        may_save=False,
+    )
+    for transition in (owner.begin_iteration, owner.commit_iteration):
+        with pytest.raises(MdpStateError, match="poison"):
+            transition(runtime, binding)
+
+
+def test_checkpoint_lifecycle_rejects_substitution_mutation_duplicate_and_forgery():
+    runtime, binding, owner = _checkpoint_lifecycle()
+    active_before = dict(api._ACTIVE_CHECKPOINT_LIFECYCLES)
+    with pytest.raises(MdpConfigurationError, match="bound|once|active"):
+        api._bind_d4_checkpoint_lifecycle(runtime, binding)
+    assert api._ACTIVE_CHECKPOINT_LIFECYCLES == active_before
+    with pytest.raises(MdpConfigurationError, match="privately minted"):
+        api._D4CheckpointLifecycleOwner(runtime, binding, object())
+    with pytest.raises(MdpConfigurationError, match="privately minted"):
+        api._D4CheckpointLifecycleSnapshot(api._INITIAL_IDLE, 0, True, False, object())
+    with pytest.raises(MdpStateError, match="runtime|binding|exact"):
+        owner.snapshot(_CheckpointRuntime(), binding)
+    with pytest.raises(MdpStateError, match="runtime|binding|exact"):
+        owner.snapshot(runtime, _binding(1))
+
+    snapshot = owner.snapshot(runtime, binding)
+    object.__setattr__(snapshot, "may_save", True)
+    with pytest.raises(MdpStateError, match="snapshot|exact"):
+        snapshot.require()
+    object.__setattr__(owner, "_state", object())
+    with pytest.raises(MdpStateError, match="state|exact"):
+        owner.snapshot(runtime, binding)
+
+
+def test_checkpoint_lifecycle_retirement_is_one_shot_and_scrubs_references():
+    runtime, binding, owner = _checkpoint_lifecycle()
+    owner.retire(runtime, binding)
+    assert owner._runtime is owner._binding is None
+    with pytest.raises(MdpStateError, match="retired"):
+        owner.snapshot(runtime, binding)
+    with pytest.raises(MdpStateError, match="retired"):
+        owner.retire(runtime, binding)
+
+    fresh_runtime = _CheckpointRuntime()
+    fresh_runtime.dynamic_group_binding = binding
+    fresh = api._bind_d4_checkpoint_lifecycle(fresh_runtime, binding)
+    _assert_checkpoint_snapshot(
+        fresh.snapshot(fresh_runtime, binding),
+        state=api._INITIAL_IDLE,
+        may_load=True,
+        may_save=False,
+    )

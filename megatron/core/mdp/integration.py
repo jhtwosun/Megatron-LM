@@ -23,6 +23,7 @@ from typing import Callable, Optional
 
 import torch
 
+from megatron.core.mdp import dynamic_cp_d4_transaction as _d4_transaction
 from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.bridge import ModalityBridge
 from megatron.core.mdp.config import (
@@ -50,7 +51,12 @@ from megatron.core.mdp.encoder import (
     build_encoder_domain,
     build_encoder_pg_collection,
 )
-from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError, MdpTaskFatalError
+from megatron.core.mdp.errors import (
+    MdpConfigurationError,
+    MdpPlanError,
+    MdpStateError,
+    MdpTaskFatalError,
+)
 from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
 from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
@@ -84,6 +90,11 @@ _D4_FACADE = None
 _D4_FACADE_CONFIG = None
 _D4_FACADE_OPTIONS = None
 
+# Persistent repeated-D4 checkpoint boundary state.  Per-iteration owners are
+# retired at Gate7 and therefore cannot represent a fresh or committed idle
+# process between schedule calls.
+_D4_CHECKPOINT_LIFECYCLE = None
+
 _D3_STATUS_TIMEOUT_SECONDS = 30.0
 _D4_STARTUP_TIMEOUT_SECONDS = 30.0
 _ZERO_DIGEST = b"\0" * 16
@@ -98,6 +109,45 @@ def set_adapter_builder(builder: Callable) -> None:
 def get_runtime() -> Optional[MdpRuntime]:
     """This process's MdpRuntime, or ``None`` when MDP is off."""
     return _RUNTIME
+
+
+def _validated_d4_checkpoint_lifecycle_pair():
+    """Return the exact installed D4 runtime/lifecycle pair, or ``None``."""
+    runtime = _RUNTIME
+    lifecycle = _D4_CHECKPOINT_LIFECYCLE
+    if runtime is None and lifecycle is None:
+        return None
+    if runtime is None:
+        raise MdpStateError("MDP: checkpoint lifecycle requires its exact runtime pair.")
+    if not runtime.config.dynamic_encoder_cp:
+        if lifecycle is None:
+            return None
+        raise MdpStateError("MDP: static/D3 runtime has no repeated-D4 checkpoint lifecycle.")
+    if type(lifecycle) is not _d4_transaction._D4CheckpointLifecycleOwner:
+        raise MdpStateError("MDP: repeated-D4 runtime retains its exact checkpoint lifecycle pair.")
+    _d4_transaction._require_checkpoint_lifecycle(lifecycle, runtime, runtime.dynamic_group_binding)
+    return runtime, lifecycle
+
+
+def get_d4_checkpoint_lifecycle_snapshot():
+    """Return the validated repeated-D4 checkpoint status, or ``None`` otherwise."""
+    pair = _validated_d4_checkpoint_lifecycle_pair()
+    if pair is None:
+        return None
+    runtime, lifecycle = pair
+    return lifecycle.snapshot(runtime, runtime.dynamic_group_binding)
+
+
+def _install_d4_checkpoint_lifecycle(runtime):
+    """Atomically mint and retain the checkpoint lifecycle before runtime publication."""
+    global _D4_CHECKPOINT_LIFECYCLE
+    if _RUNTIME is not None or _D4_CHECKPOINT_LIFECYCLE is not None:
+        raise MdpStateError("MDP: repeated-D4 checkpoint lifecycle is installed once.")
+    lifecycle = _d4_transaction._bind_d4_checkpoint_lifecycle(
+        runtime, runtime.dynamic_group_binding
+    )
+    _D4_CHECKPOINT_LIFECYCLE = lifecycle
+    return lifecycle
 
 
 def mdp_enabled(args) -> bool:
@@ -304,13 +354,13 @@ def maybe_build_mdp_domain(
     built and before the LR scheduler binds. Returns *optimizer* unchanged
     when MDP is off.
     """
-    global _RUNTIME
+    global _RUNTIME, _D4_CHECKPOINT_LIFECYCLE
     mdp_config = mdp_config_from_args(args)
     vision_capture_mode = _resolve_vision_capture_mode(args, mdp_config)
     if not mdp_enabled(args) or optimizer is None:
         return optimizer
     validate_mdp_config(mdp_config, compatibility_options_from_args(args))
-    if _RUNTIME is not None:
+    if _RUNTIME is not None or _D4_CHECKPOINT_LIFECYCLE is not None:
         raise MdpConfigurationError("MDP: runtime setup may run only once per process.")
     if _ADAPTER_BUILDER is None:
         raise MdpConfigurationError(
@@ -469,6 +519,13 @@ def maybe_build_mdp_domain(
             raise MdpTaskFatalError(
                 "MDP: repeated-D4 optimizer construction started and cannot retry."
             ) from error
+        try:
+            checkpoint_lifecycle = _install_d4_checkpoint_lifecycle(runtime)
+        except BaseException as error:
+            raise MdpTaskFatalError(
+                "MDP: repeated-D4 checkpoint lifecycle construction failed."
+            ) from error
+        assert _D4_CHECKPOINT_LIFECYCLE is checkpoint_lifecycle
     _RUNTIME = runtime
     logger.info(
         "MDP: runtime installed (outer_dp_rank=%d, worker_id=%s, endpoint=%d, "
@@ -594,6 +651,13 @@ def _build_d4_facade_from_mcore(runtime: MdpRuntime, config):
     else:
         run_iteration = _run_repeated_d4_fixed_iteration
 
+    pair = _validated_d4_checkpoint_lifecycle_pair()
+    if pair is None or pair[0] is not runtime:
+        raise MdpStateError(
+            "MDP: repeated-D4 facade retains its installed runtime and checkpoint lifecycle."
+        )
+    lifecycle = pair[1]
+
     def facade(
         *,
         data_iterators,
@@ -602,22 +666,39 @@ def _build_d4_facade_from_mcore(runtime: MdpRuntime, config):
         native_schedule_args,
         native_schedule_kwargs,
     ):
-        capture = _capture_d4_encoder_source(
-            runtime=runtime,
-            binding=runtime.dynamic_group_binding,
-            data_iterators=data_iterators,
-            num_microbatches=num_microbatches,
-            operations=capture_operations,
-            capture_mode=runtime.vision_capture_mode,
-        )
-        return run_iteration(
-            runtime,
-            capture,
-            forward_backward_func=forward_backward_func,
-            native_schedule_args=native_schedule_args,
-            native_schedule_kwargs=native_schedule_kwargs,
-            **common,
-        )
+        binding = runtime.dynamic_group_binding
+        try:
+            lifecycle.begin_iteration(runtime, binding)
+            capture = _capture_d4_encoder_source(
+                runtime=runtime,
+                binding=binding,
+                data_iterators=data_iterators,
+                num_microbatches=num_microbatches,
+                operations=capture_operations,
+                capture_mode=runtime.vision_capture_mode,
+            )
+            result = run_iteration(
+                runtime,
+                capture,
+                forward_backward_func=forward_backward_func,
+                native_schedule_args=native_schedule_args,
+                native_schedule_kwargs=native_schedule_kwargs,
+                **common,
+            )
+            lifecycle.commit_iteration(runtime, binding)
+            return result
+        except BaseException as error:
+            try:
+                lifecycle.poison(error, runtime, binding)
+            except BaseException as cleanup_error:
+                try:
+                    error.add_note(
+                        "suppressed repeated-D4 checkpoint lifecycle cleanup error: "
+                        f"{cleanup_error!r}"
+                    )
+                except BaseException:
+                    pass
+            raise
 
     return facade
 
@@ -666,9 +747,13 @@ def _build_d3_facade_from_mcore(runtime: MdpRuntime, config):
 def reset_for_testing() -> None:
     """Drop module state between tests."""
     global _RUNTIME, _ADAPTER_BUILDER, _D3_FACADE, _D4_FACADE
-    global _D4_FACADE_CONFIG, _D4_FACADE_OPTIONS
+    global _D4_FACADE_CONFIG, _D4_FACADE_OPTIONS, _D4_CHECKPOINT_LIFECYCLE
     runtime = _RUNTIME
+    checkpoint_lifecycle = _D4_CHECKPOINT_LIFECYCLE
+    if checkpoint_lifecycle is not None:
+        checkpoint_lifecycle.retire(runtime, runtime.dynamic_group_binding)
     _RUNTIME = None
+    _D4_CHECKPOINT_LIFECYCLE = None
     _ADAPTER_BUILDER = None
     _D3_FACADE = None
     _D4_FACADE = None

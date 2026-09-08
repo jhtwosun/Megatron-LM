@@ -492,6 +492,11 @@ def test_repeated_d4_gate_configuration_failure_retires_before_group_creation(mo
 
 def _patch_dynamic_construction(monkeypatch, events, *, fail_at=None):
     rank_map, rank_view = _patch_dynamic_prefix(monkeypatch)
+    monkeypatch.setattr(
+        integration._d4_transaction,
+        "_validate_repeated_d4_group_binding",
+        lambda value: value,
+    )
     adapter = _DynamicAdapter()
     integration.set_adapter_builder(lambda args: (events.append("builder") or adapter, object()))
     monkeypatch.setattr(
@@ -543,7 +548,11 @@ def _patch_dynamic_construction(monkeypatch, events, *, fail_at=None):
         captured.update(kwargs)
         if fail_at == "runtime":
             raise RuntimeError("runtime failed")
-        return SimpleNamespace(dynamic_adapter_capability=kwargs["dynamic_adapter_capability"])
+        return SimpleNamespace(
+            config=kwargs["config"],
+            dynamic_adapter_capability=kwargs["dynamic_adapter_capability"],
+            dynamic_group_binding=kwargs["dynamic_group_binding"],
+        )
 
     monkeypatch.setattr(integration, "MdpRuntime", build_runtime)
     from megatron.core.mdp import optimizer as mdp_optimizer
