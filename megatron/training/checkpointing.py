@@ -35,6 +35,11 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
+from megatron.core.mdp.checkpoint import (
+    prepare_repeated_d4_checkpoint_load,
+    prepare_repeated_d4_checkpoint_save,
+    validate_repeated_d4_decoded_checkpoint,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
@@ -603,6 +608,7 @@ def save_checkpoint(
     """
     start_ckpt = time()
     args = get_args()
+    prepare_repeated_d4_checkpoint_save(args, iteration=iteration)
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0(
@@ -2014,6 +2020,7 @@ def load_checkpoint(
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
+    prepare_repeated_d4_checkpoint_load(args)
 
     # Finetuning directories
     pretrained_dir = getattr(args, 'pretrained_checkpoint', None)
@@ -2277,6 +2284,7 @@ def load_checkpoint(
         expt_dp_group=expt_dp_group,
         **load_kwargs,
     )
+    validate_repeated_d4_decoded_checkpoint(args, state_dict)
 
     # Checkpoint not loaded.
     if state_dict is None:
