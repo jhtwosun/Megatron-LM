@@ -33,6 +33,7 @@ from megatron.core.mdp.dynamic_cp_runtime import _DynamicIterationAuthority
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError, MdpTaskFatalError
 from megatron.core.mdp.plan import EncoderThdLayout, EncoderThdSegment
 from megatron.core.mdp.protocols import DynamicEncoderCpBinding, VisionCaptureMode
+from megatron.core.utils import unwrap_model
 
 __all__ = ()
 
@@ -94,7 +95,7 @@ def _snapshot_operations(
         params_dtype = runtime.params_dtype
         encoder_domain = runtime.encoder_domain
         encoder_ddp = encoder_domain.encoder_ddp
-        raw_encoder = encoder_ddp.module
+        raw_encoder = unwrap_model(encoder_ddp.module)
         zero_grad = encoder_ddp.zero_grad_buffer
         adapter = runtime.adapter
         bind = adapter.bind_dynamic_encoder_cp
@@ -1300,7 +1301,7 @@ def run_repeated_d4_encoder_forward(
                     broadcast(
                         packed_pixels, src=owner.selected_ranks[0], group=owner.membership.group
                     )
-                output = operations.encode(operations.encoder_ddp, packed_pixels, received_layout)
+                output = operations.encode(operations.raw_encoder, packed_pixels, received_layout)
                 expected_rows = sum(segment.output_rows for segment in received_layout.segments)
                 if (
                     type(output) is not torch.Tensor

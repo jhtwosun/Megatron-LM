@@ -455,11 +455,13 @@ def pack_or_pad_batch(
     try:
         args = get_args()
         has_sp = bool(getattr(args, "sequence_parallel", False))
+        dataset_provider = getattr(args, "dataset_provider", None)
         owner_only_pixels = pixel_owner_state is not None or (
             tp_size > 1 and getattr(args, "dataset_provider", None) == "energon"
         )
     except AssertionError:
         has_sp = False
+        dataset_provider = None
         owner_only_pixels = pixel_owner_state is not None
 
     if cp_size > 1:
@@ -610,7 +612,15 @@ def pack_or_pad_batch(
                         cu_seqlens_padded,
                         image_token_id=sidecar_image_token_id,
                         spatial_merge_size=sidecar_merge,
-                        expect_pixels=False if suppress_pixels else None,
+                        expect_pixels=(
+                            None
+                            if not suppress_pixels
+                            or (
+                                type(dataset_provider) is str
+                                and dataset_provider == "mdp_mock"
+                            )
+                            else False
+                        ),
                     )
                 )
 

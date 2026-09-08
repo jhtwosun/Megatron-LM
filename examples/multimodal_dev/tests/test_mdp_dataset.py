@@ -164,6 +164,34 @@ def test_text_only_batch_produces_empty_sidecar():
     assert packed["pixel_values"].shape[0] == 0
 
 
+def test_nonowner_mock_validates_raw_pixels_before_omitting_them(monkeypatch):
+    from types import SimpleNamespace
+
+    from megatron.core.mdp import window
+
+    dataset = MdpThdMockDataset(num_samples=8)
+    sample = dict(dataset[0])
+    monkeypatch.setattr(
+        "examples.multimodal_dev.forward_step.get_args",
+        lambda: SimpleNamespace(sequence_parallel=False, dataset_provider="mdp_mock"),
+    )
+    window._PIXEL_OWNERSHIP.value = (0, 1, True)
+    try:
+        packed = pack_or_pad_batch(
+            [sample], use_packed_sequence=True, with_vision_sidecar=True
+        )
+        assert packed["vision_item_meta"].shape[0] == sample["image_grid_thw"].shape[0]
+        assert "pixel_values" not in packed
+
+        sample["pixel_values"] = sample["pixel_values"][:-1]
+        with pytest.raises(ValueError, match="sum\\(t\\*h\\*w\\)"):
+            pack_or_pad_batch(
+                [sample], use_packed_sequence=True, with_vision_sidecar=True
+            )
+    finally:
+        window._PIXEL_OWNERSHIP.value = None
+
+
 # ------------------------- negative guards -------------------------
 
 

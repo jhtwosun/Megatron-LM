@@ -63,6 +63,7 @@ class _Adapter:
     def __init__(self, events):
         self.events = events
         self.restored = []
+        self.encoded_with = []
         self.invalid_output = False
         self.fail_restore = False
         self.fail_encode = False
@@ -81,7 +82,7 @@ class _Adapter:
         return DynamicEncoderCpBinding(membership, is_current=lambda: current[0], restore=restore)
 
     def encode(self, encoder, payload, layout):
-        assert encoder is self.ddp
+        self.encoded_with.append(encoder)
         self.events.append(("encode", payload, layout))
         if self.fail_encode:
             raise RuntimeError("encode failed")
@@ -272,6 +273,38 @@ def _install_gate0(monkeypatch, events, *, reject=None, physical_error=None):
         lambda *_args, **_kwargs: events.append("payload-a2a") or bundle,
     )
     return bundle
+
+
+def test_gate0_encodes_with_typed_encoder_beneath_ddp_and_float16_layers(monkeypatch):
+    from megatron.core.transformer.module import Float16Module
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    class TypedEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+    runtime, _authority, claim, _events = _claim()
+    claim.abort()
+    typed_encoder = TypedEncoder()
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=4,
+        num_attention_heads=1,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+    )
+    runtime.encoder_domain.encoder_ddp.module = Float16Module(config, typed_encoder)
+    runtime.adapter.encoder = typed_encoder
+
+    runtime, authority, claim, events = _claim(runtime=runtime)
+    _install_gate0(monkeypatch, events)
+    owner = api.run_repeated_d4_encoder_forward(
+        runtime, claim, authority, broadcast=lambda *_args, **_kwargs: None
+    )
+
+    assert runtime.adapter.encoded_with == [typed_encoder]
+    owner.abort()
 
 
 def _forward_owner(
