@@ -175,6 +175,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         image_token_id=getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID),
     )
     return tuple(
-        MdpThdMockDataset(num_samples=n, seed=1234 + split, **kwargs)
+        MdpThdMockDataset(num_samples=n, seed=1234 + split, **kwargs) if n > 0 else None
         for split, n in enumerate(train_val_test_num_samples)
     )
