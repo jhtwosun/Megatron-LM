@@ -183,7 +183,7 @@ def _mdp_adapter_builder(args):
     # The encoder DDP derives its gradient prescale from this flag; MDP
     # requires prescale 1 (WORLD sum, normalized once by 1/T_global).
     vision_config.calculate_per_token_loss = language_config.calculate_per_token_loss
-    return build_mdp_adapter(args, language_config), vision_config
+    return build_mdp_adapter(args, language_config, vision_config), vision_config
 
 
 def _setup_mdp(args):

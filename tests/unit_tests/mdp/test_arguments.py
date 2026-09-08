@@ -2,11 +2,13 @@
 
 """CLI contract tests for multimodal encoder recompute."""
 
+import argparse
 from types import SimpleNamespace
 
 import pytest
 
 from examples.multimodal_dev.arguments import (
+    add_multimodal_args,
     encoder_recompute_overrides_from_args,
     validate_encoder_recompute_args,
 )
@@ -24,6 +26,18 @@ def _args(*, mdp_enable, **overrides):
     values = dict(_DEFAULTS)
     values.update(overrides)
     return SimpleNamespace(mdp_enable=mdp_enable, **values)
+
+
+def test_encoder_cross_microbatch_fusion_cli_defaults_on_and_can_be_disabled():
+    parser = argparse.ArgumentParser()
+    add_multimodal_args(parser)
+    assert parser.parse_args([]).mdp_encoder_fuse_across_microbatches is True
+    assert (
+        parser.parse_args(
+            ["--no-mdp-encoder-fuse-across-microbatches"]
+        ).mdp_encoder_fuse_across_microbatches
+        is False
+    )
 
 
 @pytest.mark.parametrize(

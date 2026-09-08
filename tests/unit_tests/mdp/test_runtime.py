@@ -133,7 +133,7 @@ class _StubAdapter:
         return torch.cat(pieces) if pieces else payload[:0]
 
 
-def _build_runtime():
+def _build_runtime(config=None):
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
     rank_map = build_rank_map(
@@ -150,10 +150,11 @@ def _build_runtime():
         calculate_per_token_loss=True,
         use_cpu_initialization=True,
     )
+    config = config or MdpConfig(enable=True)
     domain = build_encoder_domain(
         adapter=adapter,
         model_config=model_config,
-        mdp_config=MdpConfig(enable=True),
+        mdp_config=config,
         ddp_config=DistributedDataParallelConfig(
             use_distributed_optimizer=True,
             overlap_grad_reduce=False,
@@ -166,7 +167,6 @@ def _build_runtime():
         wrap_mixed_precision=False,
     )
     allocator = DirectBufferAllocator()
-    config = MdpConfig(enable=True)
     runtime = MdpRuntime(
         config=config,
         rank_map=rank_map,
@@ -187,6 +187,46 @@ def _build_runtime():
         num_vpp_chunks=1,
     )
     return runtime, view
+
+
+@pytest.mark.parametrize("fuse", [True, False], ids=["fused", "microbatch-bounded"])
+@pytest.mark.parametrize("granularity", [None, "whole"], ids=["retain", "recompute"])
+def test_runtime_passes_fusion_and_backward_policy_to_chunking(
+    monkeypatch, fuse, granularity
+):
+    from megatron.core.mdp import runtime as runtime_api
+
+    config = MdpConfig(
+        enable=True,
+        encoder_max_payload_rows=80,
+        encoder_fuse_across_microbatches=fuse,
+        encoder_recompute_granularity=granularity,
+    )
+    runtime, view = _build_runtime(config)
+    calls = []
+    split = runtime_api.split_encoder_layout
+
+    def observe(layout, **kwargs):
+        calls.append(kwargs)
+        return split(layout, **kwargs)
+
+    monkeypatch.setattr(runtime_api, "split_encoder_layout", observe)
+    replay = runtime.begin_iteration(
+        iter(range(10)), num_microbatches=2, forward_only=True
+    )
+    _drive_decoder(runtime, view, replay, backward=False)
+    runtime.mark_decoder_complete()
+    runtime.end_iteration()
+    assert calls
+    assert runtime.config.encoder_recompute_granularity == granularity
+    assert all(
+        call
+        == {
+            "max_payload_rows": 80,
+            "fuse_across_microbatches": fuse,
+        }
+        for call in calls
+    )
 
 
 def _drive_decoder(runtime, view, replay_iters, *, backward):
