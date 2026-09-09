@@ -19,6 +19,29 @@ from megatron.core.mdp.config import (
 from megatron.core.mdp.errors import MdpConfigurationError
 
 
+def test_round_robin_is_supported_static_assignment():
+    validate_mdp_config(
+        MdpConfig(enable=True, encoder_assignment_policy="round_robin"),
+        _options(context_parallel_size=2),
+    )
+
+
+@pytest.mark.parametrize(
+    "config_changes, option_changes",
+    [
+        ({"encoder_assignment_policy": "unknown"}, {}),
+        ({"dynamic_encoder_cp": True}, {}),
+        ({"pixel_locality": True}, {}),
+        ({}, {"dynamic_context_parallel": True}),
+    ],
+)
+def test_round_robin_rejects_unsupported_policy_combinations(config_changes, option_changes):
+    config = dict(enable=True, encoder_assignment_policy="round_robin")
+    config.update(config_changes)
+    with pytest.raises(MdpConfigurationError, match="encoder_assignment_policy"):
+        validate_mdp_config(MdpConfig(**config), _options(**option_changes))
+
+
 @pytest.mark.parametrize("fuse", [False, True])
 @pytest.mark.parametrize("encoder_cp", [1, 2])
 def test_fusion_control_preserves_cp_compatibility(fuse, encoder_cp):
@@ -31,15 +54,20 @@ def test_fusion_control_preserves_cp_compatibility(fuse, encoder_cp):
 @pytest.mark.parametrize("value", [None, 0, 1, "false"])
 def test_fusion_config_rejects_non_boolean(value):
     with pytest.raises(MdpConfigurationError, match="encoder_fuse_across_microbatches"):
-        validate_mdp_config(MdpConfig(enable=True, encoder_fuse_across_microbatches=value), _options())
+        validate_mdp_config(
+            MdpConfig(enable=True, encoder_fuse_across_microbatches=value), _options()
+        )
 
 
 @pytest.mark.parametrize("encoder_dynamic", [False, True])
 def test_dynamic_cp_rejects_unsupported_fusion_boundary_control(encoder_dynamic):
     with pytest.raises(MdpConfigurationError, match="microbatch boundary control"):
         validate_mdp_config(
-            MdpConfig(enable=True, encoder_fuse_across_microbatches=False,
-                      dynamic_encoder_cp=encoder_dynamic),
+            MdpConfig(
+                enable=True,
+                encoder_fuse_across_microbatches=False,
+                dynamic_encoder_cp=encoder_dynamic,
+            ),
             _options(dynamic_context_parallel=not encoder_dynamic),
         )
 

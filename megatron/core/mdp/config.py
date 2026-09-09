@@ -33,6 +33,7 @@ class MdpConfig:
     encoder_cp: int = 1
     encoder_max_payload_rows: Optional[int] = None
     encoder_fuse_across_microbatches: bool = True
+    encoder_assignment_policy: str = "lpt"
     encoder_recompute_granularity: Optional[str] = None
     encoder_recompute_method: Optional[str] = None
     encoder_recompute_num_layers: Optional[int] = None
@@ -96,10 +97,29 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
     groups or model weights. Raises :class:`MdpConfigurationError` with the option,
     its current value, the violated condition, and a suggested value when one exists.
     """
+
     if not config.enable:
         return
 
     # --- MdpConfig field validation ---
+    if config.encoder_assignment_policy not in ("lpt", "round_robin"):
+        _reject(
+            "encoder_assignment_policy",
+            config.encoder_assignment_policy,
+            "lpt or round_robin",
+            "Encoder assignment policy must be explicit.",
+            "lpt",
+        )
+    if config.encoder_assignment_policy == "round_robin" and (
+        config.dynamic_encoder_cp or options.dynamic_context_parallel or config.pixel_locality
+    ):
+        _reject(
+            "encoder_assignment_policy",
+            "round_robin",
+            "static CP without pixel_locality",
+            "Round robin is a cost-blind static control, without locality preferences.",
+            "lpt",
+        )
     if config.encoder_cp < 1:
         _reject(
             "encoder_cp",

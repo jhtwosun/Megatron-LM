@@ -302,6 +302,12 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-encoder-assignment-policy",
+        choices=("lpt", "round_robin"),
+        default="lpt",
+        help="Static encoder assignment: cost-aware LPT or cost-blind item-order round robin.",
+    )
+    group.add_argument(
         "--mdp-locality-slack-permille",
         type=int,
         default=10,

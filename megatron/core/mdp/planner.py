@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""MDP planner: deterministic LPT assignment to logical encoder workers.
+"""MDP planner: deterministic LPT or round-robin assignment to encoder workers.
 
 The plan-building path is pure compute — every group member independently runs
 the same integer-only algorithm from byte-identical descriptor input and must
@@ -35,7 +35,13 @@ class MdpPlanner:
         locality_slack_permille: int,
         capacity_policy: RowCapacityPolicy,
         pixel_locality: bool = False,
+        assignment_policy: str = "lpt",
     ) -> None:
+        if assignment_policy not in ("lpt", "round_robin"):
+            raise MdpPlanError("MDP: assignment policy must be lpt or round_robin.")
+        if assignment_policy == "round_robin" and pixel_locality:
+            raise MdpPlanError("MDP: round robin does not use pixel-locality preferences.")
+        self._assignment_policy = assignment_policy
         self._rank_view = rank_view
         self._locality_slack_permille = locality_slack_permille
         self._capacity_policy = capacity_policy
@@ -53,18 +59,27 @@ class MdpPlanner:
         descriptors: Sequence,
         microbatch_ids: Sequence[int],
     ) -> MdpBatchPlan:
-        """Run deterministic LPT and assemble routes, layouts, and the digest."""
+        """Assign complete items and assemble shared routes, layouts and digest."""
         view = self._rank_view
         self._validate_descriptors(descriptors, microbatch_ids)
 
         # LPT: (cost descending, item_id ascending); integer comparisons only.
-        ordered = sorted(
-            descriptors, key=lambda d: (-d.estimated_cost_units, d.global_item_id)
-        )
+        if self._assignment_policy == "round_robin":
+            ordered = sorted(descriptors, key=lambda d: d.global_item_id)
+        else:
+            ordered = sorted(
+                descriptors, key=lambda d: (-d.estimated_cost_units, d.global_item_id)
+            )
         loads = {worker_id: 0 for worker_id in view.worker_ids}
         assignment = {}  # global_item_id -> worker_id
         producer_items = {worker_id: [] for worker_id in view.worker_ids}
         for descriptor in ordered:
+            if self._assignment_policy == "round_robin":
+                chosen = view.worker_ids[len(assignment) % len(view.worker_ids)]
+                assignment[descriptor.global_item_id] = chosen
+                producer_items[chosen].append(descriptor)
+                loads[chosen] += descriptor.estimated_cost_units
+                continue
             min_load = min(loads.values())
             slack = self._locality_slack_permille * max(1, descriptor.estimated_cost_units)
             eligible = [

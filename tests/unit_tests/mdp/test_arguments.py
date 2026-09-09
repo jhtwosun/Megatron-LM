@@ -28,11 +28,18 @@ def test_vision_fusion_and_cost_defaults_preserve_db68():
     defaults = parser.parse_args([])
     assert defaults.mdp_encoder_fuse_across_microbatches is True
     assert defaults.mdp_vision_lpt_cost == "rows"
+    assert defaults.mdp_encoder_assignment_policy == "lpt"
     selected = parser.parse_args([
         "--no-mdp-encoder-fuse-across-microbatches", "--mdp-vision-lpt-cost", "flops"
     ])
     assert selected.mdp_encoder_fuse_across_microbatches is False
     assert selected.mdp_vision_lpt_cost == "flops"
+    rr = parser.parse_args(["--mdp-encoder-assignment-policy", "round_robin"])
+    assert rr.mdp_encoder_assignment_policy == "round_robin"
+    from megatron.core.mdp.integration import mdp_config_from_args
+
+    assert mdp_config_from_args(rr).encoder_assignment_policy == "round_robin"
+    assert mdp_config_from_args(selected).encoder_fuse_across_microbatches is False
 
 
 def _args(*, mdp_enable, **overrides):

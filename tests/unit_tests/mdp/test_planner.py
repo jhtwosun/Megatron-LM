@@ -52,6 +52,75 @@ def _assignment(plan):
     return {r.global_item_id: r.producer_worker_id for r in plan.routes}
 
 
+@pytest.mark.parametrize("count", [0, 1, 2, 9])
+@pytest.mark.parametrize("worker_ids", [(0, 1), (2, 7)])
+def test_round_robin_is_cost_blind_deterministic_and_conserves_items(count, worker_ids):
+    import dataclasses
+
+    descriptors = [
+        dataclasses.replace(
+            _descriptor(index, cost=1000 if index % 2 else 1), owner_worker_id=worker_ids[0]
+        )
+        for index in range(count)
+    ]
+    planner = MdpPlanner(
+        _view(worker_ids=worker_ids),
+        locality_slack_permille=10,
+        capacity_policy=RowCapacityPolicy(),
+        assignment_policy="round_robin",
+    )
+    plan = planner.build_plan(0, descriptors, (0,))
+    reversed_plan = planner.build_plan(0, descriptors[::-1], (0,))
+    different_costs = planner.build_plan(
+        0,
+        [
+            dataclasses.replace(descriptor, estimated_cost_units=12345 - index)
+            for index, descriptor in enumerate(descriptors)
+        ],
+        (0,),
+    )
+    assert plan == reversed_plan == different_costs
+    assert _assignment(plan) == {
+        index: worker_ids[index % len(worker_ids)] for index in range(count)
+    }
+    segments = [segment for layout in plan.encoder_layouts for segment in layout.segments]
+    assert sorted(segment.global_item_id for segment in segments) == list(range(count))
+    assert sum(segment.payload_rows for segment in segments) == count * 16
+    assert sum(layout.total_output_rows for layout in plan.layouts) == count * 4
+
+
+def test_round_robin_and_lpt_differ_only_in_producer_assignment_and_layout():
+    descriptors = [_descriptor(index, cost) for index, cost in enumerate((8, 7, 3, 2))]
+    lpt = _planner(slack=0).build_plan(0, descriptors, (0,))
+    rr = MdpPlanner(
+        _view(),
+        locality_slack_permille=0,
+        capacity_policy=RowCapacityPolicy(),
+        assignment_policy="round_robin",
+    ).build_plan(0, descriptors, (0,))
+    assert _assignment(lpt) != _assignment(rr)
+    assert lpt.layouts == rr.layouts
+    assert lpt.capacity_policy == rr.capacity_policy
+    for left, right in zip(lpt.routes, rr.routes, strict=True):
+        assert (left.global_item_id, left.endpoint_rank, left.owner_worker_id) == (
+            right.global_item_id,
+            right.endpoint_rank,
+            right.owner_worker_id,
+        )
+
+
+def test_round_robin_rejects_pixel_locality_and_unknown_assignment():
+    for policy, locality in (("unknown", False), ("round_robin", True)):
+        with pytest.raises(MdpPlanError):
+            MdpPlanner(
+                _view(),
+                locality_slack_permille=10,
+                capacity_policy=RowCapacityPolicy(),
+                assignment_policy=policy,
+                pixel_locality=locality,
+            )
+
+
 def test_plans_are_bit_identical_across_builds():
     descriptors = [_descriptor(i, cost=10 + (i * 7) % 5) for i in range(9)]
     a = _planner().build_plan(3, descriptors, [0])
