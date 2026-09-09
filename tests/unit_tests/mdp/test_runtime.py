@@ -514,6 +514,7 @@ def _build_runtime(
     adapter_class=_StubAdapter,
     mdp_config=None,
     vision_capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+    group_registry=None,
 ):
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
@@ -528,7 +529,9 @@ def _build_runtime(
         )
     )
     view = rank_map.view(rank)
-    groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
+    groups = install_mdp_process_groups(
+        rank_map, group_registry=group_registry or MdpGroupRegistry()
+    )
     encoder_pgs = build_encoder_pg_collection(
         rank_map, encoder_cp=encoder_cp, process_groups=groups
     )

@@ -89,6 +89,7 @@ def _run_variant(
     adapter_class=_TwoVisionAdapter,
     capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
     check_runtime=None,
+    group_registry=None,
 ):
     allocator = _TrackingAllocator()
     config = MdpConfig(
@@ -107,6 +108,7 @@ def _run_variant(
         adapter_class=adapter_class,
         mdp_config=config,
         vision_capture_mode=capture_mode,
+        group_registry=group_registry,
     )
     runtime.adapter.runtime = runtime
     runtime.adapter.use_flop_cost = cost == "flops"

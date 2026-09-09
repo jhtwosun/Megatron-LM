@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from megatron.core.mdp.bridge import BridgePhase
+from megatron.core.mdp.groups import MdpGroupRegistry
 from megatron.core.mdp.protocols import VisionCaptureMode
 from tests.unit_tests.mdp.test_runtime import _all_gather_object, _sentinel
 from tests.unit_tests.mdp.test_static_mock_runtime import _MetadataAdapter
@@ -76,17 +77,25 @@ def _check_metadata_loading(runtime, view):
 @pytest.mark.parametrize("encoder_cp", [1, 2])
 @pytest.mark.parametrize("cap", [None, 80])
 def test_metadata_loading_preserves_cost_assignment_and_packing(encoder_cp, cap):
+    # The topology is fixed within this case. Reuse the native registry so
+    # the 24 model builds do not install 24 identical NCCL group sets.
+    registry = MdpGroupRegistry()
+    group_keys = None
     for cost, policy in (("rows", "lpt"), ("flops", "lpt"), ("flops", "round_robin")):
         for fuse in (True, False):
             for recompute in (None, "whole"):
                 args = (encoder_cp, cap, cost, policy, fuse, recompute)
-                eager = _run_variant(*args)
+                eager = _run_variant(*args, group_registry=registry)
+                if group_keys is None:
+                    group_keys = registry.created_keys()
                 lazy = _run_variant(
                     *args,
                     adapter_class=_MetadataTwoVisionAdapter,
                     capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
                     check_runtime=_check_metadata_loading,
+                    group_registry=registry,
                 )
+                assert registry.created_keys() == group_keys
                 assert eager[1] == lazy[1]
                 assert eager[4:] == lazy[4:]  # Same chunk boundaries and ownership.
                 assert eager[2].keys() == lazy[2].keys()
