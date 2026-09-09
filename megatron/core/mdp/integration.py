@@ -164,6 +164,17 @@ def _resolve_vision_capture_mode(args, config: MdpConfig) -> VisionCaptureMode:
         return mode
     if getattr(args, "mdp_enable", None) is not True:
         raise MdpConfigurationError("MDP: stable locator capture requires --mdp-enable.")
+    if not config.dynamic_encoder_cp and getattr(args, "dataset_provider", None) == "mdp_mock":
+        if (
+            config.encoder_cp != 1
+            or getattr(args, "tensor_model_parallel_size", None) != 1
+            or getattr(args, "use_packed_sequence", None) is not True
+            or config.overlap_window_capture
+        ):
+            raise MdpConfigurationError(
+                "MDP: static mock locator capture requires ECP1, TP1, packed THD, and no window overlap."
+            )
+        return mode
     if config.dynamic_encoder_cp is not True:
         raise MdpConfigurationError("MDP: stable locator capture requires dynamic encoder CP.")
     if type(getattr(args, "dataset_provider", None)) is not str or args.dataset_provider != "energon":

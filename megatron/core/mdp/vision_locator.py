@@ -2,8 +2,8 @@
 
 """Versioned, bounded metadata locators for deferred vision materialization.
 
-Locators name shared-filesystem objects but never contain image bytes and never
-perform I/O. The catalog digest establishes canonical locator-metadata identity;
+Locators name shared-filesystem objects or deterministic mock fill recipes but
+never contain image bytes or perform I/O. The catalog digest establishes identity;
 it does not establish that the named file contents are immutable.
 """
 
@@ -38,6 +38,7 @@ class VisionLocatorKind(IntEnum):
     ZIP_MEMBER = 2
     PARQUET_ROW = 3
     JPGS_IMAGE = 4
+    MOCK_SENTINEL = 5
 
 
 class VisionLocatorIndexSentinel(Enum):
@@ -129,7 +130,11 @@ class VisionDataLocator:
     def __post_init__(self) -> None:
         if type(self.kind) is not VisionLocatorKind:
             raise MdpConfigurationError("MDP: vision locator kind is a closed integer enum.")
-        _require_canonical_path(self.path)
+        if self.kind is VisionLocatorKind.MOCK_SENTINEL:
+            if type(self.path) is not str or self.path != "":
+                raise MdpConfigurationError("MDP: mock sentinel recipes have no storage path.")
+        else:
+            _require_canonical_path(self.path)
         member = _require_optional_text("member", self.member, MAX_VISION_LOCATOR_MEMBER_BYTES)
         column = _require_optional_text("column", self.column, MAX_VISION_LOCATOR_COLUMN_BYTES)
         indexed = type(self.index) is int and 0 <= self.index <= _INT64_MAX
@@ -137,7 +142,12 @@ class VisionDataLocator:
         _require_grid(self.grid_thw)
         _require_dimensions(self.declared_dimensions)
 
-        if self.kind is VisionLocatorKind.SHARED_FILE:
+        if self.kind is VisionLocatorKind.MOCK_SENTINEL:
+            if not indexed or self.index == 0:
+                raise MdpConfigurationError("MDP: mock sentinel recipes require a positive fill value.")
+            if member is not None or column is not None or self.declared_dimensions is not None:
+                raise MdpConfigurationError("MDP: mock sentinel recipes forbid storage metadata.")
+        elif self.kind is VisionLocatorKind.SHARED_FILE:
             if member is not None:
                 raise MdpConfigurationError("MDP: SHARED_FILE locator forbids member metadata.")
             if column is not None:

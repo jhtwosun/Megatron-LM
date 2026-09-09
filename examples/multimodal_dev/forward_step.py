@@ -618,6 +618,7 @@ def pack_or_pad_batch(
                             or (
                                 type(dataset_provider) is str
                                 and dataset_provider == "mdp_mock"
+                                and include_vision_pixels
                             )
                             else False
                         ),
@@ -842,6 +843,16 @@ def _prepare_energon_batch(data, args):
     )
 
 
+def _static_mock_locator_capture(args):
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    return (
+        getattr(args, "mdp_vision_capture_mode", None) is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        and getattr(args, "dataset_provider", None) == "mdp_mock"
+        and not getattr(args, "mdp_dynamic_encoder_cp", False)
+    )
+
+
 def _locator_capture_root(args, group, locator_operations, expected_locator_arch):
     """Validate the exact locator launch/escrow pair before dataset advance."""
     from examples.multimodal_dev.data.energon.materializer import validate_locator_dataset_root
@@ -854,6 +865,16 @@ def _locator_capture_root(args, group, locator_operations, expected_locator_arch
     mode = getattr(
         args, "mdp_vision_capture_mode", VisionCaptureMode.SOURCE_PIXEL_SIDECAR
     )
+    if _static_mock_locator_capture(args):
+        if (
+            locator_operations is not None
+            or getattr(args, "mdp_enable", None) is not True
+            or getattr(args, "use_packed_sequence", None) is not True
+            or getattr(args, "mdp_encoder_cp", 1) != 1
+            or torch.distributed.get_world_size(group=group) != 1
+        ):
+            raise MdpConfigurationError("MDP: static mock locator capture requires enabled ECP1/TP1 THD.")
+        return None
     if locator_operations is None:
         if mode is not VisionCaptureMode.SOURCE_PIXEL_SIDECAR:
             raise MdpConfigurationError(
@@ -930,6 +951,7 @@ def get_batch(
         args, group, locator_operations, expected_locator_arch
     )
     vision_locators = ()
+    static_mock_locators = _static_mock_locator_capture(args)
     # Single-member TP group: skip the device flag tensor and the broadcast
     # entirely. Behavior-identical, and it keeps the MDP window-capture
     # prefetch thread free of NCCL calls (--mdp-overlap-window-capture).
@@ -940,6 +962,10 @@ def get_batch(
             return None
         if locator_root is None:
             data = _prepare_energon_batch(data, args)
+            if static_mock_locators:
+                vision_locators = tuple(
+                    locator for document in data for locator in document["vision_locators"]
+                )
         else:
             from examples.multimodal_dev.data.energon.materializer import prepare_energon_batch
 
@@ -992,7 +1018,7 @@ def get_batch(
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
     locator_pack_options = (
-        {"include_vision_pixels": False} if locator_root is not None else {}
+        {"include_vision_pixels": False} if locator_root is not None or static_mock_locators else {}
     )
     batch = pack_or_pad_batch(
         data,
@@ -1003,7 +1029,7 @@ def get_batch(
         pad_to_multiple=quantized_row_alignment(args),
         **locator_pack_options,
     )
-    if locator_root is not None:
+    if locator_root is not None or static_mock_locators:
         pixel_values = batch.pop("pixel_values", None)
         if pixel_values is not None and pixel_values.numel() != 0:
             from megatron.core.mdp.errors import MdpConfigurationError
@@ -1012,6 +1038,10 @@ def get_batch(
                 "MDP: stable locator capture forbids an ambiguous pixel carrier."
             )
         batch["vision_locators"] = vision_locators
+        if static_mock_locators:
+            from megatron.core.mdp.protocols import VisionCaptureMode
+
+            batch["vision_capture_mode"] = VisionCaptureMode.STABLE_LOCATOR_CATALOG
 
     # Fix shapes produced by default_collate.
     if "position_ids" in batch and batch["position_ids"] is not None:

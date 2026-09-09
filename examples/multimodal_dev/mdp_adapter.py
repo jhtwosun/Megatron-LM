@@ -965,6 +965,7 @@ class Qwen35VLMdpAdapter:
             capture_mode = VisionCaptureMode.STABLE_LOCATOR_CATALOG
         if batch is None:
             return None
+        capture_mode = batch.pop("vision_capture_mode", capture_mode)
         if "vision_item_meta" not in batch:
             raise RuntimeError(
                 "MDP adapter needs the vision sidecar; the collator must run with "
@@ -1051,6 +1052,17 @@ class Qwen35VLMdpAdapter:
         from examples.multimodal_dev.data.energon.materializer import vision_locator_image_bytes
 
         return vision_locator_image_bytes(locator)
+
+    def fill_vision_payload(self, locator, destination):
+        """Create a planned static mock item directly on its encoder producer."""
+        from examples.multimodal_dev.data.mdp_mock import materialize_mock_vision
+
+        pixels = materialize_mock_vision(
+            locator, self.payload_width, dtype=destination.dtype, device="cpu"
+        )
+        if pixels.shape != destination.shape:
+            raise ValueError("mock recipe shape differs from its planned destination")
+        destination.copy_(pixels)
 
     def prepare_materialized_vision_payloads(self, locators, encoded_payloads):
         """Decode and patchify exact in-memory payloads with Qwen's materializer."""

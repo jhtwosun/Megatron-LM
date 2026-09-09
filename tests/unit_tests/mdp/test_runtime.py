@@ -513,6 +513,7 @@ def _build_runtime(
     divergent_encoder_init=False,
     adapter_class=_StubAdapter,
     mdp_config=None,
+    vision_capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
 ):
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
@@ -578,6 +579,7 @@ def _build_runtime(
         hidden_size=WIDTH,
         params_dtype=torch.float32,
         num_vpp_chunks=1,
+        vision_capture_mode=vision_capture_mode,
     )
     return runtime, view
 
