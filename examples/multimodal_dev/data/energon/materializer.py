@@ -160,6 +160,47 @@ def validate_locator_dataset_root(dataset_root: Any) -> str:
     return _canonical_dataset_root(dataset_root)
 
 
+def validate_locator_storage_roots(roots: Any) -> tuple[str, ...]:
+    """Canonicalize explicit static-loader authority, never descriptor data."""
+    if type(roots) not in (tuple, list) or not roots:
+        raise ValueError("static locators require an explicit non-empty storage-root allowlist")
+    canonical = []
+    for root in roots:
+        root = _canonical_dataset_root(root)
+        if "\0" in root or not os.path.isdir(root):
+            raise ValueError("locator storage roots must be existing directories")
+        resolved = os.path.realpath(root)
+        if resolved == "/":
+            raise ValueError("filesystem root is not a permitted locator storage root")
+        if resolved in canonical:
+            raise ValueError("duplicate locator storage roots or aliases are not allowed")
+        canonical.append(resolved)
+    return tuple(canonical)
+
+
+def authorize_locator_storage_path(
+    path: Any, roots: tuple[str, ...], *, allow_root: bool = False
+) -> tuple[str, str]:
+    """Resolve a static absolute path under prevalidated launcher authority.
+
+    Relative descriptors need a trusted source mapping; trying roots in order
+    would silently change which data is selected. Symlinks cannot grant access
+    outside the allowlist. The deepest matching root is deterministic.
+    """
+    if type(path) is not str or "\0" in path:
+        raise ValueError("static locator paths must be canonical absolute paths")
+    _canonical_dataset_root(path)
+    resolved = os.path.realpath(path)
+    matches = [
+        root for root in roots
+        if posixpath.commonpath((root, resolved)) == root
+        and (allow_root or resolved != root)
+    ]
+    if not matches:
+        raise ValueError("static locator path is outside the configured storage roots")
+    return max(matches, key=len), resolved
+
+
 def _locator_path(value: Any, *, dataset_root: str, owner: str) -> str:
     if type(value) is not str or not value:
         raise ValueError(f"{owner} must be path-backed in locator mode")

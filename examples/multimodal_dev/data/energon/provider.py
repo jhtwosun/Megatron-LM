@@ -164,6 +164,11 @@ def _validate_provider_args(args: Any) -> None:
         raise ValueError("--energon-path is required with --dataset-provider energon") from exc
     if not isinstance(path, str) or not path.strip():
         raise ValueError("--energon-path is required with --dataset-provider energon")
+    roots = getattr(args, "energon_vision_storage_roots", None)
+    if roots is not None:
+        from .materializer import validate_locator_storage_roots
+
+        args.energon_vision_storage_roots = validate_locator_storage_roots(roots)
     for name in ("energon_split", "energon_val_split"):
         value = getattr(args, name, None)
         if not isinstance(value, str) or not value.strip():

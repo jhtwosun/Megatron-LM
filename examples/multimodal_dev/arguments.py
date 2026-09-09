@@ -105,6 +105,12 @@ def add_multimodal_args(parser):
         help="Energon dataset directory (required for --dataset-provider energon).",
     )
     group.add_argument(
+        "--energon-vision-storage-roots",
+        nargs="+",
+        default=None,
+        help="Explicit allowed storage directories for static metadata-first Energon loading.",
+    )
+    group.add_argument(
         "--energon-split",
         type=str,
         default="train",
