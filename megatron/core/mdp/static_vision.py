@@ -9,8 +9,16 @@ from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.vision_locator import VisionLocatorKind, validate_vision_locator_catalog
 
 
-def bind_static_vision_catalog(catalog, plan, worker_ids):
+def bind_static_vision_catalog(
+    catalog, plan, worker_ids, *, allowed_kinds=(VisionLocatorKind.MOCK_SENTINEL,)
+):
     """Bind ordered recipes to exactly one producer and the existing routing plan."""
+    if (
+        type(allowed_kinds) is not tuple
+        or not allowed_kinds
+        or any(type(kind) is not VisionLocatorKind for kind in allowed_kinds)
+    ):
+        raise MdpConfigurationError("static adapter locator kinds must be an explicit enum tuple")
     catalog = validate_vision_locator_catalog(catalog)
     entries = catalog.entries
     if any(entry.item_id.source_dp_lane != plan.outer_dp_rank for entry in entries):
@@ -30,11 +38,13 @@ def bind_static_vision_catalog(catalog, plan, worker_ids):
             locator = locators[item_id]
             t, h, w = locator.grid_thw
             if (
-                locator.kind is not VisionLocatorKind.MOCK_SENTINEL
+                locator.kind not in allowed_kinds
                 or locator.grid_thw != segment.grid_thw
                 or segment.payload_rows != t * h * w
             ):
-                raise MdpConfigurationError("static mock recipe matches the planned item shape")
+                raise MdpConfigurationError(
+                    "static locator kind and shape must match the adapter and plan"
+                )
             owners[item_id] = layout.producer_worker_id
     if set(owners) != set(ids):
         raise MdpConfigurationError("static locator plan has missing producers")

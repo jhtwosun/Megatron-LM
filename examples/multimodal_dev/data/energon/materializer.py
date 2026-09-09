@@ -410,6 +410,129 @@ def prepare_static_vision_locator(
     )
 
 
+def bind_webdataset_image_descriptors(sample, descriptors, *, storage_roots):
+    """Replace inline-carrier metadata using native source/index identity only."""
+    storage_fields = (
+        "zip_path",
+        "parquet_path",
+        "path",
+        "encoded_image",
+        "encoded_images",
+        "image_bytes",
+        "bytes",
+        "jpg",
+        "image",
+    )
+    deferred = [
+        index
+        for index, descriptor in enumerate(descriptors)
+        if descriptor.get("kind") in (None, "raw_bytes", "raw_jpeg", "image_bytes", "jpgs")
+        and not any(descriptor.get(key) is not None for key in storage_fields)
+    ]
+    if not deferred:
+        return descriptors
+    from megatron.energon.cache.file_store import WebdatasetFileStore
+    from megatron.energon.epathlib import EPath
+    from megatron.energon.source_info import SourceInfo
+
+    sources = sample.get("__sources__", ())
+    key = sample.get("__key__")
+    if (
+        not isinstance(sources, (list, tuple))
+        or len(sources) != 1
+        or type(sources[0]) is not SourceInfo
+    ):
+        raise ValueError("deferred WebDataset images require one native SourceInfo")
+    key = _validate_exact_zip_member(key)
+    source = sources[0]
+    if not isinstance(source.file_names, tuple) or key + ".json" not in source.file_names:
+        raise ValueError("native source identity must include this sample's JSON entry")
+    _, dataset = authorize_locator_storage_path(
+        str(source.dataset_path), storage_roots, allow_root=True
+    )
+    shard = _validate_exact_zip_member(source.shard_name)
+    _, source_tar = authorize_locator_storage_path(posixpath.join(dataset, shard), storage_roots)
+    store = WebdatasetFileStore(EPath(dataset))
+    # The default/native fast path reads SQLite metadata only. Never enable
+    # slow_mode: its fallback reads actual tar entries before planning.
+    parts = [
+        (name, tar_id)
+        for name, _, tar_id in store.list_sample_parts(key, slow_mode=False)
+        if name in ("jpg", "jpgs")
+    ]
+    if len(parts) != 1:
+        raise ValueError("native index must identify exactly one jpg or jpgs carrier")
+    extension, tar_id = parts[0]
+    if store.tar_filenames[tar_id] != source.shard_name:
+        raise ValueError("indexed carrier and native JSON source belong to different shards")
+    if extension == "jpg" and len(deferred) != 1:
+        raise ValueError("one jpg carrier cannot represent multiple vision items")
+    result = list(descriptors)
+    for ordinal in deferred:
+        descriptor = descriptors[ordinal]
+        image_index = descriptor.get("image_idx", ordinal)
+        if (
+            descriptor.get("key", key) != key
+            or type(image_index) is not int
+            or image_index != ordinal
+        ):
+            raise ValueError("deferred descriptor key/index differs from native sample order")
+        if descriptor.get("tar_path") is not None:
+            _, declared_tar = authorize_locator_storage_path(descriptor["tar_path"], storage_roots)
+            if declared_tar != source_tar:
+                raise ValueError("descriptor tar_path differs from native JSON source")
+        result[ordinal] = {
+            "kind": "webdataset_entry",
+            "dataset_root": dataset,
+            "entry": key + "." + extension,
+            "image_index": ordinal if extension == "jpgs" else VisionLocatorIndexSentinel.UNUSED,
+            **{
+                name: descriptor[name]
+                for name in ("grid_thw", "height", "width")
+                if name in descriptor
+            },
+        }
+    return tuple(result)
+
+
+def validate_static_energon_batch(batch, *, storage_roots):
+    """Reauthorize typed empty-pixel documents against trusted provider roots.
+
+    The marker identifies a carrier, not an authority: roots come from validated
+    launcher configuration, never from locators or sample SourceInfo.
+    """
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    if type(batch) is not list:
+        raise ValueError("static Energon batch must be a document list")
+    for document in batch:
+        locators = document.get("vision_locators")
+        pixels, grids = document.get("pixel_values"), document.get("image_grid_thw")
+        if (
+            document.get("vision_capture_mode") is not VisionCaptureMode.STABLE_LOCATOR_CATALOG
+            or type(locators) is not tuple
+            or not torch.is_tensor(pixels)
+            or pixels.ndim != 2
+            or pixels.numel() != 0
+            or not torch.is_tensor(grids)
+            or grids.ndim != 2
+            or grids.shape[1] != 3
+            or len(locators) != len(grids)
+        ):
+            raise ValueError(
+                "static Energon requires provider-generated locators and zero pixel rows"
+            )
+        for locator, grid in zip(locators, grids.tolist(), strict=True):
+            if type(locator) is not VisionDataLocator or locator.grid_thw != tuple(grid):
+                raise ValueError("static Energon locator grid differs from its document")
+            authorize_locator_storage_path(
+                locator.path,
+                storage_roots,
+                allow_root=locator.kind is VisionLocatorKind.WEBDATASET_ENTRY,
+            )
+    return batch
+
+
 def _parquet_locator_image_bytes(locator: VisionDataLocator) -> bytes:
     import pyarrow.parquet as pq
 

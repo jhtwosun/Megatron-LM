@@ -235,6 +235,7 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
         vision_start_token_id: int = QWEN35_VL_VISION_START_TOKEN_ID,
         vision_end_token_id: int = QWEN35_VL_VISION_END_TOKEN_ID,
         spatial_merge_size: int = _SPATIAL_MERGE_SIZE,
+        static_locator_roots=None,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
@@ -255,6 +256,11 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
         self.vision_start_token_id = int(vision_start_token_id)
         self.vision_end_token_id = int(vision_end_token_id)
         self.spatial_merge_size = _positive_integer(spatial_merge_size, "spatial_merge_size")
+        if static_locator_roots is not None:
+            from examples.multimodal_dev.data.energon.materializer import validate_locator_storage_roots
+
+            static_locator_roots = validate_locator_storage_roots(static_locator_roots)
+        self.static_locator_roots = static_locator_roots
         self._excluded_targets = frozenset(
             {
                 self.image_token_id,
@@ -671,9 +677,41 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
             raise ValueError("Qwen3.5 Energon samples must be mappings")
         if "__restore_key__" not in sample:
             raise ValueError("Qwen3.5 Energon samples must carry __restore_key__")
+        if self.static_locator_roots is not None and any(key in sample for key in ("jpg", "jpgs")):
+            raise ValueError("static Energon requires JSON-only native loading before preencoding")
         payload = self._load_payload(sample.get("json", sample))
         turns = self._turns_from_payload(payload)
         descriptors, grids = self._descriptors(sample, payload)
+        static_fields = {}
+        if self.static_locator_roots is not None:
+            from examples.multimodal_dev.data.energon.materializer import (
+                bind_webdataset_image_descriptors,
+                prepare_static_vision_locator,
+            )
+            from megatron.core.mdp.protocols import VisionCaptureMode
+
+            # The model's grid policy runs before freezing, token expansion,
+            # and the later MDP load-balancing plan.
+            descriptors = bind_webdataset_image_descriptors(
+                sample, descriptors, storage_roots=self.static_locator_roots
+            )
+            locators = tuple(
+                prepare_static_vision_locator(
+                    descriptor,
+                    storage_roots=self.static_locator_roots,
+                    grid_thw=tuple(grid),
+                    declared_dimensions=(
+                        (descriptor["height"], descriptor["width"])
+                        if "height" in descriptor and "width" in descriptor
+                        else None
+                    ),
+                )
+                for descriptor, grid in zip(descriptors, grids.tolist(), strict=True)
+            )
+            static_fields = {
+                "vision_locators": locators,
+                "vision_capture_mode": VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+            }
         merge = self.spatial_merge_size
         image_token_counts = [
             int(time) * (int(height) // merge) * (int(width) // merge)
@@ -702,6 +740,7 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
             "pixel_values": torch.empty(0, self.payload_width, dtype=torch.float32),
             "image_grid_thw": grids,
             "image_descriptors": descriptors,
+            **static_fields,
         }
 
     @stateless
@@ -790,6 +829,16 @@ def _parallel_alignment(args: Any) -> int:
 
 def build_task_encoder(*, args: Any, energon_api: Any) -> TaskEncoder:
     """Build the model-owned TaskEncoder with Megatron's configured tokenizer."""
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    static_locators = getattr(
+        args, "mdp_vision_capture_mode", None
+    ) is VisionCaptureMode.STABLE_LOCATOR_CATALOG and not getattr(
+        args, "mdp_dynamic_encoder_cp", False
+    )
+    roots = getattr(args, "energon_vision_storage_roots", None) if static_locators else None
+    if static_locators and not roots:
+        raise ValueError("static Energon requires explicit vision storage roots")
     wrapper = get_tokenizer()
     tokenizer = getattr(wrapper, "tokenizer", None)
     if tokenizer is None:
@@ -807,6 +856,7 @@ def build_task_encoder(*, args: Any, energon_api: Any) -> TaskEncoder:
         max_samples_per_sequence=getattr(args, "energon_max_samples_per_sequence", None),
         image_token_id=int(getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID)),
         spatial_merge_size=int(getattr(args, "vision_spatial_merge_size", 2) or 2),
+        static_locator_roots=roots,
     )
     if not isinstance(encoder, energon_api.task_encoder_type):
         raise TypeError("Qwen3.5 Energon factory did not create an installed TaskEncoder")

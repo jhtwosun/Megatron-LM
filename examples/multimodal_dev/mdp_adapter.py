@@ -58,6 +58,7 @@ from megatron.core.mdp.protocols import (
     VisionCaptureMode,
 )
 from megatron.core.mdp.window import MdpMicrobatchRecord, MdpMicrobatchVisionRecord
+from megatron.core.mdp.vision_locator import VisionLocatorKind
 from megatron.core.packed_seq_params import PackedSeqParams
 
 _DECODER_ROUTED_FIELD_ORDER = ("input_ids", "labels", "loss_mask", "padding_mask", "position_ids")
@@ -899,6 +900,15 @@ class Qwen35VLMdpAdapter:
         lpt_cost: Patch rows (default) or the PR129 FLOP-aware ordering proxy.
     """
 
+    static_vision_locator_kinds = (
+        VisionLocatorKind.MOCK_SENTINEL,
+        VisionLocatorKind.SHARED_FILE,
+        VisionLocatorKind.ZIP_MEMBER,
+        VisionLocatorKind.PARQUET_ROW,
+        VisionLocatorKind.JPGS_IMAGE,
+        VisionLocatorKind.WEBDATASET_ENTRY,
+    )
+
     def __init__(
         self, out_hidden_size: int, vision_kwargs: Optional[dict] = None, *, lpt_cost="rows"
     ):
@@ -1054,14 +1064,22 @@ class Qwen35VLMdpAdapter:
         return vision_locator_image_bytes(locator)
 
     def fill_vision_payload(self, locator, destination):
-        """Create a planned static mock item directly on its encoder producer."""
+        """Materialize one planned item on its encoder producer, then copy to device."""
+
         from examples.multimodal_dev.data.mdp_mock import materialize_mock_vision
 
-        pixels = materialize_mock_vision(
-            locator, self.payload_width, dtype=destination.dtype, device="cpu"
-        )
-        if pixels.shape != destination.shape:
-            raise ValueError("mock recipe shape differs from its planned destination")
+        if locator.kind is VisionLocatorKind.MOCK_SENTINEL:
+            pixels = materialize_mock_vision(
+                locator, self.payload_width, dtype=destination.dtype, device="cpu"
+            )
+        else:
+            encoded = self.materialize_vision_locator(locator)
+            pixels = self.prepare_materialized_vision_payloads((locator,), (encoded,))
+            pixels = pixels.to(dtype=destination.dtype)
+        if pixels.device.type != "cpu" or pixels.shape != destination.shape:
+            raise ValueError(
+                "static recipe must produce CPU pixels matching its planned destination"
+            )
         destination.copy_(pixels)
 
     def prepare_materialized_vision_payloads(self, locators, encoded_payloads):

@@ -58,6 +58,7 @@ from megatron.core.mdp.protocols import MdpModelAdapter, VisionCaptureMode
 from megatron.core.mdp.rank_mapping import MdpRankMap, MdpRankView
 from megatron.core.mdp.storage import MdpEmbeddingStorage
 from megatron.core.mdp.static_vision import bind_static_vision_catalog
+from megatron.core.mdp.vision_locator import VisionLocatorKind
 from megatron.core.mdp.window import MdpIterationWindow
 
 logger = logging.getLogger(__name__)
@@ -1267,7 +1268,12 @@ class MdpRuntime:
             ):
                 raise MdpStateError("static locator capture requires one DP lane per planning group")
             locators, digest = bind_static_vision_catalog(
-                window.locator_catalog(), plan, self.rank_view.worker_ids
+                window.locator_catalog(),
+                plan,
+                self.rank_view.worker_ids,
+                allowed_kinds=getattr(
+                    self.adapter, "static_vision_locator_kinds", (VisionLocatorKind.MOCK_SENTINEL,)
+                ),
             )
             wire = torch.tensor(list(digest), dtype=torch.uint8, device=self.device)
             gathered = [torch.empty_like(wire) for _ in self.rank_view.planning_group_ranks]

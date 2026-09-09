@@ -256,6 +256,23 @@ def train_valid_test_datasets_provider(_train_val_test_num_samples: Any):
         "batch_size": args.micro_batch_size,
         "packing_buffer_size": args.energon_packing_buffer_size,
     }
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    if getattr(
+        args, "mdp_vision_capture_mode", None
+    ) is VisionCaptureMode.STABLE_LOCATOR_CATALOG and not getattr(
+        args, "mdp_dynamic_encoder_cp", False
+    ):
+        if (
+            getattr(args, "mdp_enable", False) is not True
+            or not getattr(args, "energon_vision_storage_roots", None)
+            or getattr(task_encoder, "static_locator_roots", None)
+            != args.energon_vision_storage_roots
+        ):
+            raise ValueError(
+                "static Energon locators require enabled MDP and a root-bound task encoder"
+            )
+        common["part_filter"] = ["json"]
     train_dataset = api.get_train_dataset(
         args.energon_path,
         split_part=args.energon_split,
