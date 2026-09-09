@@ -1,6 +1,7 @@
 """Lazy mock identity contracts; run only in the scheduled container."""
 
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -109,3 +110,35 @@ def test_storage_path_guard_and_materializer_kind_remain_strict():
     )
     with pytest.raises(MdpConfigurationError):
         materialize_mock_vision(storage, 1536)
+
+
+def test_static_get_batch_forwards_metadata_without_pixel_materialization(monkeypatch):
+    from examples.multimodal_dev import forward_step
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    args = SimpleNamespace(
+        mdp_enable=True, mdp_vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        dataset_provider="mdp_mock", tensor_model_parallel_size=1, use_packed_sequence=True,
+        seq_length=16384,
+    )
+    monkeypatch.setattr(forward_step, "get_args", lambda: args)
+    monkeypatch.setattr(forward_step, "get_tensor_model_parallel_group", lambda: object())
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda **kwargs: 1)
+    samples = [MdpThdMockDataset(metadata_only=True)[index] for index in range(5)]
+    calls = []
+
+    def pack(batch, *args, **kwargs):
+        assert batch is samples
+        assert all(sample["pixel_values"].numel() == 0 for sample in batch)
+        assert kwargs["include_vision_pixels"] is False
+        calls.append("pack")
+        return {"pixel_values": torch.empty(0, 1536)}
+
+    monkeypatch.setattr(forward_step, "pack_or_pad_batch", pack)
+    result = forward_step.get_batch(iter([samples]))
+    assert calls == ["pack"]
+    assert "pixel_values" not in result
+    assert result["vision_capture_mode"] is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    assert result["vision_locators"] == tuple(
+        locator for sample in samples for locator in sample["vision_locators"]
+    )

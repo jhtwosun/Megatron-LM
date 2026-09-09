@@ -57,6 +57,7 @@ from megatron.core.mdp.planner import MdpPlanner, assert_consistent_plan
 from megatron.core.mdp.protocols import MdpModelAdapter, VisionCaptureMode
 from megatron.core.mdp.rank_mapping import MdpRankMap, MdpRankView
 from megatron.core.mdp.storage import MdpEmbeddingStorage
+from megatron.core.mdp.static_vision import bind_static_vision_catalog
 from megatron.core.mdp.window import MdpIterationWindow
 
 logger = logging.getLogger(__name__)
@@ -97,8 +98,19 @@ class MdpRuntime:
     ) -> None:
         if type(vision_capture_mode) is not VisionCaptureMode:
             raise MdpConfigurationError("MDP: runtime capture mode must be an exact closed enum.")
-        if not config.dynamic_encoder_cp and vision_capture_mode is not VisionCaptureMode.SOURCE_PIXEL_SIDECAR:
-            raise MdpConfigurationError("MDP: static/D3 runtime supports only source-pixel capture mode.")
+        self._static_locator_capture = (
+            not config.dynamic_encoder_cp
+            and vision_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        )
+        if self._static_locator_capture and (
+            config.encoder_cp != 1
+            or rank_map.spec.tp != 1
+            or config.overlap_window_capture
+            or not callable(getattr(adapter, "fill_vision_payload", None))
+        ):
+            raise MdpConfigurationError(
+                "MDP: static locators require ECP1, TP1, a payload materializer, and no window overlap."
+            )
         if config.dynamic_encoder_cp:
             operations_type = (
                 DynamicEncoderLocatorAdapterOperations
@@ -371,6 +383,10 @@ class MdpRuntime:
                 debug_payload_check=self.config.debug_plan_payload_check,
             )
         self._plan = plan
+        static_locators = (
+            self._prepare_static_locator_catalog(window, plan)
+            if self._static_locator_capture else None
+        )
         # Specs and ledgers are pure functions of the plan; derive them once
         # per iteration instead of once per phase (EMBEDDING and GRADIENT
         # share identical specs, and each build_ledger re-sorted the routes).
@@ -429,36 +445,39 @@ class MdpRuntime:
             raise error
 
         try:
-            with nvtx_phase("p1_pixel_dispatch"):
-                pixel_specs = self._iter_specs[BridgePhase.PIXEL]
-                sidecar = window.payload_sidecar()
-                pixel_local = {
-                    BridgeBufferKey(item_id): tensor.to(self.params_dtype)
-                    for item_id, tensor in sidecar.items()
-                }
-                pixel_ledger = self._iter_ledgers[BridgePhase.PIXEL]
-                # Owners -> producers in one collective; every group member
-                # participates (with zero splits when it has nothing to move).
-                self.bridge.exchange_all_to_all(
-                    pixel_ledger,
-                    pixel_local,
-                    tensor_specs=pixel_specs,
-                    group=self.process_groups.planning_group,
-                    group_ranks=self.rank_view.planning_group_ranks,
-                    global_rank=self.rank_view.global_rank,
-                    dtype=self.params_dtype,
-                    device=self.device,
-                    dest_views=pixel_dest,
-                )
-                if self.config.encoder_cp > 1:
-                    with nvtx_phase("p1_encoder_cp_pixel_broadcast"):
-                        for chunk_index, chunk in enumerate(self._chunk_layouts):
-                            torch.distributed.broadcast(
-                                chunk_payloads[chunk_index][: chunk.total_payload_rows],
-                                src=self.process_groups.encoder_cp_leader_rank,
-                                group=self.process_groups.encoder_cp_group,
-                            )
+            if self._static_locator_capture:
+                self._fill_static_vision_payloads(static_locators, pixel_dest)
                 window.release_pixels()
+            else:
+                with nvtx_phase("p1_pixel_dispatch"):
+                    pixel_specs = self._iter_specs[BridgePhase.PIXEL]
+                    sidecar = window.payload_sidecar()
+                    pixel_local = {
+                        BridgeBufferKey(item_id): tensor.to(self.params_dtype)
+                        for item_id, tensor in sidecar.items()
+                    }
+                    pixel_ledger = self._iter_ledgers[BridgePhase.PIXEL]
+                    # Every group member participates, including zero-split ranks.
+                    self.bridge.exchange_all_to_all(
+                        pixel_ledger,
+                        pixel_local,
+                        tensor_specs=pixel_specs,
+                        group=self.process_groups.planning_group,
+                        group_ranks=self.rank_view.planning_group_ranks,
+                        global_rank=self.rank_view.global_rank,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                        dest_views=pixel_dest,
+                    )
+                    if self.config.encoder_cp > 1:
+                        with nvtx_phase("p1_encoder_cp_pixel_broadcast"):
+                            for chunk_index, chunk in enumerate(self._chunk_layouts):
+                                torch.distributed.broadcast(
+                                    chunk_payloads[chunk_index][: chunk.total_payload_rows],
+                                    src=self.process_groups.encoder_cp_leader_rank,
+                                    group=self.process_groups.encoder_cp_group,
+                                )
+                    window.release_pixels()
         except BaseException as error:
             # All-rank returned errors are cleanup-safe. A one-rank hang inside
             # an already-posted collective remains task-fatal.
@@ -1237,13 +1256,66 @@ class MdpRuntime:
             )
         raise first_error
 
+    def _prepare_static_locator_catalog(self, window, plan):
+        local_error = None
+        try:
+            if any(
+                self.rank_map.view(rank).outer_dp_rank != self.rank_view.outer_dp_rank
+                for rank in self.rank_view.planning_group_ranks
+            ):
+                raise MdpStateError("static locator capture requires one DP lane per planning group")
+            locators, digest = bind_static_vision_catalog(
+                window.locator_catalog(), plan, self.rank_view.worker_ids
+            )
+            wire = torch.tensor(list(digest), dtype=torch.uint8, device=self.device)
+            gathered = [torch.empty_like(wire) for _ in self.rank_view.planning_group_ranks]
+        except BaseException as error:
+            local_error = error
+        if self._planning_preparation_failed(local_error):
+            error = local_error or MdpStateError("static locator preparation failed on a peer")
+            self._abort_failed_iteration(error)
+            raise error
+        torch.distributed.all_gather(gathered, wire, group=self.process_groups.planning_group)
+        if any(not torch.equal(gathered[0], value) for value in gathered[1:]):
+            error = MdpStateError("static locator catalog or producer ownership differs across ranks")
+            self._abort_failed_iteration(error)
+            raise error
+        return locators
+
+    def _fill_static_vision_payloads(self, locators, destinations):
+        local_error = None
+        try:
+            layout = self._plan.encoder_layout_for_producer(self.rank_view.my_worker_id)
+            expected = {BridgeBufferKey(segment.global_item_id) for segment in layout.segments}
+            if set(destinations) != expected:
+                raise MdpStateError("static locator destinations match the assigned producer items")
+            with nvtx_phase("p1_local_vision_materialization"):
+                for segment in layout.segments:
+                    destination = destinations[BridgeBufferKey(segment.global_item_id)]
+                    if (
+                        destination.shape != (segment.payload_rows, self.adapter.payload_width)
+                        or destination.dtype != self.params_dtype
+                        or destination.device != self.device
+                    ):
+                        raise MdpStateError("static locator destination shape, dtype and device match")
+                    self.adapter.fill_vision_payload(locators[segment.global_item_id], destination)
+        except BaseException as error:
+            local_error = error
+        # All producers finish local allocation/materialization before any P2/P3
+        # work can enter an encoder or embedding collective.
+        if self._planning_preparation_failed(local_error):
+            raise local_error or MdpStateError("static vision materialization failed on a peer")
+
     def _capture_window(self, data_iterators, num_microbatches: int) -> MdpIterationWindow:
         return MdpIterationWindow.capture(
             data_iterators,
             num_microbatches=num_microbatches,
             adapter=self.adapter,
             num_vpp_chunks=self.num_vpp_chunks,
-            lane_id=self.rank_view.lane_id,
+            lane_id=(
+                self.rank_view.outer_dp_rank
+                if self._static_locator_capture else self.rank_view.lane_id
+            ),
             my_worker_id=self.rank_view.my_worker_id,
             num_workers=len(self.rank_view.worker_ids),
             is_worker_leader=(
@@ -1254,7 +1326,7 @@ class MdpRuntime:
             ),
             capture_error_consensus=(
                 self._planning_preparation_failed
-                if self.rank_map.spec.tp > 1 or self.config.encoder_cp > 1
+                if self.rank_map.spec.tp > 1 or self.config.encoder_cp > 1 or self._static_locator_capture
                 else None
             ),
         )
@@ -1485,7 +1557,7 @@ class MdpRuntime:
 
     def _planning_preparation_failed(self, local_error: Optional[BaseException]) -> bool:
         """Converge rank-local preparation failures before a TP/P2P collective."""
-        if self.rank_map.spec.tp == 1 and self.config.encoder_cp == 1:
+        if self.rank_map.spec.tp == 1 and self.config.encoder_cp == 1 and not self._static_locator_capture:
             return local_error is not None
         failed = torch.tensor(
             [1 if local_error is not None else 0],

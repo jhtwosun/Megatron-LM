@@ -212,11 +212,16 @@ class MdpThdMockDataset(Dataset):
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Provide MDP mock train / val / test datasets."""
     from megatron.training import get_args
+    from megatron.core.mdp.protocols import VisionCaptureMode
 
     args = get_args()
     kwargs = dict(
         vocab_size=getattr(args, "padded_vocab_size", 1024),
         image_token_id=getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID),
+        metadata_only=(
+            getattr(args, "mdp_vision_capture_mode", None)
+            is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        ),
     )
     return tuple(
         MdpThdMockDataset(num_samples=n, seed=1234 + split, **kwargs) if n > 0 else None
