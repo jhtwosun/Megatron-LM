@@ -355,6 +355,61 @@ def freeze_descriptor_locator(
     )
 
 
+def prepare_static_vision_locator(
+    descriptor, *, storage_roots, grid_thw, declared_dimensions
+) -> VisionDataLocator:
+    """Authorize storage and resolve ZIP metadata before no-I/O freezing.
+
+    ZIP central-directory work is deliberately uncached and part of capture.
+    Candidate order matches the existing loader; no image payload is read here.
+    WebDataset roots must come from native source identity, never tar-path inference.
+    """
+    if type(descriptor) is not dict:
+        raise ValueError("static vision descriptors must be exact dictionaries")
+    descriptor = dict(descriptor)
+    kind = descriptor.get("kind")
+    if kind == "webdataset_entry":
+        if not set(descriptor).issubset({
+            "kind", "dataset_root", "entry", "image_index", "grid_thw", "height", "width"
+        }):
+            raise ValueError("WebDataset entry descriptor has competing or unknown payload fields")
+        _, dataset = authorize_locator_storage_path(
+            descriptor.get("dataset_root"), storage_roots, allow_root=True
+        )
+        return VisionDataLocator(
+            VisionLocatorKind.WEBDATASET_ENTRY, dataset, descriptor.get("entry"), None,
+            descriptor.get("image_index", VisionLocatorIndexSentinel.UNUSED),
+            grid_thw, declared_dimensions,
+        )
+    if kind == "zip_image":
+        path, candidates = _zip_descriptor_spec(descriptor)
+        root, path = authorize_locator_storage_path(path, storage_roots)
+        with zipfile.ZipFile(path, "r") as archive:
+            names = [info.filename for info in archive.infolist()]
+        selected = next((name for name in candidates if name in names), None)
+        if selected is None:
+            raise FileNotFoundError(f"image not found in zip {path}: candidates={candidates!r}")
+        if names.count(selected) != 1:
+            raise ValueError("zip locator member must occur exactly once in the archive")
+        descriptor.pop("candidates", None)
+        descriptor.pop("candidate", None)
+        descriptor.update(zip_path=path, path=selected)
+    else:
+        if kind == "parquet_column_image":
+            key = "parquet_path"
+        else:
+            sources = [key for key in ("path", "encoded_images", "encoded_image", "image_bytes", "bytes", "jpg", "image")
+                       if descriptor.get(key) is not None]
+            if len(sources) != 1:
+                raise ValueError("static descriptor requires one path-backed image source")
+            key = sources[0]
+        root, descriptor[key] = authorize_locator_storage_path(descriptor.get(key), storage_roots)
+    return freeze_descriptor_locator(
+        descriptor, dataset_root=root, grid_thw=grid_thw,
+        declared_dimensions=declared_dimensions,
+    )
+
+
 def _parquet_locator_image_bytes(locator: VisionDataLocator) -> bytes:
     import pyarrow.parquet as pq
 
@@ -419,6 +474,16 @@ def vision_locator_image_bytes(locator: VisionDataLocator) -> bytes:
         return _jpgs_member(locator.path, locator.index)
     if locator.kind is VisionLocatorKind.PARQUET_ROW:
         return _parquet_locator_image_bytes(locator)
+    if locator.kind is VisionLocatorKind.WEBDATASET_ENTRY:
+        from megatron.energon.cache.file_store import WebdatasetFileStore
+        from megatron.energon.epathlib import EPath
+
+        payload, _ = WebdatasetFileStore(EPath(locator.path))[locator.member]
+        if type(payload) is not bytes:
+            raise ValueError("WebDataset entry must contain exact encoded bytes")
+        if locator.member.endswith(".jpgs"):
+            return _jpgs_member(payload, locator.index)
+        return payload
     raise AssertionError("closed VisionLocatorKind was not handled")
 
 

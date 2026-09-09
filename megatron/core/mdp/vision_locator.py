@@ -32,13 +32,14 @@ _DIGEST_PERSON = b"mcore-mdp-loc-v1"
 
 
 class VisionLocatorKind(IntEnum):
-    """Closed schema-v1 storage kinds."""
+    """Closed schema-v1 storage kinds; older readers reject unknown new kinds."""
 
     SHARED_FILE = 1
     ZIP_MEMBER = 2
     PARQUET_ROW = 3
     JPGS_IMAGE = 4
     MOCK_SENTINEL = 5
+    WEBDATASET_ENTRY = 6
 
 
 class VisionLocatorIndexSentinel(Enum):
@@ -177,6 +178,17 @@ class VisionDataLocator:
                 raise MdpConfigurationError(
                     "MDP: JPGS_IMAGE locator forbids member/column metadata."
                 )
+        elif self.kind is VisionLocatorKind.WEBDATASET_ENTRY:
+            if (
+                member is None or member.startswith("/")
+                or posixpath.normpath(member) != member
+                or ".." in member.split("/") or "\\" in member
+                or not member.endswith((".jpg", ".jpgs"))
+                or column is not None
+            ):
+                raise MdpConfigurationError("MDP: WebDataset locator requires one safe jpg/jpgs entry.")
+            if (member.endswith(".jpgs") and not indexed) or (member.endswith(".jpg") and not unused):
+                raise MdpConfigurationError("MDP: WebDataset jpgs requires an index; jpg requires UNUSED.")
 
 
 @dataclass(frozen=True, slots=True)
