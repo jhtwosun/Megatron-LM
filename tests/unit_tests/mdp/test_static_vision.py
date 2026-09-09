@@ -99,6 +99,7 @@ def test_fill_coordinates_local_error_before_returning(monkeypatch):
     _, view, plan, catalog = _fixture()
     runtime = object.__new__(MdpRuntime)
     runtime._plan, runtime.rank_view = plan, view
+    runtime.process_groups = SimpleNamespace(encoder_cp_leader_rank=view.global_rank)
     runtime.params_dtype, runtime.device = torch.float32, torch.device("cpu")
     events = []
 
@@ -144,6 +145,29 @@ def test_static_metadata_tp1_ecp1_still_uses_group_error_consensus(monkeypatch):
     assert len(calls) == 1
 
 
+def test_static_follower_validates_destinations_without_materializing(monkeypatch):
+    import megatron.core.mdp.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "nvtx_phase", lambda *args: nullcontext())
+    _, view, plan, catalog = _fixture()
+    runtime = object.__new__(MdpRuntime)
+    runtime._plan, runtime.rank_view = plan, view
+    runtime.process_groups = SimpleNamespace(encoder_cp_leader_rank=-1)
+    runtime.params_dtype, runtime.device = torch.float32, torch.device("cpu")
+    calls = []
+    runtime.adapter = SimpleNamespace(
+        payload_width=3, fill_vision_payload=lambda *_: pytest.fail("follower materialized")
+    )
+    runtime._planning_preparation_failed = lambda error: calls.append(error) or False
+    locators, _ = bind_static_vision_catalog(catalog, plan, view.worker_ids)
+    destinations = {
+        BridgeBufferKey(segment.global_item_id): torch.empty(segment.payload_rows, 3)
+        for segment in plan.encoder_layout_for_producer(view.my_worker_id).segments
+    }
+    runtime._fill_static_vision_payloads(locators, destinations)
+    assert calls == [None]
+
+
 def test_static_launch_is_opt_in_and_does_not_relax_dynamic_storage_guards():
     from megatron.core.mdp.integration import _resolve_vision_capture_mode
     from megatron.core.mdp.protocols import VisionCaptureMode
@@ -154,8 +178,7 @@ def test_static_launch_is_opt_in_and_does_not_relax_dynamic_storage_guards():
     )
     config = MdpConfig(enable=True)
     assert _resolve_vision_capture_mode(args, config) is VisionCaptureMode.STABLE_LOCATOR_CATALOG
-    with pytest.raises(MdpConfigurationError, match="ECP1"):
-        _resolve_vision_capture_mode(args, replace(config, encoder_cp=2))
+    assert _resolve_vision_capture_mode(args, replace(config, encoder_cp=2)) is VisionCaptureMode.STABLE_LOCATOR_CATALOG
     with pytest.raises(MdpConfigurationError, match="overlap"):
         _resolve_vision_capture_mode(args, replace(config, overlap_window_capture=True))
     with pytest.raises(MdpConfigurationError, match="energon"):

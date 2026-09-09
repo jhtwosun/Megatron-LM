@@ -103,13 +103,12 @@ class MdpRuntime:
             and vision_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
         )
         if self._static_locator_capture and (
-            config.encoder_cp != 1
-            or rank_map.spec.tp != 1
+            rank_map.spec.tp != 1
             or config.overlap_window_capture
             or not callable(getattr(adapter, "fill_vision_payload", None))
         ):
             raise MdpConfigurationError(
-                "MDP: static locators require ECP1, TP1, a payload materializer, and no window overlap."
+                "MDP: static locators require TP1, a payload materializer, and no window overlap."
             )
         if config.dynamic_encoder_cp:
             operations_type = (
@@ -449,7 +448,6 @@ class MdpRuntime:
         try:
             if self._static_locator_capture:
                 self._fill_static_vision_payloads(static_locators, pixel_dest)
-                window.release_pixels()
             else:
                 with nvtx_phase("p1_pixel_dispatch"):
                     pixel_specs = self._iter_specs[BridgePhase.PIXEL]
@@ -471,15 +469,17 @@ class MdpRuntime:
                         device=self.device,
                         dest_views=pixel_dest,
                     )
-                    if self.config.encoder_cp > 1:
-                        with nvtx_phase("p1_encoder_cp_pixel_broadcast"):
-                            for chunk_index, chunk in enumerate(self._chunk_layouts):
-                                torch.distributed.broadcast(
-                                    chunk_payloads[chunk_index][: chunk.total_payload_rows],
-                                    src=self.process_groups.encoder_cp_leader_rank,
-                                    group=self.process_groups.encoder_cp_group,
-                                )
-                    window.release_pixels()
+            # Only the worker leader receives or materializes pixels. Reuse
+            # the same ECP replication after either loading path completes.
+            if self.config.encoder_cp > 1:
+                with nvtx_phase("p1_encoder_cp_pixel_broadcast"):
+                    for chunk_index, chunk in enumerate(self._chunk_layouts):
+                        torch.distributed.broadcast(
+                            chunk_payloads[chunk_index][: chunk.total_payload_rows],
+                            src=self.process_groups.encoder_cp_leader_rank,
+                            group=self.process_groups.encoder_cp_group,
+                        )
+            window.release_pixels()
         except BaseException as error:
             # All-rank returned errors are cleanup-safe. A one-rank hang inside
             # an already-posted collective remains task-fatal.
@@ -1300,7 +1300,8 @@ class MdpRuntime:
                         or destination.device != self.device
                     ):
                         raise MdpStateError("static locator destination shape, dtype and device match")
-                    self.adapter.fill_vision_payload(locators[segment.global_item_id], destination)
+                    if self._is_worker_leader():
+                        self.adapter.fill_vision_payload(locators[segment.global_item_id], destination)
         except BaseException as error:
             local_error = error
         # All producers finish local allocation/materialization before any P2/P3

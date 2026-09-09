@@ -82,9 +82,9 @@ class _MetadataAdapter(_StubAdapter):
         Qwen35VLMdpAdapter.fill_vision_payload(self, locator, destination)
 
 
-def _runtime(metadata, allocator):
+def _runtime(metadata, allocator, encoder_cp=1):
     runtime, view = _build_runtime(
-        decoder_cp=2, allocator=allocator,
+        decoder_cp=2, encoder_cp=encoder_cp, allocator=allocator,
         adapter_class=_MetadataAdapter if metadata else _StubAdapter,
         vision_capture_mode=(VisionCaptureMode.STABLE_LOCATOR_CATALOG if metadata
                              else VisionCaptureMode.SOURCE_PIXEL_SIDECAR),
@@ -93,11 +93,12 @@ def _runtime(metadata, allocator):
     return runtime, view
 
 
-def test_static_mock_pixel_and_metadata_input_gradient_parity():
+@pytest.mark.parametrize("encoder_cp", [1, 2])
+def test_static_mock_pixel_and_metadata_input_gradient_parity(encoder_cp):
     observations = []
     for metadata in (False, True):
         allocator = _TrackingAllocator()
-        runtime, view = _runtime(metadata, allocator)
+        runtime, view = _runtime(metadata, allocator, encoder_cp)
         phases = []
         original = runtime.bridge.exchange_all_to_all
 
@@ -144,9 +145,10 @@ def test_static_mock_pixel_and_metadata_input_gradient_parity():
     torch.testing.assert_close(eager[3], lazy[3], rtol=0, atol=0)
 
 
-def test_static_mock_failed_producer_consensus_and_cleanup():
+@pytest.mark.parametrize("encoder_cp", [1, 2])
+def test_static_mock_failed_producer_consensus_and_cleanup(encoder_cp):
     allocator = _TrackingAllocator()
-    runtime, view = _runtime(True, allocator)
+    runtime, view = _runtime(True, allocator, encoder_cp)
     # Worker zero receives an item in each independent planning group.
     runtime.adapter.fail = view.my_worker_id == 0
     error = _capture_runtime_error(lambda: runtime.begin_iteration(
@@ -156,6 +158,40 @@ def test_static_mock_failed_producer_consensus_and_cleanup():
     assert all(message is not None for message in errors)
     assert any("injected producer materialization failure" in message for message in errors)
     _assert_all_ranks_clean(runtime, allocator)
+
+
+def test_static_metadata_ecp2_matches_ecp1_without_gradient_rescaling():
+    from tests.unit_tests.mdp.test_vision_packing_runtime import _global_item_gradients
+
+    observations = []
+    for encoder_cp in (1, 2):
+        allocator = _TrackingAllocator()
+        runtime, view = _runtime(True, allocator, encoder_cp)
+        replay = runtime.begin_iteration(iter(range(2)), num_microbatches=2, forward_only=False)
+        leaf = runtime.storage.get_leaf(0)
+        leaf = None if leaf is None else leaf.detach().cpu().clone()
+        _drive_decoder(runtime, view, replay, backward=True)
+        runtime.capture_global_num_tokens(torch.tensor(20.0, device="cuda"))
+        runtime.mark_decoder_complete()
+        runtime.end_iteration()
+        inputs = _global_item_gradients(runtime.adapter, view.outer_dp_rank)
+        gradient = _reconstructed_reduced_param_grad(runtime).cpu()
+        success, _, _ = runtime.encoder_domain.encoder_optimizer.step()
+        assert success
+        parameter = next(runtime.encoder_domain.encoder_ddp.module.parameters()).detach().cpu().clone()
+        observations.append((leaf, inputs, gradient, parameter))
+        _assert_all_ranks_clean(runtime, allocator)
+    reference, candidate = observations
+    if reference[0] is None:
+        assert candidate[0] is None
+    else:
+        torch.testing.assert_close(candidate[0], reference[0], rtol=0, atol=0)
+    assert candidate[1].keys() == reference[1].keys()
+    assert len(reference[1]) == 2 * len(GRIDS)
+    for item in reference[1]:
+        torch.testing.assert_close(candidate[1][item], reference[1][item], rtol=0, atol=0)
+    for index in (2, 3):
+        torch.testing.assert_close(candidate[index], reference[index], rtol=0, atol=0)
 
 
 def test_static_mock_materializer_cpu_to_bf16_producer(monkeypatch):
@@ -200,12 +236,14 @@ def test_static_mock_one_group_forward_only_failure_isolation():
     _assert_all_ranks_clean(runtime, allocator)
 
 
-def test_static_mock_real_cp2_collator_input_parity(monkeypatch):
+@pytest.mark.parametrize("encoder_cp", [1, 2])
+def test_static_mock_real_cp2_collator_input_parity(monkeypatch, encoder_cp):
     from examples.multimodal_dev import forward_step
     from examples.multimodal_dev.data.mdp_mock import MdpThdMockDataset
 
     args = SimpleNamespace(
-        mdp_enable=True, dataset_provider="mdp_mock", tensor_model_parallel_size=1,
+        mdp_enable=True, mdp_encoder_cp=encoder_cp,
+        dataset_provider="mdp_mock", tensor_model_parallel_size=1,
         use_packed_sequence=True, seq_length=16384, sequence_parallel=False,
     )
     monkeypatch.setattr(forward_step, "get_args", lambda: args)

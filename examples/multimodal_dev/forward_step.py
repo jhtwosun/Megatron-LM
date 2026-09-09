@@ -870,10 +870,9 @@ def _locator_capture_root(args, group, locator_operations, expected_locator_arch
             locator_operations is not None
             or getattr(args, "mdp_enable", None) is not True
             or getattr(args, "use_packed_sequence", None) is not True
-            or getattr(args, "mdp_encoder_cp", 1) != 1
             or torch.distributed.get_world_size(group=group) != 1
         ):
-            raise MdpConfigurationError("MDP: static mock locator capture requires enabled ECP1/TP1 THD.")
+            raise MdpConfigurationError("MDP: static mock locator capture requires enabled TP1 THD.")
         return None
     if locator_operations is None:
         if mode is not VisionCaptureMode.SOURCE_PIXEL_SIDECAR:
