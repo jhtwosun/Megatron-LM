@@ -836,6 +836,19 @@ def _prepare_energon_batch(data, args):
     if _static_locator_capture(args):
         from examples.multimodal_dev.data.energon.materializer import validate_static_energon_batch
 
+        # Native Energon uses DataLoader(batch_size=None): default_convert
+        # changes ordinary tuples to lists. Restore this one typed carrier,
+        # then apply the unchanged strict shape/type/root/pixel checks.
+        if type(data) is list and any(
+            type(document) is dict and type(document.get("vision_locators")) is list
+            for document in data
+        ):
+            data = [
+                {**document, "vision_locators": tuple(document["vision_locators"])}
+                if type(document) is dict and type(document.get("vision_locators")) is list
+                else document
+                for document in data
+            ]
         return validate_static_energon_batch(data, storage_roots=args.energon_vision_storage_roots)
     from examples.multimodal_dev.data.energon.materializer import prepare_energon_batch
     from megatron.core.mdp.window import pixel_capture_suppressed
