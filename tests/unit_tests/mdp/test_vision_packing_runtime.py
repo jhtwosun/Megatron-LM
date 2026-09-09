@@ -15,6 +15,7 @@ import torch
 
 from examples.multimodal_dev.mdp_adapter import qwen_vision_lpt_cost
 from megatron.core.mdp.config import MdpConfig
+from megatron.core.mdp.protocols import VisionCaptureMode
 from tests.unit_tests.mdp.test_runtime import (
     GRIDS,
     MERGE,
@@ -83,7 +84,12 @@ def _global_item_gradients(adapter, lane):
     return combined
 
 
-def _run_variant(encoder_cp, cap, cost, policy, fuse, recompute):
+def _run_variant(
+    encoder_cp, cap, cost, policy, fuse, recompute, *,
+    adapter_class=_TwoVisionAdapter,
+    capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+    check_runtime=None,
+):
     allocator = _TrackingAllocator()
     config = MdpConfig(
         enable=True,
@@ -98,9 +104,11 @@ def _run_variant(encoder_cp, cap, cost, policy, fuse, recompute):
         decoder_cp=2,
         encoder_cp=encoder_cp,
         allocator=allocator,
-        adapter_class=_TwoVisionAdapter,
+        adapter_class=adapter_class,
         mdp_config=config,
+        vision_capture_mode=capture_mode,
     )
+    runtime.adapter.runtime = runtime
     runtime.adapter.use_flop_cost = cost == "flops"
     replay = runtime.begin_iteration(iter(range(2)), num_microbatches=2, forward_only=False)
     records = [next(replay[0]) for _ in range(2)]
@@ -155,6 +163,8 @@ def _run_variant(encoder_cp, cap, cost, policy, fuse, recompute):
     runtime.end_iteration()
     gradients = _global_item_gradients(runtime.adapter, view.outer_dp_rank)
     param_grad = _reconstructed_reduced_param_grad(runtime).cpu()
+    if check_runtime is not None:
+        check_runtime(runtime, view)
     _assert_all_ranks_clean(runtime, allocator)
     return leaves, local_loss, gradients, param_grad, chunk_evidence, assignments
 
