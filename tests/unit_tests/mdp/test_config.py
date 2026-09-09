@@ -19,6 +19,31 @@ from megatron.core.mdp.config import (
 from megatron.core.mdp.errors import MdpConfigurationError
 
 
+@pytest.mark.parametrize("fuse", [False, True])
+@pytest.mark.parametrize("encoder_cp", [1, 2])
+def test_fusion_control_preserves_cp_compatibility(fuse, encoder_cp):
+    validate_mdp_config(
+        MdpConfig(enable=True, encoder_cp=encoder_cp, encoder_fuse_across_microbatches=fuse),
+        _options(context_parallel_size=2),
+    )
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "false"])
+def test_fusion_config_rejects_non_boolean(value):
+    with pytest.raises(MdpConfigurationError, match="encoder_fuse_across_microbatches"):
+        validate_mdp_config(MdpConfig(enable=True, encoder_fuse_across_microbatches=value), _options())
+
+
+@pytest.mark.parametrize("encoder_dynamic", [False, True])
+def test_dynamic_cp_rejects_unsupported_fusion_boundary_control(encoder_dynamic):
+    with pytest.raises(MdpConfigurationError, match="microbatch boundary control"):
+        validate_mdp_config(
+            MdpConfig(enable=True, encoder_fuse_across_microbatches=False,
+                      dynamic_encoder_cp=encoder_dynamic),
+            _options(dynamic_context_parallel=not encoder_dynamic),
+        )
+
+
 def _options(**overrides):
     base = dict(
         world_size=8,

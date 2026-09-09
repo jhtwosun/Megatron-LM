@@ -22,6 +22,19 @@ _DEFAULTS = {
 }
 
 
+def test_vision_fusion_and_cost_defaults_preserve_db68():
+    parser = argparse.ArgumentParser()
+    add_multimodal_args(parser)
+    defaults = parser.parse_args([])
+    assert defaults.mdp_encoder_fuse_across_microbatches is True
+    assert defaults.mdp_vision_lpt_cost == "rows"
+    selected = parser.parse_args([
+        "--no-mdp-encoder-fuse-across-microbatches", "--mdp-vision-lpt-cost", "flops"
+    ])
+    assert selected.mdp_encoder_fuse_across_microbatches is False
+    assert selected.mdp_vision_lpt_cost == "flops"
+
+
 def _args(*, mdp_enable, **overrides):
     values = dict(_DEFAULTS)
     values.update(overrides)

@@ -875,15 +875,37 @@ class MultimodalDecoderPayloadCodec:
         )
 
 
+def qwen_vision_lpt_cost(grid_thw: tuple, hidden_size: int) -> int:
+    """PR129 attention-plus-FFN ordering proxy, not measured encoder FLOPs."""
+    if type(grid_thw) is not tuple or len(grid_thw) != 3:
+        raise ValueError("grid_thw must be an exact three-element tuple")
+    if any(type(value) is not int or value <= 0 for value in grid_thw):
+        raise ValueError("grid_thw elements must be positive integers")
+    if type(hidden_size) is not int or hidden_size <= 0:
+        raise ValueError("hidden_size must be a positive integer")
+    patches = grid_thw[0] * grid_thw[1] * grid_thw[2]
+    cost = patches * patches * hidden_size + patches * hidden_size * hidden_size
+    if cost > (1 << 63) - 1:
+        raise ValueError("Qwen vision LPT cost must fit signed int64")
+    return cost
+
+
 class Qwen35VLMdpAdapter:
     """MdpModelAdapter implementation for Qwen3.5-VL.
 
     Args:
         out_hidden_size: Language decoder hidden size (patch-merger output).
         vision_kwargs: Optional override of the Qwen3.5-VL vision kwargs.
+        lpt_cost: Patch rows (default) or the PR129 FLOP-aware ordering proxy.
     """
 
-    def __init__(self, out_hidden_size: int, vision_kwargs: Optional[dict] = None):
+    def __init__(
+        self, out_hidden_size: int, vision_kwargs: Optional[dict] = None, *, lpt_cost="rows"
+    ):
+        if lpt_cost not in ("rows", "flops"):
+            raise ValueError("Qwen vision LPT cost is rows or flops")
+        self._lpt_cost = lpt_cost
+        self._vision_hidden_size = None
         self._vision_kwargs = dict(vision_kwargs or VISION_KWARGS)
         self._vision_kwargs["out_hidden_size"] = out_hidden_size
         self.embedding_width = out_hidden_size
@@ -1054,7 +1076,9 @@ class Qwen35VLMdpAdapter:
     # ------------------------------------------------------------------
 
     def estimate_cost(self, item: CapturedVisionItem) -> int:
-        """Patch rows as the LPT ordering cost; never sizes any buffer."""
+        """Selected ordering proxy; payload rows alone still size buffers."""
+        if self._lpt_cost == "flops":
+            return qwen_vision_lpt_cost(item.grid_thw, self._vision_hidden_size)
         return item.payload_rows
 
     def estimate_dynamic_encoder_workload(
@@ -1124,6 +1148,10 @@ class Qwen35VLMdpAdapter:
 
     def build_encoder(self, model_config, *, pg_collection) -> torch.nn.Module:
         """Same factory as the non-MDP path (models/qwen35_vl/model.py)."""
+        # Use the effective encoder width, never the decoder or a fixture default.
+        if type(model_config.hidden_size) is not int or model_config.hidden_size <= 0:
+            raise ValueError("vision hidden_size must be a positive integer")
+        self._vision_hidden_size = model_config.hidden_size
         kwargs = self._vision_kwargs
         encoder_cp = model_config.context_parallel_size > 1
         return Qwen35VLVisionEncoder(
@@ -1197,4 +1225,7 @@ register_dynamic_encoder_adapter_class(
 
 def build_mdp_adapter(args, language_config) -> Qwen35VLMdpAdapter:
     """Adapter factory used by the pretrain entry point."""
-    return Qwen35VLMdpAdapter(out_hidden_size=language_config.hidden_size)
+    return Qwen35VLMdpAdapter(
+        out_hidden_size=language_config.hidden_size,
+        lpt_cost=getattr(args, "mdp_vision_lpt_cost", "rows"),
+    )

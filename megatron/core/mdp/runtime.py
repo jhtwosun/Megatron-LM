@@ -392,7 +392,9 @@ class MdpRuntime:
         # intermediate buffer + repack pass).
         my_layout = plan.encoder_layout_for_producer(self.rank_view.my_worker_id)
         chunk_layouts = split_encoder_layout(
-            my_layout, max_payload_rows=self.config.encoder_max_payload_rows
+            my_layout,
+            max_payload_rows=self.config.encoder_max_payload_rows,
+            fuse_across_microbatches=self.config.encoder_fuse_across_microbatches,
         )
         self._chunk_layouts = chunk_layouts if my_layout.segments else ()
         self._chunk_of_item = {}

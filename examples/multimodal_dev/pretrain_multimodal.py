@@ -59,6 +59,13 @@ def model_provider(
     """
     args = get_args()
     model_arch = getattr(args, "model_arch", "qwen35_vl")
+    if getattr(args, "mdp_vision_lpt_cost", "rows") == "flops" and (
+        model_arch != "qwen35_vl"
+        or not getattr(args, "mdp_enable", False)
+        or getattr(args, "mdp_dynamic_encoder_cp", False)
+        or getattr(args, "dynamic_context_parallel", False)
+    ):
+        raise ValueError("FLOP-aware vision LPT requires Qwen3.5-VL with static MDP enabled")
 
     from examples.multimodal_dev.models import MODEL_REGISTRY
 

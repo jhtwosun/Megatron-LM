@@ -2,6 +2,8 @@
 
 """Extra CLI arguments for multimodal_dev standalone training."""
 
+import argparse
+
 from megatron.core.mdp.protocols import VisionCaptureMode
 
 
@@ -248,6 +250,18 @@ def add_multimodal_args(parser):
             "Patch-row cap for one MDP encoder chunk; splitting happens "
             "only at complete vision-item boundaries."
         ),
+    )
+    group.add_argument(
+        "--mdp-encoder-fuse-across-microbatches",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow encoder chunks to fuse complete vision items across microbatches.",
+    )
+    group.add_argument(
+        "--mdp-vision-lpt-cost",
+        choices=("rows", "flops"),
+        default="rows",
+        help="Static Qwen3.5-VL LPT ordering proxy; neither choice changes payload row counts.",
     )
     group.add_argument(
         "--encoder-recompute-granularity",

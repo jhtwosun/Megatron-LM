@@ -90,6 +90,36 @@ def test_split_none_returns_single_chunk():
     assert split_encoder_layout(layout, max_payload_rows=None) == (layout,)
 
 
+@pytest.mark.parametrize("cap", [None, 20, 80])
+@pytest.mark.parametrize("fuse", [False, True])
+def test_fusion_boundary_control_preserves_items_rows_and_rebased_offsets(cap, fuse):
+    import dataclasses
+
+    layout = _layout()
+    layout = dataclasses.replace(layout, segments=tuple(
+        dataclasses.replace(segment, microbatch_id=index // 2)
+        for index, segment in enumerate(layout.segments)
+    ))
+    chunks = split_encoder_layout(layout, max_payload_rows=cap, fuse_across_microbatches=fuse)
+    flattened = [segment for chunk in chunks for segment in chunk.segments]
+    assert [segment.global_item_id for segment in flattened] == list(range(4))
+    assert sum(chunk.total_payload_rows for chunk in chunks) == layout.total_payload_rows
+    assert sum(chunk.total_output_rows for chunk in chunks) == layout.total_output_rows
+    for chunk in chunks:
+        assert chunk.segments[0].payload_row_start == 0
+        assert chunk.segments[0].output_row_start == 0
+        if not fuse:
+            assert len({segment.microbatch_id for segment in chunk.segments}) == 1
+        if cap is not None and chunk.total_payload_rows > cap:
+            assert len(chunk.segments) == 1
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "false"])
+def test_fusion_requires_exact_boolean(value):
+    with pytest.raises(MdpPlanError, match="exact boolean"):
+        split_encoder_layout(_layout(), max_payload_rows=None, fuse_across_microbatches=value)
+
+
 def test_split_at_item_boundaries_with_rebased_offsets():
     layout = _layout()  # payload rows: 16, 64, 32, 16
     chunks = split_encoder_layout(layout, max_payload_rows=80)

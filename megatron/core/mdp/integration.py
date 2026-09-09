@@ -180,6 +180,9 @@ def mdp_config_from_args(args) -> MdpConfig:
         enable=mdp_enabled(args),
         encoder_cp=getattr(args, "mdp_encoder_cp", 1),
         encoder_max_payload_rows=getattr(args, "mdp_encoder_max_payload_rows", None),
+        encoder_fuse_across_microbatches=getattr(
+            args, "mdp_encoder_fuse_across_microbatches", True
+        ),
         encoder_recompute_granularity=getattr(
             args, "encoder_recompute_granularity", None
         ),
