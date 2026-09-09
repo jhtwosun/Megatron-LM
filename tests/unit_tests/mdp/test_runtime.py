@@ -511,6 +511,8 @@ def _build_runtime(
     encoder_cp=1,
     allocator=None,
     divergent_encoder_init=False,
+    adapter_class=_StubAdapter,
+    mdp_config=None,
 ):
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
@@ -529,7 +531,7 @@ def _build_runtime(
     encoder_pgs = build_encoder_pg_collection(
         rank_map, encoder_cp=encoder_cp, process_groups=groups
     )
-    adapter = _StubAdapter(
+    adapter = adapter_class(
         view.outer_dp_rank, divergent_encoder_init=divergent_encoder_init
     )
     model_config = TransformerConfig(
@@ -539,10 +541,12 @@ def _build_runtime(
         calculate_per_token_loss=True,
         use_cpu_initialization=True,
     )
+    config = mdp_config or MdpConfig(enable=True, encoder_cp=encoder_cp)
+    assert config.encoder_cp == encoder_cp
     domain = build_encoder_domain(
         adapter=adapter,
         model_config=model_config,
-        mdp_config=MdpConfig(enable=True, encoder_cp=encoder_cp),
+        mdp_config=config,
         ddp_config=DistributedDataParallelConfig(
             use_distributed_optimizer=True,
             overlap_grad_reduce=False,
@@ -555,7 +559,6 @@ def _build_runtime(
         wrap_mixed_precision=False,
     )
     allocator = allocator or DirectBufferAllocator()
-    config = MdpConfig(enable=True, encoder_cp=encoder_cp)
     runtime = MdpRuntime(
         config=config,
         rank_map=rank_map,
@@ -567,6 +570,7 @@ def _build_runtime(
             view,
             locality_slack_permille=config.locality_slack_permille,
             capacity_policy=RowCapacityPolicy(config.row_alignment),
+            assignment_policy=config.encoder_assignment_policy,
         ),
         bridge=ModalityBridge(allocator),
         storage=MdpEmbeddingStorage(allocator),
