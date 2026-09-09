@@ -1036,7 +1036,7 @@ class Qwen35VLMdpAdapter:
         from examples.multimodal_dev.data.mdp_mock import materialize_mock_vision
 
         pixels = materialize_mock_vision(
-            locator, self.payload_width, dtype=destination.dtype, device=destination.device
+            locator, self.payload_width, dtype=destination.dtype, device="cpu"
         )
         if pixels.shape != destination.shape:
             raise ValueError("mock recipe shape differs from its planned destination")

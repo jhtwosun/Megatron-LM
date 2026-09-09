@@ -511,6 +511,8 @@ def _build_runtime(
     encoder_cp=1,
     allocator=None,
     divergent_encoder_init=False,
+    adapter_class=_StubAdapter,
+    vision_capture_mode=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
 ):
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
@@ -529,7 +531,7 @@ def _build_runtime(
     encoder_pgs = build_encoder_pg_collection(
         rank_map, encoder_cp=encoder_cp, process_groups=groups
     )
-    adapter = _StubAdapter(
+    adapter = adapter_class(
         view.outer_dp_rank, divergent_encoder_init=divergent_encoder_init
     )
     model_config = TransformerConfig(
@@ -574,6 +576,7 @@ def _build_runtime(
         hidden_size=WIDTH,
         params_dtype=torch.float32,
         num_vpp_chunks=1,
+        vision_capture_mode=vision_capture_mode,
     )
     return runtime, view
 
