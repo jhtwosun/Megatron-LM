@@ -284,12 +284,13 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             options.virtual_pipeline_parallel_size,
             options.expert_parallel_size,
         )
-        if topology[:5] != (1, 1, 4, 4, None) or topology[5] not in (1, 4):
+        supported_ep = (1, 4) if options.dynamic_context_parallel else (1, 4, 8)
+        if topology[:5] != (1, 1, 4, 4, None) or topology[5] not in supported_ep:
             _reject(
                 "dynamic_encoder_cp",
                 config.dynamic_encoder_cp,
-                "TP1/PP1/CP4/ECP4, VPP disabled, and EP1 or EP4",
-                "Repeated-D4 public construction is locked to one four-rank domain.",
+                f"TP1/PP1/CP4/ECP4, VPP disabled, and EP in {supported_ep}",
+                "Only fixed decoder CP may use native EP8 across encoder domains.",
             )
         if options.sequence_parallel:
             _reject(

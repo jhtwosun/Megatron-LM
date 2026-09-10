@@ -79,8 +79,8 @@ _DECODER_READY_AUTHORITY_DOMAIN = b"megatron.mdp.dynamic-cp.decoder-ready"
 _DECODER_READY_AUTHORITY_SCHEMA_VERSION = 1
 _DECODER_GRADIENT_WAVE_AUTHORITY_DOMAIN = b"megatron.mdp.dynamic-cp.decoder-gradient-wave"
 _DECODER_ROLES = ("decoder", "non-decoder")
-DYNAMIC_RUNTIME_SCHEMA_VERSION = 5
-DYNAMIC_EXECUTION_CONFIG_WIRE_WIDTH = 20
+DYNAMIC_RUNTIME_SCHEMA_VERSION = 6
+DYNAMIC_EXECUTION_CONFIG_WIRE_WIDTH = 21
 _DYNAMIC_EXECUTION_CONFIG_DOMAIN = b"megatron.mdp.dynamic-cp.runtime-config-v2"
 _JOINT_PLAN_DIGEST_DOMAIN = b"megatron.mdp.dynamic-cp.joint-plan"
 _JOINT_PLAN_DIGEST_SCHEMA_VERSION = 1
@@ -286,6 +286,7 @@ class _DynamicExecutionConfig:
     sequence_parallel: bool
     dynamic_encoder_context_parallel: bool
     overlap_window_capture: bool
+    dynamic_decoder_context_parallel: bool = True
     digest: bytes = field(init=False, repr=False)
     _wire: tuple[int, ...] = field(init=False, repr=False, compare=False)
     _authority: _DynamicExecutionConfigAuthority | None = field(
@@ -337,16 +338,19 @@ class _DynamicExecutionConfig:
             "dynamic runtime overlap_window_capture", self.overlap_window_capture
         )
         tp, ep, pp, cp, encoder_cp, vpp = topology
+        dynamic_decoder_cp = _require_exact_bool(
+            "dynamic runtime dynamic_decoder_context_parallel", self.dynamic_decoder_context_parallel
+        )
         legacy_d3 = (tp, pp, cp, encoder_cp, vpp) == (1, 1, 1, 1, 1) and not dynamic_encoder_cp
         repeated_d4_domain = (
             len(participants) == 4
             and participants[0] % 4 == 0
             and participants == tuple(range(participants[0], participants[0] + 4))
         )
-        joint_d4 = (
+        repeated_d4 = (
             repeated_d4_domain
             and (tp, pp, cp, encoder_cp, vpp) == (1, 1, 4, 4, 1)
-            and ep in (1, 4)
+            and ep in ((1, 4) if dynamic_decoder_cp else (1, 4, 8))
             and dynamic_encoder_cp
         )
         expert_group = self.expert_group_ranks
@@ -363,9 +367,15 @@ class _DynamicExecutionConfig:
                 raise MdpConfigurationError(
                     "MDP: Dynamic-CP expert group width matches expert parallel size."
                 )
-            if expert_group != participants:
+            ep_start = (participants[0] // ep) * ep
+            expected_expert = (
+                tuple(range(ep_start, ep_start + ep))
+                if not dynamic_decoder_cp and ep == 8 else participants
+            )
+            if expert_group != expected_expert:
                 raise MdpConfigurationError(
-                    "MDP: Dynamic-CP EP4 expert group exactly matches its local D4 domain."
+                    "MDP: Dynamic-CP expert group exactly matches its local D4 domain "
+                    "or the aligned native EP8 block for fixed decoder CP."
                 )
             expert_group_size = len(expert_group)
             expert_group_words = _digest_words(
@@ -375,10 +385,10 @@ class _DynamicExecutionConfig:
             raise MdpConfigurationError(
                 "MDP: legacy D3 runtime partition_mode is the locked contiguous layout."
             )
-        if sequence_parallel or overlap_capture or not (legacy_d3 or joint_d4):
+        if sequence_parallel or overlap_capture or not ((legacy_d3 and dynamic_decoder_cp) or repeated_d4):
             raise MdpConfigurationError(
-                "MDP: dynamic runtime accepts the legacy D3 topology or the exact joint D4 "
-                "size-four CP4/ECP4 domain with EP1 or domain-local EP4 and sequence "
+                "MDP: dynamic runtime accepts the legacy D3 topology or the exact D4 "
+                "CP4/ECP4 domain: joint EP1/EP4, fixed decoder EP1/EP4/EP8, with sequence "
                 "parallel and overlap off."
             )
         participant_words = _digest_words(struct.pack(f"<{len(participants)}q", *participants))
@@ -391,6 +401,7 @@ class _DynamicExecutionConfig:
             *topology,
             int(sequence_parallel),
             int(dynamic_encoder_cp),
+            int(dynamic_decoder_cp),
             int(overlap_capture),
             len(participants),
             *participant_words,
@@ -440,6 +451,7 @@ def _validate_dynamic_execution_config(config: Any) -> _DynamicExecutionConfig:
         expert_group_ranks=config.expert_group_ranks,
         sequence_parallel=config.sequence_parallel,
         dynamic_encoder_context_parallel=config.dynamic_encoder_context_parallel,
+        dynamic_decoder_context_parallel=config.dynamic_decoder_context_parallel,
         overlap_window_capture=config.overlap_window_capture,
     )
     if (

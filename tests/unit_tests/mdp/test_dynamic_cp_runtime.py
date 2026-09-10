@@ -251,7 +251,7 @@ def _dynamic_execution_config(**changes):
 
 def test_dynamic_execution_config_locks_supported_topologies_and_fixed_wire():
     config = _dynamic_execution_config()
-    assert len(config.to_wire_tuple()) == 20
+    assert len(config.to_wire_tuple()) == 21
     assert len(config.digest) == 16
     assert config == _dynamic_execution_config()
     with pytest.raises(MdpConfigurationError, match="training-only"):
@@ -275,6 +275,22 @@ def test_dynamic_execution_config_locks_supported_topologies_and_fixed_wire():
             expert_group_ranks=(4, 5, 6, 7),
             dynamic_encoder_context_parallel=True,
         )
+
+
+def test_fixed_decoder_ep8_runtime_mode_is_bound_into_wire():
+    options = dict(configured_context_parallel_size=4, encoder_context_parallel_size=4,
+                   expert_parallel_size=8, expert_group_ranks=tuple(range(8)),
+                   dynamic_encoder_context_parallel=True)
+    fixed = _dynamic_execution_config(dynamic_decoder_context_parallel=False, **options)
+    assert runtime._validate_dynamic_execution_config(fixed) is fixed
+    with pytest.raises(MdpConfigurationError):
+        _dynamic_execution_config(dynamic_decoder_context_parallel=True, **options)
+    with pytest.raises(MdpConfigurationError):
+        _dynamic_execution_config(dynamic_decoder_context_parallel="False", **options)
+    options.update(expert_parallel_size=4, expert_group_ranks=_PARTICIPANTS)
+    assert _dynamic_execution_config(dynamic_decoder_context_parallel=False, **options).digest != (
+        _dynamic_execution_config(dynamic_decoder_context_parallel=True, **options).digest
+    )
 
 
 def test_dynamic_execution_config_consensus_rejects_mismatch_before_runtime():

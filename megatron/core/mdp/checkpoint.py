@@ -79,10 +79,12 @@ _CHECKPOINT_TOPOLOGY_FIELDS = (
 def _checkpoint_topology_digest(binding: _RepeatedD4GroupBinding) -> bytes:
     authority = _validate_repeated_d4_group_binding(binding)
     hasher = hashlib.blake2b(digest_size=16)
-    hasher.update(b"megatron.mdp.repeated_d4.checkpoint.topology.v1")
+    # v2 deliberately rejects old boundaries that did not bind decoder mode.
+    hasher.update(b"megatron.mdp.repeated_d4.checkpoint.topology.v2")
     hasher.update(struct.pack("<q", len(authority.world_ranks)))
     hasher.update(struct.pack(f"<{len(authority.world_ranks)}q", *authority.world_ranks))
     hasher.update(struct.pack("<qq", 4, authority.expert_parallel_size))
+    hasher.update(struct.pack("<q", int(authority.dynamic_decoder_cp)))
     return hasher.digest()
 
 

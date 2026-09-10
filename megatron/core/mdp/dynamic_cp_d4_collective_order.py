@@ -97,10 +97,12 @@ class _RepeatedD4CollectiveRunner:
         gate_id: int,
         prepare: Callable[[], Any],
         domain_collective: Callable[[Any], Any],
+        native_decoder_contract: Callable[[Any], tuple[int, int]] | None = None,
     ) -> Any:
         """Enter domain data only after WORLD/domain/WORLD success."""
         local_error: BaseException | None = None
         prepared = None
+        world_kwargs = {}
         stage_digests = (b"\0" * _DIGEST_BYTES,) * _STAGE_COUNT
         try:
             _require_digest("global manifest digest", global_manifest_digest)
@@ -112,6 +114,13 @@ class _RepeatedD4CollectiveRunner:
             if not callable(domain_collective):
                 raise MdpConfigurationError("MDP: repeated-D4 domain collective is callable.")
             prepared = prepare()
+            if native_decoder_contract is not None:
+                # Snapshot once during preparation; never execute a getter after
+                # the final WORLD gate or compare domain-local encoder plans.
+                contract = native_decoder_contract(prepared)
+                if contract is None:
+                    raise MdpConfigurationError("MDP: prepared fixed decoder contract is present.")
+                world_kwargs["native_decoder_contract"] = contract
         except BaseException as error:
             local_error = error
 
@@ -120,6 +129,7 @@ class _RepeatedD4CollectiveRunner:
             plan_digest=stage_digests[_WORLD_PREPARATION_STAGE],
             gate_id=gate_id,
             local_error=local_error,
+            **world_kwargs,
         )
         if local_error is not None:
             raise MdpStateError(
@@ -138,6 +148,7 @@ class _RepeatedD4CollectiveRunner:
             plan_digest=stage_digests[_WORLD_OUTCOME_STAGE],
             gate_id=gate_id,
             local_error=outcome.error,
+            **world_kwargs,
         )
         if outcome.error is not None:
             raise MdpStateError(

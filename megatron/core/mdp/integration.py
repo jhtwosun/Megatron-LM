@@ -450,6 +450,7 @@ def maybe_build_mdp_domain(
                 ),
                 global_rank=torch.distributed.get_rank(),
                 expert_parallel_size=getattr(args, "expert_model_parallel_size", 1),
+                dynamic_decoder_cp=getattr(args, "dynamic_context_parallel", False),
                 device=torch.device("cuda", torch.cuda.current_device()),
                 timeout_seconds=_D4_STARTUP_TIMEOUT_SECONDS,
             )
@@ -656,6 +657,8 @@ def _build_d4_facade_from_mcore(runtime: MdpRuntime, config):
         "cp_partition_mode": "contiguous",
     }
     dynamic_decoder = getattr(config, "dynamic_context_parallel", None) is True
+    if dynamic_decoder != runtime.dynamic_group_binding.dynamic_decoder_cp:
+        raise MdpConfigurationError("MDP: D4 facade retains its captured decoder mode.")
     if dynamic_decoder:
         minimum_cp = getattr(config, "min_dynamic_context_parallel_size", None)
         if type(minimum_cp) is not int or minimum_cp <= 0:

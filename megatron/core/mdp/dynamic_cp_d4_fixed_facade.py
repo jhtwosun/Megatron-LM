@@ -77,7 +77,9 @@ def _run_repeated_d4_fixed_iteration(
     transaction = _transaction._begin_d4_transaction(capture_owner)
     binding = transaction.binding
     try:
-        projection = _gather_d4_source_catalog(capture_owner, binding)
+        projection = _gather_d4_source_catalog(
+            capture_owner, binding, expected_dynamic_decoder_cp=False
+        )
         transaction.attach_source_catalog(projection)
         authority = build_repeated_d4_joint_iteration_authority(
             binding,

@@ -9,6 +9,9 @@ Run with::
 """
 
 import os
+import hashlib
+import struct
+from dataclasses import replace
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -43,6 +46,43 @@ if _DISTRIBUTED:
         )
         yield
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("remote_mode", ("old-v1", "joint"))
+def test_checkpoint_rejects_old_or_different_decoder_mode_boundary(monkeypatch, remote_mode):
+    authority = SimpleNamespace(
+        world_ranks=tuple(range(8)), global_rank=0, expert_parallel_size=4,
+        dynamic_decoder_cp=False, _world_group=object(), _device=torch.device("cuda"),
+        _group_ranks_getter=lambda group: tuple(range(8)), _timeout_seconds=1.0,
+    )
+    monkeypatch.setattr(checkpoint_api, "_validate_repeated_d4_group_binding", lambda binding: authority)
+    fixed_digest = checkpoint_api._checkpoint_topology_digest(object())
+    if remote_mode == "old-v1":
+        old = hashlib.blake2b(digest_size=16)
+        old.update(b"megatron.mdp.repeated_d4.checkpoint.topology.v1")
+        old.update(struct.pack("<q", 8))
+        old.update(struct.pack("<8q", *range(8)))
+        old.update(struct.pack("<qq", 4, 4))
+        remote_digest = old.digest()
+    else:
+        authority.dynamic_decoder_cp = True
+        remote_digest = checkpoint_api._checkpoint_topology_digest(object())
+        authority.dynamic_decoder_cp = False
+    assert remote_digest != fixed_digest
+
+    def gather(wire, **kwargs):
+        local = checkpoint_api._RepeatedD4CheckpointStatus.from_wire_tuple(wire)
+        return tuple(replace(local, global_rank=rank,
+                             topology_digest=remote_digest if rank == 7 else fixed_digest).to_wire_tuple()
+                     for rank in range(8))
+
+    authority._status_gather_factory = lambda **kwargs: gather
+    snapshot = SimpleNamespace(require=lambda: SimpleNamespace(generation=0))
+    with pytest.raises(MdpCheckpointError, match="boundary mismatch at rank 7"):
+        checkpoint_api._converge_repeated_d4_checkpoint_boundary(
+            SimpleNamespace(dynamic_group_binding=object()), snapshot,
+            operation="save", phase="pre-state", iteration=0, local_error=None,
+        )
 
 
 def test_exact_resume_flags_are_accepted():
@@ -254,7 +294,7 @@ def repeated_d4_checkpoint_runtime(monkeypatch):
     integration.reset_for_testing()
     binding = object()
     runtime = _CheckpointRuntime(binding)
-    authority = SimpleNamespace(world_ranks=tuple(range(8)), expert_parallel_size=1)
+    authority = SimpleNamespace(world_ranks=tuple(range(8)), expert_parallel_size=1, dynamic_decoder_cp=True)
     monkeypatch.setattr(
         transaction_api, "_validate_repeated_d4_group_binding", lambda _value: authority
     )

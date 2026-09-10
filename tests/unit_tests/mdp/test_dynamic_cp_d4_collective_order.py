@@ -106,6 +106,42 @@ def test_runner_accepts_terminal_gate7():
     assert [event[1]["gate_id"] for event in events] == [7, 7, 7]
 
 
+def test_decoder_contract_snapshotted_once_before_world_gates():
+    events = []
+    runner = _runner(events=events)
+    value = object()
+
+    def contract(prepared):
+        assert prepared is value
+        events.append(("contract",))
+        return (8, 3)
+
+    assert runner.run(
+        global_manifest_digest=_MANIFEST, plan_digest=_PLAN, gate_id=2,
+        prepare=lambda: events.append(("prepare",)) or value,
+        native_decoder_contract=contract,
+        domain_collective=lambda prepared: events.append(("native",)) or prepared,
+    ) is value
+    assert [event[0] for event in events] == ["prepare", "contract", "world", "domain", "world", "native"]
+    assert events[2][1]["native_decoder_contract"] == (8, 3)
+    assert events[4][1]["native_decoder_contract"] == (8, 3)
+
+
+def test_decoder_contract_failure_converges_before_native_call():
+    events = []
+
+    def contract(prepared):
+        raise RuntimeError("invalid prepared replay")
+
+    with pytest.raises(MdpPlanError, match="WORLD rejected"):
+        _runner(events=events).run(
+            global_manifest_digest=_MANIFEST, plan_digest=_PLAN, gate_id=2,
+            prepare=lambda: object(), native_decoder_contract=contract,
+            domain_collective=lambda prepared: events.append(("native",)),
+        )
+    assert [event[0] for event in events] == ["world"]
+
+
 def test_runner_rejects_gate8_with_eight_gate_diagnostic():
     events = []
     runner = _runner(events=events)

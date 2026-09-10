@@ -154,6 +154,15 @@ def test_dynamic_cp_rejects_encoder_cp_and_overlap_capture_at_startup():
         )
 
 
+def test_fixed_decoder_ep8_is_supported_but_joint_ep8_rejected():
+    config = MdpConfig(enable=True, encoder_cp=4, dynamic_encoder_cp=True)
+    options = dict(world_size=8, pipeline_parallel_size=1, context_parallel_size=4,
+                   expert_parallel_size=8)
+    validate_mdp_config(config, _options(dynamic_context_parallel=False, **options))
+    with pytest.raises(MdpConfigurationError):
+        validate_mdp_config(config, _options(dynamic_context_parallel=True, **options))
+
+
 def test_dynamic_encoder_cp_defaults_are_inert():
     config = MdpConfig()
     assert config.dynamic_encoder_cp is False

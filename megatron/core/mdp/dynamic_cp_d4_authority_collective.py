@@ -98,6 +98,7 @@ def run_repeated_d4_authority_collective(
     prepare: Callable[[], Any],
     domain_collective: Callable[[Any], Any],
     byte_generator: Callable[[int], Any] | None = None,
+    native_decoder_contract: Callable[[Any], tuple[int, int]] | None = None,
 ) -> Any:
     """Run one authority-bound domain collective behind WORLD/domain/WORLD gates.
 
@@ -114,10 +115,14 @@ def run_repeated_d4_authority_collective(
         _snapshot_local_authority(binding, authority)
         return prepare()
 
+    run_kwargs = {}
+    if native_decoder_contract is not None:
+        run_kwargs["native_decoder_contract"] = native_decoder_contract
     return runner.run(
         global_manifest_digest=_candidate_digest(authority, "global_manifest"),
         plan_digest=_candidate_iteration_plan_digest(authority),
         gate_id=gate_id,
         prepare=prepare_bound_value,
         domain_collective=domain_collective,
+        **run_kwargs,
     )

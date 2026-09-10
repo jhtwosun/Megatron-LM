@@ -22,8 +22,8 @@ from megatron.core.mdp.errors import (
 
 __all__ = ()
 
-_WIRE_VERSION = 1
-_WIRE_WIDTH = 7
+_WIRE_VERSION = 2
+_WIRE_WIDTH = 9
 _DOMAIN_WIDTH = 4
 _COMPLETION_SEAL = object()
 
@@ -42,8 +42,20 @@ class _RepeatedD4WorldStatus:
     plan_digest: bytes
     error_code: int
     gate_id: int
+    native_decoder_contract: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
+        contract = self.native_decoder_contract
+        if contract is not None and (
+            type(contract) is not tuple
+            or len(contract) != 2
+            or type(contract[0]) is not int
+            or contract[0] not in (1, 4, 8)
+            or type(contract[1]) is not int
+            or not 0 < contract[1] < 2**63
+            or self.gate_id != 2
+        ):
+            raise MdpConfigurationError("MDP: fixed decoder Gate2 has an exact EP/count contract.")
         if type(self.domain_width) is not int or self.domain_width != _DOMAIN_WIDTH:
             raise MdpConfigurationError("MDP: repeated-D4 WORLD domain width is exactly four.")
         _PrecollectiveStatus(
@@ -67,13 +79,16 @@ class _RepeatedD4WorldStatus:
             rank,
             *digest_and_error,
             _control_word(domain_width=self.domain_width, gate_id=self.gate_id),
+            *(self.native_decoder_contract or (0, 0)),
         )
 
     @classmethod
     def from_wire_tuple(cls, value: Any) -> "_RepeatedD4WorldStatus":
         if type(value) is not tuple or len(value) != _WIRE_WIDTH:
             raise MdpPlanError(f"MDP: repeated-D4 WORLD status wire has fixed width {_WIRE_WIDTH}.")
-        rank, manifest_word_0, manifest_word_1, plan_word_0, plan_word_1, error, control = value
+        rank, manifest_word_0, manifest_word_1, plan_word_0, plan_word_1, error, control, ep, count = value
+        if type(ep) is not int or type(count) is not int:
+            raise MdpPlanError("MDP: repeated-D4 decoder contract uses exact integers.")
         if type(control) is not int or control < 0:
             raise MdpPlanError("MDP: repeated-D4 WORLD status has a canonical control word.")
         version = (control >> 16) & 0xFF
@@ -93,6 +108,7 @@ class _RepeatedD4WorldStatus:
             plan_digest=status.plan_digest,
             error_code=status.error_code,
             gate_id=gate_id,
+            native_decoder_contract=None if (ep, count) == (0, 0) else (ep, count),
         )
 
 
@@ -174,6 +190,16 @@ def _validate_gathered_rows(
                     raise MdpPlanError(
                         f"MDP: repeated-D4 WORLD {label} mismatch at rank " f"{status.global_rank}."
                     )
+    contracts = [status.native_decoder_contract for status in parsed]
+    if any(contract is not None for contract in contracts):
+        if any(contract is None for contract in contracts):
+            raise MdpPlanError("MDP: WORLD fixed decoder contract presence agrees.")
+        ep = contracts[0][0]
+        if any(contract[0] != ep for contract in contracts):
+            raise MdpPlanError("MDP: WORLD fixed decoder expert size agrees.")
+        for start in range(0, len(parsed), ep):
+            if len(set(contracts[start : start + ep])) != 1:
+                raise MdpPlanError("MDP: native expert peers require equal decoder replay counts.")
 
 
 def _collect_repeated_d4_world_status(
@@ -240,6 +266,7 @@ def _make_repeated_d4_world_pre_gate(
         plan_digest: bytes,
         gate_id: int,
         local_error: BaseException | None,
+        native_decoder_contract: tuple[int, int] | None = None,
     ) -> None:
         effective_error = local_error
         try:
@@ -254,6 +281,7 @@ def _make_repeated_d4_world_pre_gate(
                 plan_digest=plan_digest,
                 error_code=int(local_error is not None),
                 gate_id=gate_id,
+                native_decoder_contract=native_decoder_contract,
             )
         except BaseException as error:
             effective_error = error

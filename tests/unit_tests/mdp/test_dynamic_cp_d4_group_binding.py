@@ -25,21 +25,51 @@ def _status_gather_factory(**_kwargs):
     return lambda *_args, **_kwargs: None
 
 
-def _build(*, rank=2, ep=1, world_ranks=tuple(range(8)), domain_ranks=(0, 1, 2, 3)):
+def _build(*, rank=2, ep=1, world_ranks=tuple(range(8)), domain_ranks=(0, 1, 2, 3), dynamic_decoder_cp=True, expert_ranks=None):
     world = _Group(world_ranks)
     domain = _Group(domain_ranks)
-    expert = None if ep == 1 else _Group(domain_ranks)
+    expert = None if ep == 1 else _Group(domain_ranks if expert_ranks is None else expert_ranks)
     return binding_api._make_repeated_d4_group_binding(
         world_group=world,
         domain_group=domain,
         expert_group=expert,
         global_rank=rank,
         expert_parallel_size=ep,
+        dynamic_decoder_cp=dynamic_decoder_cp,
         device=torch.device("cuda", 0),
         timeout_seconds=5.0,
         group_ranks_getter=lambda group: group.ranks,
         status_gather_factory=_status_gather_factory,
     )
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_fixed_decoder_ep8_preserves_native_group_across_domains(rank):
+    start = rank // 4 * 4
+    binding = _build(rank=rank, ep=8, domain_ranks=tuple(range(start, start + 4)),
+                     expert_ranks=tuple(range(8)), dynamic_decoder_cp=False)
+    authority = binding_api._validate_repeated_d4_group_binding(binding)
+    assert binding.expert_group.ranks == tuple(range(8))
+    assert authority.dynamic_decoder_cp is False
+    assert authority._expert_group is binding.expert_group
+
+
+@pytest.mark.parametrize("ranks", (tuple(range(4)), tuple(reversed(range(8))), tuple(range(1, 9))))
+def test_fixed_decoder_ep8_rejects_wrong_actual_membership(ranks):
+    with pytest.raises(MdpConfigurationError, match="expert group"):
+        _build(ep=8, expert_ranks=ranks, dynamic_decoder_cp=False)
+
+
+def test_joint_decoder_still_rejects_ep8():
+    with pytest.raises(MdpConfigurationError, match="EP1 or domain-local EP4"):
+        _build(ep=8, expert_ranks=tuple(range(8)))
+
+
+def test_fixed_decoder_revalidates_mutated_native_ep8_membership():
+    binding = _build(ep=8, expert_ranks=tuple(range(8)), dynamic_decoder_cp=False)
+    binding.expert_group.ranks = tuple(range(4))
+    with pytest.raises(MdpStateError, match="native group authority"):
+        binding_api._validate_repeated_d4_group_binding(binding)
 
 
 @pytest.mark.parametrize("ep", (1, 4))

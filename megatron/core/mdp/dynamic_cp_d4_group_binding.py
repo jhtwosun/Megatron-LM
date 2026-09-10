@@ -61,6 +61,7 @@ class _RepeatedD4GroupAuthority:
     _world_pre_gate: Callable[..., None] = field(compare=False, repr=False)
     _domain_status: Callable[..., Any] = field(compare=False, repr=False)
     _seal: object = field(compare=False, repr=False)
+    dynamic_decoder_cp: bool = True
 
     def __post_init__(self) -> None:
         if type(self) is not _RepeatedD4GroupAuthority or self._seal is not _AUTHORITY_SEAL:
@@ -79,6 +80,7 @@ class _RepeatedD4GroupBinding:
     expert_parallel_size: int
     _authority: _RepeatedD4GroupAuthority = field(compare=False, repr=False)
     _seal: object = field(compare=False, repr=False)
+    dynamic_decoder_cp: bool = True
 
     def __post_init__(self) -> None:
         if type(self) is not _RepeatedD4GroupBinding or self._seal is not _BINDING_SEAL:
@@ -135,6 +137,7 @@ def _validate_repeated_d4_group_binding(value: Any) -> _RepeatedD4GroupAuthority
         or value.domain_ranks != authority.domain_ranks
         or value.global_rank != authority.global_rank
         or value.expert_parallel_size != authority.expert_parallel_size
+        or value.dynamic_decoder_cp is not authority.dynamic_decoder_cp
         or not callable(authority._group_ranks_getter)
         or not callable(authority._status_gather_factory)
         or not callable(authority._world_pre_gate)
@@ -156,12 +159,20 @@ def _validate_repeated_d4_group_binding(value: Any) -> _RepeatedD4GroupAuthority
         expert_ranks = _actual_group_ranks(
             "expert", authority._expert_group, authority._group_ranks_getter
         )
-    expected_expert = None if authority.expert_parallel_size == 1 else domain_ranks
+    ep = authority.expert_parallel_size
+    if type(ep) is not int or ep not in (1, 4, 8):
+        raise MdpStateError("MDP: repeated-D4 group binding retains its expert size.")
+    supported_ep = (1, 4) if authority.dynamic_decoder_cp else (1, 4, 8)
+    ep_start = (authority.global_rank // ep) * ep if type(ep) is int and ep > 0 else 0
+    expected_expert = None if ep == 1 else world_ranks[ep_start : ep_start + ep]
     if (
         authority.world_ranks != world_ranks
         or authority.domain_ranks != domain_ranks
         or actual_domain != domain_ranks
-        or authority.expert_parallel_size not in (1, 4)
+        or type(authority.dynamic_decoder_cp) is not bool
+        or type(ep) is not int
+        or ep not in supported_ep
+        or (ep > 1 and len(expected_expert) != ep)
         or expert_ranks != expected_expert
         or not isinstance(authority._device, torch.device)
         or authority._device.type != "cuda"
@@ -182,10 +193,13 @@ def _make_repeated_d4_group_binding(
     expert_parallel_size: int,
     device: torch.device,
     timeout_seconds: float,
+    dynamic_decoder_cp: bool = True,
     group_ranks_getter: Callable[[Any], Any] = dist.get_process_group_ranks,
     status_gather_factory: Callable[..., Any] = make_precollective_status_gather,
 ) -> _RepeatedD4GroupBinding:
-    """Validate and bind one rank's existing WORLD, D4, and optional EP4 groups."""
+    """Bind native EP groups; only fixed decoder CP admits cross-domain EP8."""
+    if type(dynamic_decoder_cp) is not bool:
+        raise MdpConfigurationError("MDP: repeated-D4 decoder mode is an exact boolean.")
     if not callable(group_ranks_getter):
         raise MdpConfigurationError("MDP: repeated-D4 group-ranks getter is callable.")
     if not callable(status_gather_factory):
@@ -203,16 +217,22 @@ def _make_repeated_d4_group_binding(
             "MDP: repeated-D4 native domain group matches the derived local D4 domain."
         )
 
-    if type(expert_parallel_size) is not int or expert_parallel_size not in (1, 4):
-        raise MdpConfigurationError("MDP: repeated-D4 supports EP1 or domain-local EP4 exactly.")
+    supported_ep = (1, 4) if dynamic_decoder_cp else (1, 4, 8)
+    if type(expert_parallel_size) is not int or expert_parallel_size not in supported_ep:
+        raise MdpConfigurationError(
+            "MDP: repeated-D4 supports EP1 or domain-local EP4; fixed decoder also admits EP8."
+        )
     if expert_parallel_size == 1:
         if expert_group is not None:
             raise MdpConfigurationError("MDP: repeated-D4 EP1 has no expert group.")
     else:
         expert_ranks = _actual_group_ranks("expert", expert_group, group_ranks_getter)
-        if expert_ranks != domain_ranks:
+        start = (global_rank // expert_parallel_size) * expert_parallel_size
+        expected_expert = world_ranks[start : start + expert_parallel_size]
+        if expert_ranks != expected_expert or len(expert_ranks) != expert_parallel_size:
             raise MdpConfigurationError(
-                "MDP: repeated-D4 EP4 expert group matches the local D4 domain."
+                "MDP: repeated-D4 expert group matches the local D4 domain for EP4 "
+                "or the exact aligned native WORLD block for fixed EP8."
             )
 
     if not isinstance(device, torch.device) or device.type != "cuda":
@@ -239,6 +259,7 @@ def _make_repeated_d4_group_binding(
         domain_ranks=domain_ranks,
         global_rank=global_rank,
         expert_parallel_size=expert_parallel_size,
+        dynamic_decoder_cp=dynamic_decoder_cp,
         _world_group=world_group,
         _domain_group=domain_group,
         _expert_group=expert_group,
@@ -255,6 +276,7 @@ def _make_repeated_d4_group_binding(
         domain_ranks=domain_ranks,
         global_rank=global_rank,
         expert_parallel_size=expert_parallel_size,
+        dynamic_decoder_cp=dynamic_decoder_cp,
         _authority=authority,
         _seal=_BINDING_SEAL,
     )

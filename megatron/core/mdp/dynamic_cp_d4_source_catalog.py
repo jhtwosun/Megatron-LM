@@ -226,7 +226,8 @@ def _validate_d4_source_catalog(value: Any) -> _D4SourceCatalog:
 
 
 def _gather_d4_source_catalog(
-    capture_owner: _D4EncoderCaptureOwner, binding: _RepeatedD4GroupBinding
+    capture_owner: _D4EncoderCaptureOwner, binding: _RepeatedD4GroupBinding,
+    *, expected_dynamic_decoder_cp: bool | None = None,
 ) -> _D4SourceCatalogProjection:
     """Gather WORLD metadata without consuming the capture owner."""
     group_authority = _validate_repeated_d4_group_binding(binding)
@@ -241,6 +242,11 @@ def _gather_d4_source_catalog(
     capture_mode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR
     local_error = None
     try:
+        if expected_dynamic_decoder_cp is not None and (
+            type(expected_dynamic_decoder_cp) is not bool
+            or group_authority.dynamic_decoder_cp is not expected_dynamic_decoder_cp
+        ):
+            raise MdpStateError("MDP: D4 facade retains its sealed decoder mode.")
         if type(capture_owner) is not _D4EncoderCaptureOwner:
             raise MdpStateError("MDP: D4 source catalog uses an exact capture owner.")
         capture_owner.require()

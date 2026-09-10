@@ -109,6 +109,7 @@ def _binding(group):
         domain_ranks=(0, 1, 2, 3),
         global_rank=0,
         expert_parallel_size=1,
+        dynamic_decoder_cp=False,
         _world_group=object(),
         _domain_group=group,
         _expert_group=None,
@@ -125,6 +126,7 @@ def _binding(group):
         domain_ranks=(0, 1, 2, 3),
         global_rank=0,
         expert_parallel_size=1,
+        dynamic_decoder_cp=False,
         _authority=authority,
         _seal=_BINDING_SEAL,
     )
@@ -259,6 +261,7 @@ def _parts(
     def runner(_binding, _authority, **kwargs):
         events.append(("gate", kwargs["gate_id"], kwargs["byte_generator"]))
         prepared = kwargs["prepare"]()
+        assert kwargs["native_decoder_contract"](prepared) == (1, microbatches)
         events.append("world0")
         prepared = kwargs["domain_collective"](prepared)
         events.extend(("domain", "world1"))

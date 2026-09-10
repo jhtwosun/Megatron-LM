@@ -110,7 +110,7 @@ for _stage in (*_PHASES, "commit"):
 def _install(monkeypatch, *, fail=None, role="source", locator_digest=None):
     events = []
     transactions = []
-    binding = object()
+    binding = SimpleNamespace(dynamic_decoder_cp=False)
     capture = SimpleNamespace(binding=binding, role=role)
     projection = SimpleNamespace(
         metadata=object(),
@@ -143,7 +143,8 @@ def _install(monkeypatch, *, fail=None, role="source", locator_digest=None):
 
     monkeypatch.setattr(api._transaction, "_begin_d4_transaction", begin)
 
-    def gather(value, actual_binding):
+    def gather(value, actual_binding, *, expected_dynamic_decoder_cp):
+        assert expected_dynamic_decoder_cp is False
         assert value is capture and actual_binding is binding
         events.append("metadata")
         if fail == "metadata":

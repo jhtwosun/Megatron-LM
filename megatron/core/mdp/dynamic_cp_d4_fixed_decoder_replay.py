@@ -1255,6 +1255,11 @@ def run_repeated_d4_fixed_decoder_replay(
             )
         return prepared
 
+    def native_decoder_contract(prepared: _ReplayCandidate) -> tuple[int, int]:
+        if binding.dynamic_decoder_cp is not False:
+            raise MdpStateError("MDP: fixed decoder replay retains its sealed decoder mode.")
+        return (binding.expert_parallel_size, len(prepared.records))
+
     try:
         result = run_repeated_d4_authority_collective(
             binding,
@@ -1263,6 +1268,7 @@ def run_repeated_d4_fixed_decoder_replay(
             prepare=prepare,
             domain_collective=domain_collective,
             byte_generator=byte_generator,
+            native_decoder_contract=native_decoder_contract,
         )
         if result is not candidate or type(result) is not _ReplayCandidate:
             raise MdpTaskFatalError("MDP: fixed decoder replay runner returns its exact result.")

@@ -4,6 +4,7 @@
 
 import os
 import struct
+from dataclasses import replace
 
 import pytest
 import torch
@@ -57,9 +58,11 @@ def test_status_wire_is_versioned_fixed_width_and_roundtrips():
         *struct.unpack("<qq", _MANIFEST_B),
         *struct.unpack("<qq", _PLAN_B),
         7,
-        (1 << 16) | (4 << 8) | 7,
+        (2 << 16) | (4 << 8) | 7,
+        0,
+        0,
     )
-    assert len(wire) == 7
+    assert len(wire) == 9
     assert status_api._RepeatedD4WorldStatus.from_wire_tuple(wire) == local
 
 
@@ -68,6 +71,27 @@ def test_accepts_distinct_digests_only_between_ordered_four_rank_domains():
 
     assert type(outcome) is status_api._CompletedRepeatedD4WorldStatus
     assert outcome.error is None
+
+
+@pytest.mark.parametrize("ep", (1, 4, 8))
+def test_fixed_decoder_count_allows_distinct_encoder_plans(ep):
+    rows = tuple(replace(_status(rank), native_decoder_contract=(ep, 3)) for rank in range(8))
+    outcome = _collect(rows[3], gather=lambda *args, **kwargs: tuple(row.to_wire_tuple() for row in rows))
+    assert outcome.error is None
+
+
+@pytest.mark.parametrize("contract", (None, (4, 3), (8, 4)))
+def test_fixed_ep8_rejects_missing_mode_ep_or_decoder_count(contract):
+    rows = [replace(_status(rank), native_decoder_contract=(8, 3)) for rank in range(8)]
+    rows[7] = replace(rows[7], native_decoder_contract=contract)
+    outcome = _collect(rows[3], gather=lambda *args, **kwargs: tuple(row.to_wire_tuple() for row in rows))
+    assert type(outcome.error) is MdpPlanError
+
+
+@pytest.mark.parametrize("contract", ((True, 1), (8, True), (8, 0), (8, -1), (8, 2**63), [8, 1], (8,)))
+def test_fixed_decoder_contract_is_exact_and_positive(contract):
+    with pytest.raises(MdpConfigurationError, match="EP/count"):
+        replace(_status(0), native_decoder_contract=contract)
 
 
 def test_rejects_intra_domain_digest_mismatch_after_completed_gather():

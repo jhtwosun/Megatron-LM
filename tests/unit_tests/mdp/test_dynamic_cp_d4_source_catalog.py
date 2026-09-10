@@ -141,6 +141,24 @@ def _owner(
     return owner
 
 
+def test_facade_mode_error_joins_existing_world_capture_gate(monkeypatch):
+    binding = _binding(0)
+    owner = _owner(monkeypatch, binding, _manifest(0))
+    seen = []
+
+    def gather(local_manifest, **kwargs):
+        error = kwargs["local_prepare_error"]
+        seen.append(error)
+        assert isinstance(error, MdpStateError)
+        assert "sealed decoder mode" in str(error)
+        raise MdpPlanError("WORLD rejected mode") from error
+
+    monkeypatch.setattr(api, "_gather_decoder_source_metadata", gather)
+    with pytest.raises(MdpPlanError, match="WORLD rejected mode"):
+        api._gather_d4_source_catalog(owner, binding, expected_dynamic_decoder_cp=False)
+    assert len(seen) == 1
+
+
 def test_world_catalog_allows_domain_local_schema_and_projects_exact_lane(monkeypatch):
     manifests = (_manifest(0), _manifest(1, dtype=torch.int32))
     with pytest.raises(MdpConfigurationError, match="globally compatible"):
