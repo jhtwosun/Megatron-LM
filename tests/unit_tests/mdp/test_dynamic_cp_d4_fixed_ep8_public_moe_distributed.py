@@ -8,6 +8,8 @@ replay/finalization but is not the stock full Megatron training schedule.
 """
 
 import os
+import json
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -44,6 +46,39 @@ def _world_checked(action):
     dist.all_gather_object(errors, error)
     assert not any(errors), errors
     return value
+
+
+def _gradient_metrics(candidate, baseline):
+    assert candidate is not None and baseline is not None
+    assert candidate.shape == baseline.shape
+    candidate, baseline = candidate.double(), baseline.double()
+    assert torch.isfinite(candidate).all() and torch.isfinite(baseline).all()
+    candidate_norm, baseline_norm = float(candidate.norm()), float(baseline.norm())
+    assert math.isfinite(candidate_norm) and math.isfinite(baseline_norm)
+    assert candidate_norm > 0 and baseline_norm > 0
+    delta = candidate - baseline
+    dot = float(torch.dot(candidate.flatten(), baseline.flatten()))
+    metrics = dict(candidate_norm=candidate_norm, baseline_norm=baseline_norm, dot=dot,
+                cosine=dot / (candidate_norm * baseline_norm),
+                l2_relative=float(delta.norm()) / baseline_norm,
+                max_abs_relative=float(delta.abs().max()) / float(baseline.abs().max()),
+                norm_ratio=candidate_norm / baseline_norm)
+    assert all(math.isfinite(value) for value in metrics.values())
+    return metrics
+
+
+def _check_gradient_parity(candidate, reference):
+    assert candidate.keys() == reference.keys()
+    metrics = {name: _gradient_metrics(value, reference[name]) for name, value in candidate.items()}
+    root = os.environ.get("T3_METRICS_ROOT")
+    if root:
+        with open(f"{root}/t3-v3-metrics-rank{dist.get_rank()}.jsonl", "a") as stream:
+            stream.write(json.dumps(metrics, allow_nan=False) + "\n")
+    for name, metric in metrics.items():
+        assert metric["l2_relative"] <= 0.01, (name, metric)
+        assert metric["max_abs_relative"] <= 0.015, (name, metric)
+        assert metric["cosine"] >= 0.999, (name, metric)
+        assert 0.99 <= metric["norm_ratio"] <= 1.01, (name, metric)
 
 
 @pytest.fixture(scope="module")
@@ -216,10 +251,12 @@ def _compare(candidate, reference, selected_choice):
     torch.testing.assert_close(candidate["batches"], reference["batches"], rtol=0, atol=0)
     for field in ("loss", "output", "leaf"):
         torch.testing.assert_close(candidate[field], reference[field], rtol=8e-3, atol=2e-3)
-    for field in ("encoder_grads", "decoder_grads"):
-        public._assert_gradient_parity(candidate[field], reference[field], field)
-    public._assert_gradient_parity({"vision_input": candidate["leaf_grad"]},
-                                   {"vision_input": reference["leaf_grad"]}, "decoder_input")
+    def gradients(result):
+        values = {f"{field}.{name}": value for field in ("encoder_grads", "decoder_grads")
+                  for name, value in result[field].items()}
+        values["decoder_input.vision"] = result["leaf_grad"]
+        return values
+    _check_gradient_parity(gradients(candidate), gradients(reference))
 
 
 def test_real_world_gate2_rejects_unequal_native_decoder_calls(native_groups):
