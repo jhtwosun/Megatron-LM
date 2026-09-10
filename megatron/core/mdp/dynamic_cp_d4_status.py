@@ -255,7 +255,8 @@ def _make_repeated_d4_world_pre_gate(
     if not callable(status_gather_factory):
         raise MdpConfigurationError("MDP: repeated-D4 WORLD status gather factory is callable.")
     status_gather = status_gather_factory(
-        group=group, group_ranks=ranks, global_rank=global_rank, device=device
+        group=group, group_ranks=ranks, global_rank=global_rank, device=device,
+        wire_width=_WIRE_WIDTH,
     )
     if not callable(status_gather):
         raise MdpConfigurationError("MDP: repeated-D4 WORLD status gather is callable.")

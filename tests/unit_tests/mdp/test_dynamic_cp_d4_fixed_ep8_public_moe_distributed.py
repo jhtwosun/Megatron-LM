@@ -124,6 +124,7 @@ def _run(monkeypatch, native_groups, capacity):
         scoped.setattr(public, "_make_repeated_d4_group_binding", fixed_binding)
         runtime = public._runtime(group_registry=registry, encoder_capacity=capacity,
                                   expert_parallel_size=8)
+    integration._install_d4_checkpoint_lifecycle(runtime)
     integration._RUNTIME = runtime
     decoder = _NativeEp8Decoder(pgs).bfloat16().cuda()
     initial = {"encoder": public._clone_named_parameters(runtime.encoder_domain.encoder_ddp),

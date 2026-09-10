@@ -246,6 +246,7 @@ def test_world_pre_gate_binds_exact_transport_and_submits_one_status():
             "group_ranks": tuple(range(8)),
             "global_rank": 3,
             "device": torch.device("cuda", 0),
+            "wire_width": 9,
         }
     ]
     assert gather_calls == [(_status(3).to_wire_tuple(), {"timeout_seconds": 1.0})]

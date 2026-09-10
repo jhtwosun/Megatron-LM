@@ -1204,9 +1204,10 @@ def prepare_decoder_payload_bundle(
     return validate_prepared_decoder_payload_bundle(bundle)
 
 
-def _validate_status_wire(value: Any) -> tuple[int, ...]:
-    if not isinstance(value, tuple) or len(value) != 7:
-        raise MdpPlanError("MDP: precollective status has an exact seven-word tuple wire.")
+def _validate_status_wire(value: Any, *, wire_width: int = 7) -> tuple[int, ...]:
+    if not isinstance(value, tuple) or len(value) != wire_width:
+        width_name = "seven" if wire_width == 7 else "nine"
+        raise MdpPlanError(f"MDP: precollective status has an exact {width_name}-word tuple wire.")
     if any(
         not isinstance(component, int)
         or isinstance(component, bool)
@@ -1336,6 +1337,7 @@ def make_precollective_status_gather(
     device: torch.device,
     group_ranks_getter: Callable[[Any], Any] = dist.get_process_group_ranks,
     all_gather_into_tensor: Callable[..., Any] = dist.all_gather_into_tensor,
+    wire_width: int = 7,
 ) -> Callable[..., tuple[tuple[int, ...], ...]]:
     """Bind a fixed-width bounded status gather to one exact native group.
 
@@ -1344,6 +1346,8 @@ def make_precollective_status_gather(
     recover from asymmetric misuse; caller-side ordering and consensus remain
     runtime responsibilities.
     """
+    if type(wire_width) is not int or wire_width not in (7, 9):
+        raise MdpConfigurationError("MDP: precollective status wire width is exactly seven or nine.")
     ranks = _validate_status_group_context(
         group=group,
         group_ranks=group_ranks,
@@ -1354,7 +1358,7 @@ def make_precollective_status_gather(
     )
 
     def gather(value: tuple[int, ...], *, timeout_seconds: float) -> tuple[tuple[int, ...], ...]:
-        wire = _validate_status_wire(value)
+        wire = _validate_status_wire(value, wire_width=wire_width)
         timeout = _validate_status_timeout(timeout_seconds)
         _validate_status_group_context(
             group=group,

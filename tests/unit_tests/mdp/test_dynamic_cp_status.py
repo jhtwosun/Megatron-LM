@@ -87,6 +87,65 @@ def test_factory_and_gather_bind_exact_group_wire_buffers_async_call_and_wait():
     assert work.wait_calls == [timedelta(seconds=2.5)]
 
 
+def test_explicit_nine_word_transport_roundtrip_preserves_all_fields():
+    wire = (*_WIRE, 8, 3)
+    calls = []
+
+    def gather(output, value, **kwargs):
+        calls.append(tuple(value.shape))
+        output.view(3, 9).copy_(value.expand(3, 9))
+        return _FakeWork()
+
+    transport_gather = _factory(wire_width=9, all_gather_into_tensor=gather)
+    assert transport_gather(wire, timeout_seconds=1) == (wire,) * 3
+    assert calls == [(9,)]
+
+
+def test_d4_world_factory_binds_actual_nine_word_transport():
+    from megatron.core.mdp.dynamic_cp_d4_status import _make_repeated_d4_world_pre_gate
+
+    group = _FakeGroup(tuple(range(8)), 0)
+    widths = []
+
+    def collective(output, value, **kwargs):
+        rows = output.view(8, 9)
+        rows.copy_(value.expand(8, 9))
+        rows[:, 0].copy_(torch.arange(8))
+        return _FakeWork()
+
+    def factory(**kwargs):
+        widths.append(kwargs["wire_width"])
+        # Exercise actual transport validation/allocation/result parsing with
+        # CPU tensors and a fake collective; not distributed runtime evidence.
+        kwargs.update(device=torch.device("cpu"),
+                      group_ranks_getter=lambda value: value.ranks,
+                      all_gather_into_tensor=collective)
+        return transport.make_precollective_status_gather(**kwargs)
+
+    gate = _make_repeated_d4_world_pre_gate(
+        group=group, world_ranks=tuple(range(8)), global_rank=0,
+        device=torch.device("cuda"), timeout_seconds=1, status_gather_factory=factory,
+    )
+    gate(global_manifest_digest=b"m" * 16, plan_digest=b"p" * 16, gate_id=2,
+         local_error=None, native_decoder_contract=(8, 3))
+    assert widths == [9]
+
+
+@pytest.mark.parametrize("width,wire", ((7, (0,) * 9), (9, (0,) * 7)))
+def test_bound_transport_width_rejects_other_protocol_before_collective(width, wire):
+    calls = []
+    gather = _factory(wire_width=width, all_gather_into_tensor=lambda *a, **k: calls.append(True))
+    with pytest.raises(MdpPlanError, match="tuple wire"):
+        gather(wire, timeout_seconds=1)
+    assert calls == []
+
+
+@pytest.mark.parametrize("width", (None, True, 7.0, 0, 8, 10))
+def test_status_transport_rejects_unsupported_width_at_construction(width):
+    with pytest.raises(MdpConfigurationError, match="width"):
+        _factory(wire_width=width)
+
+
 @pytest.mark.parametrize(
     "wire",
     (
