@@ -278,6 +278,8 @@ def test_dynamic_execution_config_locks_supported_topologies_and_fixed_wire():
 
 
 def test_fixed_decoder_ep8_runtime_mode_is_bound_into_wire():
+    from megatron.core.mdp import dynamic_cp_runtime as runtime
+
     options = dict(configured_context_parallel_size=4, encoder_context_parallel_size=4,
                    expert_parallel_size=8, expert_group_ranks=tuple(range(8)),
                    dynamic_encoder_context_parallel=True)
