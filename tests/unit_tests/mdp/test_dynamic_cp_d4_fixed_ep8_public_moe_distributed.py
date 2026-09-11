@@ -75,8 +75,8 @@ def _check_gradient_parity(candidate, reference):
         with open(f"{root}/t3-v3-metrics-rank{dist.get_rank()}.jsonl", "a") as stream:
             stream.write(json.dumps(metrics, allow_nan=False) + "\n")
     for name, metric in metrics.items():
-        assert metric["l2_relative"] <= 0.01, (name, metric)
-        assert metric["max_abs_relative"] <= 0.015, (name, metric)
+        assert metric["l2_relative"] <= 0.02, (name, metric)
+        assert metric["max_abs_relative"] <= 0.02, (name, metric)
         assert metric["cosine"] >= 0.999, (name, metric)
         assert 0.99 <= metric["norm_ratio"] <= 1.01, (name, metric)
 

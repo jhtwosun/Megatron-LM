@@ -26,6 +26,17 @@ def test_tiny_nonidentical_metrics_do_not_use_epsilon_floor():
     _check_gradient_parity({"x": a}, {"x": b})
 
 
+@pytest.mark.parametrize("delta", (0.019, 0.02, 0.021))
+def test_two_percent_relative_error_boundary(delta):
+    candidate = torch.tensor([1.0, delta], dtype=torch.float64)
+    baseline = torch.tensor([1.0, 0.0], dtype=torch.float64)
+    if delta <= 0.02:
+        _check_gradient_parity({"x": candidate}, {"x": baseline})
+    else:
+        with pytest.raises(AssertionError):
+            _check_gradient_parity({"x": candidate}, {"x": baseline})
+
+
 @pytest.mark.parametrize("other,cosine", (([0, 1e-12], 0), ([-1e-12, 0], -1)))
 def test_orthogonal_and_opposite_gradients_still_rejected(other, cosine):
     a, b = torch.tensor([1e-12, 0], dtype=torch.float64), torch.tensor(other, dtype=torch.float64)
