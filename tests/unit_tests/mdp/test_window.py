@@ -2,14 +2,28 @@
 
 """Iteration-window tests with a stub adapter (CPU only)."""
 
+from dataclasses import replace
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
 import torch
 
+from megatron.core.mdp.dynamic_cp import GlobalVisionItemId
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
-from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
-from megatron.core.mdp.window import MdpIterationWindow
+from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem, VisionCaptureMode
+from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
+from megatron.core.mdp.vision_locator import (
+    VisionDataLocator,
+    VisionLocatorCatalogEntry,
+    VisionLocatorIndexSentinel,
+    VisionLocatorKind,
+    build_vision_locator_catalog,
+)
+from megatron.core.mdp.window import (
+    MdpIterationWindow,
+    pixel_capture_owner_state,
+    pixel_capture_suppressed,
+)
 
 MERGE = 2
 
@@ -34,9 +48,9 @@ def _microbatch(items, total_rows, sentinel_base=0.0):
     if items:
         pixels = torch.zeros(total_rows, 4)
         for index, item in enumerate(items):
-            pixels[
-                item.payload_row_start : item.payload_row_start + item.payload_rows
-            ] = sentinel_base + index + 1
+            pixels[item.payload_row_start : item.payload_row_start + item.payload_rows] = (
+                sentinel_base + index + 1
+            )
     return CapturedMicrobatch(
         decoder_packed_seq_params=SimpleNamespace(qkv_format="thd"),
         vision_items=tuple(items),
@@ -62,6 +76,27 @@ class _StubAdapter:
         return item.payload_rows
 
 
+class _OwnershipAdapter(_StubAdapter):
+    """Mirror collate: retain metadata but materialize pixels only for the owner."""
+
+    def __init__(self, microbatches):
+        super().__init__(microbatches)
+        self.capture_states = []
+
+    def get_batch(self, iterator):
+        captured = super().get_batch(iterator)
+        suppressed = pixel_capture_suppressed()
+        self.capture_states.append((suppressed, pixel_capture_owner_state()))
+        if not suppressed:
+            return captured
+        return CapturedMicrobatch(
+            decoder_packed_seq_params=captured.decoder_packed_seq_params,
+            vision_items=captured.vision_items,
+            flat_pixel_payload=None,
+            model_payload=captured.model_payload,
+        )
+
+
 def _default_microbatches():
     mb0 = _microbatch(
         [_item(0, 0, (1, 4, 4), 0), _item(0, 1, (1, 4, 8), 16), _item(2, 0, (2, 4, 4), 48)],
@@ -69,6 +104,24 @@ def _default_microbatches():
     )
     mb1 = _microbatch([], total_rows=0)  # text-only
     return [mb0, mb1]
+
+
+def _locator_catalog(*item_ids):
+    entries = tuple(
+        VisionLocatorCatalogEntry(
+            item_id,
+            VisionDataLocator(
+                VisionLocatorKind.SHARED_FILE,
+                f"/datasets/image-{item_id.local_item_id}.jpg",
+                None,
+                None,
+                VisionLocatorIndexSentinel.UNUSED,
+                (1, 4, 4),
+            ),
+        )
+        for item_id in item_ids
+    )
+    return build_vision_locator_catalog(tuple(item_ids), entries)
 
 
 def test_capture_builds_descriptors_and_sidecar_on_endpoint():
@@ -115,6 +168,80 @@ def test_non_endpoint_member_holds_records_and_owned_pixels():
     assert len(window.records()) == 2
 
 
+@pytest.mark.parametrize(
+    ("global_rank", "is_worker_leader", "expected_state", "expected_sidecar"),
+    (
+        (0, True, (False, True), {0, 1, 2}),
+        (1, False, (True, False), set()),
+        (2, True, (True, False), set()),
+    ),
+    ids=("owner-leader", "owner-follower", "non-owner-leader"),
+)
+def test_encoder_cp_pixel_capture_is_worker_leader_only(
+    global_rank, is_worker_leader, expected_state, expected_sidecar
+):
+    """TP2/ECP2: only the selected logical worker's leader decodes pixels."""
+    rank_map = build_rank_map(MdpRankSpec(world_size=4, tp=2, pp=2, cp=1, ep=1, encoder_cp=2))
+    view = rank_map.view(global_rank)
+    adapter = _OwnershipAdapter(_default_microbatches()[:1])
+
+    window = MdpIterationWindow.capture(
+        iter(range(10)),
+        num_microbatches=1,
+        adapter=adapter,
+        num_vpp_chunks=1,
+        lane_id=view.lane_id,
+        my_worker_id=view.my_worker_id,
+        num_workers=len(view.worker_ids),
+        data_loader_source_worker_ids=rank_map.data_loader_source_worker_ids(0),
+        is_worker_leader=is_worker_leader,
+    )
+
+    assert adapter.capture_states == [expected_state]
+    assert set(window.payload_sidecar()) == expected_sidecar
+
+
+def test_tp2_ecp3_misalignment_never_selects_a_tp1_worker_leader():
+    rank_map = build_rank_map(MdpRankSpec(world_size=6, tp=2, pp=3, cp=1, ep=1, encoder_cp=3))
+    source_worker_ids = rank_map.data_loader_source_worker_ids(0)
+    assert source_worker_ids == (0,)
+
+    observations = []
+    for global_rank in (0, 2, 3, 4):
+        view = rank_map.view(global_rank)
+        is_worker_leader = global_rank == rank_map.worker_leader_rank(
+            view.outer_dp_rank, view.my_worker_id
+        )
+        adapter = _OwnershipAdapter(_default_microbatches()[:1])
+        window = MdpIterationWindow.capture(
+            iter(range(10)),
+            num_microbatches=1,
+            adapter=adapter,
+            num_vpp_chunks=1,
+            lane_id=view.lane_id,
+            my_worker_id=view.my_worker_id,
+            num_workers=len(view.worker_ids),
+            data_loader_source_worker_ids=source_worker_ids,
+            is_worker_leader=is_worker_leader,
+        )
+        observations.append(
+            (
+                global_rank,
+                view.my_worker_id,
+                is_worker_leader,
+                adapter.capture_states[0],
+                set(window.payload_sidecar()),
+            )
+        )
+
+    assert observations == [
+        (0, 0, True, (False, True), {0, 1, 2}),
+        (2, 0, False, (True, False), set()),
+        (3, 1, True, (True, False), set()),
+        (4, 1, False, (True, False), set()),
+    ]
+
+
 def test_vpp_replay_contract():
     window = MdpIterationWindow.capture(
         iter(range(10)),
@@ -152,6 +279,103 @@ def test_release_pixels_clears_the_sidecar_only():
     assert len(window.records()) == 2  # replay records unaffected
 
 
+def test_locator_capture_is_exact_nonpixel_carrier_and_releases_reference():
+    item_id = GlobalVisionItemId(3, 0)
+    catalog = _locator_catalog(item_id)
+    locator = catalog.entries[0].locator
+    captured = replace(
+        _microbatch([_item(0, 0, (1, 4, 4), 0)], 16),
+        flat_pixel_payload=None,
+        vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        vision_locators=(locator,),
+    )
+    window = MdpIterationWindow.capture(
+        iter((0,)),
+        num_microbatches=1,
+        adapter=_StubAdapter([captured]),
+        num_vpp_chunks=1,
+        lane_id=3,
+        my_worker_id=0,
+        num_workers=1,
+    )
+
+    assert window.capture_payload_mode() is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    assert window.locator_catalog().entries == catalog.entries
+    assert window.locator_catalog().digest == catalog.digest
+    assert window.locator_catalog().entries[0].locator is locator
+    assert window.payload_sidecar() == {}
+    assert len(window.records()) == 1
+    window.release_capture_payload()
+    assert window.locator_catalog().entries == ()
+    assert window.payload_sidecar() == {}
+
+
+def test_capture_payload_mode_rejects_ambiguous_pixel_and_locator_state():
+    item_id = GlobalVisionItemId(0, 0)
+    locator = _locator_catalog(item_id).entries[0].locator
+    base = _microbatch([_item(0, 0, (1, 4, 4), 0)], 16)
+
+    with pytest.raises(MdpConfigurationError, match="exactly one"):
+        replace(
+            base,
+            vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+            vision_locators=(locator,),
+        )
+    with pytest.raises(MdpConfigurationError, match="exactly one"):
+        replace(base, vision_locators=(locator,))
+    with pytest.raises(MdpConfigurationError, match="exactly one"):
+        replace(
+            base,
+            flat_pixel_payload=None,
+            vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        )
+
+
+def test_locator_capture_requires_endpoint_alignment_and_uniform_window_mode():
+    locator = _locator_catalog(GlobalVisionItemId(0, 0)).entries[0].locator
+    base = _microbatch([_item(0, 0, (1, 4, 4), 0)], 16)
+    locator_capture = replace(
+        base,
+        flat_pixel_payload=None,
+        vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+        vision_locators=(locator,),
+    )
+    with pytest.raises(MdpConfigurationError, match="source endpoint"):
+        MdpIterationWindow.capture(
+            iter((0,)),
+            num_microbatches=1,
+            adapter=_StubAdapter([locator_capture]),
+            num_vpp_chunks=1,
+            lane_id=None,
+            my_worker_id=0,
+            num_workers=1,
+        )
+    with pytest.raises(MdpConfigurationError, match="one exact capture mode"):
+        MdpIterationWindow.capture(
+            iter((0, 1)),
+            num_microbatches=2,
+            adapter=_StubAdapter([base, locator_capture]),
+            num_vpp_chunks=1,
+            lane_id=0,
+            my_worker_id=0,
+            num_workers=1,
+        )
+
+    text_only = replace(
+        _microbatch([], 0), vision_capture_mode=VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    )
+    window = MdpIterationWindow.capture(
+        iter((0,)),
+        num_microbatches=1,
+        adapter=_StubAdapter([text_only]),
+        num_vpp_chunks=1,
+        lane_id=0,
+        my_worker_id=0,
+        num_workers=1,
+    )
+    assert window.locator_catalog().entries == ()
+
+
 @pytest.mark.parametrize(
     "mutate, match",
     [
@@ -176,9 +400,7 @@ def test_release_pixels_clears_the_sidecar_only():
         (lambda: [_microbatch([_item(0, 0, (1, 3, 4), 0)], 12)], "divisible"),
         # duplicate (sample, ordinal)
         (
-            lambda: [
-                _microbatch([_item(0, 0, (1, 4, 4), 0), _item(0, 0, (1, 4, 4), 16)], 32)
-            ],
+            lambda: [_microbatch([_item(0, 0, (1, 4, 4), 0), _item(0, 0, (1, 4, 4), 16)], 32)],
             "without duplicates",
         ),
         # payload interval out of bounds

@@ -14,6 +14,7 @@ import torch
 
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.schedule import (
+    _wrap_d3_forward_backward,
     unwrap_finalize_model_grads,
     wrap_finalize_model_grads,
     wrap_forward_backward,
@@ -159,3 +160,80 @@ def test_forward_backward_wrapper_order_and_double_wrap():
     ]
     with pytest.raises(MdpConfigurationError, match="wrapped twice"):
         wrap_forward_backward(wrapped, runtime)
+
+
+def _d3_facade(events, *, records=("record-0", "record-1")):
+    from megatron.core.mdp.dynamic_cp_d3_private_facade import _D3PrivateFacade
+
+    facade = object.__new__(_D3PrivateFacade)
+    facade._active = None
+
+    def begin(data, **kwargs):
+        events.append(("begin", data, kwargs))
+        return SimpleNamespace(records=records)
+
+    facade.begin_iteration = begin
+    facade.decoder_replay_cursor = lambda ready, **kwargs: iter(ready.records)
+    facade.mark_decoder_complete = lambda ready: events.append(("decoder_done", ready.records))
+    facade.end_iteration = lambda ready: events.append(("end", ready.records))
+
+    def abort(ready, error):
+        events.append(("abort", ready.records, error))
+        raise error
+
+    facade.abort_scheduled_iteration = abort
+    return facade
+
+
+def test_d3_wrapper_replays_dynamic_count_through_native_schedule():
+    events = []
+    facade = _d3_facade(events)
+
+    def schedule(*, data_iterator, num_microbatches, forward_only):
+        events.append(("schedule", tuple(data_iterator), num_microbatches, forward_only))
+        return "native-result"
+
+    wrapped = _wrap_d3_forward_backward(schedule, facade)
+    result = wrapped(data_iterator=iter(("raw",)), num_microbatches=7, forward_only=False)
+
+    assert result == "native-result"
+    assert events[0][0] == "begin"
+    assert events[0][2] == {"num_microbatches": 7, "forward_only": False}
+    assert events[1:] == [
+        ("schedule", ("record-0", "record-1"), 2, False),
+        ("decoder_done", ("record-0", "record-1")),
+        ("end", ("record-0", "record-1")),
+    ]
+    with pytest.raises(MdpConfigurationError, match="wrapped twice"):
+        _wrap_d3_forward_backward(wrapped, facade)
+
+
+def test_d3_wrapper_preserves_native_schedule_error_and_aborts():
+    events = []
+    facade = _d3_facade(events, records=("record",))
+    primary = RuntimeError("native schedule failed")
+
+    def schedule(*, data_iterator, num_microbatches, forward_only):
+        del data_iterator, num_microbatches, forward_only
+        raise primary
+
+    wrapped = _wrap_d3_forward_backward(schedule, facade)
+    with pytest.raises(RuntimeError, match="native schedule failed") as caught:
+        wrapped(data_iterator=iter(("raw",)), num_microbatches=1, forward_only=False)
+
+    assert caught.value is primary
+    assert events[0][0] == "begin"
+    assert events[1:] == [("abort", ("record",), primary)]
+
+
+def test_d3_wrapper_rejects_vpp_before_starting_iteration():
+    events = []
+    facade = _d3_facade(events)
+
+    def schedule(*, data_iterator, num_microbatches, forward_only):
+        del data_iterator, num_microbatches, forward_only
+
+    wrapped = _wrap_d3_forward_backward(schedule, facade)
+    with pytest.raises(MdpConfigurationError, match="VPP1"):
+        wrapped(data_iterator=[iter((0,)), iter((1,))], num_microbatches=1, forward_only=False)
+    assert events == []

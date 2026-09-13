@@ -23,7 +23,11 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from examples.multimodal_dev.data.mdp_mock import MdpThdMockDataset, item_sentinel
+from examples.multimodal_dev.data.mdp_mock import (
+    MdpThdMockDataset,
+    item_sentinel,
+    train_valid_test_datasets_provider,
+)
 from examples.multimodal_dev.forward_step import build_vision_sidecar, pack_or_pad_batch
 from tests.unit_tests.test_utilities import Utils
 
@@ -162,6 +166,47 @@ def test_text_only_batch_produces_empty_sidecar():
     assert packed["vision_item_meta"].shape == (0, 6)
     assert packed["vision_decoder_positions"].numel() == 0
     assert packed["pixel_values"].shape[0] == 0
+
+
+def test_mdp_mock_provider_omits_zero_length_eval_splits(monkeypatch):
+    monkeypatch.setattr(
+        "megatron.training.get_args",
+        lambda: type("Args", (), {"padded_vocab_size": 1024, "image_token_id": IMAGE_TOKEN_ID})(),
+    )
+
+    train, valid, test = train_valid_test_datasets_provider((8, 0, 0))
+
+    assert len(train) == 8
+    assert valid is None
+    assert test is None
+
+
+def test_nonowner_mock_validates_raw_pixels_before_omitting_them(monkeypatch):
+    from types import SimpleNamespace
+
+    from megatron.core.mdp import window
+
+    dataset = MdpThdMockDataset(num_samples=8)
+    sample = dict(dataset[0])
+    monkeypatch.setattr(
+        "examples.multimodal_dev.forward_step.get_args",
+        lambda: SimpleNamespace(sequence_parallel=False, dataset_provider="mdp_mock"),
+    )
+    window._PIXEL_OWNERSHIP.value = (0, 1, True)
+    try:
+        packed = pack_or_pad_batch(
+            [sample], use_packed_sequence=True, with_vision_sidecar=True
+        )
+        assert packed["vision_item_meta"].shape[0] == sample["image_grid_thw"].shape[0]
+        assert "pixel_values" not in packed
+
+        sample["pixel_values"] = sample["pixel_values"][:-1]
+        with pytest.raises(ValueError, match="sum\\(t\\*h\\*w\\)"):
+            pack_or_pad_batch(
+                [sample], use_packed_sequence=True, with_vision_sidecar=True
+            )
+    finally:
+        window._PIXEL_OWNERSHIP.value = None
 
 
 # ------------------------- negative guards -------------------------

@@ -153,6 +153,48 @@ def test_capture_with_fewer_microbatches_than_workers():
     assert len(window.records()) == 2
 
 
+@pytest.mark.parametrize("my_worker_id", [0, 1, 2, 3])
+def test_explicit_tp1_data_sources_preserve_capture_bytes(my_worker_id):
+    def _capture(data_loader_source_worker_ids=None):
+        kwargs = {}
+        if data_loader_source_worker_ids is not None:
+            kwargs["data_loader_source_worker_ids"] = data_loader_source_worker_ids
+        window = MdpIterationWindow.capture(
+            iter(range(10)),
+            num_microbatches=5,
+            adapter=_ShardAwareAdapter(_window_microbatches()),
+            num_vpp_chunks=1,
+            lane_id=0 if my_worker_id == 0 else None,
+            my_worker_id=my_worker_id,
+            num_workers=4,
+            **kwargs,
+        )
+        return (
+            window.records(),
+            window.descriptors(),
+            {
+                item_id: tensor.clone()
+                for item_id, tensor in window.payload_sidecar().items()
+            },
+        )
+
+    implicit_records, implicit_descriptors, implicit_sidecar = _capture()
+    explicit_records, explicit_descriptors, explicit_sidecar = _capture((0, 1, 2, 3))
+    assert len(implicit_records) == len(explicit_records)
+    for implicit_record, explicit_record in zip(implicit_records, explicit_records):
+        assert implicit_record.microbatch_id == explicit_record.microbatch_id
+        assert implicit_record.text_only == explicit_record.text_only
+        assert implicit_record.vision_items == explicit_record.vision_items
+        assert implicit_record.decoder_packed_seq_params == explicit_record.decoder_packed_seq_params
+        assert tuple(implicit_record.model_payload) == tuple(explicit_record.model_payload)
+        for key, tensor in implicit_record.model_payload.items():
+            assert torch.equal(tensor, explicit_record.model_payload[key])
+    assert implicit_descriptors == explicit_descriptors
+    assert implicit_sidecar.keys() == explicit_sidecar.keys()
+    for item_id, tensor in implicit_sidecar.items():
+        assert torch.equal(tensor, explicit_sidecar[item_id])
+
+
 def test_capture_rejects_unsuppressed_pixels_on_non_owner():
     with pytest.raises(MdpConfigurationError, match="not suppressed"):
         MdpIterationWindow.capture(

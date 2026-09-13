@@ -69,15 +69,122 @@ _NO_CP_GROUP = _NoCPGroup()
 # Gradients are correct; only the *logged* value drifts.
 
 
-def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+def _thd_cp_partition_index(
+    cu_seqlens_padded, total_tokens, cp_size, cp_rank, partition_mode="zigzag"
+):
     """Per-rank token index for THD + CP via TE's
     ``thd_get_partitioned_indices``.  Cast to int64 so the result can be
     used directly with ``index_select`` regardless of TE's return dtype.
     """
+    if partition_mode == "contiguous":
+        if total_tokens % cp_size != 0:
+            raise ValueError(
+                f"contiguous CP requires total_tokens={total_tokens} divisible by cp_size={cp_size}"
+            )
+        local_tokens = total_tokens // cp_size
+        start = cp_rank * local_tokens
+        return torch.arange(
+            start, start + local_tokens, dtype=torch.long, device=cu_seqlens_padded.device
+        )
+    if partition_mode != "zigzag":
+        raise ValueError(f"unsupported CP partition mode: {partition_mode}")
+
     from transformer_engine.pytorch import cpp_extensions as tex
 
     idx = tex.thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
     return idx.long()
+
+
+def _cp_size_rank(packed_seq_params):
+    """Resolve a per-microbatch Dynamic-CP group before the static CP group."""
+    cp_group = getattr(packed_seq_params, "cp_group", None)
+    if cp_group is not None:
+        return cp_group.size(), cp_group.rank()
+    return (
+        parallel_state.get_context_parallel_world_size(),
+        parallel_state.get_context_parallel_rank(),
+    )
+
+
+def split_multimodal_inputs_for_context_parallel(
+    *,
+    decoder_input,
+    input_ids,
+    labels,
+    loss_mask,
+    attention_mask,
+    position_ids,
+    packed_seq_params,
+    sequence_parallel,
+    padding_mask=None,
+):
+    """Apply the existing multimodal CP layout to decoder inputs.
+
+    BSHD zigzag-splits every sequence-shaped input except ``position_ids``.
+    THD partitions decoder/input IDs, labels, loss and padding masks using the
+    padded segment boundaries, while leaving ``position_ids`` and
+    ``attention_mask`` global for their existing RoPE/attention-side split.
+    """
+    cp_size, cp_rank = _cp_size_rank(packed_seq_params)
+    if cp_size <= 1:
+        return (
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
+        )
+    decoder_input_uses_sp = (
+        decoder_input is not None
+        and sequence_parallel
+        and parallel_state.get_tensor_model_parallel_world_size() > 1
+    )
+    if decoder_input_uses_sp:
+        decoder_input = tensor_parallel.gather_from_sequence_parallel_region(
+            decoder_input, tensor_parallel_output_grad=False
+        )
+
+    if packed_seq_params is not None:
+        total_tokens = decoder_input.shape[0] if decoder_input is not None else input_ids.shape[1]
+        idx = _thd_cp_partition_index(
+            packed_seq_params.cu_seqlens_q_padded,
+            total_tokens,
+            cp_size,
+            cp_rank,
+            getattr(packed_seq_params, "cp_partition_mode", "zigzag"),
+        )
+        if decoder_input is not None:
+            decoder_input = decoder_input.index_select(0, idx)
+        if input_ids is not None:
+            input_ids = input_ids.index_select(1, idx)
+        if labels is not None:
+            labels = labels.index_select(1, idx)
+        if loss_mask is not None:
+            loss_mask = loss_mask.index_select(1, idx)
+        if padding_mask is not None:
+            padding_mask = padding_mask.index_select(1, idx)
+    else:
+
+        def _split(tensor, seq_dim):
+            return (
+                None
+                if tensor is None
+                else _cp_split_tensor(tensor, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank)
+            )
+
+        decoder_input = _split(decoder_input, 0)
+        input_ids = _split(input_ids, 1)
+        labels = _split(labels, 1)
+        loss_mask = _split(loss_mask, 1)
+        attention_mask = _split(attention_mask, 1)
+        padding_mask = _split(padding_mask, 1)
+
+    if decoder_input_uses_sp:
+        decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(decoder_input)
+
+    return (decoder_input, input_ids, labels, loss_mask, attention_mask, position_ids, padding_mask)
 
 
 class MultimodalModel(MegatronModule):
@@ -206,6 +313,7 @@ class MultimodalModel(MegatronModule):
                     packed_seq_params=packed_seq_params,
                 )
 
+        decoder_block_kwargs = None
         if self.pre_process:
             # An MDP endpoint supplies the pre-encoded leaf. The native path
             # encodes pixels here; both feed the same scatter below.
@@ -222,7 +330,7 @@ class MultimodalModel(MegatronModule):
 
                 if vision_embeddings is not None:
                     with nvtx_phase("scatter_vision_embeddings"):
-                        decoder_input = self._scatter_vision_embeddings(
+                        decoder_input, decoder_block_kwargs = self.prepare_decoder_inputs(
                             input_ids, text_embeddings, vision_embeddings
                         )
                 else:
@@ -253,7 +361,7 @@ class MultimodalModel(MegatronModule):
             padding_mask=padding_mask,
         )
 
-        return dict(
+        decoder_inputs = dict(
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -263,6 +371,15 @@ class MultimodalModel(MegatronModule):
             padding_mask=padding_mask,
             packed_seq_params=packed_seq_params,
         )
+        if decoder_block_kwargs is not None:
+            decoder_inputs["extra_block_kwargs"] = decoder_block_kwargs
+        return decoder_inputs
+
+    def prepare_decoder_inputs(self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings):
+        """Build decoder input plus optional model-owned block arguments."""
+        return self._scatter_vision_embeddings(
+            input_ids, text_embeddings, vision_embeddings
+        ), None
 
     def build_schedule_plan(
         self,
@@ -373,50 +490,16 @@ class MultimodalModel(MegatronModule):
         ``_apply_rotary_pos_emb_thd`` does the per-sample CP zigzag
         itself via ``_get_thd_freqs_on_this_cp_rank``.
         """
-        cp_size = parallel_state.get_context_parallel_world_size()
-        if cp_size <= 1:
-            return (
-                decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids, padding_mask,
-            )
-        cp_rank = parallel_state.get_context_parallel_rank()
-
-        if packed_seq_params is not None:
-            total_tokens = (
-                decoder_input.shape[0] if decoder_input is not None else input_ids.shape[1]
-            )
-            idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded, total_tokens, cp_size, cp_rank
-            )
-            if decoder_input is not None:
-                decoder_input = decoder_input.index_select(0, idx)
-            if input_ids is not None:
-                input_ids = input_ids.index_select(1, idx)
-            if labels is not None:
-                labels = labels.index_select(1, idx)
-            if loss_mask is not None:
-                loss_mask = loss_mask.index_select(1, idx)
-            if padding_mask is not None:
-                padding_mask = padding_mask.index_select(1, idx)
-        else:
-
-            def _split(t, seq_dim):
-                return (
-                    None
-                    if t is None
-                    else _cp_split_tensor(t, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank)
-                )
-
-            decoder_input = _split(decoder_input, 0)
-            input_ids = _split(input_ids, 1)
-            labels = _split(labels, 1)
-            loss_mask = _split(loss_mask, 1)
-            attention_mask = _split(attention_mask, 1)
-            padding_mask = _split(padding_mask, 1)
-
-        return (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+        return split_multimodal_inputs_for_context_parallel(
+            decoder_input=decoder_input,
+            input_ids=input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            sequence_parallel=self.config.sequence_parallel,
+            padding_mask=padding_mask,
         )
 
     @staticmethod
@@ -428,13 +511,16 @@ class MultimodalModel(MegatronModule):
         with the model's CP-shard output. Returns ``loss_mask`` unchanged
         when ``CP <= 1``.
         """
-        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_size, cp_rank = _cp_size_rank(packed_seq_params)
         if cp_size <= 1 or loss_mask is None:
             return loss_mask
-        cp_rank = parallel_state.get_context_parallel_rank()
         if packed_seq_params is not None:
             idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded, loss_mask.shape[1], cp_size, cp_rank
+                packed_seq_params.cu_seqlens_q_padded,
+                loss_mask.shape[1],
+                cp_size,
+                cp_rank,
+                getattr(packed_seq_params, "cp_partition_mode", "zigzag"),
             )
             return loss_mask.index_select(1, idx)
         return _cp_split_tensor(loss_mask, seq_dim=1, cp_size=cp_size, cp_rank=cp_rank)

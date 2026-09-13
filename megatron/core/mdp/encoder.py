@@ -61,27 +61,26 @@ def build_encoder_pg_collection(
 ) -> ProcessGroupCollection:
     """Process groups for the encoder domain.
 
-    With ``encoder_cp=1``: ``dp = dp_cp = intra_dp_cp = intra_dist_opt = WORLD``
-    (replicated parameters reduced once over all ranks, ZeRO-1 sharded over the
-    same domain), ``tp/pp/ep`` are rank-local singletons, and
-    ``mp/expt_dp/tp_ep_pp`` are ``None`` (``get_pg_rank(None) == 0``,
-    ``get_pg_size(None) == 1`` — exactly the intended meaning).
-
-    The singleton is created the way Megatron itself does it: each rank calls
-    ``new_group`` once with its own rank list. The ``encoder_cp>1`` evolution
-    (cp = each logical worker's ranks, dp = workers sharing a cp coordinate)
-    changes only this function, but its DDP/ZeRO semantics still require
-    revalidation and are rejected here.
+    ``cp`` is the local logical worker's encoder-CP group. Parameters and
+    optimizer state remain reduced/sharded over WORLD through
+    ``dp = dp_cp = intra_dp_cp = intra_dist_opt = WORLD``. All non-CP model
+    parallel dimensions reuse the canonical rank singleton.
     """
-    if encoder_cp != 1:
+    if encoder_cp != rank_map.spec.encoder_cp:
         raise MdpConfigurationError(
-            f"MDP: encoder_cp={encoder_cp} violates: encoder_cp == 1. The encoder-CP "
-            "group construction requires revalidating MCore CP gradient semantics."
+            f"MDP: encoder_cp={encoder_cp} violates: encoder_cp matches the rank-map "
+            f"spec ({rank_map.spec.encoder_cp})."
+        )
+    if len(process_groups.encoder_cp_group_ranks) != encoder_cp:
+        raise MdpConfigurationError(
+            "MDP: encoder process groups violate: local encoder-CP rank count "
+            f"{len(process_groups.encoder_cp_group_ranks)} == encoder_cp {encoder_cp}."
         )
     world = process_groups.world_group
-    mine = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
+    mine = process_groups.singleton_group
 
     pgs = ProcessGroupCollection()
+    pgs.cp = process_groups.encoder_cp_group
     pgs.dp = world
     pgs.dp_cp = world
     pgs.intra_dp_cp = world
@@ -90,9 +89,9 @@ def build_encoder_pg_collection(
     pgs.pp = mine
     pgs.ep = mine
     pgs.mp = None
-    # The encoder has no experts. Set expt_dp explicitly so DDP's fallback
-    # does not create another singleton group with a warning.
-    pgs.expt_dp = None
+    # The encoder has no experts, but DDP still requires an explicit group.
+    # Reuse the canonical singleton so setup cannot create a group out of order.
+    pgs.expt_dp = mine
     pgs.tp_ep_pp = None
     pgs.inter_dist_opt = None
     return pgs
@@ -135,6 +134,10 @@ def build_encoder_domain(
             )
 
     effective_config = apply_encoder_recompute_config(model_config, mdp_config)
+    if effective_config.context_parallel_size != mdp_config.encoder_cp:
+        effective_config = replace(
+            effective_config, context_parallel_size=mdp_config.encoder_cp
+        )
     validate_effective_vision_config(mdp_config, effective_config)
     logger.info(
         "MDP: effective encoder recompute granularity: %s",
@@ -157,6 +160,10 @@ def build_encoder_domain(
         pg_collection=encoder_pgs,
     )
     assert_encoder_prescale_is_one(encoder_ddp)
+    # MDP constructs the encoder after the decoder's optional startup
+    # broadcast. Synchronize this late-built WORLD-replicated domain before
+    # the distributed optimizer snapshots or shards its parameters.
+    encoder_ddp.broadcast_params()
 
     from megatron.core.optimizer import get_megatron_optimizer
 

@@ -8,11 +8,12 @@ fixed-width descriptor records inside each planning group.
 """
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
 
+from megatron.core.mdp.dynamic_cp import DynamicCpGroupMembership, nested_dynamic_cp_group_specs
 from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError
 from megatron.core.mdp.protocols import VisionDescriptor
 from megatron.core.mdp.rank_mapping import MdpRankMap
@@ -24,11 +25,20 @@ DESCRIPTOR_SLOTS = 12
 
 @dataclass(frozen=True)
 class MdpProcessGroups:
-    """The process groups one rank participates in."""
+    """The process groups one rank participates in.
+
+    ``encoder_cp_groups`` is empty on the unchanged static path.
+    """
 
     planning_group: dist.ProcessGroup
+    encoder_cp_group: dist.ProcessGroup
+    encoder_cp_group_ranks: tuple
+    encoder_cp_leader_rank: int
+    singleton_group: dist.ProcessGroup
     encoder_reduction_group: dist.ProcessGroup
     world_group: dist.ProcessGroup
+    decoder_tp_group: Optional[dist.ProcessGroup] = None
+    encoder_cp_groups: tuple[DynamicCpGroupMembership, ...] = ()
 
 
 class MdpGroupRegistry:
@@ -69,45 +79,174 @@ class MdpGroupRegistry:
     def assert_no_leak(self) -> None:
         """Every created key must be a planning group or a registered alias."""
         for key in self._groups:
-            if key[0] not in ("planning", "world_alias"):
+            if key[0] not in (
+                "planning",
+                "encoder_cp",
+                "encoder_cp_dynamic",
+                "singleton",
+                "world_alias",
+            ):
                 raise MdpConfigurationError(
                     f"MDP: group registry violates: no unexpected groups (found {key})."
                 )
 
 
 def install_mdp_process_groups(
-    rank_map: MdpRankMap, *, group_registry: MdpGroupRegistry
+    rank_map: MdpRankMap,
+    *,
+    group_registry: MdpGroupRegistry,
+    decoder_pg_collection=None,
+    dynamic_encoder_cp: bool = False,
+    min_dynamic_encoder_cp_size: int = 1,
 ) -> MdpProcessGroups:
     """Install MDP process groups; every rank creates groups in the same order.
 
-    One planning group per outer-DP group, in ascending ``outer_dp_rank`` order.
-    With ``encoder_cp=1`` the encoder reduction group aliases WORLD; no duplicate
-    same-sized group is created.
+    Every WORLD rank creates all singleton groups, then all planning groups,
+    then all logical-worker encoder-CP groups in the same canonical order.
+    Encoder-CP size one aliases the corresponding singleton. Encoder gradient
+    reduction and optimizer sharding continue to alias WORLD.
     """
-    if rank_map.spec.encoder_cp != 1:
-        raise MdpConfigurationError(
-            f"MDP: encoder_cp={rank_map.spec.encoder_cp} violates: encoder_cp == 1. "
-            "Encoder-CP group construction requires revalidating DDP/ZeRO semantics."
+    if type(dynamic_encoder_cp) is not bool:
+        raise MdpConfigurationError("MDP: dynamic encoder CP enablement is an exact bool.")
+    dynamic_specs_by_worker = ()
+    if dynamic_encoder_cp:
+        if type(min_dynamic_encoder_cp_size) is not int:
+            raise MdpConfigurationError("MDP: dynamic encoder CP minimum size is an exact integer.")
+        dynamic_specs_by_worker = tuple(
+            (
+                outer_dp_rank,
+                worker_id,
+                ranks,
+                nested_dynamic_cp_group_specs(ranks, minimum_size=min_dynamic_encoder_cp_size),
+            )
+            for outer_dp_rank, _ in enumerate(rank_map.planning_groups())
+            for worker_id in range(rank_map.num_workers_per_group)
+            for ranks in (rank_map.worker_ranks(outer_dp_rank, worker_id),)
         )
+        if any(
+            len(ranks) != rank_map.spec.encoder_cp
+            or not specs
+            or specs[-1].group_size != rank_map.spec.encoder_cp
+            or specs[-1].ranks != ranks
+            for _, _, ranks, specs in dynamic_specs_by_worker
+        ):
+            raise MdpConfigurationError(
+                "MDP: dynamic encoder CP minimum/maximum sizes match each exact worker pool."
+            )
+
     world = dist.group.WORLD
     my_rank = dist.get_rank()
+    decoder_tp_group = (
+        None if decoder_pg_collection is None else getattr(decoder_pg_collection, "tp", None)
+    )
+    if rank_map.spec.tp > 1:
+        if decoder_tp_group is None:
+            raise MdpConfigurationError(
+                f"MDP: tensor_parallel_size={rank_map.spec.tp} requires the native "
+                "decoder TP ProcessGroupCollection; MDP does not create TP groups."
+            )
+        expected_tp_ranks = rank_map.tp_group_ranks(my_rank)
+        actual_tp_ranks = tuple(dist.get_process_group_ranks(decoder_tp_group))
+        if actual_tp_ranks != expected_tp_ranks:
+            raise MdpConfigurationError(
+                f"MDP: native decoder TP group ranks {actual_tp_ranks} violate: "
+                f"RankGenerator TP ranks {expected_tp_ranks}."
+            )
+
+    singleton_groups = {}
+    my_singleton_group = None
+    for rank in range(rank_map.spec.world_size):
+        group = group_registry.get_or_create(("singleton", rank), (rank,))
+        singleton_groups[rank] = group
+        if my_rank == rank:
+            my_singleton_group = group
+
     my_planning_group = None
     for outer_dp_rank, ranks in enumerate(rank_map.planning_groups()):
         group = group_registry.get_or_create(("planning", outer_dp_rank), ranks)
         if my_rank in ranks:
             my_planning_group = group
+
+    my_encoder_cp_group = None
+    my_encoder_cp_group_ranks = None
+    my_encoder_cp_leader_rank = None
+    encoder_cp_groups = {}
+    for outer_dp_rank, _ in enumerate(rank_map.planning_groups()):
+        for worker_id in range(rank_map.num_workers_per_group):
+            ranks = rank_map.worker_ranks(outer_dp_rank, worker_id)
+            leader_rank = rank_map.worker_leader_rank(outer_dp_rank, worker_id)
+            key = ("encoder_cp", outer_dp_rank, worker_id)
+            if rank_map.spec.encoder_cp == 1:
+                group = singleton_groups[leader_rank]
+                group_registry.register_alias(key, ranks, group)
+            else:
+                group = group_registry.get_or_create(key, ranks)
+            encoder_cp_groups[(outer_dp_rank, worker_id)] = group
+            if my_rank in ranks:
+                my_encoder_cp_group = group
+                my_encoder_cp_group_ranks = ranks
+                my_encoder_cp_leader_rank = leader_rank
+
+    dynamic_groups = {}
+    for outer_dp_rank, worker_id, ranks, specs in dynamic_specs_by_worker:
+        for spec in specs:
+            if spec.group_size in (1, len(ranks)):
+                continue
+            key = (
+                "encoder_cp_dynamic",
+                outer_dp_rank,
+                worker_id,
+                spec.group_size,
+                spec.group_index,
+            )
+            dynamic_groups[(outer_dp_rank, worker_id, spec.group_size, spec.group_index)] = (
+                group_registry.get_or_create(key, spec.ranks)
+            )
+
+    my_dynamic_memberships = []
+    for outer_dp_rank, worker_id, ranks, specs in dynamic_specs_by_worker:
+        if my_rank not in ranks:
+            continue
+        for spec in specs:
+            if my_rank not in spec.ranks:
+                continue
+            if spec.group_size == 1:
+                group = singleton_groups[my_rank]
+            elif spec.group_size == len(ranks):
+                group = encoder_cp_groups[(outer_dp_rank, worker_id)]
+            else:
+                group = dynamic_groups[
+                    (outer_dp_rank, worker_id, spec.group_size, spec.group_index)
+                ]
+            my_dynamic_memberships.append(
+                DynamicCpGroupMembership(spec.group_size, spec.ranks, group)
+            )
+
     group_registry.register_alias(
         ("world_alias",), tuple(range(rank_map.spec.world_size)), world
     )
-    if my_planning_group is None:
+    if (
+        my_singleton_group is None
+        or my_planning_group is None
+        or my_encoder_cp_group is None
+        or my_encoder_cp_group_ranks is None
+        or my_encoder_cp_leader_rank is None
+        or (dynamic_encoder_cp and not my_dynamic_memberships)
+    ):
         raise MdpConfigurationError(
-            f"MDP: rank {my_rank} violates: every rank belongs to exactly one planning "
-            "group."
+            f"MDP: rank {my_rank} violates: every rank belongs to one singleton, "
+            "planning, and encoder-CP group."
         )
     return MdpProcessGroups(
         planning_group=my_planning_group,
+        encoder_cp_group=my_encoder_cp_group,
+        encoder_cp_group_ranks=my_encoder_cp_group_ranks,
+        encoder_cp_leader_rank=my_encoder_cp_leader_rank,
+        singleton_group=my_singleton_group,
         encoder_reduction_group=world,
         world_group=world,
+        decoder_tp_group=decoder_tp_group,
+        encoder_cp_groups=tuple(my_dynamic_memberships),
     )
 
 

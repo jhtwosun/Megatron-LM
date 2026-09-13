@@ -119,18 +119,22 @@ class EncoderThdLayout:
         return sum(segment.output_rows for segment in self.segments)
 
 
-def split_encoder_layout(layout: EncoderThdLayout, *, max_payload_rows) -> tuple:
+def split_encoder_layout(
+    layout: EncoderThdLayout, *, max_payload_rows, fuse_across_microbatches: bool = True
+) -> tuple:
     """Split a producer layout into chunk sub-layouts at complete segment boundaries.
 
     Every sub-layout rebases ``payload_row_start/output_row_start`` to 0 so it can
     construct that chunk's ``PackedSeqParams`` directly; the adapter never learns
     that chunking exists. If one segment alone exceeds ``max_payload_rows`` its
-    chunk is allowed to exceed the limit. ``max_payload_rows=None`` returns a
-    one-element tuple.
+    chunk is allowed to exceed the limit. With fusion disabled, a change in
+    microbatch ID also starts a new chunk; item order is never changed.
     """
-    if max_payload_rows is None or not layout.segments:
+    if type(fuse_across_microbatches) is not bool:
+        raise MdpPlanError("MDP: fuse_across_microbatches must be an exact boolean.")
+    if not layout.segments or (max_payload_rows is None and fuse_across_microbatches):
         return (layout,)
-    if max_payload_rows <= 0:
+    if max_payload_rows is not None and max_payload_rows <= 0:
         raise MdpPlanError(
             f"MDP: max_payload_rows={max_payload_rows} violates: None or a positive integer."
         )
@@ -139,7 +143,13 @@ def split_encoder_layout(layout: EncoderThdLayout, *, max_payload_rows) -> tuple
     current = []
     current_rows = 0
     for segment in layout.segments:
-        if current and current_rows + segment.payload_rows > max_payload_rows:
+        crosses_microbatch = current and segment.microbatch_id != current[-1].microbatch_id
+        exceeds_cap = (
+            current
+            and max_payload_rows is not None
+            and current_rows + segment.payload_rows > max_payload_rows
+        )
+        if (crosses_microbatch and not fuse_across_microbatches) or exceeds_cap:
             chunks.append(current)
             current = []
             current_rows = 0

@@ -2,6 +2,23 @@
 
 """Extra CLI arguments for multimodal_dev standalone training."""
 
+import argparse
+
+from megatron.core.mdp.protocols import VisionCaptureMode
+
+
+def _vision_capture_mode(value: str) -> VisionCaptureMode:
+    modes = {
+        "source-pixel-sidecar": VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+        "stable-locator-catalog": VisionCaptureMode.STABLE_LOCATOR_CATALOG,
+    }
+    try:
+        return modes[value]
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            "vision capture mode must be source-pixel-sidecar or stable-locator-catalog"
+        ) from error
+
 
 def validate_encoder_recompute_args(args) -> None:
     """Validate the shared native/MDP encoder recompute argument matrix."""
@@ -67,7 +84,7 @@ def add_multimodal_args(parser):
         "--model-arch",
         type=str,
         default="qwen35_vl",
-        help="Model architecture. Available: qwen35_vl",
+        help="Model architecture. Available: qwen35_vl, qwen3_vl, nemotron_omni",
     )
     group.add_argument(
         "--model-variant",
@@ -79,7 +96,67 @@ def add_multimodal_args(parser):
         "--dataset-provider",
         type=str,
         default="mock",
-        help="Dataset provider: mock",
+        help="Dataset provider: mock or energon",
+    )
+    group.add_argument(
+        "--energon-path",
+        type=str,
+        default=None,
+        help="Energon dataset directory (required for --dataset-provider energon).",
+    )
+    group.add_argument(
+        "--energon-vision-storage-roots",
+        nargs="+",
+        default=None,
+        help="Explicit allowed storage directories for static metadata-first Energon loading.",
+    )
+    group.add_argument(
+        "--energon-split",
+        type=str,
+        default="train",
+        help="Energon training split name.",
+    )
+    group.add_argument(
+        "--energon-val-split",
+        type=str,
+        default="val",
+        help="Energon validation split name.",
+    )
+    group.add_argument(
+        "--energon-packing-buffer-size",
+        type=int,
+        default=32,
+        help="Number of preencoded samples available to the Energon pack selector.",
+    )
+    group.add_argument(
+        "--energon-max-samples-per-sequence",
+        type=int,
+        default=8,
+        help="Maximum raw samples in one upstream Energon shard-slice sequence.",
+    )
+    group.add_argument(
+        "--energon-shuffle-buffer-size",
+        type=int,
+        default=100,
+        help="Energon training shuffle-buffer size.",
+    )
+    group.add_argument(
+        "--energon-prefetch-factor",
+        type=int,
+        default=2,
+        help="Energon loader prefetch factor.",
+    )
+    group.add_argument(
+        "--nemotron-omni-input-contract",
+        type=str,
+        default="expanded_sequence_v1",
+        help="Nemotron Omni input contract (only expanded_sequence_v1 is supported).",
+    )
+    group.add_argument(
+        "--nemotron-omni-enable-sound",
+        action="store_true",
+        default=False,
+        help="Enable Nemotron Omni sound input (unsupported by this image-only integration).",
     )
     group.add_argument(
         "--image-token-id",
@@ -144,10 +221,32 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-vision-capture-mode",
+        type=_vision_capture_mode,
+        default=VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
+        metavar="MODE",
+        help=(
+            "Exact repeated-D4 vision carrier: source-pixel-sidecar (default) or "
+            "stable-locator-catalog."
+        ),
+    )
+    group.add_argument(
         "--mdp-encoder-cp",
         type=int,
         default=1,
-        help="MDP encoder context-parallel width (must currently be 1).",
+        help="MDP encoder context-parallel width, independent of decoder CP.",
+    )
+    group.add_argument(
+        "--mdp-dynamic-encoder-cp",
+        action="store_true",
+        default=False,
+        help="Dynamically select encoder CP within the configured MDP encoder-CP width.",
+    )
+    group.add_argument(
+        "--mdp-min-dynamic-encoder-cp-size",
+        type=int,
+        default=1,
+        help="Minimum encoder CP size considered by dynamic MDP planning.",
     )
     group.add_argument(
         "--mdp-encoder-max-payload-rows",
@@ -157,6 +256,18 @@ def add_multimodal_args(parser):
             "Patch-row cap for one MDP encoder chunk; splitting happens "
             "only at complete vision-item boundaries."
         ),
+    )
+    group.add_argument(
+        "--mdp-encoder-fuse-across-microbatches",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow encoder chunks to fuse complete vision items across microbatches.",
+    )
+    group.add_argument(
+        "--mdp-vision-lpt-cost",
+        choices=("rows", "flops"),
+        default="rows",
+        help="Static Qwen3.5-VL LPT ordering proxy; neither choice changes payload row counts.",
     )
     group.add_argument(
         "--encoder-recompute-granularity",
@@ -197,6 +308,12 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-encoder-assignment-policy",
+        choices=("lpt", "round_robin"),
+        default="lpt",
+        help="Static encoder assignment: cost-aware LPT or cost-blind item-order round robin.",
+    )
+    group.add_argument(
         "--mdp-locality-slack-permille",
         type=int,
         default=10,
@@ -226,7 +343,7 @@ def add_multimodal_args(parser):
             "thread and a dedicated side CUDA stream while the current "
             "iteration runs, hiding the serial P1 window-capture cost "
             "without inserting H2D copies into the main compute stream. "
-            "TP=1 only."
+            "TP=1 and encoder-CP=1 only."
         ),
     )
     group.add_argument(

@@ -11,6 +11,9 @@ import torch.distributed.checkpoint
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.mdp import checkpoint as mdp_checkpoint_api
+from megatron.core.mdp import integration as mdp_integration
+from megatron.core.mdp.runtime import MdpRuntimeState
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
@@ -19,6 +22,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from megatron.training import checkpointing as checkpointing_api
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
@@ -72,6 +76,214 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+class _CheckpointBoundaryReached(RuntimeError):
+    pass
+
+
+def test_repeated_d4_save_boundary_precedes_native_callbacks_rng_and_state(monkeypatch):
+    args = SimpleNamespace(mdp_dynamic_encoder_cp=True, async_save=False)
+    set_args(args)
+    events = []
+    monkeypatch.setattr(
+        checkpointing_api,
+        "prepare_repeated_d4_checkpoint_save",
+        lambda selected, *, iteration: events.append(("save", iteration)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        checkpointing_api,
+        "on_save_checkpoint_start",
+        lambda *_args: (_ for _ in ()).throw(_CheckpointBoundaryReached("native callback")),
+    )
+    monkeypatch.setattr(
+        checkpointing_api,
+        "get_rng_state",
+        lambda *_args, **_kwargs: pytest.fail("RNG state generated before D4 boundary"),
+    )
+    monkeypatch.setattr(
+        checkpointing_api,
+        "generate_state_dict",
+        lambda *_args, **_kwargs: pytest.fail("state generated before D4 boundary"),
+    )
+
+    with pytest.raises(_CheckpointBoundaryReached, match="native callback"):
+        save_checkpoint(1, [], None, None, 0)
+    assert events == [("save", 1)]
+
+
+def test_repeated_d4_load_pre_boundary_precedes_any_checkpoint_io(monkeypatch):
+    args = SimpleNamespace(
+        mdp_dynamic_encoder_cp=True, load="/does/not/matter", pretrained_checkpoint="/also/not/read"
+    )
+    set_args(args)
+    monkeypatch.setattr(
+        checkpointing_api,
+        "prepare_repeated_d4_checkpoint_load",
+        lambda selected: (_ for _ in ()).throw(_CheckpointBoundaryReached("load pre-io")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        checkpointing_api,
+        "checkpoint_exists",
+        lambda *_args: pytest.fail("checkpoint path read before D4 load boundary"),
+    )
+    monkeypatch.setattr(
+        checkpointing_api,
+        "_load_base_checkpoint",
+        lambda *_args, **_kwargs: pytest.fail("native checkpoint I/O started before boundary"),
+    )
+
+    with pytest.raises(_CheckpointBoundaryReached, match="load pre-io"):
+        load_checkpoint([], None, None)
+
+
+def _minimal_load_args():
+    # Supported native training setup invokes load_checkpoint once in a fresh
+    # process. K1b intentionally does not add LOADED_IDLE or repeated direct-load support.
+    return SimpleNamespace(
+        mdp_dynamic_encoder_cp=True,
+        load="/does/not/matter",
+        pretrained_checkpoint=None,
+        ckpt_format="torch",
+        auto_detect_ckpt_format=False,
+        world_size=8,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=4,
+        expert_model_parallel_size=1,
+        mdp_encoder_cp=4,
+    )
+
+
+def test_repeated_d4_post_decode_boundary_precedes_all_state_mutation(monkeypatch):
+    args = _minimal_load_args()
+    set_args(args)
+    state = {"args": object(), "model": {}, "mdp_vision_model": {}}
+    events = []
+    monkeypatch.setattr(
+        checkpointing_api,
+        "prepare_repeated_d4_checkpoint_load",
+        lambda selected: events.append("pre"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        checkpointing_api,
+        "validate_repeated_d4_decoded_checkpoint",
+        lambda selected, decoded: (
+            events.append(("post", decoded))
+            or (_ for _ in ()).throw(_CheckpointBoundaryReached("post-decode"))
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(checkpointing_api, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing_api,
+        "_load_base_checkpoint",
+        lambda *_args, **_kwargs: (state, "checkpoint", False, CheckpointType.LEGACY),
+    )
+    for name in ("set_checkpoint_version", "check_checkpoint_args", "update_num_microbatches"):
+        monkeypatch.setattr(
+            checkpointing_api,
+            name,
+            lambda *_args, _name=name, **_kwargs: pytest.fail(
+                f"{_name} mutated state before post-decode boundary"
+            ),
+        )
+
+    with pytest.raises(_CheckpointBoundaryReached, match="post-decode"):
+        load_checkpoint([object()], None, None)
+    assert events == ["pre", ("post", state)]
+
+
+@pytest.mark.parametrize("preliminary", (False, True), ids=("main", "preliminary-rank0"))
+def test_native_load_io_failure_is_task_fatal_without_post_decode_consensus(
+    monkeypatch, preliminary
+):
+    args = _minimal_load_args()
+    args.auto_detect_ckpt_format = preliminary
+    set_args(args)
+    events = []
+    monkeypatch.setattr(
+        checkpointing_api,
+        "prepare_repeated_d4_checkpoint_load",
+        lambda selected: events.append("pre"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        checkpointing_api,
+        "validate_repeated_d4_decoded_checkpoint",
+        lambda *_args: pytest.fail("post-decode consensus entered after native I/O failure"),
+        raising=False,
+    )
+    monkeypatch.setattr(checkpointing_api, "unwrap_model", lambda value: value)
+    native_error = OSError("native read failed")
+    monkeypatch.setattr(
+        checkpointing_api,
+        "_load_base_checkpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(native_error),
+    )
+
+    with pytest.raises(OSError, match="native read failed") as raised:
+        load_checkpoint([object()], None, None)
+    assert raised.value is native_error
+    assert events == ["pre"]
+
+
+def test_missing_checkpoint_still_runs_post_decode_consensus_before_clean_return(monkeypatch):
+    args = _minimal_load_args()
+    set_args(args)
+    events = []
+    monkeypatch.setattr(
+        checkpointing_api,
+        "prepare_repeated_d4_checkpoint_load",
+        lambda selected: events.append("pre"),
+        raising=False,
+    )
+    binding = object()
+    runtime = SimpleNamespace(state=MdpRuntimeState.EMPTY, dynamic_group_binding=binding)
+    snapshot = SimpleNamespace(may_load=True)
+    authority = SimpleNamespace(world_ranks=tuple(range(8)), expert_parallel_size=1)
+    monkeypatch.setattr(
+        mdp_checkpoint_api,
+        "_validate_repeated_d4_group_binding",
+        lambda selected: authority if selected is binding else pytest.fail("wrong binding"),
+    )
+    monkeypatch.setattr(mdp_integration, "get_runtime", lambda: runtime)
+    monkeypatch.setattr(mdp_integration, "get_d4_checkpoint_lifecycle_snapshot", lambda: snapshot)
+
+    def converge(
+        selected_runtime,
+        selected_snapshot,
+        *,
+        operation,
+        phase,
+        iteration,
+        local_error,
+        **_boundary_metadata,
+    ):
+        assert selected_runtime is runtime
+        assert selected_snapshot is snapshot
+        assert (operation, phase, iteration, local_error) == ("load", "post-decode", 0, None)
+        events.append(("post", None))
+
+    monkeypatch.setattr(mdp_checkpoint_api, "_converge_repeated_d4_checkpoint_boundary", converge)
+    monkeypatch.setattr(
+        checkpointing_api,
+        "validate_repeated_d4_decoded_checkpoint",
+        mdp_checkpoint_api.validate_repeated_d4_decoded_checkpoint,
+        raising=False,
+    )
+    monkeypatch.setattr(checkpointing_api, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing_api,
+        "_load_base_checkpoint",
+        lambda *_args, **_kwargs: (None, "checkpoint", False, None),
+    )
+
+    assert load_checkpoint([object()], None, None) == (0, 0)
+    assert events == ["pre", ("post", None)]
 
 
 def create_checkpoint(load_path, ckpt_format):

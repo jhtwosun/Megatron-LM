@@ -9,21 +9,32 @@ Run with::
 """
 
 import os
+import hashlib
+import struct
+from dataclasses import replace
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from megatron.core import dist_checkpointing
+from megatron.core.mdp import checkpoint as checkpoint_api
+from megatron.core.mdp import dynamic_cp_d4_group_binding as binding_api
+from megatron.core.mdp import dynamic_cp_d4_transaction as transaction_api
+from megatron.core.mdp import integration
 from megatron.core.mdp.checkpoint import (
     ENCODER_STATE_KEY,
     add_encoder_state,
     assert_supported_checkpoint_config,
     load_encoder_state,
 )
+from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.errors import MdpCheckpointError
+from megatron.core.mdp.runtime import MdpRuntimeState
 
-_DISTRIBUTED = int(os.environ.get("WORLD_SIZE", "1")) > 1
+_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+_DISTRIBUTED = _WORLD_SIZE > 1
 
 if _DISTRIBUTED:
     from tests.unit_tests.test_utilities import Utils
@@ -35,6 +46,43 @@ if _DISTRIBUTED:
         )
         yield
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("remote_mode", ("old-v1", "joint"))
+def test_checkpoint_rejects_old_or_different_decoder_mode_boundary(monkeypatch, remote_mode):
+    authority = SimpleNamespace(
+        world_ranks=tuple(range(8)), global_rank=0, expert_parallel_size=4,
+        dynamic_decoder_cp=False, _world_group=object(), _device=torch.device("cuda"),
+        _group_ranks_getter=lambda group: tuple(range(8)), _timeout_seconds=1.0,
+    )
+    monkeypatch.setattr(checkpoint_api, "_validate_repeated_d4_group_binding", lambda binding: authority)
+    fixed_digest = checkpoint_api._checkpoint_topology_digest(object())
+    if remote_mode == "old-v1":
+        old = hashlib.blake2b(digest_size=16)
+        old.update(b"megatron.mdp.repeated_d4.checkpoint.topology.v1")
+        old.update(struct.pack("<q", 8))
+        old.update(struct.pack("<8q", *range(8)))
+        old.update(struct.pack("<qq", 4, 4))
+        remote_digest = old.digest()
+    else:
+        authority.dynamic_decoder_cp = True
+        remote_digest = checkpoint_api._checkpoint_topology_digest(object())
+        authority.dynamic_decoder_cp = False
+    assert remote_digest != fixed_digest
+
+    def gather(wire, **kwargs):
+        local = checkpoint_api._RepeatedD4CheckpointStatus.from_wire_tuple(wire)
+        return tuple(replace(local, global_rank=rank,
+                             topology_digest=remote_digest if rank == 7 else fixed_digest).to_wire_tuple()
+                     for rank in range(8))
+
+    authority._status_gather_factory = lambda **kwargs: gather
+    snapshot = SimpleNamespace(require=lambda: SimpleNamespace(generation=0))
+    with pytest.raises(MdpCheckpointError, match="boundary mismatch at rank 7"):
+        checkpoint_api._converge_repeated_d4_checkpoint_boundary(
+            SimpleNamespace(dynamic_group_binding=object()), snapshot,
+            operation="save", phase="pre-state", iteration=0, local_error=None,
+        )
 
 
 def test_exact_resume_flags_are_accepted():
@@ -53,6 +101,141 @@ def test_exact_resume_flags_are_accepted():
     assert_supported_checkpoint_config(exact_resume)
     no_ckpt = SimpleNamespace(save=None, load=None)
     assert_supported_checkpoint_config(no_ckpt)
+
+
+def _checkpoint_args(*, save="/tmp/x", load="/tmp/x", **overrides):
+    values = dict(
+        save=save,
+        load=load,
+        mdp_enable=True,
+        mdp_dynamic_encoder_cp=True,
+        dynamic_context_parallel=False,
+        no_save_optim=True,
+        no_load_optim=True,
+        no_save_rng=True,
+        no_load_rng=True,
+        ckpt_fully_parallel_save=False,
+        ckpt_fully_parallel_load=False,
+        num_layers=2,
+        hidden_size=8,
+        num_attention_heads=2,
+        add_position_embedding=True,
+        vocab_file=None,
+        data_parallel_random_init=False,
+        phase_transition_iterations=None,
+        use_dist_ckpt=True,
+        max_position_embeddings=16,
+        make_vocab_size_divisible_by=8,
+        padded_vocab_size=32,
+        tokenizer_type="test-tokenizer",
+        global_batch_size=4,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("save", "load"),
+    (("/tmp/x", None), (None, "/tmp/x"), ("/tmp/x", "/tmp/x")),
+    ids=("save-only", "load-only", "save-and-load"),
+)
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+def test_repeated_d4_accepts_only_explicit_weight_only_checkpoint_policy(
+    save, load, dynamic_decoder
+):
+    args = _checkpoint_args(save=save, load=load, dynamic_context_parallel=dynamic_decoder)
+    before = vars(args).copy()
+    assert_supported_checkpoint_config(args)
+    assert vars(args) == before
+
+
+@pytest.mark.parametrize(
+    ("field", "flag"),
+    (
+        ("no_save_optim", "--no-save-optim"),
+        ("no_load_optim", "--no-load-optim"),
+        ("no_save_rng", "--no-save-rng"),
+        ("no_load_rng", "--no-load-rng"),
+    ),
+)
+@pytest.mark.parametrize("value", (None, False, 0, 1, "yes"), ids=repr)
+@pytest.mark.parametrize(
+    ("save", "load"),
+    (("/tmp/x", None), (None, "/tmp/x"), ("/tmp/x", "/tmp/x")),
+    ids=("save-only", "load-only", "save-and-load"),
+)
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+def test_repeated_d4_rejects_non_exact_weight_only_flags(
+    field, flag, value, save, load, dynamic_decoder
+):
+    args = _checkpoint_args(
+        save=save, load=load, dynamic_context_parallel=dynamic_decoder, **{field: value}
+    )
+    before = vars(args).copy()
+    with pytest.raises(MdpCheckpointError, match=flag):
+        assert_supported_checkpoint_config(args)
+    assert vars(args) == before
+
+
+@pytest.mark.parametrize(
+    ("field", "flag"),
+    (
+        ("no_save_optim", "--no-save-optim"),
+        ("no_load_optim", "--no-load-optim"),
+        ("no_save_rng", "--no-save-rng"),
+        ("no_load_rng", "--no-load-rng"),
+    ),
+)
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+def test_repeated_d4_rejects_absent_weight_only_flags(field, flag, dynamic_decoder):
+    args = _checkpoint_args(dynamic_context_parallel=dynamic_decoder)
+    delattr(args, field)
+    with pytest.raises(MdpCheckpointError, match=flag):
+        assert_supported_checkpoint_config(args)
+
+
+@pytest.mark.parametrize("predicate", (None, False, 0, 1, "yes"), ids=repr)
+def test_non_repeated_d4_checkpoint_modes_keep_exact_resume_compatibility(predicate):
+    args = SimpleNamespace(
+        save="/tmp/x",
+        load="/tmp/x",
+        mdp_enable=True,
+        mdp_dynamic_encoder_cp=predicate,
+        no_save_optim=False,
+        no_load_optim=False,
+        no_save_rng=False,
+        no_load_rng=False,
+        ckpt_fully_parallel_save=False,
+        ckpt_fully_parallel_load=False,
+    )
+    assert_supported_checkpoint_config(args)
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("static-mdp", "decoder-only-d3"))
+def test_static_mdp_and_decoder_only_d3_keep_full_state_resume(dynamic_decoder):
+    # This helper is called only after _setup_mdp validates mdp_enable. The
+    # policy discriminator is deliberately encoder D4, never decoder DCP.
+    args = SimpleNamespace(
+        save="/tmp/x",
+        load="/tmp/x",
+        mdp_enable=True,
+        mdp_dynamic_encoder_cp=False,
+        dynamic_context_parallel=dynamic_decoder,
+        no_save_optim=False,
+        no_load_optim=False,
+        no_save_rng=False,
+        no_load_rng=False,
+        ckpt_fully_parallel_save=False,
+        ckpt_fully_parallel_load=False,
+    )
+    assert_supported_checkpoint_config(args)
+
+
+def test_checkpoint_free_repeated_d4_does_not_force_or_validate_weight_only_flags():
+    args = SimpleNamespace(save=None, load=None, mdp_enable=True, mdp_dynamic_encoder_cp=True)
+    before = vars(args).copy()
+    assert_supported_checkpoint_config(args)
+    assert vars(args) == before
 
 
 def test_fully_parallel_modes_are_rejected():
@@ -88,6 +271,564 @@ def test_unsupported_checkpoint_execution_modes_rejected():
         save=None, load=None, async_save=True, ckpt_assume_constant_structure=True
     )
     assert_supported_checkpoint_config(quiet)
+
+
+class _CheckpointRuntime:
+    def __init__(self, binding):
+        self.config = MdpConfig(enable=True, dynamic_encoder_cp=True)
+        self.dynamic_group_binding = binding
+        self.state = MdpRuntimeState.EMPTY
+        self.encoder_domain = SimpleNamespace(
+            encoder_ddp=SimpleNamespace(
+                state_dict=lambda: {"layers.0.weight": object(), "layers.1.weight": object()}
+            )
+        )
+        if _DISTRIBUTED:
+            self.process_groups = SimpleNamespace(world_group=torch.distributed.group.WORLD)
+            self.rank_view = SimpleNamespace(global_rank=torch.distributed.get_rank())
+            self.device = torch.device("cuda", torch.cuda.current_device())
+
+
+@pytest.fixture
+def repeated_d4_checkpoint_runtime(monkeypatch):
+    integration.reset_for_testing()
+    binding = object()
+    runtime = _CheckpointRuntime(binding)
+    authority = SimpleNamespace(world_ranks=tuple(range(8)), expert_parallel_size=1, dynamic_decoder_cp=True)
+    monkeypatch.setattr(
+        transaction_api, "_validate_repeated_d4_group_binding", lambda _value: authority
+    )
+    monkeypatch.setattr(
+        checkpoint_api, "_validate_repeated_d4_group_binding", lambda _value: authority
+    )
+    lifecycle = transaction_api._bind_d4_checkpoint_lifecycle(runtime, binding)
+    monkeypatch.setattr(integration, "_RUNTIME", runtime)
+    monkeypatch.setattr(integration, "_D4_CHECKPOINT_LIFECYCLE", lifecycle)
+    yield runtime, binding, lifecycle
+    integration.reset_for_testing()
+
+
+def _checkpoint_world_gate(monkeypatch, calls):
+    def converge(
+        runtime, snapshot, *, operation, phase, iteration, local_error, **_boundary_metadata
+    ):
+        calls.append((runtime, snapshot, operation, phase, iteration, local_error))
+        if local_error is not None:
+            raise MdpCheckpointError(
+                f"MDP: repeated-D4 WORLD rejected {operation} {phase}"
+            ) from local_error
+
+    monkeypatch.setattr(checkpoint_api, "_converge_repeated_d4_checkpoint_boundary", converge)
+
+
+@pytest.mark.parametrize("dynamic_decoder", (False, True), ids=("fixed-cp4", "joint-dcp"))
+def test_repeated_d4_save_and_fresh_load_use_exact_lifecycle_boundary(
+    monkeypatch, repeated_d4_checkpoint_runtime, dynamic_decoder
+):
+    runtime, binding, lifecycle = repeated_d4_checkpoint_runtime
+    args = _checkpoint_args(dynamic_context_parallel=dynamic_decoder)
+    calls = []
+    _checkpoint_world_gate(monkeypatch, calls)
+
+    checkpoint_api.prepare_repeated_d4_checkpoint_load(args)
+    assert calls[-1][2:] == ("load", "pre-io", 0, None)
+    with pytest.raises(MdpCheckpointError, match="save.*pre-state"):
+        checkpoint_api.prepare_repeated_d4_checkpoint_save(args, iteration=11)
+    assert isinstance(calls[-1][-1], BaseException)
+
+    lifecycle.begin_iteration(runtime, binding)
+    lifecycle.commit_iteration(runtime, binding)
+    checkpoint_api.prepare_repeated_d4_checkpoint_save(args, iteration=11)
+    assert calls[-1][2:] == ("save", "pre-state", 11, None)
+    with pytest.raises(MdpCheckpointError, match="load.*pre-io"):
+        checkpoint_api.prepare_repeated_d4_checkpoint_load(args)
+    assert isinstance(calls[-1][-1], BaseException)
+
+
+@pytest.mark.parametrize("operation", ("save", "load"))
+@pytest.mark.parametrize("invalid_state", ("active", "poisoned"))
+def test_checkpoint_boundary_converges_local_idle_validation_errors(
+    monkeypatch, repeated_d4_checkpoint_runtime, invalid_state, operation
+):
+    runtime, binding, lifecycle = repeated_d4_checkpoint_runtime
+    args = _checkpoint_args()
+    lifecycle.begin_iteration(runtime, binding)
+    if invalid_state == "poisoned":
+        lifecycle.poison(RuntimeError("iteration failed"), runtime, binding)
+    calls = []
+    _checkpoint_world_gate(monkeypatch, calls)
+
+    with pytest.raises(MdpCheckpointError, match="WORLD rejected"):
+        if operation == "save":
+            checkpoint_api.prepare_repeated_d4_checkpoint_save(args, iteration=11)
+        else:
+            checkpoint_api.prepare_repeated_d4_checkpoint_load(args)
+    assert len(calls) == 1 and isinstance(calls[0][-1], BaseException)
+
+
+def test_checkpoint_boundary_requires_empty_runtime_after_committed_iteration(
+    monkeypatch, repeated_d4_checkpoint_runtime
+):
+    runtime, binding, lifecycle = repeated_d4_checkpoint_runtime
+    lifecycle.begin_iteration(runtime, binding)
+    lifecycle.commit_iteration(runtime, binding)
+    runtime.state = MdpRuntimeState.DECODER_READY
+    calls = []
+    _checkpoint_world_gate(monkeypatch, calls)
+
+    with pytest.raises(MdpCheckpointError, match="WORLD rejected"):
+        checkpoint_api.prepare_repeated_d4_checkpoint_save(_checkpoint_args(), iteration=11)
+    assert isinstance(calls[0][-1], BaseException)
+    assert "EMPTY" in str(calls[0][-1])
+
+
+@pytest.mark.parametrize("predicate", (None, False, 0, 1, "yes"), ids=repr)
+def test_checkpoint_boundaries_are_exact_literal_true_only(monkeypatch, predicate):
+    args = SimpleNamespace(mdp_dynamic_encoder_cp=predicate)
+    monkeypatch.setattr(
+        integration,
+        "get_d4_checkpoint_lifecycle_snapshot",
+        lambda: pytest.fail("non-D4 checkpoint queried lifecycle"),
+    )
+    monkeypatch.setattr(
+        checkpoint_api,
+        "_converge_repeated_d4_checkpoint_boundary",
+        lambda *_args, **_kwargs: pytest.fail("non-D4 checkpoint entered WORLD"),
+        raising=False,
+    )
+
+    assert checkpoint_api.prepare_repeated_d4_checkpoint_save(args, iteration=1) is None
+    assert checkpoint_api.prepare_repeated_d4_checkpoint_load(args) is None
+    assert checkpoint_api.validate_repeated_d4_decoded_checkpoint(args, None) is None
+
+
+def _decoded_state(args):
+    checkpoint_args = SimpleNamespace(
+        world_size=args.world_size,
+        tensor_model_parallel_size=args.tensor_model_parallel_size,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        context_parallel_size=args.context_parallel_size,
+        expert_model_parallel_size=args.expert_model_parallel_size,
+        mdp_encoder_cp=args.mdp_encoder_cp,
+        num_layers=args.num_layers,
+        hidden_size=args.hidden_size,
+        num_attention_heads=args.num_attention_heads,
+        add_position_embedding=args.add_position_embedding,
+        max_position_embeddings=args.max_position_embeddings,
+        make_vocab_size_divisible_by=args.make_vocab_size_divisible_by,
+        padded_vocab_size=args.padded_vocab_size,
+        tokenizer_type=args.tokenizer_type,
+        data_parallel_random_init=args.data_parallel_random_init,
+        global_batch_size=args.global_batch_size,
+        model_parallel_size=args.tensor_model_parallel_size,
+    )
+    return {
+        "args": checkpoint_args,
+        "iteration": 11,
+        "checkpoint_version": 3.0,
+        "model": {"language_model.layers.0.weight": "decoder"},
+        ENCODER_STATE_KEY: {
+            "vision_model.module.layers.0.weight": "vision-0",
+            "vision_model.module.layers.1.weight": "vision-1",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-encoder",
+        "missing-encoder-weight",
+        "bad-encoder-key",
+        "missing-language",
+        "topology",
+        "missing-args",
+        "missing-iteration",
+        "missing-version",
+        "nonexact-version",
+        "unsupported-version",
+        "negative-version",
+        "native-num-layers",
+        "native-hidden-size",
+    ),
+)
+def test_decoded_checkpoint_validation_is_pure_and_world_consensed(
+    monkeypatch, repeated_d4_checkpoint_runtime, mutation
+):
+    args = _checkpoint_args()
+    args.world_size = 8
+    args.tensor_model_parallel_size = 1
+    args.pipeline_model_parallel_size = 1
+    args.context_parallel_size = 4
+    args.expert_model_parallel_size = 1
+    args.mdp_encoder_cp = 4
+    state = _decoded_state(args)
+    if mutation == "missing-encoder":
+        state.pop(ENCODER_STATE_KEY)
+    elif mutation == "missing-encoder-weight":
+        state[ENCODER_STATE_KEY].pop("vision_model.module.layers.1.weight")
+    elif mutation == "bad-encoder-key":
+        state[ENCODER_STATE_KEY] = {"decoder.weight": "bad-prefix"}
+    elif mutation == "missing-language":
+        state["model"] = {"vision_model.weight": "wrong-model-domain"}
+    elif mutation == "topology":
+        state["args"].context_parallel_size = 2
+    elif mutation == "missing-args":
+        state.pop("args")
+    elif mutation == "missing-iteration":
+        state.pop("iteration")
+    elif mutation == "missing-version":
+        state.pop("checkpoint_version")
+    elif mutation == "nonexact-version":
+        state["checkpoint_version"] = "3.0"
+    elif mutation == "unsupported-version":
+        state["checkpoint_version"] = 1.5
+    elif mutation == "negative-version":
+        state["checkpoint_version"] = -1
+    elif mutation == "native-num-layers":
+        state["args"].num_layers += 1
+    else:
+        state["args"].hidden_size += 1
+    before = deepcopy(state)
+    nested_before = {key: value.copy() for key, value in state.items() if type(value) is dict}
+    args_before = vars(state["args"]).copy() if "args" in state else None
+    calls = []
+    _checkpoint_world_gate(monkeypatch, calls)
+
+    with pytest.raises(MdpCheckpointError, match="load.*post-decode"):
+        checkpoint_api.validate_repeated_d4_decoded_checkpoint(args, state)
+    assert state == before
+    assert all(state[key] == value for key, value in nested_before.items())
+    if args_before is not None:
+        assert vars(state["args"]) == args_before
+    assert isinstance(calls[-1][-1], BaseException)
+
+
+@pytest.mark.parametrize(
+    ("field", "mode"),
+    (
+        ("num_attention_heads", "always"),
+        ("add_position_embedding", "always"),
+        ("max_position_embeddings", "vocab"),
+        ("make_vocab_size_divisible_by", "vocab"),
+        ("padded_vocab_size", "vocab"),
+        ("tokenizer_type", "vocab"),
+        ("data_parallel_random_init", "data-parallel-random"),
+        ("global_batch_size", "phase-transition"),
+        ("model_parallel_size", "legacy-version"),
+    ),
+)
+def test_decoded_checkpoint_prevalidates_native_argument_comparisons(
+    monkeypatch, repeated_d4_checkpoint_runtime, field, mode
+):
+    args = _checkpoint_args()
+    for name, value in (
+        ("world_size", 8),
+        ("tensor_model_parallel_size", 1),
+        ("pipeline_model_parallel_size", 1),
+        ("context_parallel_size", 4),
+        ("expert_model_parallel_size", 1),
+        ("mdp_encoder_cp", 4),
+    ):
+        setattr(args, name, value)
+    if mode == "vocab":
+        args.vocab_file = "tokenizer.model"
+        args.use_dist_ckpt = False
+    elif mode == "data-parallel-random":
+        args.data_parallel_random_init = True
+    elif mode == "phase-transition":
+        args.phase_transition_iterations = [1]
+    state = _decoded_state(args)
+    if mode == "legacy-version":
+        state["checkpoint_version"] = 1.0
+    setattr(state["args"], field, f"wrong-{field}")
+    calls = []
+    _checkpoint_world_gate(monkeypatch, calls)
+
+    with pytest.raises(MdpCheckpointError, match="load.*post-decode"):
+        checkpoint_api.validate_repeated_d4_decoded_checkpoint(args, state)
+    assert len(calls) == 1
+    assert isinstance(calls[0][-1], BaseException)
+
+
+def test_valid_decoded_checkpoint_preserves_logical_keys_and_metadata(
+    monkeypatch, repeated_d4_checkpoint_runtime
+):
+    args = _checkpoint_args()
+    args.world_size = 8
+    args.tensor_model_parallel_size = 1
+    args.pipeline_model_parallel_size = 1
+    args.context_parallel_size = 4
+    args.expert_model_parallel_size = 1
+    args.mdp_encoder_cp = 4
+    state = _decoded_state(args)
+    calls = []
+    _checkpoint_world_gate(monkeypatch, calls)
+
+    checkpoint_api.validate_repeated_d4_decoded_checkpoint(args, state)
+
+    assert calls[-1][2:] == ("load", "post-decode", 11, None)
+    assert tuple(state["model"]) == ("language_model.layers.0.weight",)
+    assert tuple(state[ENCODER_STATE_KEY]) == (
+        "vision_model.module.layers.0.weight",
+        "vision_model.module.layers.1.weight",
+    )
+
+
+@pytest.mark.parametrize("version", (2.5, 4.0))
+def test_decoded_checkpoint_accepts_native_supported_noncanonical_versions(
+    monkeypatch, repeated_d4_checkpoint_runtime, version
+):
+    args = _checkpoint_args()
+    for name, value in (
+        ("world_size", 8),
+        ("tensor_model_parallel_size", 1),
+        ("pipeline_model_parallel_size", 1),
+        ("context_parallel_size", 4),
+        ("expert_model_parallel_size", 1),
+        ("mdp_encoder_cp", 4),
+    ):
+        setattr(args, name, value)
+    state = _decoded_state(args)
+    state["checkpoint_version"] = version
+    calls = []
+    _checkpoint_world_gate(monkeypatch, calls)
+
+    checkpoint_api.validate_repeated_d4_decoded_checkpoint(args, state)
+
+    assert calls[-1][2:] == ("load", "post-decode", 11, None)
+
+
+@pytest.mark.parametrize(
+    "decoder_state",
+    (
+        {"model": {"language_model.layers.0.weight": "decoder"}},
+        {"model0": {"language_model.layers.0.weight": "decoder"}, "model1": {}},
+    ),
+    ids=("pp-single", "vpp-with-native-empty-stage"),
+)
+def test_decoded_checkpoint_accepts_native_pp_vpp_model_key_grammar(
+    monkeypatch, repeated_d4_checkpoint_runtime, decoder_state
+):
+    args = _checkpoint_args()
+    for name, value in (
+        ("world_size", 8),
+        ("tensor_model_parallel_size", 1),
+        ("pipeline_model_parallel_size", 1),
+        ("context_parallel_size", 4),
+        ("expert_model_parallel_size", 1),
+        ("mdp_encoder_cp", 4),
+    ):
+        setattr(args, name, value)
+    state = _decoded_state(args)
+    state.pop("model")
+    state.update(decoder_state)
+    calls = []
+    _checkpoint_world_gate(monkeypatch, calls)
+
+    checkpoint_api.validate_repeated_d4_decoded_checkpoint(args, state)
+    assert calls[-1][2:] == ("load", "post-decode", 11, None)
+
+
+def test_checkpoint_status_generation_and_iteration_use_signed_int64_bounds():
+    maximum = (1 << 63) - 1
+    status = checkpoint_api._RepeatedD4CheckpointStatus(
+        global_rank=0,
+        operation="save",
+        phase="pre-state",
+        topology_digest=b"t" * 16,
+        lifecycle_generation=maximum,
+        iteration=maximum,
+        error_code=0,
+    )
+    assert (
+        checkpoint_api._RepeatedD4CheckpointStatus.from_wire_tuple(status.to_wire_tuple()) == status
+    )
+    for field in ("lifecycle_generation", "iteration"):
+        values = dict(
+            global_rank=0,
+            operation="save",
+            phase="pre-state",
+            topology_digest=b"t" * 16,
+            lifecycle_generation=0,
+            iteration=0,
+            error_code=0,
+        )
+        values[field] = maximum + 1
+        with pytest.raises(MdpCheckpointError, match="int64|bounded"):
+            checkpoint_api._RepeatedD4CheckpointStatus(**values)
+        wire = list(status.to_wire_tuple())
+        wire[3 if field == "lifecycle_generation" else 4] = maximum + 1
+        with pytest.raises(MdpCheckpointError, match="int64|bounded"):
+            checkpoint_api._RepeatedD4CheckpointStatus.from_wire_tuple(tuple(wire))
+
+
+@pytest.mark.skipif(_WORLD_SIZE != 8, reason="requires the exact repeated-D4 world8")
+def test_checkpoint_boundary_uses_one_real_lifecycle_bound_world_consensus():
+    rank = torch.distributed.get_rank()
+    world = torch.distributed.group.WORLD
+    domains = tuple(
+        torch.distributed.new_group(ranks=ranks) for ranks in (tuple(range(4)), tuple(range(4, 8)))
+    )
+    factory_calls = []
+    gather_calls = []
+
+    def status_factory(**kwargs):
+        factory_calls.append((tuple(kwargs["group_ranks"]), kwargs["global_rank"]))
+        gather = checkpoint_api.make_precollective_status_gather(**kwargs)
+
+        def counted(value, *, timeout_seconds):
+            gather_calls.append((tuple(kwargs["group_ranks"]), value))
+            return gather(value, timeout_seconds=timeout_seconds)
+
+        return counted
+
+    binding = binding_api._make_repeated_d4_group_binding(
+        world_group=world,
+        domain_group=domains[rank // 4],
+        expert_group=None,
+        global_rank=rank,
+        expert_parallel_size=1,
+        device=torch.device("cuda", torch.cuda.current_device()),
+        timeout_seconds=30.0,
+        status_gather_factory=status_factory,
+    )
+    factory_calls.clear()
+    gather_calls.clear()
+
+    try:
+        for case in (
+            "success",
+            "one-rank-error",
+            "generation-skew",
+            "iteration-skew",
+            "iteration-overflow",
+            "bad-phase",
+            "bad-order",
+        ):
+            runtime = _CheckpointRuntime(binding)
+            lifecycle = transaction_api._bind_d4_checkpoint_lifecycle(runtime, binding)
+            try:
+                lifecycle.begin_iteration(runtime, binding)
+                lifecycle.commit_iteration(runtime, binding)
+                if case == "generation-skew" and rank >= 4:
+                    lifecycle.begin_iteration(runtime, binding)
+                    lifecycle.commit_iteration(runtime, binding)
+                snapshot = lifecycle.snapshot(runtime, binding)
+                if case == "iteration-overflow":
+                    iteration = 1 << 63 if rank == 0 else (1 << 63) - 1
+                else:
+                    iteration = 12 if case == "iteration-skew" and rank >= 4 else 11
+                phase = "unknown" if case == "bad-phase" else "pre-state"
+                operation = "load" if case == "bad-order" else "save"
+                local_error = (
+                    RuntimeError("rank zero failed")
+                    if case == "one-rank-error" and rank == 0
+                    else None
+                )
+                before_factory = len(factory_calls)
+                before_gather = len(gather_calls)
+                if case == "success":
+                    checkpoint_api._converge_repeated_d4_checkpoint_boundary(
+                        runtime,
+                        snapshot,
+                        operation=operation,
+                        phase=phase,
+                        iteration=iteration,
+                        local_error=local_error,
+                    )
+                else:
+                    with pytest.raises(MdpCheckpointError, match="WORLD|checkpoint"):
+                        checkpoint_api._converge_repeated_d4_checkpoint_boundary(
+                            runtime,
+                            snapshot,
+                            operation=operation,
+                            phase=phase,
+                            iteration=iteration,
+                            local_error=local_error,
+                        )
+                assert factory_calls[before_factory:] == [(tuple(range(8)), rank)]
+                assert len(gather_calls) == before_gather + 1
+                assert gather_calls[-1][0] == tuple(range(8))
+                if case not in ("bad-phase", "bad-order", "iteration-overflow"):
+                    status = checkpoint_api._RepeatedD4CheckpointStatus.from_wire_tuple(
+                        gather_calls[-1][1]
+                    )
+                    assert status.global_rank == rank
+                    assert status.operation == operation
+                    assert status.phase == phase
+                    assert status.lifecycle_generation == snapshot.generation
+                    assert status.iteration == iteration
+                    assert status.topology_digest == checkpoint_api._checkpoint_topology_digest(
+                        binding
+                    )
+            finally:
+                lifecycle.retire(runtime, binding)
+
+        for case in (
+            "all-none",
+            "content-success",
+            "mixed-none",
+            "version-skew",
+            "topology-skew",
+            "num-layers-skew",
+            "hidden-size-skew",
+            "invalid-legacy-version",
+        ):
+            args = _checkpoint_args()
+            for name, value in (
+                ("world_size", 8),
+                ("tensor_model_parallel_size", 1),
+                ("pipeline_model_parallel_size", 1),
+                ("context_parallel_size", 4),
+                ("expert_model_parallel_size", 1),
+                ("mdp_encoder_cp", 4),
+            ):
+                setattr(args, name, value)
+            runtime = _CheckpointRuntime(binding)
+            lifecycle = transaction_api._bind_d4_checkpoint_lifecycle(runtime, binding)
+            integration._RUNTIME = runtime
+            integration._D4_CHECKPOINT_LIFECYCLE = lifecycle
+            try:
+                state = None if case in ("all-none", "mixed-none") else _decoded_state(args)
+                if case == "mixed-none" and rank != 0:
+                    state = _decoded_state(args)
+                if state is not None:
+                    state["model"]["language_model.layers.0.weight"] = f"decoder-rank-{rank}"
+                    state[ENCODER_STATE_KEY][
+                        "vision_model.module.layers.0.weight"
+                    ] = f"vision-rank-{rank}"
+                if case == "version-skew" and rank >= 4:
+                    state["checkpoint_version"] = 2.0
+                if case == "topology-skew" and rank >= 4:
+                    args.pipeline_model_parallel_size = 2
+                    state["args"].pipeline_model_parallel_size = 2
+                if case == "num-layers-skew" and rank >= 4:
+                    state["args"].num_layers += 1
+                if case == "hidden-size-skew" and rank >= 4:
+                    state["args"].hidden_size += 1
+                if case == "invalid-legacy-version" and rank >= 4:
+                    state["checkpoint_version"] = -1
+                before_factory = len(factory_calls)
+                before_gather = len(gather_calls)
+                if case in ("all-none", "content-success"):
+                    checkpoint_api.validate_repeated_d4_decoded_checkpoint(args, state)
+                else:
+                    with pytest.raises(MdpCheckpointError, match="WORLD|checkpoint"):
+                        checkpoint_api.validate_repeated_d4_decoded_checkpoint(args, state)
+                assert factory_calls[before_factory:] == [(tuple(range(8)), rank)]
+                assert len(gather_calls) == before_gather + 1
+                status = checkpoint_api._RepeatedD4CheckpointStatus.from_wire_tuple(
+                    gather_calls[-1][1]
+                )
+                assert status.operation == "load"
+                assert status.phase == "post-decode"
+            finally:
+                integration._D4_CHECKPOINT_LIFECYCLE = None
+                integration._RUNTIME = None
+                lifecycle.retire(runtime, binding)
+    finally:
+        torch.distributed.destroy_process_group(domains[rank // 4])
 
 
 def test_add_encoder_state_rejects_duplicates():

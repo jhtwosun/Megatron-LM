@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -1059,3 +1060,617 @@ def test_qk_layernorm_spec_config_mismatch_raises():
             SelfAttention(config, submodules, layer_number=1)
     finally:
         Utils.destroy_model_parallel()
+
+
+class _DynamicCpAttentionStub:
+    def __init__(self, original_group, weight):
+        self.pg_collection = mock.Mock(cp=original_group)
+        self.config = mock.Mock(flash_decode=False, sequence_parallel=False)
+        self.attention_type = "self"
+        self.training = True
+        self.weight = weight
+        self.seen = []
+
+    def _forward_impl(self, hidden_states, attention_mask, *args, **kwargs):
+        self.seen.append(("attention", hidden_states, self.pg_collection.cp))
+        return hidden_states * self.weight, None
+
+
+def _dynamic_cp_packed(cp_size, boundaries):
+    boundaries = torch.tensor(boundaries, dtype=torch.int32)
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=boundaries,
+        cu_seqlens_kv=boundaries,
+        cu_seqlens_q_padded=boundaries,
+        cu_seqlens_kv_padded=boundaries,
+        max_seqlen_q=int(torch.diff(boundaries).max()),
+        max_seqlen_kv=int(torch.diff(boundaries).max()),
+        local_cp_size=cp_size,
+        cp_group=object(),
+        total_tokens=int(boundaries[-1]),
+        cp_partition_mode="contiguous",
+    )
+
+
+def test_contiguous_thd_dynamic_cp_rejects_boundary_device_mismatch(monkeypatch):
+    from megatron.core.transformer import attention as attention_module
+
+    packed = _dynamic_cp_packed(2, [0, 8, 16])
+    packed.cu_seqlens_kv_padded = torch.empty(3, dtype=torch.int32, device="meta")
+    stub = _DynamicCpAttentionStub(object(), torch.tensor(1.0))
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: 2)
+    convert = mock.Mock()
+    monkeypatch.setattr(attention_module, "contiguous_to_zigzag_chunks", convert)
+
+    with pytest.raises(ValueError, match="dtype and device"):
+        attention_module.Attention.forward(
+            stub, torch.ones((8, 1, 3)), None, packed_seq_params=packed
+        )
+
+    convert.assert_not_called()
+
+
+def test_nonexact_packed_carrier_is_rejected_without_attribute_access():
+    from megatron.core.transformer import attention as attention_module
+
+    class BombPacked:
+        calls = 0
+
+        def __getattribute__(self, name):
+            type(self).calls += 1
+            raise AssertionError("carrier attribute accessed")
+
+    stub = _DynamicCpAttentionStub(object(), torch.tensor(1.0))
+
+    with pytest.raises(TypeError, match="exact PackedSeqParams"):
+        attention_module.Attention.forward(
+            stub, torch.ones((8, 1, 3)), None, packed_seq_params=BombPacked()
+        )
+
+    assert BombPacked.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("qkv_format", "sbhd", "THD"),
+        ("total_tokens", 20, "endpoint"),
+        ("cu_seqlens_kv_padded", torch.tensor([0, 4, 16], dtype=torch.int32), "identical"),
+        ("padded_boundaries", torch.tensor([0, 6, 16], dtype=torch.int32), "divisible"),
+        ("cu_seqlens_kv_padded", torch.tensor([[0, 8, 16]], dtype=torch.int32), "shape"),
+        ("cu_seqlens_kv_padded", torch.tensor([0, 8, 16], dtype=torch.int64), "dtype"),
+    ],
+)
+def test_contiguous_thd_dynamic_cp_rejects_malformed_metadata_before_mutation(
+    monkeypatch, field, value, error
+):
+    from megatron.core.transformer import attention as attention_module
+
+    packed = _dynamic_cp_packed(2, [0, 8, 16])
+    if field == "padded_boundaries":
+        packed.cu_seqlens_q_padded = value
+        packed.cu_seqlens_kv_padded = value
+    else:
+        setattr(packed, field, value)
+    original_group = object()
+    stub = _DynamicCpAttentionStub(original_group, torch.tensor(1.0))
+    collectives = []
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(
+        attention_module,
+        "contiguous_to_zigzag_chunks",
+        lambda *args, **kwargs: collectives.append("collective"),
+    )
+
+    with pytest.raises((TypeError, ValueError), match=error):
+        attention_module.Attention.forward(
+            stub, torch.ones((8, 1, 3)), None, packed_seq_params=packed
+        )
+
+    assert collectives == []
+    assert stub.seen == []
+    assert stub.pg_collection.cp is original_group
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"attention_mask": torch.ones(1)},
+        {"attention_bias": torch.ones(1)},
+        {"key_value_states": torch.ones(1)},
+        {"sequence_len_offset": 0},
+    ],
+)
+def test_contiguous_thd_dynamic_cp_rejects_unsupported_modes_before_collective(monkeypatch, kwargs):
+    from megatron.core.transformer import attention as attention_module
+
+    packed = _dynamic_cp_packed(2, [0, 8, 16])
+    stub = _DynamicCpAttentionStub(object(), torch.tensor(1.0))
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: 2)
+    convert = mock.Mock()
+    monkeypatch.setattr(attention_module, "contiguous_to_zigzag_chunks", convert)
+    attention_mask = kwargs.pop("attention_mask", None)
+
+    with pytest.raises(ValueError):
+        attention_module.Attention.forward(
+            stub, torch.ones((8, 1, 3)), attention_mask, packed_seq_params=packed, **kwargs
+        )
+
+    convert.assert_not_called()
+
+
+@pytest.mark.parametrize("unsupported", ["eval", "sequence_parallel"])
+def test_contiguous_thd_dynamic_cp_rejects_training_modes_before_collective(
+    monkeypatch, unsupported
+):
+    from megatron.core.transformer import attention as attention_module
+
+    packed = _dynamic_cp_packed(2, [0, 8, 16])
+    stub = _DynamicCpAttentionStub(object(), torch.tensor(1.0))
+    if unsupported == "eval":
+        stub.training = False
+    else:
+        stub.config.sequence_parallel = True
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: 2)
+    convert = mock.Mock()
+    monkeypatch.setattr(attention_module, "contiguous_to_zigzag_chunks", convert)
+
+    with pytest.raises(ValueError, match="training|sequence parallelism"):
+        attention_module.Attention.forward(
+            stub, torch.ones((8, 1, 3)), None, packed_seq_params=packed
+        )
+
+    convert.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["inference_context", "inference_params", "local_rows", "group_size", "partition_mode"],
+)
+def test_contiguous_thd_dynamic_cp_preflight_rejects_before_group_or_conversion(
+    monkeypatch, failure
+):
+    from megatron.core.transformer import attention as attention_module
+
+    packed = _dynamic_cp_packed(2, [0, 8, 16])
+    original_group = object()
+    stub = _DynamicCpAttentionStub(original_group, torch.tensor(1.0))
+    hidden = torch.ones((8, 1, 3))
+    kwargs = {}
+    group_size = 2
+    if failure == "inference_context":
+        kwargs["inference_context"] = object()
+    elif failure == "inference_params":
+        kwargs["inference_params"] = object()
+    elif failure == "local_rows":
+        hidden = torch.ones((7, 1, 3))
+    elif failure == "group_size":
+        group_size = 4
+    else:
+        packed.cp_partition_mode = "blocked"
+    convert = mock.Mock()
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: group_size)
+    monkeypatch.setattr(attention_module, "contiguous_to_zigzag_chunks", convert)
+
+    with pytest.raises(ValueError):
+        attention_module.Attention.forward(stub, hidden, None, packed_seq_params=packed, **kwargs)
+
+    convert.assert_not_called()
+    assert stub.pg_collection.cp is original_group
+    assert stub.seen == []
+
+
+def test_contiguous_thd_body_and_nvtx_cleanup_failures_preserve_body_and_restore_group(monkeypatch):
+    from megatron.core.transformer import attention as attention_module
+
+    packed = _dynamic_cp_packed(2, [0, 8, 16])
+    original_group = object()
+    stub = _DynamicCpAttentionStub(original_group, torch.tensor(1.0))
+    primary = RuntimeError("body failure")
+    pop_calls = []
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(
+        attention_module, "contiguous_to_zigzag_chunks", lambda value, *args, **kwargs: value
+    )
+
+    def fail_forward(hidden_states, attention_mask, *args, **kwargs):
+        kwargs["_active_nvtx_ranges"].append("megatron.core.transformer.attention.forward.qkv")
+        raise primary
+
+    def fail_pop(*, msg):
+        pop_calls.append((msg, stub.pg_collection.cp))
+        raise RuntimeError("pop failure")
+
+    stub._forward_impl = fail_forward
+    monkeypatch.setattr(attention_module, "nvtx_range_pop", fail_pop)
+
+    with pytest.raises(RuntimeError, match="body failure") as raised:
+        attention_module.Attention.forward(
+            stub, torch.ones((8, 1, 3)), None, packed_seq_params=packed
+        )
+
+    assert raised.value is primary
+    assert pop_calls == [("megatron.core.transformer.attention.forward.qkv", original_group)]
+    assert stub.pg_collection.cp is original_group
+    assert any("pop failure" in note for note in primary.__notes__)
+
+
+@pytest.mark.parametrize("failure", ["qkv", "core_attention", "linear_proj"])
+def test_attention_named_failure_balances_exact_legacy_nvtx_messages(monkeypatch, failure):
+    from megatron.core import utils
+    from megatron.core.transformer import attention as attention_module
+
+    packed = _dynamic_cp_packed(2, [0, 8, 16])
+    stub = _DynamicCpAttentionStub(object(), torch.tensor(1.0))
+    stub.config.no_rope_freq = None
+    stub.config.test_mode = False
+    stub.config.fused_single_qkv_rope = False
+    stub.config.attention_output_gate = False
+    stub.config.head_wise_attn_gate = False
+    stub.rotary_pos_emb = None
+    stub.layer_number = 1
+    stub.q_layernorm = None
+    stub.k_layernorm = None
+    stub.offload_qkv_linear = False
+    stub.attn_mask_type = AttnMaskType.causal
+    stub.offload_core_attention = False
+    stub.checkpoint_core_attention = False
+    stub.offload_attn_proj = False
+    stub._forward_impl = attention_module.Attention._forward_impl.__get__(stub)
+    hidden = torch.ones((8, 1, 3))
+
+    class StageModule(torch.nn.Module):
+        def __init__(self, stage):
+            super().__init__()
+            self.stage = stage
+
+        def forward(self, value, *args, **kwargs):
+            if failure == self.stage:
+                raise RuntimeError(f"real {failure} failure")
+            if self.stage == "linear_proj":
+                return value, None
+            return value
+
+    if failure == "qkv":
+        stub.get_query_key_value_tensors = mock.Mock(side_effect=RuntimeError("real qkv failure"))
+    else:
+        stub.get_query_key_value_tensors = mock.Mock(return_value=(hidden, hidden, hidden))
+    stub._adjust_key_value_for_inference = mock.Mock(
+        side_effect=lambda context, query, key, value, rotary, *args: (
+            query,
+            key,
+            value,
+            rotary,
+            AttnMaskType.causal,
+            None,
+        )
+    )
+    stub.core_attention = StageModule("core_attention")
+    stub.linear_proj = StageModule("linear_proj")
+    messages = []
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(
+        attention_module, "contiguous_to_zigzag_chunks", lambda value, *args, **kwargs: value
+    )
+    monkeypatch.setattr(utils, "_nvtx_enabled", True)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda msg: messages.append(("push", msg)))
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: messages.append(("pop", None)))
+    assert utils._nvtx_range_messages == []
+
+    with pytest.raises(RuntimeError, match=f"real {failure} failure"):
+        attention_module.Attention.forward(stub, hidden, None, packed_seq_params=packed)
+
+    pushed = [msg for operation, msg in messages if operation == "push"]
+    assert pushed[-1] == f"megatron.core.transformer.attention.forward.{failure}"
+    assert len(pushed) == sum(operation == "pop" for operation, _ in messages)
+    assert utils._nvtx_range_messages == []
+
+
+def test_attention_nvtx_push_failure_restores_group_without_pop(monkeypatch):
+    from megatron.core.transformer import attention as attention_module
+
+    packed = _dynamic_cp_packed(2, [0, 8, 16])
+    original_group = object()
+    stub = _DynamicCpAttentionStub(original_group, torch.tensor(1.0))
+    stub.config.no_rope_freq = None
+    stub.config.test_mode = False
+    stub.config.fused_single_qkv_rope = False
+    stub.config.attention_output_gate = False
+    stub.config.head_wise_attn_gate = False
+    stub.rotary_pos_emb = None
+    stub.layer_number = 1
+    stub._forward_impl = attention_module.Attention._forward_impl.__get__(stub)
+    primary = RuntimeError("push failure")
+    pop = mock.Mock()
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(
+        attention_module, "contiguous_to_zigzag_chunks", lambda value, *args, **kwargs: value
+    )
+    monkeypatch.setattr(attention_module, "nvtx_range_push", mock.Mock(side_effect=primary))
+    monkeypatch.setattr(attention_module, "nvtx_range_pop", pop)
+
+    with pytest.raises(RuntimeError, match="push failure") as raised:
+        attention_module.Attention.forward(
+            stub, torch.ones((8, 1, 3)), None, packed_seq_params=packed
+        )
+
+    assert raised.value is primary
+    assert stub.pg_collection.cp is original_group
+    pop.assert_not_called()
+
+
+@pytest.mark.parametrize(("cp_size", "mode"), [(1, "contiguous"), (2, "zigzag")])
+def test_dynamic_cp_native_layout_paths_are_unchanged(monkeypatch, cp_size, mode):
+    from megatron.core.transformer import attention as attention_module
+
+    packed = _dynamic_cp_packed(cp_size, [0, 8])
+    packed.cp_partition_mode = mode
+    original_group = object()
+    stub = _DynamicCpAttentionStub(original_group, torch.tensor(1.0))
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: cp_size)
+    to_zigzag = mock.Mock()
+    to_contiguous = mock.Mock()
+    monkeypatch.setattr(attention_module, "contiguous_to_zigzag_chunks", to_zigzag)
+    monkeypatch.setattr(attention_module, "zigzag_to_contiguous_chunks", to_contiguous)
+    hidden = torch.ones((8 // cp_size, 1, 3))
+
+    output, _ = attention_module.Attention.forward(stub, hidden, None, packed_seq_params=packed)
+
+    assert output is not hidden
+    assert stub.seen[0][1] is hidden
+    assert stub.seen[0][2] is packed.cp_group
+    assert stub.pg_collection.cp is original_group
+    to_zigzag.assert_not_called()
+    to_contiguous.assert_not_called()
+
+
+class _TestCpGroup:
+    def __init__(self, size, rank=0):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
+class _TupleLinear(torch.nn.Module):
+    def __init__(self, input_size, output_size, name):
+        super().__init__()
+        self.linear = torch.nn.Linear(input_size, output_size, bias=False)
+        self.name = name
+        self.events = None
+        self.seen = []
+
+    def forward(self, value):
+        if self.events is not None:
+            self.events.append(self.name)
+        self.seen.append(value)
+        return self.linear(value), None
+
+
+class _TestCoreAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.events = None
+
+    def forward(self, query, key, value, *args, **kwargs):
+        if self.events is not None:
+            self.events.append("core")
+        return query
+
+
+def _actual_attention_stub(cp_size):
+    from megatron.core.transformer import attention as attention_module
+
+    stub = _DynamicCpAttentionStub(object(), torch.tensor(1.0))
+    stub.config.no_rope_freq = None
+    stub.config.test_mode = False
+    stub.config.fused_single_qkv_rope = False
+    stub.config.attention_output_gate = False
+    stub.config.head_wise_attn_gate = False
+    stub.config.apply_rope_fusion = False
+    stub.config.rotary_interleaved = False
+    stub.config.multi_latent_attention = False
+    stub.config.mrope_section = None
+    stub.config.num_query_groups = 1
+    stub.rotary_pos_emb = None
+    stub.layer_number = 1
+    stub.q_layernorm = None
+    stub.k_layernorm = None
+    stub.offload_qkv_linear = False
+    stub.offload_core_attention = False
+    stub.checkpoint_core_attention = False
+    stub.offload_attn_proj = False
+    stub.attn_mask_type = AttnMaskType.causal
+    stub._yarn_concentration_factor = 1.0
+    stub.world_size = 1
+    stub.num_attention_heads_per_partition = 1
+    stub.num_query_groups_per_partition = 1
+    stub.hidden_size_per_attention_head = 4
+    stub.pg_collection.tp = object()
+    stub.linear_qkv = _TupleLinear(4, 12, "qkv")
+    stub.linear_proj = _TupleLinear(4, 4, "projection")
+    stub.core_attention = _TestCoreAttention()
+    stub.get_query_key_value_tensors = (
+        attention_module.SelfAttention.get_query_key_value_tensors.__get__(stub)
+    )
+    stub._adjust_key_value_for_inference = (
+        attention_module.Attention._adjust_key_value_for_inference.__get__(stub)
+    )
+    stub._forward_impl = attention_module.Attention._forward_impl.__get__(stub)
+    packed = _dynamic_cp_packed(cp_size, [0, 4 * cp_size, 8 * cp_size])
+    packed.cp_group = _TestCpGroup(cp_size)
+    return stub, packed
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_actual_attention_flow_uses_multisequence_contiguous_boundary_and_gradients(
+    monkeypatch, cp_size
+):
+    from megatron.core.transformer import attention as attention_module
+
+    stub, packed = _actual_attention_stub(cp_size)
+    reference, reference_packed = _actual_attention_stub(cp_size)
+    reference.linear_qkv.load_state_dict(stub.linear_qkv.state_dict())
+    reference.linear_proj.load_state_dict(stub.linear_proj.state_dict())
+    reference_packed.cp_partition_mode = "zigzag"
+    hidden = (torch.arange(32, dtype=torch.float32).reshape(8, 1, 4) / 17).requires_grad_()
+    reference_hidden = hidden.detach().flip(0).clone().requires_grad_()
+    freqs = (
+        torch.arange(packed.total_tokens * 4, dtype=torch.float32).reshape(
+            packed.total_tokens, 1, 1, 4
+        )
+        / 101
+    )
+    events = []
+    rope_boundaries = []
+    metadata = tuple(packed.__dict__.items())
+    stub.linear_qkv.events = events
+    stub.core_attention.events = events
+    stub.linear_proj.events = events
+    actual_rope = attention_module.apply_rotary_pos_emb
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: cp_size)
+    monkeypatch.setattr(attention_module, "SplitAlongDim", None)
+    monkeypatch.setattr(
+        attention_module,
+        "contiguous_to_zigzag_chunks",
+        lambda value, *args, **kwargs: events.append("to_zigzag") or value.flip(0),
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "zigzag_to_contiguous_chunks",
+        lambda value, *args, **kwargs: events.append("to_contiguous") or value.flip(0),
+    )
+
+    def record_rope(value, frequencies, **kwargs):
+        rope_boundaries.append(kwargs["cu_seqlens"])
+        return actual_rope(value, frequencies, **kwargs)
+
+    monkeypatch.setattr(attention_module, "apply_rotary_pos_emb", record_rope)
+
+    output, bias = attention_module.Attention.forward(
+        stub, hidden, None, rotary_pos_emb=(freqs, freqs), packed_seq_params=packed
+    )
+    reference_output, reference_bias = attention_module.Attention.forward(
+        reference,
+        reference_hidden,
+        None,
+        rotary_pos_emb=(freqs, freqs),
+        packed_seq_params=reference_packed,
+    )
+    output.square().sum().backward()
+    reference_output.square().sum().backward()
+
+    assert bias is None
+    assert reference_bias is None
+    assert events == ["to_zigzag", "qkv", "core", "projection", "to_contiguous"]
+    assert stub.linear_qkv.seen[0] is not hidden
+    assert rope_boundaries[0] is packed.cu_seqlens_q_padded
+    assert rope_boundaries[1] is packed.cu_seqlens_kv_padded
+    torch.testing.assert_close(output, reference_output.flip(0))
+    torch.testing.assert_close(hidden.grad, reference_hidden.grad.flip(0))
+    torch.testing.assert_close(
+        stub.linear_qkv.linear.weight.grad, reference.linear_qkv.linear.weight.grad
+    )
+    torch.testing.assert_close(
+        stub.linear_proj.linear.weight.grad, reference.linear_proj.linear.weight.grad
+    )
+    for gradient in (
+        hidden.grad,
+        stub.linear_qkv.linear.weight.grad,
+        stub.linear_proj.linear.weight.grad,
+    ):
+        assert torch.isfinite(gradient).all()
+        assert torch.count_nonzero(gradient) > 0
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output) > 0
+    assert all(packed.__dict__[name] is value for name, value in metadata)
+
+
+def test_actual_offload_interface_finishes_before_inverse_conversion(monkeypatch):
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as offload
+    from megatron.core.transformer import attention as attention_module
+
+    stub, packed = _actual_attention_stub(2)
+    stub.offload_qkv_linear = True
+    stub.offload_core_attention = True
+    stub.offload_attn_proj = True
+    hidden = torch.randn((8, 1, 4), requires_grad=True)
+    events = []
+
+    class Manager:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, *args):
+            events.append("exit")
+
+    manager = Manager()
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(attention_module, "SplitAlongDim", None)
+    monkeypatch.setattr(
+        attention_module,
+        "contiguous_to_zigzag_chunks",
+        lambda value, *args, **kwargs: events.append("to_zigzag") or value,
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "zigzag_to_contiguous_chunks",
+        lambda value, *args, **kwargs: events.append("to_contiguous") or value,
+    )
+    monkeypatch.setattr(
+        offload,
+        "fine_grained_offloading_group_start",
+        lambda value, name: events.append(f"start:{name}") or value,
+    )
+    monkeypatch.setattr(
+        offload,
+        "fine_grained_offloading_group_offload",
+        lambda value, name, *args, **kwargs: events.append(f"offload:{name}") or value,
+    )
+    monkeypatch.setattr(
+        offload.PipelineOffloadManager, "get_instance", classmethod(lambda cls: manager)
+    )
+
+    output, _ = attention_module.Attention.forward(stub, hidden, None, packed_seq_params=packed)
+    output.sum().backward()
+
+    assert events[-1] == "to_contiguous"
+    inverse_index = events.index("to_contiguous")
+    assert max(index for index, event in enumerate(events) if event == "exit") < inverse_index
+    assert events.index("offload:attn_proj") < inverse_index
+    assert hidden.grad is not None
+    assert stub.linear_qkv.linear.weight.grad is not None
+    assert stub.linear_proj.linear.weight.grad is not None
+
+
+def test_actual_attention_inverse_failure_restores_group_and_metadata(monkeypatch):
+    from megatron.core import utils
+    from megatron.core.transformer import attention as attention_module
+
+    stub, packed = _actual_attention_stub(2)
+    original_group = stub.pg_collection.cp
+    metadata = tuple(packed.__dict__.items())
+    monkeypatch.setattr(attention_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(attention_module, "SplitAlongDim", None)
+    monkeypatch.setattr(
+        attention_module, "contiguous_to_zigzag_chunks", lambda value, *args, **kwargs: value
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "zigzag_to_contiguous_chunks",
+        mock.Mock(side_effect=RuntimeError("inverse failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="inverse failure"):
+        attention_module.Attention.forward(
+            stub, torch.ones((8, 1, 4)), None, packed_seq_params=packed
+        )
+
+    assert stub.pg_collection.cp is original_group
+    assert all(packed.__dict__[name] is value for name, value in metadata)
+    assert utils._nvtx_range_messages == []

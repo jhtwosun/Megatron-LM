@@ -17,6 +17,17 @@ code ownership, invariants, control flow, and safe extension points.
   route. There is no endpoint-star pixel mode and no pixel-sharding
   compatibility switch.
 
+The bullets above identify the reconstructed historical baseline. The current
+stack additionally contains the training-only D3 decoder Dynamic-CP
+composition, repeated-D4 encoder-only and joint compositions, generic model
+dispatch, Energon descriptor-first materialization, and model-owned
+Qwen3-VL/Nemotron adapters. The Qwen3-VL registration is outside repeated-D4
+and does not authorize that composition. Do not infer production support from
+lower-level contracts or registration: each executable composition has the
+locked matrix under
+[Configuration quick reference](#configuration-quick-reference), and
+repeated-D4 still requires its public world-eight correctness gate.
+
 When this file disagrees with code, code and tests win. Update this file in the
 same commit whenever an invariant, phase, flag, support constraint, or primary
 entry point changes.
@@ -106,8 +117,9 @@ The iteration phases are:
 | P5 | `runtime.py`, `activation.py`, `encoder.py` | Route leaf gradients back; run retained-graph backward or replay complete encoder chunks with restored RNG before backward; reduce WORLD gradients and normalize them. |
 | P6 | `optimizer.py` | Union overflow state, compute a combined norm, clip consistently, and step decoder plus encoder optimizers. |
 
-Evaluation runs P0-P4, skips autograd/backward, releases retained state, and
-returns to `EMPTY`.
+The static runtime evaluation path runs P0-P4, skips autograd/backward, releases
+retained state, and returns to `EMPTY`. Repeated-D4 is training-only and rejects
+`training=False` before iterator access or schedule/finalizer/model mutation.
 
 ## Quick code index
 
@@ -331,7 +343,10 @@ per-sample rule that forces every rank's local row count to be a multiple of
 `pad_to_multiple` (a microbatch can hold a single sample). It is strict --
 up to `divisible_by - 1` padded rows per sample, 256 at `cp_size=8` with MXFP8
 and no SP. A total-only variant would be tighter and is not written because
-MDP rejects CP > 1 outright.
+the original static baseline did not establish this configured-CP path.
+Repeated-D4 uses a separately locked contiguous decoder rebuild contract; its
+presence is not evidence that this static alignment derivation supports wider
+configured CP.
 
 Why `pad_between_seqs=False` is declared, and when it would be wrong. Declaring
 it lets `TEDotProductAttention.forward()`
@@ -357,7 +372,9 @@ adds a non-causal decoder spec owns dropping the flag (or padding every sample).
 Primary flags:
 
 - `--mdp-enable`
-- `--mdp-encoder-cp` (currently must be 1)
+- `--mdp-encoder-cp`
+- `--mdp-dynamic-encoder-cp`
+- `--mdp-min-dynamic-encoder-cp-size`
 - `--mdp-encoder-max-payload-rows`
 - `--encoder-recompute-granularity selective|full|whole`
 - `--encoder-recompute-method uniform|block`
@@ -481,7 +498,31 @@ P5.
 There is deliberately no pixel-sharding flag. Pixel owner sharding is part of
 the MDP definition in this baseline.
 
-Current major constraints:
+Current composition matrix:
+
+| Decoder Dynamic-CP | Encoder Dynamic-CP | Composition | Configured topology and selection |
+|---|---|---|---|
+| off | off | Static MDP | Historical support matrix; lower-level wider-topology tests do not automatically widen end-to-end claims |
+| on | off | D3 | Configured `TP1/EP1/PP1/CP1/ECP1`, VPP and window-capture overlap disabled; selects contiguous decoder CP groups from the WORLD DP pool |
+| off | on | Repeated-D4 fixed decoder | Configured `TP1/PP1/CP4/ECP4`, `EP1` or domain-local `EP4`; decoder stays CP4 and encoder selects E1/E2/E4 |
+| on | on | Repeated-D4 joint | Same configured topology; decoder independently selects CP1/CP2/CP4 and encoder selects E1/E2/E4 |
+
+For repeated-D4, `--mdp-min-dynamic-encoder-cp-size` and, in joint mode,
+`--min-dynamic-context-parallel-size` must be one of 1, 2, or 4. Sequence
+parallelism, VPP, window-capture overlap, decoder gradient-reduce overlap,
+decoder parameter-gather overlap, and MoE expert-communication overlap are
+rejected. Evaluation is rejected at the exact schedule boundary before any
+iterator or schedule mutation. Only exact Qwen3.5-VL and Nemotron Omni adapter
+classes are registered; Qwen3-VL and inherited/substituted classes fail closed.
+
+Repeated-D4 adapter prevalidation is recoverable before process-group creation.
+After process-group construction or model/DDP collective construction starts,
+failures are `MdpTaskFatalError` and require process restart; no in-process
+retry is promised. The code path remains a validation candidate until actual
+world-eight two-domain optimizer, failure/retry, cleanup, and collective-order
+gates pass.
+
+Historical static-runtime major constraints:
 
 - Qwen3.5-VL adapter;
 - TP=1;
@@ -501,6 +542,13 @@ Current major constraints:
 - no `--sequence-packing-scheduler`; MDP owns its packing, and
   `--mdp-greedy-packing` additionally rejects `--train-samples` and
   `--rampup-batch-size`.
+
+For D3 specifically, configured TP/PP/CP/ECP/EP are still locked to one, VPP is
+disabled, and window-capture overlap is disabled. Per-record decoder CP may be
+selected from the WORLD DP pool; this is verified for Qwen3.5-VL at CP1/CP2 on
+one node. Qwen3-VL DeepStack is verified only at selected CP1 and fails closed
+above it. Static-runtime decoder-TP/CP and encoder-CP tests are not evidence
+that D3 supports those configured dimensions.
 
 Always read `validate_mdp_config` before relaxing a constraint. A validation
 change without corresponding runtime/test support is not an implementation.

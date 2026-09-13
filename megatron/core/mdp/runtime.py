@@ -17,8 +17,10 @@ empty ledgers, zero local encoder work, and zero encoder gradients.
 import logging
 import threading
 import time
+import weakref
 from enum import Enum, auto
-from typing import Iterator, Optional, Sequence, Union
+from types import MappingProxyType
+from typing import Any, Iterator, Mapping, Optional, Sequence, Union
 
 import torch
 
@@ -36,6 +38,12 @@ from megatron.core.mdp.bridge import (
     ModalityBridge,
 )
 from megatron.core.mdp.config import MdpConfig
+from megatron.core.mdp.dynamic_cp_d4_group_binding import _validate_repeated_d4_group_binding
+from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+    DynamicEncoderAdapterCapability,
+    DynamicEncoderAdapterOperations,
+    DynamicEncoderLocatorAdapterOperations,
+)
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
@@ -47,9 +55,11 @@ from megatron.core.mdp.observability import (
 )
 from megatron.core.mdp.plan import MdpBatchPlan, split_encoder_layout
 from megatron.core.mdp.planner import MdpPlanner, assert_consistent_plan
-from megatron.core.mdp.protocols import MdpModelAdapter
+from megatron.core.mdp.protocols import MdpModelAdapter, VisionCaptureMode
 from megatron.core.mdp.rank_mapping import MdpRankMap, MdpRankView
 from megatron.core.mdp.storage import MdpEmbeddingStorage
+from megatron.core.mdp.static_vision import bind_static_vision_catalog
+from megatron.core.mdp.vision_locator import VisionLocatorKind
 from megatron.core.mdp.window import MdpIterationWindow
 
 logger = logging.getLogger(__name__)
@@ -86,7 +96,66 @@ class MdpRuntime:
         greedy_token_budget: Optional[int] = None,
         greedy_max_num_seqs: Optional[int] = None,
         greedy_row_alignment: int = 1,
+        dynamic_adapter_capability: DynamicEncoderAdapterCapability | None = None,
+        dynamic_adapter_owner: Any = None,
+        dynamic_group_binding: Any = None,
+        vision_capture_mode: VisionCaptureMode = VisionCaptureMode.SOURCE_PIXEL_SIDECAR,
     ) -> None:
+        if type(vision_capture_mode) is not VisionCaptureMode:
+            raise MdpConfigurationError("MDP: runtime capture mode must be an exact closed enum.")
+        self._static_locator_capture = (
+            not config.dynamic_encoder_cp
+            and vision_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        )
+        if self._static_locator_capture and (
+            rank_map.spec.tp != 1
+            or config.overlap_window_capture
+            or not callable(getattr(adapter, "fill_vision_payload", None))
+        ):
+            raise MdpConfigurationError(
+                "MDP: static locators require TP1, a payload materializer, and no window overlap."
+            )
+        if config.dynamic_encoder_cp:
+            operations_type = (
+                DynamicEncoderLocatorAdapterOperations
+                if vision_capture_mode is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+                else DynamicEncoderAdapterOperations
+            )
+            if type(adapter) is not operations_type:
+                raise MdpConfigurationError(
+                    "MDP: repeated-D4 runtime capture mode requires its exact operation schema."
+                )
+            if (
+                type(dynamic_adapter_capability) is not DynamicEncoderAdapterCapability
+                or dynamic_adapter_owner is None
+                or dynamic_group_binding is None
+            ):
+                raise MdpConfigurationError(
+                    "MDP: repeated-D4 runtime retains its exact adapter and group capability."
+                )
+            try:
+                capability_record = dynamic_adapter_capability._record
+                active_adapter = adapter._adapter()
+                _validate_repeated_d4_group_binding(dynamic_group_binding)
+            except (AttributeError, MdpConfigurationError, MdpStateError) as error:
+                raise MdpConfigurationError(
+                    "MDP: repeated-D4 runtime requires one active exact adapter capability."
+                ) from error
+            if (
+                capability_record.capability is not dynamic_adapter_capability
+                or capability_record.operations is not adapter
+                or active_adapter is not dynamic_adapter_owner
+            ):
+                raise MdpConfigurationError(
+                    "MDP: repeated-D4 runtime retains its exact adapter and group capability."
+                )
+        elif any(
+            value is not None
+            for value in (dynamic_adapter_capability, dynamic_adapter_owner, dynamic_group_binding)
+        ):
+            raise MdpConfigurationError(
+                "MDP: static/D3 runtime does not accept repeated-D4 capabilities."
+            )
         self.config = config
         self.rank_map = rank_map
         self.rank_view = rank_view
@@ -101,6 +170,10 @@ class MdpRuntime:
         self.params_dtype = params_dtype
         self.num_vpp_chunks = num_vpp_chunks
         self.device = device or torch.device("cuda", torch.cuda.current_device())
+        self.dynamic_adapter_capability = dynamic_adapter_capability
+        self.dynamic_group_binding = dynamic_group_binding
+        self.vision_capture_mode = vision_capture_mode
+        self._dynamic_adapter_owner = dynamic_adapter_owner
 
         self._state = MdpRuntimeState.EMPTY
         self._iteration = 0
@@ -114,6 +187,7 @@ class MdpRuntime:
         ] = None
         self._eval_outputs: Sequence = ()
         self._chunk_layouts: Sequence = ()
+        self._chunk_payload_bases: Sequence[torch.Tensor] = ()
         self._chunk_of_item: dict = {}
         self._captured_num_tokens: Optional[torch.Tensor] = None
         self._token_capture_count = 0
@@ -123,6 +197,16 @@ class MdpRuntime:
         self._decoder_schedule_ms = 0.0
         self._decoder_start = 0.0
         self._last_metrics: Optional[MdpIterationMetrics] = None
+        # Dynamic-CP keeps one short-lived, exact-identity P0--P2 producer
+        # handoff until the private D3 binder consumes or aborts it. The static
+        # phase machine never reads this slot.
+        self._pre_authority_dynamic_producer: Any | None = None
+        self._retired_pre_authority_dynamic_producers: dict[int, weakref.ReferenceType[Any]] = {}
+        # Capture-only repeated-D4 ownership is independent of the legacy
+        # window/plan phase machine and of the D3 producer handoff above.
+        self._d4_encoder_capture_owner: Any | None = None
+        self._d4_encoder_capture_trusted_owner: Any | None = None
+        self._retired_d4_encoder_capture_owners: dict[int, weakref.ReferenceType[Any]] = {}
         # Window-capture overlap: one in-flight prefetch keyed by the data
         # iterator's identity, so an interleaved eval (different iterator)
         # leaves a pending train prefetch untouched. The prefetch thread runs
@@ -142,6 +226,10 @@ class MdpRuntime:
         self._greedy_max_num_seqs = greedy_max_num_seqs
         self._greedy_row_alignment = greedy_row_alignment
         self._greedy_streams: dict = {}
+        if self.rank_map.spec.tp > 1 and self.process_groups.decoder_tp_group is None:
+            raise MdpConfigurationError(
+                "MDP: TP > 1 requires the existing native decoder TP process group."
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -170,6 +258,94 @@ class MdpRuntime:
         ``forward_only`` flag is recorded once here; ``end_iteration`` uses it
         so inconsistent values cannot be passed at two call sites.
         """
+        return self._begin_iteration(
+            data_iterators,
+            num_microbatches=num_microbatches,
+            forward_only=forward_only,
+        )
+
+    def _prepare_dynamic_encoder_producer(
+        self,
+        data_iterators: Union[Iterator, Sequence[Iterator]],
+        *,
+        num_microbatches: int,
+        forward_only: bool,
+        codec: Any,
+    ) -> Any:
+        """Run P0--P2 and return one local producer for D3 metadata rendezvous."""
+        from megatron.core.mdp.dynamic_cp_d3_producer_owner import (
+            _capture_d3_producer_owner,
+        )
+        from megatron.core.mdp.dynamic_cp_runtime import _PreAuthorityDynamicProducer
+
+        if type(forward_only) is not bool or forward_only:
+            raise MdpConfigurationError("MDP: D3 producer preparation supports training only.")
+        self._require_state(MdpRuntimeState.EMPTY, "_prepare_dynamic_encoder_producer")
+
+        def capture(window, plan, detached):
+            build_source = getattr(codec, "build_source_window_with_locations", None)
+            if not callable(build_source):
+                raise MdpConfigurationError(
+                    "MDP: D3 decoder codec provides build_source_window_with_locations."
+                )
+            source_window, sample_locations = build_source(
+                tuple(window.records()), source_dp_lane=self.rank_view.lane_id
+            )
+            item_outputs = {
+                item_id: detached[chunk_index][
+                    segment.output_row_start : segment.output_row_start + segment.output_rows
+                ]
+                for item_id, (chunk_index, segment) in self._chunk_of_item.items()
+            }
+            owner = _capture_d3_producer_owner(
+                runtime=self,
+                rank_view=self.rank_view,
+                local_manifest=source_window.metadata_manifest(),
+                source_window=source_window,
+                static_plan=plan,
+                item_outputs=item_outputs,
+                sample_location_by_id=sample_locations,
+                forward_only=False,
+            )
+            return owner.producer
+
+        try:
+            return self._begin_iteration(
+                data_iterators,
+                num_microbatches=num_microbatches,
+                forward_only=False,
+                p2_handoff=capture,
+            )
+        except BaseException as error:
+            local_prepare_error = error
+            if not isinstance(error, Exception):
+                local_prepare_error = MdpStateError(
+                    "MDP: local dynamic producer preparation raised a non-Exception "
+                    "BaseException."
+                )
+                local_prepare_error.__cause__ = error
+            self._abort_failed_iteration(local_prepare_error)
+            return _PreAuthorityDynamicProducer(
+                rank_view=None,
+                local_manifest=None,
+                source_window=None,
+                static_plan=None,
+                item_outputs=MappingProxyType({}),
+                sample_location_by_id=MappingProxyType({}),
+                owner=None,
+                local_prepare_error=local_prepare_error,
+                forward_only=False,
+            )
+
+    def _begin_iteration(
+        self,
+        data_iterators: Union[Iterator, Sequence[Iterator]],
+        *,
+        num_microbatches: int,
+        forward_only: bool,
+        p2_handoff: Any = None,
+    ) -> Any:
+        """Execute the shared P0--P2 prefix and either hand off or enter P3."""
         self._require_state(MdpRuntimeState.EMPTY, "begin_iteration")
         self._forward_only = forward_only
 
@@ -228,6 +404,10 @@ class MdpRuntime:
                 debug_payload_check=self.config.debug_plan_payload_check,
             )
         self._plan = plan
+        static_locators = (
+            self._prepare_static_locator_catalog(window, plan)
+            if self._static_locator_capture else None
+        )
         # Specs and ledgers are pure functions of the plan; derive them once
         # per iteration instead of once per phase (EMBEDDING and GRADIENT
         # share identical specs, and each build_ledger re-sorted the routes).
@@ -249,51 +429,85 @@ class MdpRuntime:
         # intermediate buffer + repack pass).
         my_layout = plan.encoder_layout_for_producer(self.rank_view.my_worker_id)
         chunk_layouts = split_encoder_layout(
-            my_layout, max_payload_rows=self.config.encoder_max_payload_rows
+            my_layout,
+            max_payload_rows=self.config.encoder_max_payload_rows,
+            fuse_across_microbatches=self.config.encoder_fuse_across_microbatches,
         )
         self._chunk_layouts = chunk_layouts if my_layout.segments else ()
         self._chunk_of_item = {}
         chunk_payloads = []
         pixel_dest = {}
-        with nvtx_phase("p2_pack_payload"):
-            for chunk_index, chunk in enumerate(self._chunk_layouts):
-                payload = self.allocator.acquire(
-                    rows=plan.capacity_policy.capacity_of(chunk.total_payload_rows),
-                    width=self.adapter.payload_width,
-                    dtype=self.params_dtype,
-                    device=self.device,
-                    tag="packed_pixels",
-                )
-                chunk_payloads.append(payload)
-                for segment in chunk.segments:
-                    pixel_dest[BridgeBufferKey(segment.global_item_id)] = payload[
-                        segment.payload_row_start : segment.payload_row_start
-                        + segment.payload_rows
-                    ]
-                    self._chunk_of_item[segment.global_item_id] = (chunk_index, segment)
-
-        with nvtx_phase("p1_pixel_dispatch"):
-            pixel_specs = self._iter_specs[BridgePhase.PIXEL]
-            sidecar = window.payload_sidecar()
-            pixel_local = {
-                BridgeBufferKey(item_id): tensor.to(self.params_dtype)
-                for item_id, tensor in sidecar.items()
-            }
-            pixel_ledger = self._iter_ledgers[BridgePhase.PIXEL]
-            # Owners -> producers in one collective; every group member
-            # participates (with zero splits when it has nothing to move).
-            self.bridge.exchange_all_to_all(
-                pixel_ledger,
-                pixel_local,
-                tensor_specs=pixel_specs,
-                group=self.process_groups.planning_group,
-                group_ranks=self.rank_view.planning_group_ranks,
-                global_rank=self.rank_view.global_rank,
-                dtype=self.params_dtype,
-                device=self.device,
-                dest_views=pixel_dest,
+        payload_error = None
+        try:
+            with nvtx_phase("p2_pack_payload"):
+                for chunk_index, chunk in enumerate(self._chunk_layouts):
+                    payload = self.allocator.acquire(
+                        rows=plan.capacity_policy.capacity_of(chunk.total_payload_rows),
+                        width=self.adapter.payload_width,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                        tag="packed_pixels",
+                    )
+                    chunk_payloads.append(payload)
+                    self._chunk_payload_bases = tuple(chunk_payloads)
+                    for segment in chunk.segments:
+                        pixel_dest[BridgeBufferKey(segment.global_item_id)] = payload[
+                            segment.payload_row_start : segment.payload_row_start
+                            + segment.payload_rows
+                        ]
+                        self._chunk_of_item[segment.global_item_id] = (chunk_index, segment)
+        except BaseException as error:
+            payload_error = error
+        if self._planning_preparation_failed(payload_error):
+            error = payload_error or MdpStateError(
+                "MDP: P2 payload preparation failed on another planning rank; "
+                "pixel communication was not started."
             )
+            pixel_dest.clear()
+            self._abort_failed_iteration(error)
+            raise error
+
+        try:
+            if self._static_locator_capture:
+                self._fill_static_vision_payloads(static_locators, pixel_dest)
+            else:
+                with nvtx_phase("p1_pixel_dispatch"):
+                    pixel_specs = self._iter_specs[BridgePhase.PIXEL]
+                    sidecar = window.payload_sidecar()
+                    pixel_local = {
+                        BridgeBufferKey(item_id): tensor.to(self.params_dtype)
+                        for item_id, tensor in sidecar.items()
+                    }
+                    pixel_ledger = self._iter_ledgers[BridgePhase.PIXEL]
+                    # Every group member participates, including zero-split ranks.
+                    self.bridge.exchange_all_to_all(
+                        pixel_ledger,
+                        pixel_local,
+                        tensor_specs=pixel_specs,
+                        group=self.process_groups.planning_group,
+                        group_ranks=self.rank_view.planning_group_ranks,
+                        global_rank=self.rank_view.global_rank,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                        dest_views=pixel_dest,
+                    )
+            # Only the worker leader receives or materializes pixels. Reuse
+            # the same ECP replication after either loading path completes.
+            if self.config.encoder_cp > 1:
+                with nvtx_phase("p1_encoder_cp_pixel_broadcast"):
+                    for chunk_index, chunk in enumerate(self._chunk_layouts):
+                        torch.distributed.broadcast(
+                            chunk_payloads[chunk_index][: chunk.total_payload_rows],
+                            src=self.process_groups.encoder_cp_leader_rank,
+                            group=self.process_groups.encoder_cp_group,
+                        )
             window.release_pixels()
+        except BaseException as error:
+            # All-rank returned errors are cleanup-safe. A one-rank hang inside
+            # an already-posted collective remains task-fatal.
+            pixel_dest.clear()
+            self._abort_failed_iteration(error)
+            raise
 
         # P2: retain the normal autograd graph, or whole-encoder recompute
         # run under no_grad and retain only the replay recipe. Evaluation also
@@ -306,23 +520,36 @@ class MdpRuntime:
             and self.config.encoder_recompute_granularity == "whole"
         )
         forward_start = time.monotonic()
-        for chunk_index, chunk in enumerate(self._chunk_layouts):
-            payload = chunk_payloads[chunk_index]
-            payload_valid = payload[: chunk.total_payload_rows]
-            if forward_only or whole_recompute:
-                if whole_recompute:
-                    chunk_rng_states.append(capture_encoder_rng_state())
-                with torch.no_grad(), nvtx_phase("p2_encoder_forward"):
-                    output = self.adapter.encode(encoder, payload_valid, chunk)
-            else:
-                with nvtx_phase("p2_encoder_forward"):
-                    output = self.adapter.encode(encoder, payload_valid, chunk)
-                if output.shape[0] and (not output.requires_grad or output.grad_fn is None):
-                    raise MdpStateError(
-                        "MDP: encoder chunk output is not graph-connected in training; "
-                        "adapter.encode must run with gradients enabled."
-                    )
-            chunk_outputs.append(output)
+        try:
+            for chunk_index, chunk in enumerate(self._chunk_layouts):
+                payload = chunk_payloads[chunk_index]
+                payload_valid = payload[: chunk.total_payload_rows]
+                if forward_only or whole_recompute:
+                    if whole_recompute:
+                        chunk_rng_states.append(capture_encoder_rng_state())
+                    with torch.no_grad(), nvtx_phase("p2_encoder_forward"):
+                        output = self.adapter.encode(encoder, payload_valid, chunk)
+                else:
+                    with nvtx_phase("p2_encoder_forward"):
+                        output = self.adapter.encode(encoder, payload_valid, chunk)
+                    if output.shape[0] and (
+                        not output.requires_grad or output.grad_fn is None
+                    ):
+                        raise MdpStateError(
+                            "MDP: encoder chunk output is not graph-connected in training; "
+                            "adapter.encode must run with gradients enabled."
+                        )
+                chunk_outputs.append(output)
+        except BaseException as error:
+            # This makes a symmetrically observed P2 failure locally reusable.
+            # An asymmetric failure after an encoder collective has posted is
+            # task-fatal; no new consensus collective is safe at this point.
+            chunk_outputs.clear()
+            chunk_payloads.clear()
+            pixel_dest.clear()
+            output = payload = payload_valid = None
+            self._abort_failed_iteration(error)
+            raise
 
         self._encoder_forward_ms = (time.monotonic() - forward_start) * 1000.0
 
@@ -356,55 +583,123 @@ class MdpRuntime:
             self._eval_outputs = tuple(chunk_outputs)
             detached = tuple(output.detach() for output in chunk_outputs)
 
-        # P3: embedding exchange straight into the endpoint leaves.
+        if p2_handoff is not None:
+            return p2_handoff(window, plan, detached)
+
+        # P3: bridge into TP0 endpoints, then replicate full leaves over the
+        # already-created native decoder TP group on PP0.
         emb_dest = {}
-        leaves = []  # (microbatch_id, valid leaf view)
-        if self.rank_view.lane_id is not None:
-            with nvtx_phase("p3_leaf_assembly"):
-                for layout in plan.layouts:
-                    if layout.text_only:
-                        continue
-                    leaf = self.allocator.acquire(
-                        rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
-                        width=self.hidden_size,
-                        dtype=self.params_dtype,
-                        device=self.device,
-                        tag="leaf",
+        leaves = []  # (microbatch_id, allocation base, valid leaf view)
+        leaf_error = None
+        local_endpoint_id = self._local_decoder_endpoint_id()
+        try:
+            if local_endpoint_id is not None:
+                with nvtx_phase("p3_leaf_assembly"):
+                    for layout in plan.layouts:
+                        if layout.text_only:
+                            continue
+                        leaf = self.allocator.acquire(
+                            rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
+                            width=self.hidden_size,
+                            dtype=self.params_dtype,
+                            device=self.device,
+                            tag="leaf",
+                        )
+                        if self.rank_view.decoder_endpoint_id is not None:
+                            for segment in layout.segments:
+                                emb_dest[
+                                    BridgeBufferKey(
+                                        segment.global_item_id, local_endpoint_id
+                                    )
+                                ] = leaf[
+                                    segment.leaf_row_start : segment.leaf_row_start
+                                    + segment.output_rows
+                                ]
+                        leaves.append(
+                            (
+                                layout.microbatch_id,
+                                leaf,
+                                leaf[: layout.total_output_rows],
+                            )
+                        )
+        except BaseException as error:
+            leaf_error = error
+        if self._planning_preparation_failed(leaf_error):
+            error = leaf_error or MdpStateError(
+                "MDP: P3 leaf preparation failed on another planning rank; "
+                "embedding communication was not started."
+            )
+            emb_dest.clear()
+            self._abort_failed_iteration(
+                error,
+                cleanup_actions=tuple(
+                    (
+                        f"releasing unstored P3 leaf for microbatch {microbatch_id}",
+                        lambda leaf=leaf: self.allocator.release(leaf),
                     )
-                    for segment in layout.segments:
-                        emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
-                            segment.leaf_row_start : segment.leaf_row_start
+                    for microbatch_id, leaf, _ in leaves
+                ),
+            )
+            raise error
+
+        owned_leaf_bases = {id(leaf): leaf for _, leaf, _ in leaves}
+        try:
+            with nvtx_phase("p3_embedding_exchange"):
+                emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
+                emb_local = {}
+                endpoint_count = len(
+                    self.rank_map.decoder_endpoint_ranks(plan.outer_dp_rank)
+                )
+                if self._is_worker_leader():
+                    for item_id, (chunk_index, segment) in self._chunk_of_item.items():
+                        output = detached[chunk_index][
+                            segment.output_row_start : segment.output_row_start
                             + segment.output_rows
                         ]
-                    leaves.append((layout.microbatch_id, leaf[: layout.total_output_rows]))
-        with nvtx_phase("p3_embedding_exchange"):
-            emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
-            emb_local = {}
-            for item_id, (chunk_index, segment) in self._chunk_of_item.items():
-                emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
-                    segment.output_row_start : segment.output_row_start + segment.output_rows
-                ]
-            # One alltoall instead of batched P2P: same ledger and payload,
-            # but no per-edge kernel pairs and no torch.cuda.synchronize
-            # workaround (all_to_all_single stream-orders its receive buffer).
-            self.bridge.exchange_all_to_all(
-                self._iter_ledgers[BridgePhase.EMBEDDING],
-                emb_local,
-                tensor_specs=emb_specs,
-                group=self.process_groups.planning_group,
-                group_ranks=self.rank_view.planning_group_ranks,
-                global_rank=self.rank_view.global_rank,
-                dtype=self.params_dtype,
-                device=self.device,
-                dest_views=emb_dest,
+                        for destination_id in range(endpoint_count):
+                            emb_local[BridgeBufferKey(item_id, destination_id)] = output
+                self.bridge.exchange_all_to_all(
+                    self._iter_ledgers[BridgePhase.EMBEDDING],
+                    emb_local,
+                    tensor_specs=emb_specs,
+                    group=self.process_groups.planning_group,
+                    group_ranks=self.rank_view.planning_group_ranks,
+                    global_rank=self.rank_view.global_rank,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                    dest_views=emb_dest,
+                )
+            if self.rank_map.spec.tp > 1 and local_endpoint_id is not None:
+                with nvtx_phase("p3_tp_leaf_broadcast"):
+                    source_rank = self._decoder_tp_source_rank()
+                    for _, _, leaf_valid in leaves:
+                        torch.distributed.broadcast(
+                            leaf_valid,
+                            src=source_rank,
+                            group=self.process_groups.decoder_tp_group,
+                        )
+            # requires_grad only after every exchange/broadcast copy is done.
+            for microbatch_id, leaf, leaf_valid in leaves:
+                leaf_valid.requires_grad_(True)
+                self.storage.put_leaf(microbatch_id, leaf_valid)
+                owned_leaf_bases.pop(id(leaf))
+            if forward_only:
+                # Evaluation retains no encoder graph after embedding routing.
+                self._eval_outputs = ()
+                self._release_chunk_payload_bases()
+        except BaseException as error:
+            emb_dest.clear()
+            self._abort_failed_iteration(
+                error,
+                cleanup_actions=tuple(
+                    (
+                        "releasing unstored P3 leaf",
+                        lambda leaf=leaf: self.allocator.release(leaf),
+                    )
+                    for leaf in owned_leaf_bases.values()
+                ),
             )
-        # requires_grad only after every exchange copy into the leaf is done.
-        for microbatch_id, leaf_valid in leaves:
-            leaf_valid.requires_grad_(True)
-            self.storage.put_leaf(microbatch_id, leaf_valid)
-        if forward_only and self._eval_outputs:
-            # Evaluation releases producer outputs once the bridge completed.
-            self._eval_outputs = ()
+            raise
 
         self._state = MdpRuntimeState.DECODER_READY
         self._decoder_start = time.monotonic()
@@ -458,70 +753,183 @@ class MdpRuntime:
             # the chunk output dtype). Therefore encoder_max_payload_rows bounds
             # one replay graph, not the full set of P5 gradient buffers.
             chunk_grads = []
+            endpoint_staging = []
             grad_dest = {}
-            if self._handle is not None:
-                with nvtx_phase("p5_grad_regroup"):
-                    for chunk_index, chunk in enumerate(self._chunk_layouts):
-                        # Match the chunk output dtype: a mixed-precision wrapper
-                        # (Float16Module) returns fp32 at the module boundary even
-                        # when parameters and transport run in bf16.
-                        output_dtype = self._handle.output_dtype(chunk_index)
-                        grad_buffer = self.allocator.acquire(
-                            rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
-                            width=self.hidden_size,
-                            dtype=output_dtype,
-                            device=self.device,
-                            tag="grad_regroup",
-                        )
-                        for segment in chunk.segments:
-                            grad_dest[BridgeBufferKey(segment.global_item_id)] = grad_buffer[
-                                segment.output_row_start : segment.output_row_start
-                                + segment.output_rows
-                            ]
-                        chunk_grads.append(grad_buffer[: chunk.total_output_rows])
-                    # Drop only the loop-local base-tensor reference; this does not
-                    # release its storage. The grad_dest and chunk_grads views
-                    # intentionally keep it alive through gradient exchange and
-                    # encoder backward.
-                    del grad_buffer
-            with nvtx_phase("p5_grad_exchange"):
-                grad_specs = self._iter_specs[BridgePhase.GRADIENT]
-                grad_local = {}
-                if self.rank_view.lane_id is not None:
-                    for layout in plan.layouts:
-                        if layout.text_only:
-                            continue
-                        grad = self.storage.pop_grad(layout.microbatch_id)
-                        for segment in layout.segments:
-                            grad_local[BridgeBufferKey(segment.global_item_id)] = grad[
-                                segment.leaf_row_start : segment.leaf_row_start
-                                + segment.output_rows
-                            ]
-                self.bridge.exchange_all_to_all(
-                    self._iter_ledgers[BridgePhase.GRADIENT],
-                    grad_local,
-                    tensor_specs=grad_specs,
-                    group=self.process_groups.planning_group,
-                    group_ranks=self.rank_view.planning_group_ranks,
-                    global_rank=self.rank_view.global_rank,
-                    dtype=self.params_dtype,
-                    device=self.device,
-                    dest_views=grad_dest,
-                )
-                # The chunk views remain in chunk_grads; segment views are no
-                # longer needed after the collective has populated them.
-                grad_dest.clear()
-            if self._handle is not None:
-                with nvtx_phase("p5_encoder_backward"):
-                    if isinstance(self._handle, EncoderWholeRecomputeHandle):
-                        self._handle.backward(
-                            chunk_grads,
-                            encoder=self.encoder_domain.encoder_ddp,
-                            encode=self.adapter.encode,
-                        )
-                    else:
-                        self._handle.backward(chunk_grads)
+            endpoint_count = len(self.rank_map.decoder_endpoint_ranks(plan.outer_dp_rank))
+            endpoint_id = self.rank_view.decoder_endpoint_id
+            local_endpoint_id = self._local_decoder_endpoint_id()
+            grad_bases = []
+            staging_bases = []
+            p5_error = None
+            encoder_backward_completed = False
+            decoder_input_gradients_validated = False
+            try:
+                self._validate_tp_leaf_gradients(plan)
+                decoder_input_gradients_validated = True
+
+                preparation_error = None
+                try:
+                    if self._handle is not None:
+                        with nvtx_phase("p5_grad_regroup"):
+                            for chunk_index, chunk in enumerate(self._chunk_layouts):
+                                # Match the chunk output dtype: a mixed-precision wrapper
+                                # returns fp32 at its boundary while transport may be bf16.
+                                output_dtype = self._handle.output_dtype(chunk_index)
+                                grad_buffer = self.allocator.acquire(
+                                    rows=plan.capacity_policy.capacity_of(
+                                        chunk.total_output_rows
+                                    ),
+                                    width=self.hidden_size,
+                                    dtype=output_dtype,
+                                    device=self.device,
+                                    tag="grad_regroup",
+                                )
+                                grad_bases.append(grad_buffer)
+                                chunk_grad = grad_buffer[: chunk.total_output_rows]
+                                chunk_grads.append(chunk_grad)
+                                if not self._is_worker_leader():
+                                    chunk_grad.zero_()
+                                    endpoint_staging.append(())
+                                    continue
+                                for segment in chunk.segments:
+                                    grad_dest[
+                                        BridgeBufferKey(segment.global_item_id)
+                                    ] = grad_buffer[
+                                        segment.output_row_start : segment.output_row_start
+                                        + segment.output_rows
+                                    ]
+
+                                stages = []
+                                for destination_id in range(1, endpoint_count):
+                                    stage = self.allocator.acquire(
+                                        rows=plan.capacity_policy.capacity_of(
+                                            chunk.total_output_rows
+                                        ),
+                                        width=self.hidden_size,
+                                        dtype=output_dtype,
+                                        device=self.device,
+                                        tag="grad_endpoint_stage",
+                                    )
+                                    staging_bases.append(stage)
+                                    stage_valid = stage[: chunk.total_output_rows]
+                                    stages.append(stage_valid)
+                                    for segment in chunk.segments:
+                                        grad_dest[
+                                            BridgeBufferKey(
+                                                segment.global_item_id,
+                                                destination_id,
+                                            )
+                                        ] = stage_valid[
+                                            segment.output_row_start : segment.output_row_start
+                                            + segment.output_rows
+                                        ]
+                                endpoint_staging.append(tuple(stages))
+                except BaseException as error:
+                    preparation_error = error
+                if self._planning_preparation_failed(preparation_error):
+                    if preparation_error is not None:
+                        raise preparation_error
+                    raise MdpStateError(
+                        "MDP: P5 gradient preparation failed on another planning rank; "
+                        "gradient communication was not started."
+                    )
+
+                with nvtx_phase("p5_grad_exchange"):
+                    grad_specs = self._iter_specs[BridgePhase.GRADIENT]
+                    grad_local = {}
+                    if local_endpoint_id is not None:
+                        for layout in plan.layouts:
+                            if layout.text_only:
+                                continue
+                            grad = self.storage.pop_grad(layout.microbatch_id)
+                            if endpoint_id is not None:
+                                for segment in layout.segments:
+                                    grad_local[
+                                        BridgeBufferKey(
+                                            segment.global_item_id, endpoint_id
+                                        )
+                                    ] = grad[
+                                        segment.leaf_row_start : segment.leaf_row_start
+                                        + segment.output_rows
+                                    ]
+                    self.bridge.exchange_all_to_all(
+                        self._iter_ledgers[BridgePhase.GRADIENT],
+                        grad_local,
+                        tensor_specs=grad_specs,
+                        group=self.process_groups.planning_group,
+                        group_ranks=self.rank_view.planning_group_ranks,
+                        global_rank=self.rank_view.global_rank,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                        dest_views=grad_dest,
+                    )
+                if endpoint_count > 1 and self._is_worker_leader():
+                    with nvtx_phase("p5_grad_sum"):
+                        for chunk_grad, stages in zip(chunk_grads, endpoint_staging):
+                            for stage in stages:
+                                chunk_grad.add_(stage)
+                if self._handle is not None:
+                    with nvtx_phase("p5_encoder_backward"):
+                        if isinstance(self._handle, EncoderWholeRecomputeHandle):
+                            self._handle.backward(
+                                chunk_grads,
+                                encoder=self.encoder_domain.encoder_ddp,
+                                encode=self.adapter.encode,
+                            )
+                        else:
+                            self._handle.backward(chunk_grads)
+                # From here onward every encoder autograd collective has
+                # returned. Rank-local release/cleanup failures can therefore
+                # safely converge before any rank enters WORLD finalization.
+                encoder_backward_completed = True
+                if self._handle is not None:
                     self._handle.release()
+            except BaseException as error:
+                p5_error = error
+            finally:
+                grad_dest.clear()
+                endpoint_staging.clear()
+                cleanup_actions = [
+                    (
+                        "releasing P5 endpoint staging buffer",
+                        lambda stage=stage: self.allocator.release(stage),
+                    )
+                    for stage in staging_bases
+                ]
+                cleanup_actions.extend(
+                    (
+                        "releasing P5 regroup buffer",
+                        lambda grad_base=grad_base: self.allocator.release(grad_base),
+                    )
+                    for grad_base in grad_bases
+                )
+                if p5_error is None:
+                    cleanup_actions.append(
+                        ("releasing P5 packed-pixel buffers", self._release_chunk_payload_bases)
+                    )
+                try:
+                    self._attempt_cleanup(cleanup_actions, primary_error=p5_error)
+                except BaseException as cleanup_error:
+                    p5_error = cleanup_error
+            if not encoder_backward_completed:
+                assert p5_error is not None
+                # ECP1 validation failures retain leaves for the inherited
+                # correct-and-retry contract. Once validation returns, any P5
+                # failure may have consumed partial state and must abort.
+                validation_retry = (
+                    self.config.encoder_cp == 1
+                    and not decoder_input_gradients_validated
+                )
+                if not validation_retry:
+                    self._abort_failed_iteration(p5_error)
+                raise p5_error
+            if self._encoder_finalize_preparation_failed(p5_error):
+                error = p5_error or MdpStateError(
+                    "MDP: post-backward cleanup failed on another encoder rank; "
+                    "WORLD gradient finalization was not started."
+                )
+                self._abort_failed_iteration(error)
+                raise error
             with nvtx_phase("p5_finalize_encoder_grads"):
                 finalize_encoder_grads(
                     self.encoder_domain.encoder_ddp,
@@ -567,9 +975,366 @@ class MdpRuntime:
         """The captured token tensor (test hook for the data_ptr assertion)."""
         return self._captured_num_tokens
 
+    def _register_pre_authority_dynamic_producer(self, owner: Any, producer: Any) -> None:
+        """Install one caller-owned Dynamic-CP producer by exact identity."""
+        self._validate_pre_authority_dynamic_producer_owner(owner, producer)
+        if self._pre_authority_dynamic_producer is not None:
+            raise MdpStateError("MDP: runtime already owns one producer handoff.")
+        bound_runtime = getattr(producer, "_mdp_pre_authority_runtime", None)
+        if bound_runtime is not None and bound_runtime is not self:
+            raise MdpStateError("MDP: dynamic producer belongs to its exact runtime owner.")
+        if self._pre_authority_dynamic_producer_is_retired(producer):
+            raise MdpStateError("MDP: runtime rejects a retired producer handoff.")
+        try:
+            weakref.ref(producer)
+            object.__setattr__(producer, "_mdp_pre_authority_runtime", self)
+        except (AttributeError, TypeError) as error:
+            raise MdpStateError(
+                "MDP: dynamic producer supports runtime-owned one-shot identity."
+            ) from error
+        self._pre_authority_dynamic_producer = producer
+
+    def _register_d4_encoder_capture_owner(self, owner: Any) -> None:
+        """Install one capture-only owner by exact identity."""
+        if (
+            self._d4_encoder_capture_owner is not None
+            or self._d4_encoder_capture_trusted_owner is not None
+        ):
+            raise MdpStateError("MDP: runtime already owns one D4 encoder capture.")
+        reference = self._retired_d4_encoder_capture_owners.get(id(owner))
+        if reference is not None and reference() is owner:
+            raise MdpStateError("MDP: runtime rejects a retired D4 encoder capture.")
+        try:
+            weakref.ref(owner)
+        except TypeError as error:
+            raise MdpStateError(
+                "MDP: D4 encoder capture supports runtime-owned one-shot identity."
+            ) from error
+        self._d4_encoder_capture_owner = self._d4_encoder_capture_trusted_owner = owner
+
+    def _require_d4_encoder_capture_owner(self, owner: Any) -> None:
+        """Require without consuming the exact active capture-only owner."""
+        if self._d4_encoder_capture_trusted_owner is owner:
+            if self._d4_encoder_capture_owner is owner:
+                return
+            raise MdpStateError(
+                "MDP: runtime D4 encoder capture slot matches its trusted owner."
+            )
+        reference = self._retired_d4_encoder_capture_owners.get(id(owner))
+        if reference is not None and reference() is owner:
+            raise MdpStateError("MDP: runtime rejects a retired D4 encoder capture.")
+        raise MdpStateError("MDP: runtime has the exact active D4 encoder capture owner.")
+
+    def _retire_d4_encoder_capture_owner(self, owner: Any) -> None:
+        """Retire the exact active capture owner before its resources are released."""
+        if self._d4_encoder_capture_trusted_owner is not owner:
+            self._require_d4_encoder_capture_owner(owner)
+        owner_identity = id(owner)
+        tombstones = self._retired_d4_encoder_capture_owners
+
+        def remove_tombstone(reference: weakref.ReferenceType[Any]) -> None:
+            if tombstones.get(owner_identity) is reference:
+                del tombstones[owner_identity]
+
+        tombstones[owner_identity] = weakref.ref(owner, remove_tombstone)
+        self._d4_encoder_capture_owner = None
+        self._d4_encoder_capture_trusted_owner = None
+
+    def _validate_pre_authority_dynamic_producer(self, owner: Any, producer: Any) -> None:
+        """Require the one unconsumed producer registered by this runtime."""
+        self._validate_pre_authority_dynamic_producer_owner(owner, producer)
+        if getattr(producer, "_mdp_pre_authority_runtime", None) is not self:
+            raise MdpStateError("MDP: dynamic producer belongs to its exact runtime owner.")
+        if self._pre_authority_dynamic_producer is not producer:
+            raise MdpStateError("MDP: runtime has the exact registered producer handoff.")
+
+    def _consume_pre_authority_dynamic_producer(self, owner: Any, producer: Any) -> None:
+        """Consume one exact producer handoff after successful private binding."""
+        self._validate_pre_authority_dynamic_producer(owner, producer)
+        bind_owner = getattr(owner, "_mark_pre_authority_dynamic_producer_bound", None)
+        if bind_owner is not None:
+            if not callable(bind_owner):
+                raise MdpStateError("MDP: dynamic producer owner binding hook is callable.")
+            bind_owner(producer)
+        self._retire_pre_authority_dynamic_producer()
+
+    def _abort_pre_authority_dynamic_producer(self, owner: Any | None = None) -> None:
+        """Discard the active private producer handoff without communication."""
+        producer = self._pre_authority_dynamic_producer
+        if producer is None:
+            return
+        self._validate_pre_authority_dynamic_producer_owner(owner, producer)
+        self._retire_pre_authority_dynamic_producer()
+
+    def _validate_pre_authority_dynamic_producer_owner(self, owner: Any, producer: Any) -> None:
+        if owner is None or producer is None or getattr(producer, "owner", None) is not owner:
+            raise MdpStateError("MDP: dynamic producer has its exact producer owner.")
+        if getattr(owner, "_runtime", None) is not self:
+            raise MdpStateError("MDP: dynamic producer has its exact runtime owner.")
+
+    def _pre_authority_dynamic_producer_is_retired(self, producer: Any) -> bool:
+        reference = self._retired_pre_authority_dynamic_producers.get(id(producer))
+        if reference is None:
+            return False
+        retired = reference()
+        if retired is None:
+            del self._retired_pre_authority_dynamic_producers[id(producer)]
+            return False
+        return retired is producer
+
+    def _retire_pre_authority_dynamic_producer(self) -> None:
+        """Clear the active slot while preserving its one-shot identity tombstone."""
+        producer = self._pre_authority_dynamic_producer
+        if producer is None:
+            return
+        try:
+            producer_identity = id(producer)
+            tombstones = self._retired_pre_authority_dynamic_producers
+
+            def remove_tombstone(reference: weakref.ReferenceType[Any]) -> None:
+                if tombstones.get(producer_identity) is reference:
+                    del tombstones[producer_identity]
+
+            tombstones[producer_identity] = weakref.ref(producer, remove_tombstone)
+        except TypeError as error:
+            raise MdpStateError(
+                "MDP: dynamic producer supports runtime-owned one-shot identity."
+            ) from error
+        self._pre_authority_dynamic_producer = None
+
+    def _capture_pre_authority_dynamic_producer(
+        self,
+        *,
+        owner: Any,
+        rank_view: Any,
+        local_manifest: Any,
+        source_window: Any,
+        static_plan: Any,
+        item_outputs: Mapping,
+        sample_location_by_id: Mapping,
+        local_prepare_error: Exception | None,
+        forward_only: bool,
+    ) -> Any:
+        """Seal a local Dynamic-CP P0--P2 result and register it without a collective."""
+        from megatron.core.mdp.dynamic_cp_runtime import _PreAuthorityDynamicProducer
+
+        if owner is None or getattr(owner, "_runtime", None) is not self:
+            raise MdpStateError("MDP: dynamic producer capture has its exact runtime owner.")
+        if local_prepare_error is not None:
+            if not isinstance(local_prepare_error, Exception):
+                raise MdpConfigurationError(
+                    "MDP: dynamic producer local preparation error is an Exception or None."
+                )
+            self._abort_pre_authority_dynamic_producer(owner)
+            return _PreAuthorityDynamicProducer(
+                rank_view=None,
+                local_manifest=None,
+                source_window=None,
+                static_plan=None,
+                item_outputs=MappingProxyType({}),
+                sample_location_by_id=MappingProxyType({}),
+                owner=None,
+                local_prepare_error=local_prepare_error,
+                forward_only=forward_only,
+            )
+        if not isinstance(item_outputs, Mapping) or not isinstance(sample_location_by_id, Mapping):
+            raise MdpConfigurationError(
+                "MDP: dynamic producer capture outputs and sample locations are mappings."
+            )
+        producer = _PreAuthorityDynamicProducer(
+            rank_view=rank_view,
+            local_manifest=local_manifest,
+            source_window=source_window,
+            static_plan=static_plan,
+            item_outputs=MappingProxyType(dict(item_outputs)),
+            sample_location_by_id=MappingProxyType(dict(sample_location_by_id)),
+            owner=owner,
+            local_prepare_error=None,
+            forward_only=forward_only,
+        )
+        self._register_pre_authority_dynamic_producer(owner, producer)
+        return producer
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _is_worker_leader(self) -> bool:
+        """Whether this rank owns its logical worker's public bridge edges."""
+        return self.rank_view.global_rank == self.process_groups.encoder_cp_leader_rank
+
+    def _abort_failed_iteration(self, primary_error, *, cleanup_actions=()) -> None:
+        """Release phase-local state and make the same runtime reusable.
+
+        ``primary_error`` always survives. Cleanup is best-effort; any cleanup
+        error is attached as a note instead of replacing the failure that made
+        every planning rank enter this path.
+        """
+        self._retire_pre_authority_dynamic_producer()
+        handle = self._handle
+        self._handle = None
+        self._eval_outputs = ()
+        actions = list(cleanup_actions)
+        if self._plan is not None:
+            actions.extend(
+                (
+                    f"releasing stored leaf for microbatch {layout.microbatch_id}",
+                    lambda microbatch_id=layout.microbatch_id: self.storage.release(
+                        microbatch_id
+                    ),
+                )
+                for layout in self._plan.layouts
+            )
+        if handle is not None and not handle.consumed:
+            actions.append(("releasing encoder forward handle", handle.release_forward_only))
+        actions.append(("releasing packed-pixel buffers", self._release_chunk_payload_bases))
+        self._attempt_cleanup(actions, primary_error=primary_error)
+        self._reset_failed_iteration_state()
+
+    def _reset_failed_iteration_state(self) -> None:
+        self._retire_pre_authority_dynamic_producer()
+        self._window = None
+        self._plan = None
+        self._iter_specs = {}
+        self._iter_ledgers = {}
+        self._handle = None
+        self._eval_outputs = ()
+        self._chunk_layouts = ()
+        self._chunk_payload_bases = ()
+        self._chunk_of_item = {}
+        self._captured_num_tokens = None
+        self._token_capture_count = 0
+        self._token_consumed = False
+        self._state = MdpRuntimeState.EMPTY
+
+    def _commit_successful_d3_iteration(self, *, iteration: int, token: torch.Tensor) -> None:
+        """Commit one post-Gate-6 D3 success without re-entering P5."""
+        if (
+            type(iteration) is not int
+            or iteration != self._iteration
+            or self._state is not MdpRuntimeState.EMPTY
+            or self._pre_authority_dynamic_producer is not None
+            or self._handle is not None
+            or self._chunk_payload_bases
+            or self._captured_num_tokens is not token
+            or self._token_capture_count != 1
+            or self._token_consumed is not True
+        ):
+            raise MdpStateError("MDP: D3 success commit retains its exact completed iteration.")
+        self._window = None
+        self._plan = None
+        self._iter_specs = {}
+        self._iter_ledgers = {}
+        self._eval_outputs = ()
+        self._chunk_layouts = ()
+        self._chunk_of_item = {}
+        self._captured_num_tokens = None
+        self._token_capture_count = 0
+        self._token_consumed = False
+        self._last_metrics = None
+        self._iteration += 1
+
+    def _release_chunk_payload_bases(self) -> None:
+        bases = self._chunk_payload_bases
+        self._chunk_payload_bases = ()
+        self._attempt_cleanup(
+            tuple(
+                (
+                    "releasing packed-pixel buffer",
+                    lambda base=base: self.allocator.release(base),
+                )
+                for base in bases
+            ),
+            primary_error=None,
+        )
+
+    @staticmethod
+    def _add_cleanup_note(primary_error: BaseException, note: str) -> None:
+        """Attach cleanup diagnostics without allowing an exception to replace the primary."""
+        try:
+            primary_error.add_note(note)
+        except BaseException:
+            pass
+
+    @staticmethod
+    def _attempt_cleanup(actions, *, primary_error=None) -> None:
+        cleanup_errors = []
+        for description, action in actions:
+            try:
+                action()
+            except BaseException as error:
+                cleanup_errors.append((description, error))
+                logger.exception("MDP: cleanup failed while %s.", description)
+        if not cleanup_errors:
+            return
+        if primary_error is not None:
+            for description, error in cleanup_errors:
+                MdpRuntime._add_cleanup_note(
+                    primary_error, f"suppressed cleanup error while {description}: {error!r}"
+                )
+            return
+        _, first_error = cleanup_errors[0]
+        for description, error in cleanup_errors[1:]:
+            MdpRuntime._add_cleanup_note(
+                first_error, f"another cleanup error while {description}: {error!r}"
+            )
+        raise first_error
+
+    def _prepare_static_locator_catalog(self, window, plan):
+        local_error = None
+        try:
+            if any(
+                self.rank_map.view(rank).outer_dp_rank != self.rank_view.outer_dp_rank
+                for rank in self.rank_view.planning_group_ranks
+            ):
+                raise MdpStateError("static locator capture requires one DP lane per planning group")
+            locators, digest = bind_static_vision_catalog(
+                window.locator_catalog(),
+                plan,
+                self.rank_view.worker_ids,
+                allowed_kinds=getattr(
+                    self.adapter, "static_vision_locator_kinds", (VisionLocatorKind.MOCK_SENTINEL,)
+                ),
+            )
+            wire = torch.tensor(list(digest), dtype=torch.uint8, device=self.device)
+            gathered = [torch.empty_like(wire) for _ in self.rank_view.planning_group_ranks]
+        except BaseException as error:
+            local_error = error
+        if self._planning_preparation_failed(local_error):
+            error = local_error or MdpStateError("static locator preparation failed on a peer")
+            self._abort_failed_iteration(error)
+            raise error
+        torch.distributed.all_gather(gathered, wire, group=self.process_groups.planning_group)
+        if any(not torch.equal(gathered[0], value) for value in gathered[1:]):
+            error = MdpStateError("static locator catalog or producer ownership differs across ranks")
+            self._abort_failed_iteration(error)
+            raise error
+        return locators
+
+    def _fill_static_vision_payloads(self, locators, destinations):
+        local_error = None
+        try:
+            layout = self._plan.encoder_layout_for_producer(self.rank_view.my_worker_id)
+            expected = {BridgeBufferKey(segment.global_item_id) for segment in layout.segments}
+            if set(destinations) != expected:
+                raise MdpStateError("static locator destinations match the assigned producer items")
+            with nvtx_phase("p1_local_vision_materialization"):
+                for segment in layout.segments:
+                    destination = destinations[BridgeBufferKey(segment.global_item_id)]
+                    if (
+                        destination.shape != (segment.payload_rows, self.adapter.payload_width)
+                        or destination.dtype != self.params_dtype
+                        or destination.device != self.device
+                    ):
+                        raise MdpStateError("static locator destination shape, dtype and device match")
+                    if self._is_worker_leader():
+                        self.adapter.fill_vision_payload(locators[segment.global_item_id], destination)
+        except BaseException as error:
+            local_error = error
+        # All producers finish local allocation/materialization before any P2/P3
+        # work can enter an encoder or embedding collective.
+        if self._planning_preparation_failed(local_error):
+            raise local_error or MdpStateError("static vision materialization failed on a peer")
 
     @staticmethod
     def _first_iterator(data_iterators):
@@ -657,9 +1422,23 @@ class MdpRuntime:
             num_microbatches=num_microbatches,
             adapter=self.adapter,
             num_vpp_chunks=self.num_vpp_chunks,
-            lane_id=self.rank_view.lane_id,
+            lane_id=(
+                self.rank_view.outer_dp_rank
+                if self._static_locator_capture else self.rank_view.lane_id
+            ),
             my_worker_id=self.rank_view.my_worker_id,
             num_workers=len(self.rank_view.worker_ids),
+            is_worker_leader=(
+                self._is_worker_leader() if self.config.encoder_cp > 1 else None
+            ),
+            data_loader_source_worker_ids=self.rank_map.data_loader_source_worker_ids(
+                self.rank_view.outer_dp_rank
+            ),
+            capture_error_consensus=(
+                self._planning_preparation_failed
+                if self.rank_map.spec.tp > 1 or self.config.encoder_cp > 1 or self._static_locator_capture
+                else None
+            ),
         )
 
     @staticmethod
@@ -764,21 +1543,166 @@ class MdpRuntime:
 
     def _tensor_specs(self, plan: MdpBatchPlan, *, pixels: bool) -> dict:
         specs = {}
+        endpoint_count = len(self.rank_map.decoder_endpoint_ranks(plan.outer_dp_rank))
         for route in plan.routes:
             segment = plan.segment_for_item(route.global_item_id)
             valid = segment.payload_rows if pixels else segment.output_rows
             width = self.adapter.payload_width if pixels else self.hidden_size
-            specs[BridgeBufferKey(route.global_item_id)] = BridgeTensorSpec(
-                valid_rows=valid,
-                capacity_rows=plan.capacity_policy.capacity_of(valid),
-                width=width,
-                dtype=self.params_dtype,
-                device=self.device,
-            )
+            endpoint_ids = (0,) if pixels else range(endpoint_count)
+            for endpoint_id in endpoint_ids:
+                specs[BridgeBufferKey(route.global_item_id, endpoint_id)] = BridgeTensorSpec(
+                    valid_rows=valid,
+                    capacity_rows=plan.capacity_policy.capacity_of(valid),
+                    width=width,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                )
         return specs
+
+    def _decoder_tp_source_rank(self) -> Optional[int]:
+        """PP0/TP0 source for this rank's native TP group, or ``None`` off PP0."""
+        source_rank = self.rank_map.tp_group_ranks(self.rank_view.global_rank)[0]
+        endpoints = self.rank_map.decoder_endpoint_ranks(self.rank_view.outer_dp_rank)
+        return source_rank if source_rank in endpoints else None
+
+    def _local_decoder_endpoint_id(self) -> Optional[int]:
+        """Decoder-CP endpoint represented by this PP0 native TP group."""
+        source_rank = self._decoder_tp_source_rank()
+        if source_rank is None:
+            return None
+        endpoints = self.rank_map.decoder_endpoint_ranks(self.rank_view.outer_dp_rank)
+        return endpoints.index(source_rank)
+
+    def _validate_tp_leaf_gradients(self, plan: MdpBatchPlan) -> None:
+        """Require exact TP-replica equality before TP0 owns the bridge source.
+
+        Leaves stay in storage until the coordinated verdict is known, so a
+        fail-closed mismatch or pre-collective allocation failure can be fixed
+        and retried on the same runtime without posting gradient communication.
+        """
+        local_endpoint_id = self._local_decoder_endpoint_id()
+        leaf_grads = []
+        reference = None
+        preparation_error = None
+        try:
+            if local_endpoint_id is not None:
+                for layout in plan.layouts:
+                    if layout.text_only:
+                        continue
+                    leaf = self.storage.get_leaf(layout.microbatch_id)
+                    if leaf is None or leaf.grad is None:
+                        raise MdpStateError(
+                            f"MDP: decoder TP leaf for microbatch {layout.microbatch_id} "
+                            "must have a gradient before collapse."
+                        )
+                    grad = leaf.grad
+                    expected_shape = (layout.total_output_rows, self.hidden_size)
+                    if (
+                        tuple(grad.shape) != expected_shape
+                        or grad.dtype != self.params_dtype
+                        or grad.device != self.device
+                    ):
+                        raise MdpStateError(
+                            f"MDP: decoder TP leaf gradient for microbatch "
+                            f"{layout.microbatch_id} violates expected "
+                            f"shape/dtype/device {expected_shape}/{self.params_dtype}/"
+                            f"{self.device}."
+                        )
+                    leaf_grads.append(grad)
+                if self.rank_map.spec.tp > 1 and leaf_grads:
+                    reference = self.allocator.acquire(
+                        rows=max(grad.shape[0] for grad in leaf_grads),
+                        width=self.hidden_size,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                        tag="tp_grad_reference",
+                    )
+        except BaseException as error:
+            preparation_error = error
+
+        if self._planning_preparation_failed(preparation_error):
+            if reference is not None:
+                self.allocator.release(reference)
+            if preparation_error is not None:
+                raise preparation_error
+            raise MdpStateError(
+                "MDP: decoder-input gradient preparation failed on another planning rank; "
+                "gradient communication was not started."
+            )
+
+        if self.rank_map.spec.tp == 1:
+            return
+
+        local_mismatch = torch.zeros(1, dtype=torch.int32, device=self.device)
+        try:
+            if local_endpoint_id is not None:
+                source_rank = self._decoder_tp_source_rank()
+                for grad in leaf_grads:
+                    reference_valid = reference[: grad.shape[0]]
+                    if self.rank_view.global_rank == source_rank:
+                        reference_valid.copy_(grad)
+                    torch.distributed.broadcast(
+                        reference_valid,
+                        src=source_rank,
+                        group=self.process_groups.decoder_tp_group,
+                    )
+                    torch.maximum(
+                        local_mismatch,
+                        torch.any(grad != reference_valid).to(torch.int32).view(1),
+                        out=local_mismatch,
+                    )
+            torch.distributed.all_reduce(
+                local_mismatch,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.process_groups.planning_group,
+            )
+            if bool(local_mismatch.item()):
+                raise MdpStateError(
+                    "MDP: replicated TP decoder-input gradients differ; only exact "
+                    "equal copies may collapse to TP0."
+                )
+        finally:
+            if reference is not None:
+                self.allocator.release(reference)
+
+    def _planning_preparation_failed(self, local_error: Optional[BaseException]) -> bool:
+        """Converge rank-local preparation failures before a TP/P2P collective."""
+        if self.rank_map.spec.tp == 1 and self.config.encoder_cp == 1 and not self._static_locator_capture:
+            return local_error is not None
+        failed = torch.tensor(
+            [1 if local_error is not None else 0],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.distributed.all_reduce(
+            failed,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.process_groups.planning_group,
+        )
+        return bool(failed.item())
+
+    def _encoder_finalize_preparation_failed(
+        self, local_error: Optional[BaseException]
+    ) -> bool:
+        """Converge post-backward local failures before WORLD finalization."""
+        failed = torch.tensor(
+            [1 if local_error is not None else 0],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.distributed.all_reduce(
+            failed,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.process_groups.encoder_reduction_group,
+        )
+        return bool(failed.item())
 
     def _assert_iteration_boundary(self) -> None:
         """Lifecycle invariants at every iteration boundary."""
+        if self._chunk_payload_bases:
+            raise MdpStateError(
+                "MDP: packed-pixel buffers survived the iteration boundary."
+            )
         if self._handle is not None and not self._handle.consumed:
             raise MdpStateError(
                 "MDP: an unconsumed producer forward handle survived the iteration."

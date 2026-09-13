@@ -1,0 +1,44 @@
+--- a/transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py
+@@ -1768,9 +1768,20 @@
+                                 )
+                             else:
+                                 # MHA or GQA
+-                                out = torch.zeros_like(q if not fp8 else out_per_step[0]).view(
+-                                    q.shape
+-                                )
++                                out = torch.zeros_like(
++                                    q if not fp8 else out_per_step[0],
++                                    dtype=(
++                                        torch.float32
++                                        if (
++                                            qkv_format == "thd"
++                                            and causal
++                                            and not fp8
++                                            and not enable_mla
++                                            and q.dtype == torch.bfloat16
++                                        )
++                                        else None
++                                    ),
++                                ).view(q.shape)
+                     elif (i - 1) <= rank or not causal:
+                         flash_attn_fwd_softmax_lse_correction(
+                             softmax_lse, softmax_lse_per_step[i - 1]
+@@ -1833,7 +1844,7 @@
+                 elif qkv_format == "thd":
+                     tex.thd_out_correction(
+                         out,
+-                        out_per_step[i],
++                        out_per_step[i].to(dtype=out.dtype),
+                         softmax_lse,
+                         softmax_lse_per_step[i],
+                         cu_seqlens_q_padded,
+@@ -1852,7 +1863,7 @@
+                 elif qkv_format == "thd":
+                     tex.thd_out_correction(
+                         out,
+-                        out_per_step[i],
++                        out_per_step[i].to(dtype=out.dtype),
+                         softmax_lse,
+                         softmax_lse_per_step[i],
+                         cu_seqlens_q_padded,
