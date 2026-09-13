@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel_layout import zigzag_to_contiguous_chunks
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
@@ -23,6 +24,7 @@ from megatron.core.ssm.gated_delta_net import (
     GatedDeltaNet,
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
+    _resolve_gdn_cp_partition_mode,
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
 )
@@ -137,6 +139,24 @@ def test_gdn_chunkwise_cp_head_divisibility_ignores_cp_size():
     assert config.linear_cp_mode == "chunkwise"
 
 
+@pytest.mark.parametrize("partition_mode", ["zigzag", "contiguous"])
+def test_gdn_packed_thd_cp_partition_mode(partition_mode):
+    packed_seq_params = PackedSeqParams(qkv_format="thd", cp_partition_mode=partition_mode)
+    assert _resolve_gdn_cp_partition_mode(packed_seq_params) == partition_mode
+
+
+@pytest.mark.parametrize("partition_mode", ["unknown", True, None])
+def test_gdn_rejects_unknown_packed_thd_cp_partition_mode(partition_mode):
+    packed_seq_params = PackedSeqParams(qkv_format="thd")
+    packed_seq_params.cp_partition_mode = partition_mode
+    with pytest.raises(ValueError, match="cp_partition_mode"):
+        _resolve_gdn_cp_partition_mode(packed_seq_params)
+
+
+def test_gdn_nonpacked_input_retains_zigzag_cp_layout():
+    assert _resolve_gdn_cp_partition_mode(None) == "zigzag"
+
+
 def test_fused_pre_gdr_split_batched_recv_send_works():
     from megatron.core.fusions.fused_pre_gated_delta_rule import _split_batched_recv_send_works
 
@@ -186,6 +206,7 @@ def test_gdn_headwise_cp_head_divisibility_includes_cp_size():
         (1, False, 2, "chunkwise"),
         (2, False, 2, "chunkwise"),
         (2, True, 2, "chunkwise"),
+        (1, False, 4, "chunkwise"),
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
@@ -199,6 +220,8 @@ class TestGatedDeltaNet:
             tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=1,
             context_parallel_size=cp_size,
+            dynamic_context_parallel=cp_size == 4,
+            min_dynamic_context_parallel_size=1,
         )
         model_parallel_cuda_manual_seed(123)
         self.tp_size = tp_size
@@ -294,6 +317,114 @@ class TestGatedDeltaNet:
         assert (
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
+
+    def test_packed_thd_contiguous_layout_matches_zigzag_forward_and_grad(self):
+        if self.cp_size == 1 or self.sp_size > 1 or self.linear_cp_mode != "chunkwise":
+            pytest.skip("This branch supports packed THD CP layout only for chunkwise SP-off GDN.")
+
+        gdn = self.gdn
+        gdn.train()
+        cp_group = gdn.pg_collection.cp
+        source_rank = torch.distributed.get_global_rank(cp_group, 0)
+        for parameter in gdn.parameters():
+            torch.distributed.broadcast(parameter.data, src=source_rank, group=cp_group)
+
+        total_sequence_length = 64
+        local_sequence_length = total_sequence_length // self.cp_size
+        cu_seqlens = torch.tensor(
+            [0, total_sequence_length], dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        torch.manual_seed(1234)
+        zigzag_input = torch.randn(
+            (local_sequence_length, 1, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        contiguous_input = zigzag_to_contiguous_chunks(
+            zigzag_input, cp_group, seq_dim=0, cu_seqlens=cu_seqlens
+        )
+
+        def run(hidden_states, partition_mode):
+            gdn.zero_grad(set_to_none=True)
+            hidden_states = hidden_states.detach().clone().requires_grad_(True)
+            packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens.cpu().tolist())
+            packed_seq_params.cp_partition_mode = partition_mode
+            output, _ = gdn(hidden_states, None, packed_seq_params=packed_seq_params)
+            output.float().square().mean().backward()
+            parameter_grads = {
+                name: parameter.grad.detach().clone()
+                for name, parameter in gdn.named_parameters()
+                if parameter.grad is not None
+            }
+            for parameter_grad in parameter_grads.values():
+                torch.distributed.all_reduce(parameter_grad, group=cp_group)
+            return output.detach(), hidden_states.grad.detach(), parameter_grads
+
+        zigzag_output, zigzag_input_grad, zigzag_parameter_grads = run(zigzag_input, "zigzag")
+        with (
+            mock.patch(
+                "megatron.core.ssm.gated_delta_net.zigzag_to_contiguous_chunks",
+                side_effect=AssertionError("contiguous input must not be transformed"),
+            ),
+            mock.patch(
+                "megatron.core.ssm.gated_delta_net.contiguous_to_zigzag_chunks",
+                side_effect=AssertionError("contiguous output must not be transformed"),
+            ),
+        ):
+            contiguous_output, contiguous_input_grad, contiguous_parameter_grads = run(
+                contiguous_input, "contiguous"
+            )
+
+        zigzag_output_contiguous = zigzag_to_contiguous_chunks(
+            zigzag_output, cp_group, seq_dim=0, cu_seqlens=cu_seqlens
+        )
+        zigzag_input_grad_contiguous = zigzag_to_contiguous_chunks(
+            zigzag_input_grad, cp_group, seq_dim=0, cu_seqlens=cu_seqlens
+        )
+        torch.testing.assert_close(
+            contiguous_output, zigzag_output_contiguous, atol=3e-3, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            contiguous_input_grad, zigzag_input_grad_contiguous, atol=3e-3, rtol=1e-2
+        )
+        assert contiguous_parameter_grads.keys() == zigzag_parameter_grads.keys()
+        for name in zigzag_parameter_grads:
+            torch.testing.assert_close(
+                contiguous_parameter_grads[name],
+                zigzag_parameter_grads[name],
+                atol=3e-3,
+                rtol=1e-2,
+                msg=lambda msg, parameter_name=name: (
+                    f"packed THD CP layout grad mismatch for {parameter_name!r}: {msg}"
+                ),
+            )
+
+    def test_packed_thd_uses_dynamic_cp_group_size_for_length_validation(self):
+        if self.cp_size != 4 or self.linear_cp_mode != "chunkwise":
+            pytest.skip("This regression requires a CP2 microbatch under a CP4 model.")
+
+        dynamic_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=2)
+        total_sequence_length = 10  # Divisible by dynamic CP2, but not static CP4.
+        hidden_states = torch.randn(
+            (total_sequence_length // dynamic_cp_group.size(), 1, self.gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=[0, total_sequence_length])
+        packed_seq_params.local_cp_size = dynamic_cp_group.size()
+        packed_seq_params.cp_group = dynamic_cp_group
+        packed_seq_params.cp_partition_mode = "contiguous"
+
+        with mock.patch.object(
+            self.gdn, "_resolve_cu_seqlens", wraps=self.gdn._resolve_cu_seqlens
+        ) as resolve_cu_seqlens:
+            output, _ = self.gdn(
+                hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+            )
+        assert [call.kwargs["cp_size"] for call in resolve_cu_seqlens.call_args_list] == [2, 2]
+        output.float().square().mean().backward()
+        assert hidden_states.grad is not None
 
     @pytest.mark.flaky_in_dev  # Issue #5473
     def test_selective_recompute_gdn(self):

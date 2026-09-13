@@ -23,6 +23,9 @@ from typing import Optional, Sequence
 import torch
 from torch.utils.data import Dataset
 
+from megatron.core.mdp.errors import MdpConfigurationError
+from megatron.core.mdp.vision_locator import VisionDataLocator, VisionLocatorKind
+
 from examples.multimodal_dev.data.mdp_scenarios import build_scenarios, scenario_totals
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
@@ -33,6 +36,31 @@ from examples.multimodal_dev.models.qwen35_vl.configuration import (
 def item_sentinel(sample_id: int, image_ordinal: int) -> int:
     """The integer written into every pixel of one vision item."""
     return 1000 * (sample_id + 1) + image_ordinal
+
+
+def materialize_mock_vision(locator, payload_width, *, dtype=torch.float32, device=None):
+    """Generate one assigned mock item, preserving the eager float32 rounding."""
+    if (
+        type(locator) is not VisionDataLocator
+        or locator.kind is not VisionLocatorKind.MOCK_SENTINEL
+    ):
+        raise MdpConfigurationError("mock materialization requires a typed sentinel recipe")
+    # Frozen carriers can still be forged; validate again before allocation.
+    VisionDataLocator(
+        locator.kind,
+        locator.path,
+        locator.member,
+        locator.column,
+        locator.index,
+        locator.grid_thw,
+        locator.declared_dimensions,
+    )
+    if type(payload_width) is not int or payload_width <= 0:
+        raise ValueError("mock payload width must be a positive integer")
+    t, h, w = locator.grid_thw
+    return torch.full(
+        (t * h * w, payload_width), float(locator.index), dtype=torch.float32, device=device
+    ).to(dtype=dtype)
 
 
 # Per-sample scenarios, cycled by sample index. Grids are (t, h, w) in patch
@@ -68,6 +96,8 @@ class MdpThdMockDataset(Dataset):
             controlling the per-sample *total* token length distribution
             (same schema as ``--varlen-mock-dataset-config-json``). Ignored
             when ``scenarios`` is given.
+        metadata_only: Return typed mock recipes and zero pixel rows; selected
+            producers materialize the recipes after the iteration plan.
     """
 
     def __init__(
@@ -82,6 +112,7 @@ class MdpThdMockDataset(Dataset):
         seed: int = 1234,
         scenarios: Optional[Sequence] = None,
         length_config: Optional[dict] = None,
+        metadata_only: bool = False,
     ):
         self.num_samples = num_samples
         self.vocab_size = vocab_size
@@ -91,6 +122,7 @@ class MdpThdMockDataset(Dataset):
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
         self.seed = seed
+        self.metadata_only = metadata_only
         if scenarios is not None:
             self.scenarios = tuple(scenarios)
         elif length_config is not None:
@@ -153,7 +185,7 @@ class MdpThdMockDataset(Dataset):
         loss_mask[input_ids == self.vision_start_token_id] = 0.0
         loss_mask[-1] = 0.0
 
-        if grids:
+        if grids and not self.metadata_only:
             pixel_chunks = []
             for ordinal, grid in enumerate(grids):
                 pixel_chunks.append(
@@ -164,18 +196,30 @@ class MdpThdMockDataset(Dataset):
                     )
                 )
             pixel_values = torch.cat(pixel_chunks)
-            image_grid_thw = torch.tensor(grids, dtype=torch.long)
         else:
             pixel_values = torch.empty(0, self.pixel_dim, dtype=torch.float32)
-            image_grid_thw = torch.empty(0, 3, dtype=torch.long)
+        image_grid_thw = torch.tensor(grids, dtype=torch.long).reshape(-1, 3)
 
-        return {
+        sample = {
             "input_ids": input_ids,
             "labels": labels,
             "loss_mask": loss_mask,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
         }
+        if self.metadata_only:
+            sample["vision_locators"] = tuple(
+                VisionDataLocator(
+                    VisionLocatorKind.MOCK_SENTINEL,
+                    "",
+                    None,
+                    None,
+                    item_sentinel(idx, ordinal),
+                    tuple(grid),
+                )
+                for ordinal, grid in enumerate(grids)
+            )
+        return sample
 
 
 #: Extra margin on top of the computed greedy sample requirement. The mean
@@ -211,6 +255,7 @@ def _greedy_sample_scale(args, scenarios):
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Provide MDP mock train / val / test datasets."""
     from megatron.training import get_args
+    from megatron.core.mdp.protocols import VisionCaptureMode
 
     args = get_args()
     length_config = getattr(args, "mdp_mock_dataset_config_json", None)
@@ -225,9 +270,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         vocab_size=getattr(args, "padded_vocab_size", 1024),
         image_token_id=getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID),
         scenarios=scenarios,
+        metadata_only=(
+            getattr(args, "mdp_vision_capture_mode", None)
+            is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        ),
     )
     scale = _greedy_sample_scale(args, scenarios)
     return tuple(
-        MdpThdMockDataset(num_samples=math.ceil(n * scale), seed=1234 + split, **kwargs)
+        MdpThdMockDataset(num_samples=math.ceil(n * scale), seed=1234 + split, **kwargs) if n > 0 else None
         for split, n in enumerate(train_val_test_num_samples)
     )

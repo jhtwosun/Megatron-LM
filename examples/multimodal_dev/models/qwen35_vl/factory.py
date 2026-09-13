@@ -102,6 +102,7 @@ def build_model(
 
     return Qwen35VLModel(
         language_config=language_config,
+        rotary_percent=(getattr(args, "rotary_percent", 0.25) if getattr(args, "model_variant", None) == "proxy" else 0.25),
         language_spec=language_spec,
         vision_config=vision_config,
         # Under MDP the replicated encoder domain owns the vision weights.

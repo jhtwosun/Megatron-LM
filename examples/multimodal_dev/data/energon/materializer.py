@@ -1,0 +1,800 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Generic descriptor I/O and owner-only Energon materialization dispatch."""
+
+from __future__ import annotations
+
+import io
+import os
+import pickle
+import posixpath
+import zipfile
+from collections.abc import Mapping, Sequence
+from pathlib import PurePosixPath
+from typing import Any
+
+import torch
+
+from megatron.core.mdp.vision_locator import (
+    VisionDataLocator,
+    VisionLocatorIndexSentinel,
+    VisionLocatorKind,
+)
+
+from .provider import _resolve_callable
+
+
+class _BytesOnlyUnpickler(pickle.Unpickler):
+    """Unpickler for legacy ``.jpgs`` byte lists without executable globals."""
+
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError(
+            f"global objects are not allowed in .jpgs payloads: {module}.{name}"
+        )
+
+
+def _read_bytes(value: Any, owner: str) -> bytes:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, (str, os.PathLike)):
+        with open(os.fspath(value), "rb") as stream:
+            return stream.read()
+    raise ValueError(f"{owner} must contain bytes or a filesystem path")
+
+
+def _validate_jpgs_index(index: Any) -> int:
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError(".jpgs image index must be a non-negative integer")
+    return index
+
+
+def _jpgs_member(payload: Any, index: Any) -> bytes:
+    index = _validate_jpgs_index(index)
+    try:
+        stream = io.BytesIO(_read_bytes(payload, ".jpgs payload"))
+        images = _BytesOnlyUnpickler(stream).load()
+        if stream.read(1):
+            raise pickle.UnpicklingError("trailing data is not allowed")
+    except (EOFError, pickle.UnpicklingError) as exc:
+        raise ValueError(f"invalid .jpgs payload: {exc}") from exc
+    if not isinstance(images, (list, tuple)) or not all(
+        isinstance(image, (bytes, bytearray)) for image in images
+    ):
+        raise ValueError(".jpgs payload must contain a list of image byte strings")
+    if index >= len(images):
+        raise ValueError(f".jpgs image index {index} is out of range for {len(images)} images")
+    return bytes(images[index])
+
+
+def _safe_zip_member(member: str) -> bool:
+    path = PurePosixPath(member)
+    return bool(member) and not path.is_absolute() and ".." not in path.parts
+
+
+def _zip_descriptor_spec(descriptor: Mapping[str, Any]) -> tuple[Any, tuple[str, ...]]:
+    zip_path = descriptor.get("zip_path")
+    if not isinstance(zip_path, (str, os.PathLike)):
+        raise ValueError("zip_image descriptor requires zip_path")
+    candidates = descriptor.get("candidates")
+    if candidates is None:
+        candidates = tuple(
+            value
+            for value in (descriptor.get("candidate"), descriptor.get("path"))
+            if value is not None
+        )
+    elif not isinstance(candidates, Sequence) or isinstance(candidates, (str, bytes)):
+        raise ValueError("zip_image candidates must be a sequence of member paths")
+    else:
+        candidates = tuple(candidates)
+    if not candidates or any(not isinstance(value, str) or not value for value in candidates):
+        raise ValueError("zip_image candidate member paths must be strings and non-empty")
+    members = tuple(candidates)
+    if not all(_safe_zip_member(member) for member in members):
+        raise ValueError("zip_image requires safe relative member candidates")
+    return zip_path, members
+
+
+def _zip_image_bytes(zip_path: Any, members: tuple[str, ...]) -> bytes:
+    with zipfile.ZipFile(os.fspath(zip_path), "r") as archive:
+        for member in members:
+            try:
+                return archive.read(member)
+            except KeyError:
+                continue
+    raise FileNotFoundError(f"image not found in zip {zip_path!s}: candidates={members!r}")
+
+
+def _parquet_descriptor_spec(descriptor: Mapping[str, Any]) -> tuple[Any, str, int]:
+    parquet_path = descriptor.get("parquet_path")
+    column = descriptor.get("column")
+    row_index = descriptor.get("row_idx")
+    if not isinstance(parquet_path, (str, os.PathLike)):
+        raise ValueError("parquet_column_image descriptor requires parquet_path")
+    if not isinstance(column, str) or not column:
+        raise ValueError("parquet_column_image descriptor requires a column")
+    if isinstance(row_index, bool) or not isinstance(row_index, int) or row_index < 0:
+        raise ValueError("parquet_column_image row_idx must be a non-negative integer")
+    return parquet_path, column, row_index
+
+
+def _parquet_image_bytes(parquet_path: Any, column: str, row_index: int) -> bytes:
+    import pyarrow.parquet as pq
+
+    parquet_file = pq.ParquetFile(os.fspath(parquet_path))
+    if column not in parquet_file.schema_arrow.names:
+        raise KeyError(f"parquet_column_image column {column!r} is unavailable")
+    offset = 0
+    value = None
+    for row_group in range(parquet_file.num_row_groups):
+        rows = parquet_file.metadata.row_group(row_group).num_rows
+        if row_index < offset + rows:
+            table = parquet_file.read_row_group(row_group, columns=[column])
+            value = table.column(column)[row_index - offset].as_py()
+            break
+        offset += rows
+    if value is None:
+        raise ValueError(f"parquet_column_image row_idx {row_index} is out of range")
+    if isinstance(value, Mapping):
+        if value.get("bytes") is not None:
+            value = value["bytes"]
+        elif value.get("path") is not None:
+            value = value["path"]
+        else:
+            raise ValueError("parquet_column_image value has neither bytes nor path")
+    return _read_bytes(value, "parquet_column_image value")
+
+
+def _canonical_dataset_root(dataset_root: Any) -> str:
+    if type(dataset_root) is not str:
+        raise ValueError("locator dataset root must be a canonical absolute path")
+    root = dataset_root
+    if not root.startswith("/") or root.startswith("//"):
+        raise ValueError("locator dataset root must be a canonical absolute path")
+    if posixpath.normpath(root) != root:
+        raise ValueError("locator dataset root must be a canonical absolute path")
+    return root
+
+
+def validate_locator_dataset_root(dataset_root: Any) -> str:
+    """Validate and return the canonical shared-filesystem locator root."""
+    return _canonical_dataset_root(dataset_root)
+
+
+def validate_locator_storage_roots(roots: Any) -> tuple[str, ...]:
+    """Canonicalize explicit static-loader authority, never descriptor data."""
+    if type(roots) not in (tuple, list) or not roots:
+        raise ValueError("static locators require an explicit non-empty storage-root allowlist")
+    canonical = []
+    for root in roots:
+        root = _canonical_dataset_root(root)
+        if "\0" in root or not os.path.isdir(root):
+            raise ValueError("locator storage roots must be existing directories")
+        resolved = os.path.realpath(root)
+        if resolved == "/":
+            raise ValueError("filesystem root is not a permitted locator storage root")
+        if resolved in canonical:
+            raise ValueError("duplicate locator storage roots or aliases are not allowed")
+        canonical.append(resolved)
+    return tuple(canonical)
+
+
+def authorize_locator_storage_path(
+    path: Any, roots: tuple[str, ...], *, allow_root: bool = False
+) -> tuple[str, str]:
+    """Resolve a static absolute path under prevalidated launcher authority.
+
+    Relative descriptors need a trusted source mapping; trying roots in order
+    would silently change which data is selected. Symlinks cannot grant access
+    outside the allowlist. The deepest matching root is deterministic.
+    """
+    if type(path) is not str or "\0" in path:
+        raise ValueError("static locator paths must be canonical absolute paths")
+    _canonical_dataset_root(path)
+    resolved = os.path.realpath(path)
+    matches = [
+        root for root in roots
+        if posixpath.commonpath((root, resolved)) == root
+        and (allow_root or resolved != root)
+    ]
+    if not matches:
+        raise ValueError("static locator path is outside the configured storage roots")
+    return max(matches, key=len), resolved
+
+
+def _locator_path(value: Any, *, dataset_root: str, owner: str) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{owner} must be path-backed in locator mode")
+    path = value
+    if path.startswith("/") and posixpath.normpath(path) != path:
+        raise ValueError(f"{owner} absolute path must already be canonical")
+    candidate = posixpath.normpath(
+        path if path.startswith("/") else posixpath.join(dataset_root, path)
+    )
+    try:
+        confined = posixpath.commonpath((dataset_root, candidate)) == dataset_root
+    except ValueError:
+        confined = False
+    if not confined or candidate == dataset_root:
+        raise ValueError(f"{owner} must remain within the configured dataset root")
+    return candidate
+
+
+def _validate_exact_zip_member(member: Any) -> str:
+    if (
+        type(member) is not str
+        or not member
+        or member.startswith("/")
+        or posixpath.normpath(member) != member
+        or member == "."
+        or ".." in PurePosixPath(member).parts
+        or "\0" in member
+        or "\\" in member
+    ):
+        raise ValueError("zip locator requires one safe canonical relative member")
+    return member
+
+
+def _exact_zip_member(descriptor: Mapping[str, Any]) -> str:
+    values = []
+    for key in ("candidate", "path"):
+        if descriptor.get(key) is not None:
+            values.append(descriptor[key])
+    candidates = descriptor.get("candidates")
+    if candidates is not None:
+        if type(candidates) not in (tuple, list):
+            raise ValueError("zip locator candidates must contain exactly one member")
+        values.extend(candidates)
+    if len(values) != 1:
+        qualifier = "ambiguous" if len(values) > 1 else "missing"
+        raise ValueError(f"zip locator has an {qualifier} member; exactly one is required")
+    return _validate_exact_zip_member(values[0])
+
+
+def freeze_descriptor_locator(
+    descriptor: Mapping[str, Any],
+    *,
+    dataset_root: Any,
+    grid_thw: tuple[int, int, int],
+    declared_dimensions: tuple[int, int] | None,
+) -> VisionDataLocator:
+    """Freeze one descriptor into a no-byte, no-I/O shared-filesystem locator."""
+    if type(descriptor) is not dict:
+        raise ValueError("image descriptor must be an exact metadata dictionary")
+    root = _canonical_dataset_root(dataset_root)
+    kind = descriptor.get("kind")
+    if kind is not None and type(kind) is not str:
+        raise ValueError("image descriptor kind must be exact text or None")
+    direct_keys = tuple(
+        key
+        for key in ("encoded_image", "image_bytes", "bytes", "jpg", "image")
+        if descriptor.get(key) is not None
+    )
+    has_bundle = descriptor.get("encoded_images") is not None
+    has_path = descriptor.get("path") is not None
+
+    if kind == "zip_image":
+        if direct_keys or has_bundle or descriptor.get("parquet_path") is not None:
+            raise ValueError("zip locator has an ambiguous competing image source")
+        path = _locator_path(
+            descriptor.get("zip_path"), dataset_root=root, owner="zip locator path"
+        )
+        return VisionDataLocator(
+            VisionLocatorKind.ZIP_MEMBER,
+            path,
+            _exact_zip_member(descriptor),
+            None,
+            VisionLocatorIndexSentinel.UNUSED,
+            grid_thw,
+            declared_dimensions,
+        )
+
+    if kind == "parquet_column_image":
+        if (
+            direct_keys
+            or has_bundle
+            or has_path
+            or descriptor.get("zip_path") is not None
+            or descriptor.get("candidate") is not None
+            or descriptor.get("candidates") is not None
+        ):
+            raise ValueError("parquet locator has an ambiguous competing image source")
+        if type(descriptor.get("parquet_path")) is not str:
+            raise ValueError("parquet locator path must be path-backed in locator mode")
+        parquet_path, column, row_index = _parquet_descriptor_spec(descriptor)
+        path = _locator_path(parquet_path, dataset_root=root, owner="parquet locator path")
+        return VisionDataLocator(
+            VisionLocatorKind.PARQUET_ROW,
+            path,
+            None,
+            column,
+            row_index,
+            grid_thw,
+            declared_dimensions,
+        )
+
+    if kind not in (None, "image_bytes", "image_path", "raw_bytes", "raw_jpeg", "jpgs"):
+        raise ValueError(f"unsupported image descriptor kind {kind!r}")
+    if set(descriptor) == {"__restore_key__"}:
+        raise ValueError("a bare __restore_key__ is not a vision data locator")
+
+    if any(
+        descriptor.get(key) is not None
+        for key in ("zip_path", "candidate", "candidates", "parquet_path", "column", "row_idx")
+    ):
+        raise ValueError("image descriptor has an ambiguous competing locator source")
+    if len(direct_keys) + int(has_bundle) + int(has_path) != 1:
+        raise ValueError("image descriptor has an ambiguous or missing locator source")
+
+    path_value = descriptor.get("path")
+    path_is_jpgs = type(path_value) is str and path_value.lower().endswith(".jpgs")
+    if has_bundle or kind == "jpgs" or path_is_jpgs:
+        payload = descriptor.get("encoded_images") if has_bundle else descriptor.get("path")
+        if type(payload) is not str:
+            raise ValueError("inline .jpgs payloads are not allowed in locator mode")
+        payload_path = payload
+        if not payload_path.lower().endswith(".jpgs"):
+            raise ValueError(".jpgs locator must be backed by a .jpgs filesystem path")
+        if "encoded_image_index" not in descriptor:
+            raise ValueError(".jpgs locator requires an explicit image index")
+        index = _validate_jpgs_index(descriptor["encoded_image_index"])
+        path = _locator_path(payload_path, dataset_root=root, owner=".jpgs locator path")
+        return VisionDataLocator(
+            VisionLocatorKind.JPGS_IMAGE, path, None, None, index, grid_thw, declared_dimensions
+        )
+
+    key = "path" if has_path else direct_keys[0]
+    path = _locator_path(descriptor[key], dataset_root=root, owner=f"image descriptor {key}")
+    return VisionDataLocator(
+        VisionLocatorKind.SHARED_FILE,
+        path,
+        None,
+        None,
+        VisionLocatorIndexSentinel.UNUSED,
+        grid_thw,
+        declared_dimensions,
+    )
+
+
+def prepare_static_vision_locator(
+    descriptor, *, storage_roots, grid_thw, declared_dimensions
+) -> VisionDataLocator:
+    """Authorize storage and resolve ZIP metadata before no-I/O freezing.
+
+    ZIP central-directory work is deliberately uncached and part of capture.
+    Candidate order matches the existing loader; no image payload is read here.
+    WebDataset roots must come from native source identity, never tar-path inference.
+    """
+    if type(descriptor) is not dict:
+        raise ValueError("static vision descriptors must be exact dictionaries")
+    descriptor = dict(descriptor)
+    kind = descriptor.get("kind")
+    if kind == "webdataset_entry":
+        if not set(descriptor).issubset({
+            "kind", "dataset_root", "entry", "image_index", "grid_thw", "height", "width"
+        }):
+            raise ValueError("WebDataset entry descriptor has competing or unknown payload fields")
+        _, dataset = authorize_locator_storage_path(
+            descriptor.get("dataset_root"), storage_roots, allow_root=True
+        )
+        return VisionDataLocator(
+            VisionLocatorKind.WEBDATASET_ENTRY, dataset, descriptor.get("entry"), None,
+            descriptor.get("image_index", VisionLocatorIndexSentinel.UNUSED),
+            grid_thw, declared_dimensions,
+        )
+    if kind == "zip_image":
+        path, candidates = _zip_descriptor_spec(descriptor)
+        root, path = authorize_locator_storage_path(path, storage_roots)
+        with zipfile.ZipFile(path, "r") as archive:
+            names = [info.filename for info in archive.infolist()]
+        selected = next((name for name in candidates if name in names), None)
+        if selected is None:
+            raise FileNotFoundError(f"image not found in zip {path}: candidates={candidates!r}")
+        if names.count(selected) != 1:
+            raise ValueError("zip locator member must occur exactly once in the archive")
+        descriptor.pop("candidates", None)
+        descriptor.pop("candidate", None)
+        descriptor.update(zip_path=path, path=selected)
+    else:
+        if kind == "parquet_column_image":
+            key = "parquet_path"
+        else:
+            sources = [key for key in ("path", "encoded_images", "encoded_image", "image_bytes", "bytes", "jpg", "image")
+                       if descriptor.get(key) is not None]
+            if len(sources) != 1:
+                raise ValueError("static descriptor requires one path-backed image source")
+            key = sources[0]
+        root, descriptor[key] = authorize_locator_storage_path(descriptor.get(key), storage_roots)
+    return freeze_descriptor_locator(
+        descriptor, dataset_root=root, grid_thw=grid_thw,
+        declared_dimensions=declared_dimensions,
+    )
+
+
+def bind_webdataset_image_descriptors(sample, descriptors, *, storage_roots):
+    """Replace inline-carrier metadata using native source/index identity only."""
+    storage_fields = (
+        "zip_path",
+        "parquet_path",
+        "path",
+        "encoded_image",
+        "encoded_images",
+        "image_bytes",
+        "bytes",
+        "jpg",
+        "image",
+    )
+    deferred = [
+        index
+        for index, descriptor in enumerate(descriptors)
+        if descriptor.get("kind") in (None, "raw_bytes", "raw_jpeg", "image_bytes", "jpgs")
+        and not any(descriptor.get(key) is not None for key in storage_fields)
+    ]
+    if not deferred:
+        return descriptors
+    from megatron.energon.cache.file_store import WebdatasetFileStore
+    from megatron.energon.epathlib import EPath
+    from megatron.energon.source_info import SourceInfo
+
+    sources = sample.get("__sources__", ())
+    key = sample.get("__key__")
+    if (
+        not isinstance(sources, (list, tuple))
+        or len(sources) != 1
+        or type(sources[0]) is not SourceInfo
+    ):
+        raise ValueError("deferred WebDataset images require one native SourceInfo")
+    key = _validate_exact_zip_member(key)
+    source = sources[0]
+    if not isinstance(source.file_names, tuple) or key + ".json" not in source.file_names:
+        raise ValueError("native source identity must include this sample's JSON entry")
+    _, dataset = authorize_locator_storage_path(
+        str(source.dataset_path), storage_roots, allow_root=True
+    )
+    shard = _validate_exact_zip_member(source.shard_name)
+    _, source_tar = authorize_locator_storage_path(posixpath.join(dataset, shard), storage_roots)
+    store = WebdatasetFileStore(EPath(dataset))
+    # The default/native fast path reads SQLite metadata only. Never enable
+    # slow_mode: its fallback reads actual tar entries before planning.
+    parts = [
+        (name, tar_id)
+        for name, _, tar_id in store.list_sample_parts(key, slow_mode=False)
+        if name in ("jpg", "jpgs")
+    ]
+    if len(parts) != 1:
+        raise ValueError("native index must identify exactly one jpg or jpgs carrier")
+    extension, tar_id = parts[0]
+    if store.tar_filenames[tar_id] != source.shard_name:
+        raise ValueError("indexed carrier and native JSON source belong to different shards")
+    if extension == "jpg" and len(deferred) != 1:
+        raise ValueError("one jpg carrier cannot represent multiple vision items")
+    result = list(descriptors)
+    for ordinal in deferred:
+        descriptor = descriptors[ordinal]
+        image_index = descriptor.get("image_idx", ordinal)
+        if (
+            descriptor.get("key", key) != key
+            or type(image_index) is not int
+            or image_index != ordinal
+        ):
+            raise ValueError("deferred descriptor key/index differs from native sample order")
+        if descriptor.get("tar_path") is not None:
+            _, declared_tar = authorize_locator_storage_path(descriptor["tar_path"], storage_roots)
+            if declared_tar != source_tar:
+                raise ValueError("descriptor tar_path differs from native JSON source")
+        result[ordinal] = {
+            "kind": "webdataset_entry",
+            "dataset_root": dataset,
+            "entry": key + "." + extension,
+            "image_index": ordinal if extension == "jpgs" else VisionLocatorIndexSentinel.UNUSED,
+            **{
+                name: descriptor[name]
+                for name in ("grid_thw", "height", "width")
+                if name in descriptor
+            },
+        }
+    return tuple(result)
+
+
+def validate_static_energon_batch(batch, *, storage_roots):
+    """Reauthorize typed empty-pixel documents against trusted provider roots.
+
+    The marker identifies a carrier, not an authority: roots come from validated
+    launcher configuration, never from locators or sample SourceInfo.
+    """
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    if type(batch) is not list:
+        raise ValueError("static Energon batch must be a document list")
+    for document in batch:
+        locators = document.get("vision_locators")
+        pixels, grids = document.get("pixel_values"), document.get("image_grid_thw")
+        if (
+            document.get("vision_capture_mode") is not VisionCaptureMode.STABLE_LOCATOR_CATALOG
+            or type(locators) is not tuple
+            or not torch.is_tensor(pixels)
+            or pixels.ndim != 2
+            or pixels.numel() != 0
+            or not torch.is_tensor(grids)
+            or grids.ndim != 2
+            or grids.shape[1] != 3
+            or len(locators) != len(grids)
+        ):
+            raise ValueError(
+                "static Energon requires provider-generated locators and zero pixel rows"
+            )
+        for locator, grid in zip(locators, grids.tolist(), strict=True):
+            if type(locator) is not VisionDataLocator or locator.grid_thw != tuple(grid):
+                raise ValueError("static Energon locator grid differs from its document")
+            authorize_locator_storage_path(
+                locator.path,
+                storage_roots,
+                allow_root=locator.kind is VisionLocatorKind.WEBDATASET_ENTRY,
+            )
+    return batch
+
+
+def _parquet_locator_image_bytes(locator: VisionDataLocator) -> bytes:
+    import pyarrow.parquet as pq
+
+    parquet_file = pq.ParquetFile(locator.path)
+    if locator.column not in parquet_file.schema_arrow.names:
+        raise KeyError(f"parquet locator column {locator.column!r} is unavailable")
+    offset = 0
+    missing = object()
+    value = missing
+    for row_group in range(parquet_file.num_row_groups):
+        rows = parquet_file.metadata.row_group(row_group).num_rows
+        if locator.index < offset + rows:
+            table = parquet_file.read_row_group(row_group, columns=[locator.column])
+            value = table.column(locator.column)[locator.index - offset].as_py()
+            break
+        offset += rows
+    if value is missing:
+        raise ValueError(f"parquet locator row index {locator.index} is out of range")
+    if isinstance(value, Mapping):
+        if type(value) is not dict or not set(value).issubset({"bytes", "path"}):
+            raise ValueError("parquet locator value has unsupported payload fields")
+        present = tuple(key for key in ("bytes", "path") if value.get(key) is not None)
+        if len(present) != 1:
+            raise ValueError("parquet locator value has an ambiguous or missing payload")
+        value = value[present[0]]
+    if type(value) is str:
+        if value.startswith("/"):
+            raise ValueError("parquet locator payload path must be relative to its container")
+        container = posixpath.dirname(locator.path)
+        value = _locator_path(value, dataset_root=container, owner="parquet locator payload path")
+        return _read_bytes(value, "parquet locator value")
+    if type(value) is bytes:
+        return value
+    raise ValueError("parquet locator payload value must be exact bytes or a confined path")
+
+
+def vision_locator_image_bytes(locator: VisionDataLocator) -> bytes:
+    """Read exact encoded bytes named by one validated locator."""
+    if type(locator) is not VisionDataLocator:
+        raise ValueError("vision locator must use the exact VisionDataLocator type")
+    locator = VisionDataLocator(
+        locator.kind,
+        locator.path,
+        locator.member,
+        locator.column,
+        locator.index,
+        locator.grid_thw,
+        locator.declared_dimensions,
+    )
+    if locator.kind is VisionLocatorKind.SHARED_FILE:
+        return _read_bytes(locator.path, "shared-file locator")
+    if locator.kind is VisionLocatorKind.ZIP_MEMBER:
+        member = _validate_exact_zip_member(locator.member)
+        with zipfile.ZipFile(locator.path, "r") as archive:
+            matches = tuple(info for info in archive.infolist() if info.filename == member)
+            if len(matches) != 1:
+                raise ValueError("zip locator member must occur exactly once in the archive")
+            return archive.read(matches[0])
+    if locator.kind is VisionLocatorKind.JPGS_IMAGE:
+        if not locator.path.lower().endswith(".jpgs"):
+            raise ValueError(".jpgs locator must be backed by a .jpgs filesystem path")
+        return _jpgs_member(locator.path, locator.index)
+    if locator.kind is VisionLocatorKind.PARQUET_ROW:
+        return _parquet_locator_image_bytes(locator)
+    if locator.kind is VisionLocatorKind.WEBDATASET_ENTRY:
+        from megatron.energon.cache.file_store import WebdatasetFileStore
+        from megatron.energon.epathlib import EPath
+
+        payload, _ = WebdatasetFileStore(EPath(locator.path))[locator.member]
+        if type(payload) is not bytes:
+            raise ValueError("WebDataset entry must contain exact encoded bytes")
+        if locator.member.endswith(".jpgs"):
+            return _jpgs_member(payload, locator.index)
+        return payload
+    raise AssertionError("closed VisionLocatorKind was not handled")
+
+
+def _descriptor_source_spec(descriptor: Mapping[str, Any]) -> tuple[str, tuple[Any, ...]]:
+    """Validate one descriptor without opening or decoding its payload."""
+    if not isinstance(descriptor, Mapping):
+        raise ValueError("image descriptor must be a metadata mapping")
+    kind = descriptor.get("kind")
+    if kind == "zip_image":
+        return "zip", _zip_descriptor_spec(descriptor)
+    if kind == "parquet_column_image":
+        return "parquet", _parquet_descriptor_spec(descriptor)
+    if kind not in (None, "image_bytes", "image_path", "raw_bytes", "raw_jpeg", "jpgs"):
+        raise ValueError(f"unsupported image descriptor kind {kind!r}")
+    direct_keys = tuple(
+        key
+        for key in ("encoded_image", "image_bytes", "bytes", "jpg", "image")
+        if descriptor.get(key) is not None
+    )
+    has_bundle = descriptor.get("encoded_images") is not None
+    has_path = descriptor.get("path") is not None
+    if len(direct_keys) + int(has_bundle) + int(has_path) != 1:
+        raise ValueError("image descriptor has an ambiguous or missing image source")
+    if has_bundle:
+        payload = descriptor["encoded_images"]
+        if not isinstance(payload, (bytes, bytearray, memoryview, str, os.PathLike)):
+            raise ValueError(".jpgs payload must contain bytes or a filesystem path")
+        index = _validate_jpgs_index(descriptor.get("encoded_image_index", 0))
+        return "jpgs", (payload, index)
+    if has_path:
+        path = descriptor["path"]
+        if not isinstance(path, (str, os.PathLike)):
+            raise ValueError("image descriptor path must contain bytes or a filesystem path")
+        if str(os.fspath(path)).lower().endswith(".jpgs"):
+            index = _validate_jpgs_index(descriptor.get("encoded_image_index", 0))
+            return "jpgs", (path, index)
+        return "bytes", (path, "image descriptor path")
+    key = direct_keys[0]
+    value = descriptor[key]
+    if not isinstance(value, (bytes, bytearray, memoryview, str, os.PathLike)):
+        raise ValueError(f"image descriptor {key} must contain bytes or a filesystem path")
+    return "bytes", (value, f"image descriptor {key}")
+
+
+def descriptor_image_bytes(descriptor: Mapping[str, Any]) -> bytes:
+    """Return exact encoded bytes from one structurally validated descriptor."""
+    source, values = _descriptor_source_spec(descriptor)
+    if source == "zip":
+        return _zip_image_bytes(*values)
+    if source == "parquet":
+        return _parquet_image_bytes(*values)
+    if source == "jpgs":
+        return _jpgs_member(*values)
+    return _read_bytes(*values)
+
+
+def validate_descriptor_structure(descriptor: Mapping[str, Any]) -> None:
+    """Validate descriptor routing fields without reading its payload."""
+    _descriptor_source_spec(descriptor)
+
+
+def load_descriptor_image(descriptor: Mapping[str, Any]):
+    """Decode one validated descriptor as an independent RGB PIL image."""
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        with Image.open(io.BytesIO(descriptor_image_bytes(descriptor))) as image:
+            return image.convert("RGB").copy()
+    except (UnidentifiedImageError, SyntaxError) as exc:
+        raise ValueError("failed to decode image descriptor") from exc
+
+
+def _metadata_grid_tuple(value: Any, owner: str) -> tuple[int, int, int]:
+    if torch.is_tensor(value):
+        value = value.detach().cpu().reshape(-1).tolist()
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or len(value) != 3
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+    ):
+        raise ValueError(f"{owner} must contain three integers")
+    grid = tuple(int(item) for item in value)
+    if min(grid) <= 0:
+        raise ValueError(f"{owner} values must be positive")
+    return grid
+
+
+def _document_vision_metadata(document: Mapping[str, Any], index: int):
+    descriptors = document.get("image_descriptors", ())
+    grids = document.get("image_grid_thw")
+    pixels = document.get("pixel_values")
+    if not isinstance(descriptors, Sequence) or isinstance(descriptors, (str, bytes)):
+        raise ValueError(f"Energon document {index} image_descriptors must be a sequence")
+    if not torch.is_tensor(grids) or grids.dim() != 2 or int(grids.shape[1]) != 3:
+        raise ValueError(f"Energon document {index} image_grid_thw must have shape [N, 3]")
+    if not torch.is_tensor(pixels) or pixels.dim() != 2:
+        raise ValueError(f"Energon document {index} pixel_values must be a rank-2 tensor")
+    if int(pixels.shape[0]) != 0:
+        raise ValueError(
+            f"Energon document {index} pixels are already materialized; "
+            "owner materialization requires an empty placeholder"
+        )
+    if len(descriptors) != int(grids.shape[0]):
+        raise ValueError(
+            f"Energon document {index} descriptors and grid counts differ: "
+            f"{len(descriptors)} != {int(grids.shape[0])}"
+        )
+    if grids.numel() and (grids <= 0).any():
+        raise ValueError(f"Energon document {index} image grids must be positive")
+    for ordinal, descriptor in enumerate(descriptors):
+        if not isinstance(descriptor, Mapping):
+            raise ValueError(
+                f"Energon document {index} image descriptor {ordinal} must be a mapping"
+            )
+        validate_descriptor_structure(descriptor)
+        descriptor_grid = descriptor.get("grid_thw")
+        if descriptor_grid is not None:
+            actual_grid = _metadata_grid_tuple(
+                descriptor_grid, f"Energon document {index} image descriptor {ordinal} grid_thw"
+            )
+            expected_grid = tuple(int(item) for item in grids[ordinal].detach().cpu().tolist())
+            if actual_grid != expected_grid:
+                raise ValueError(
+                    f"Energon document {index} image descriptor {ordinal} grid_thw "
+                    "does not match image_grid_thw"
+                )
+    return tuple(descriptors), grids
+
+
+def prepare_energon_batch(
+    batch: list[dict[str, Any]], *, args: Any, materialize_pixels: bool
+) -> list[dict[str, Any]]:
+    """Materialize selected image documents on their pixel owner."""
+    if getattr(args, "dataset_provider", None) != "energon":
+        return batch
+    if not isinstance(batch, list):
+        raise TypeError("Energon batches must be a list of document dictionaries")
+
+    pending = []
+    for index, document in enumerate(batch):
+        if not isinstance(document, Mapping):
+            raise TypeError(f"Energon batch document {index} must be a mapping")
+        descriptors, grids = _document_vision_metadata(document, index)
+        if descriptors:
+            pending.append((index, document, descriptors, grids))
+    if not pending:
+        return batch
+
+    from examples.multimodal_dev.models import MODEL_REGISTRY
+
+    model_arch = getattr(args, "model_arch", None)
+    registry = MODEL_REGISTRY.get(model_arch)
+    validator_spec = None if registry is None else registry.get("energon_image_metadata_validator")
+    if validator_spec is not None:
+        validate_metadata = _resolve_callable(
+            validator_spec, owner=f"{model_arch!r} energon_image_metadata_validator"
+        )
+        for _index, _document, descriptors, grids in pending:
+            validate_metadata(descriptors, grids)
+    if not materialize_pixels:
+        return batch
+    factory_spec = None if registry is None else registry.get("energon_image_materializer_factory")
+    if factory_spec is None:
+        raise NotImplementedError(
+            f"Model {model_arch!r} does not define energon_image_materializer_factory"
+        )
+    factory = _resolve_callable(
+        factory_spec, owner=f"{model_arch!r} energon_image_materializer_factory"
+    )
+    materialize = factory(args=args)
+    if not callable(materialize):
+        raise TypeError(
+            f"Model {model_arch!r} energon_image_materializer_factory must return a callable"
+        )
+
+    prepared = list(batch)
+    for index, document, descriptors, grids in pending:
+        pixels = materialize(descriptors, grids)
+        if not torch.is_tensor(pixels) or pixels.dim() != 2:
+            raise ValueError(f"Energon document {index} materializer must return a rank-2 tensor")
+        expected_rows = int(grids.to(dtype=torch.int64).prod(dim=1).sum().item())
+        if int(pixels.shape[0]) != expected_rows:
+            raise ValueError(
+                f"Energon document {index} materialized pixel rows "
+                f"{int(pixels.shape[0])} != grid rows {expected_rows}"
+            )
+        if not torch.isfinite(pixels).all():
+            raise ValueError(f"Energon document {index} materialized pixels must be finite")
+        prepared[index] = {**document, "pixel_values": pixels}
+    return prepared

@@ -11,6 +11,10 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import (
+    contiguous_to_zigzag_chunks,
+    zigzag_to_contiguous_chunks,
+)
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -1331,6 +1335,159 @@ class Attention(MegatronModule, ABC):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> tuple[Tensor, Tensor | None]:
+        """Run attention, adapting admitted contiguous THD input to native zigzag CP."""
+        cp_group = None
+        padded_cu_seqlens = None
+        convert_layout = False
+        if packed_seq_params is not None and type(packed_seq_params) is not PackedSeqParams:
+            raise TypeError("packed_seq_params must be an exact PackedSeqParams")
+        if packed_seq_params is not None:
+            local_cp_size = packed_seq_params.local_cp_size
+            if local_cp_size is not None and type(local_cp_size) is not int:
+                raise TypeError("local_cp_size must be an exact int")
+        else:
+            local_cp_size = None
+        if local_cp_size is not None:
+            cp_group = packed_seq_params.cp_group
+            if cp_group is None:
+                raise ValueError("cp_group must be set in dynamic-cp mode")
+            cp_size = get_pg_size(cp_group)
+            if local_cp_size != cp_size:
+                raise ValueError("local_cp_size must equal the resolved CP group size")
+            mode = packed_seq_params.cp_partition_mode
+            if mode not in ("zigzag", "contiguous"):
+                raise ValueError(f"Unsupported context-parallel partition mode {mode!r}")
+            convert_layout = mode == "contiguous" and cp_size > 1
+            if convert_layout:
+                if packed_seq_params.qkv_format != "thd":
+                    raise ValueError("contiguous dynamic CP requires THD packed input")
+                if not self.training:
+                    raise ValueError("contiguous dynamic CP supports training only")
+                if (
+                    inference_context is not None
+                    or inference_params is not None
+                    or InferenceMode.is_active()
+                    or sequence_len_offset is not None
+                    or self.config.flash_decode
+                ):
+                    raise ValueError("contiguous dynamic CP does not support inference or decode")
+                if self.config.sequence_parallel:
+                    raise ValueError("contiguous dynamic CP does not support sequence parallelism")
+                if self.attention_type != "self" or key_value_states is not None:
+                    raise ValueError("contiguous dynamic CP supports self attention only")
+                if attention_mask is not None or attention_bias is not None:
+                    raise ValueError("contiguous dynamic CP does not support dense mask or bias")
+                if any(
+                    value is not None
+                    for value in (rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin)
+                ):
+                    raise ValueError("contiguous dynamic CP does not support inference RoPE state")
+
+                q_cu = packed_seq_params.cu_seqlens_q_padded
+                kv_cu = packed_seq_params.cu_seqlens_kv_padded
+                if type(q_cu) is not Tensor or type(kv_cu) is not Tensor:
+                    raise TypeError("contiguous dynamic CP requires exact padded Q/KV boundaries")
+                if q_cu.ndim != 1 or kv_cu.ndim != 1 or q_cu.shape != kv_cu.shape:
+                    raise ValueError("padded Q/KV boundaries must have identical 1-D shapes")
+                if (
+                    q_cu.dtype is not torch.int32
+                    or kv_cu.dtype is not torch.int32
+                    or q_cu.device != kv_cu.device
+                ):
+                    raise ValueError("padded Q/KV boundaries must share int32 dtype and device")
+                if not q_cu.is_contiguous() or not kv_cu.is_contiguous():
+                    raise ValueError("padded Q/KV boundaries must be contiguous")
+                if not torch.equal(q_cu, kv_cu):
+                    raise ValueError(
+                        "padded Q/KV boundaries must be identical one-dimensional tensors"
+                    )
+                if q_cu.numel() < 2 or int(q_cu[0].item()) != 0:
+                    raise ValueError("padded Q/KV boundaries must start at zero")
+                total_tokens = packed_seq_params.total_tokens
+                if type(total_tokens) is not int or total_tokens < 0:
+                    raise TypeError("total_tokens must be a nonnegative exact int")
+                if int(q_cu[-1].item()) != total_tokens:
+                    raise ValueError("padded Q/KV endpoint must equal total_tokens")
+                lengths = torch.diff(q_cu.to(dtype=torch.long))
+                divisor = 2 * cp_size
+                if torch.any(lengths <= 0) or torch.any(lengths % divisor != 0):
+                    raise ValueError(
+                        f"every padded sequence interval must be positive and divisible by {divisor}"
+                    )
+                if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
+                    raise ValueError("contiguous dynamic CP requires rank-local THD hidden states")
+                if total_tokens % cp_size or hidden_states.shape[0] != total_tokens // cp_size:
+                    raise ValueError(
+                        "rank-local hidden rows must equal padded total_tokens / local_cp_size"
+                    )
+                padded_cu_seqlens = q_cu
+
+        original_cp_group = self.pg_collection.cp
+        active_nvtx_ranges: list[str] = []
+        body_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        try:
+            if cp_group is not None:
+                self.pg_collection.cp = cp_group
+            if convert_layout:
+                hidden_states = contiguous_to_zigzag_chunks(
+                    hidden_states, cp_group, cu_seqlens=padded_cu_seqlens
+                )
+            output, bias = self._forward_impl(
+                hidden_states,
+                attention_mask,
+                key_value_states,
+                inference_context,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                rotary_pos_cos_sin,
+                attention_bias,
+                packed_seq_params,
+                sequence_len_offset,
+                inference_params=inference_params,
+                _active_nvtx_ranges=active_nvtx_ranges,
+            )
+            if convert_layout:
+                output = zigzag_to_contiguous_chunks(output, cp_group, cu_seqlens=padded_cu_seqlens)
+            return output, bias
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            self.pg_collection.cp = original_cp_group
+            while active_nvtx_ranges:
+                msg = active_nvtx_ranges.pop()
+                try:
+                    nvtx_range_pop(msg=msg)
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            if cleanup_error is not None:
+                if body_error is None:
+                    raise cleanup_error
+                try:
+                    body_error.add_note(f"NVTX cleanup failed: {cleanup_error!r}")
+                except BaseException:
+                    pass
+
+    def _forward_impl(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        _active_nvtx_ranges: list[str],
+    ) -> tuple[Tensor, Tensor | None]:
         """
         Perform a forward pass through the attention module.
 
@@ -1356,11 +1513,16 @@ class Attention(MegatronModule, ABC):
 
         """
 
-        # here we need to set the right cp group for dynamic-cp
-        _orig_cp_group = self.pg_collection.cp
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
-            self.pg_collection.cp = packed_seq_params.cp_group
+        def push_nvtx(suffix: str) -> None:
+            msg = f"megatron.core.transformer.attention.forward.{suffix}"
+            nvtx_range_push(msg=msg)
+            _active_nvtx_ranges.append(msg)
+
+        def pop_nvtx(suffix: str) -> None:
+            expected = f"megatron.core.transformer.attention.forward.{suffix}"
+            msg = _active_nvtx_ranges.pop()
+            assert msg == expected
+            nvtx_range_pop(msg=msg)
 
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
@@ -1409,7 +1571,7 @@ class Attention(MegatronModule, ABC):
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
-        nvtx_range_push(suffix="qkv")
+        push_nvtx(suffix="qkv")
         split_qkv = (self.attention_type == "cross") or not all(
             [
                 not self.config.test_mode,
@@ -1472,7 +1634,7 @@ class Attention(MegatronModule, ABC):
                 not self.config.attention_output_gate
             ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
             mixed_qkv, qkv_split_arg_list = qkv_output
-        nvtx_range_pop(suffix="qkv")
+        pop_nvtx(suffix="qkv")
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -1486,7 +1648,7 @@ class Attention(MegatronModule, ABC):
 
         # This branch only runs in the decode phase of flash decoding and returns after the linear
         # projection. This conditional is not used in the prefill phase or non-flash-decoding cases.
-        nvtx_range_push(suffix="adjust_key_value")
+        push_nvtx(suffix="adjust_key_value")
         if in_decode_mode and self.config.flash_decode:
             assert self.layer_number in inference_context.key_value_memory_dict
             assert inference_context.sequence_len_offset is not None
@@ -1507,7 +1669,6 @@ class Attention(MegatronModule, ABC):
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = apply_module(self.linear_proj)(context_layer)
-            self.pg_collection.cp = _orig_cp_group
             return output, bias
 
         if (
@@ -1536,12 +1697,12 @@ class Attention(MegatronModule, ABC):
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
-        nvtx_range_pop(suffix="adjust_key_value")
+        pop_nvtx(suffix="adjust_key_value")
 
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================
-        nvtx_range_push(suffix="rotary_pos_emb")
+        push_nvtx(suffix="rotary_pos_emb")
         if rotary_pos_emb is not None and (
             not self.config.flash_decode or inference_context is None
         ):
@@ -1603,13 +1764,13 @@ class Attention(MegatronModule, ABC):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
-        nvtx_range_pop(suffix="rotary_pos_emb")
+        pop_nvtx(suffix="rotary_pos_emb")
 
         # ==================================
         # core attention computation
         # ==================================
 
-        nvtx_range_push(suffix="core_attention")
+        push_nvtx(suffix="core_attention")
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
@@ -1672,35 +1833,34 @@ class Attention(MegatronModule, ABC):
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
-        nvtx_range_pop(suffix="core_attention")
+        pop_nvtx(suffix="core_attention")
 
         if head_wise_gate is not None:
-            nvtx_range_push(suffix="head_wise_attn_gate")
+            push_nvtx(suffix="head_wise_attn_gate")
             gate_states = head_wise_gate.view(*head_wise_gate.shape[:2], -1, 1)
             core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)
             core_attn_out = core_attn_out * torch.sigmoid(gate_states.float()).to(
                 core_attn_out.dtype
             )
             core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)
-            nvtx_range_pop(suffix="head_wise_attn_gate")
+            pop_nvtx(suffix="head_wise_attn_gate")
 
         # Output gate (attention_output_gate: full head_dim gate fused into QKV)
         if gate is not None:
-            nvtx_range_push(suffix="output_gate")
+            push_nvtx(suffix="output_gate")
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
-            nvtx_range_pop(suffix="output_gate")
+            pop_nvtx(suffix="output_gate")
 
         # =================
         # Output. [sq, b, h]
         # =================
-        nvtx_range_push(suffix="linear_proj")
+        push_nvtx(suffix="linear_proj")
         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
         with attn_proj_manager as core_attn_out:
             output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
-        nvtx_range_pop(suffix="linear_proj")
+        pop_nvtx(suffix="linear_proj")
 
-        self.pg_collection.cp = _orig_cp_group
         return output, bias
 
     @jit_fuser

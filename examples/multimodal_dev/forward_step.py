@@ -142,6 +142,38 @@ def broadcast_data_batch(data, device="cuda"):
     return result
 
 
+def _move_owner_pixels_to_device(pixel_values, device):
+    """Move pixels on the TP source and converge source failures across TP."""
+    if not torch.distributed.is_initialized():
+        if pixel_values is None:
+            return None
+        return pixel_values.to(device, non_blocking=pixel_values.is_pinned())
+    group = get_tensor_model_parallel_group()
+    is_src = get_tensor_model_parallel_rank() == 0
+    status = torch.zeros(1, dtype=torch.uint8, device=device)
+    owner_pixels = None
+    source_error = None
+    source_traceback = None
+    if is_src and pixel_values is not None:
+        try:
+            owner_pixels = pixel_values.to(
+                device, non_blocking=pixel_values.is_pinned()
+            )
+        except BaseException as exc:
+            source_error = exc
+            source_traceback = exc.__traceback__
+            status.fill_(1)
+
+    torch.distributed.broadcast(
+        status, get_tensor_model_parallel_src_rank(), group=group
+    )
+    if int(status.item()) != 0:
+        if is_src:
+            raise source_error.with_traceback(source_traceback)
+        raise RuntimeError("TP source pixel H2D failed after metadata broadcast")
+    return owner_pixels
+
+
 # -------------------------------------------------------------------
 # THD (packed sequence) helpers
 # -------------------------------------------------------------------
@@ -311,6 +343,7 @@ def build_vision_sidecar(
     cu_seqlens_padded: list[int],
     image_token_id: int,
     spatial_merge_size: int,
+    expect_pixels: Optional[bool] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the per-item vision sidecar for a THD-packed batch.
 
@@ -321,7 +354,8 @@ def build_vision_sidecar(
 
     Consistency guards (fail the batch rather than silently degrade):
 
-    * pixel data and grid metadata are all-or-nothing per sample;
+    * pixel data and grid metadata are all-or-nothing per sample unless an
+      owner-sharded capture explicitly supplies ``expect_pixels=False``;
     * per-sample pixel rows equal ``sum(t*h*w)`` over its grids;
     * per-sample image-token slots equal ``sum(t*(h/m)*(w/m))``, so truncation
       can never leave a cut image block;
@@ -336,7 +370,12 @@ def build_vision_sidecar(
         pixels = sample.get("pixel_values")
         num_items = 0 if grids is None else int(grids.shape[0])
         pixel_rows = 0 if pixels is None else int(pixels.shape[0])
-        if (num_items == 0) != (pixel_rows == 0):
+        if expect_pixels is False and pixel_rows:
+            raise ValueError(
+                f"sample {sample_index}: suppressed pixel capture must not carry "
+                f"pixel rows (found {pixel_rows})"
+            )
+        if expect_pixels is not False and (num_items == 0) != (pixel_rows == 0):
             raise ValueError(
                 f"sample {sample_index}: pixel data and grid metadata must either both "
                 f"exist or both be absent (items={num_items}, pixel_rows={pixel_rows})"
@@ -356,7 +395,7 @@ def build_vision_sidecar(
             expected_rows += t * h * w
             item_slot_counts.append(t * (h // merge) * (w // merge))
             expected_slots += item_slot_counts[-1]
-        if expected_rows != pixel_rows:
+        if expect_pixels is not False and expected_rows != pixel_rows:
             raise ValueError(
                 f"sample {sample_index}: pixel rows {pixel_rows} != sum(t*h*w) "
                 f"{expected_rows} over its grids"
@@ -401,6 +440,7 @@ def pack_or_pad_batch(
     device="cuda",
     pad_to_multiple: Optional[int] = None,
     with_vision_sidecar: bool = False,
+    include_vision_pixels: bool = True,
 ) -> Dict[str, Any]:
     """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD or ``[B, S]`` BSHD.
 
@@ -415,14 +455,27 @@ def pack_or_pad_batch(
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
     is_src = mpu.get_tensor_model_parallel_rank() == 0
+    if type(include_vision_pixels) is not bool:
+        raise ValueError("include_vision_pixels must be an exact bool")
+    from megatron.core.mdp.window import pixel_capture_owner_state
+
+    pixel_owner_state = pixel_capture_owner_state()
+    suppress_pixels = pixel_owner_state is False or not include_vision_pixels
 
     # SP is an explicit runtime option; TP>1 does not imply SP is enabled.
     # get_args() itself raises in test contexts where megatron globals are
     # not initialised.
     try:
-        has_sp = bool(getattr(get_args(), "sequence_parallel", False))
+        args = get_args()
+        has_sp = bool(getattr(args, "sequence_parallel", False))
+        dataset_provider = getattr(args, "dataset_provider", None)
+        owner_only_pixels = pixel_owner_state is not None or (
+            tp_size > 1 and getattr(args, "dataset_provider", None) == "energon"
+        )
     except AssertionError:
         has_sp = False
+        dataset_provider = None
+        owner_only_pixels = pixel_owner_state is not None
 
     if cp_size > 1:
         divisible_by = (tp_size * cp_size * 2) if has_sp else (cp_size * 2)
@@ -476,10 +529,6 @@ def pack_or_pad_batch(
         # materialization + H2D wholesale. All text tensors and vision item
         # metadata (grid_thw, sidecar) are still built from input_ids/grids,
         # so every offset stays valid. False outside a sharded MDP capture.
-        from megatron.core.mdp.window import pixel_capture_suppressed
-
-        suppress_pixels = pixel_capture_suppressed()
-
         # MDP capture fast path (TP=1): build each packed field directly in
         # one pinned buffer (no per-sample F.pad + concat churn) and move it
         # with a non-blocking copy. Pageable H2D copies each carry an implicit
@@ -618,6 +667,16 @@ def pack_or_pad_batch(
                         cu_seqlens_padded,
                         image_token_id=sidecar_image_token_id,
                         spatial_merge_size=sidecar_merge,
+                        expect_pixels=(
+                            None
+                            if not suppress_pixels
+                            or (
+                                type(dataset_provider) is str
+                                and dataset_provider == "mdp_mock"
+                                and include_vision_pixels
+                            )
+                            else False
+                        ),
                     )
                 )
 
@@ -682,7 +741,17 @@ def pack_or_pad_batch(
                 if key in packed_batch:
                     sidecar_cpu[key] = packed_batch.pop(key)
 
+        owner_pixel_values = None
+        if owner_only_pixels and is_src:
+            if "pixel_values" in packed_batch:
+                pixel_values = packed_batch.pop("pixel_values")
+                if pixel_values.numel():
+                    owner_pixel_values = pixel_values
         packed_batch = broadcast_data_batch(packed_batch, device=device)
+        if owner_only_pixels:
+            owner_pixels = _move_owner_pixels_to_device(owner_pixel_values, device)
+            if owner_pixels is not None:
+                packed_batch["pixel_values"] = owner_pixels
         packed_batch.update(sidecar_cpu)
 
         cu_seqlens_t = packed_batch.pop("cu_seqlens")
@@ -784,10 +853,22 @@ def pack_or_pad_batch(
         if has_padding:
             positions = torch.arange(target_seqlens).unsqueeze(0)
             padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
-        padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
+        if not suppress_pixels:
+            padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
 
-    return broadcast_data_batch(padded_batch, device=device)
+    owner_pixel_values = None
+    if owner_only_pixels and is_src:
+        if "pixel_values" in padded_batch:
+            pixel_values = padded_batch.pop("pixel_values")
+            if pixel_values.numel():
+                owner_pixel_values = pixel_values
+    padded_batch = broadcast_data_batch(padded_batch, device=device)
+    if owner_only_pixels:
+        owner_pixels = _move_owner_pixels_to_device(owner_pixel_values, device)
+        if owner_pixels is not None:
+            padded_batch["pixel_values"] = owner_pixels
+    return padded_batch
 
 
 # -------------------------------------------------------------------
@@ -840,12 +921,152 @@ def quantized_row_alignment(args) -> Optional[int]:
     )
 
 
-def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
+def _prepare_energon_batch(data, args):
+    """Materialize selected Energon pixels before the existing native packer."""
+    if getattr(args, "dataset_provider", None) != "energon":
+        return data
+    if _static_locator_capture(args):
+        from examples.multimodal_dev.data.energon.materializer import validate_static_energon_batch
+
+        # Native Energon uses DataLoader(batch_size=None): default_convert
+        # changes ordinary tuples to lists. Restore this one typed carrier,
+        # then apply the unchanged strict shape/type/root/pixel checks.
+        if type(data) is list and any(
+            type(document) is dict and type(document.get("vision_locators")) is list
+            for document in data
+        ):
+            data = [
+                {**document, "vision_locators": tuple(document["vision_locators"])}
+                if type(document) is dict and type(document.get("vision_locators")) is list
+                else document
+                for document in data
+            ]
+        return validate_static_energon_batch(data, storage_roots=args.energon_vision_storage_roots)
+    from examples.multimodal_dev.data.energon.materializer import prepare_energon_batch
+    from megatron.core.mdp.window import pixel_capture_suppressed
+
+    return prepare_energon_batch(
+        data,
+        args=args,
+        materialize_pixels=not pixel_capture_suppressed(),
+    )
+
+
+def _static_locator_capture(args):
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    return (
+        getattr(args, "mdp_vision_capture_mode", None) is VisionCaptureMode.STABLE_LOCATOR_CATALOG
+        and (
+            getattr(args, "dataset_provider", None) == "mdp_mock"
+            or (
+                getattr(args, "dataset_provider", None) == "energon"
+                and getattr(args, "model_arch", None) == "qwen35_vl"
+                and bool(getattr(args, "energon_vision_storage_roots", None))
+            )
+        )
+        and not getattr(args, "mdp_dynamic_encoder_cp", False)
+    )
+
+
+def _locator_capture_root(args, group, locator_operations, expected_locator_arch):
+    """Validate the exact locator launch/escrow pair before dataset advance."""
+    from examples.multimodal_dev.data.energon.materializer import validate_locator_dataset_root
+    from megatron.core.mdp.dynamic_encoder_adapter_capability import (
+        DynamicEncoderLocatorAdapterOperations,
+    )
+    from megatron.core.mdp.errors import MdpConfigurationError
+    from megatron.core.mdp.protocols import VisionCaptureMode
+
+    mode = getattr(
+        args, "mdp_vision_capture_mode", VisionCaptureMode.SOURCE_PIXEL_SIDECAR
+    )
+    if _static_locator_capture(args):
+        if (
+            locator_operations is not None
+            or getattr(args, "mdp_enable", None) is not True
+            or getattr(args, "use_packed_sequence", None) is not True
+            or torch.distributed.get_world_size(group=group) != 1
+        ):
+            raise MdpConfigurationError("MDP: static locator capture requires enabled TP1 THD.")
+        return None
+    if locator_operations is None:
+        if mode is not VisionCaptureMode.SOURCE_PIXEL_SIDECAR:
+            raise MdpConfigurationError(
+                "MDP: stable locator capture requires its exact locator operation escrow."
+            )
+        return None
+    if (
+        type(locator_operations) is not DynamicEncoderLocatorAdapterOperations
+        or mode is not VisionCaptureMode.STABLE_LOCATOR_CATALOG
+    ):
+        raise MdpConfigurationError(
+            "MDP: vision capture mode and locator operation escrow must be an exact pair."
+        )
+    if getattr(args, "mdp_enable", None) is not True:
+        raise MdpConfigurationError("MDP: stable locator capture requires mdp_enable exact True.")
+    if getattr(args, "dataset_provider", None) != "energon":
+        raise MdpConfigurationError("MDP: stable locator capture requires exact energon data.")
+    if (
+        type(expected_locator_arch) is not str
+        or not expected_locator_arch
+        or getattr(args, "model_arch", None) != expected_locator_arch
+        or locator_operations.locator_model_arch != expected_locator_arch
+    ):
+        raise MdpConfigurationError(
+            "MDP: locator launch, adapter, and operation escrow model arch must match exactly."
+        )
+    if getattr(args, "use_packed_sequence", None) is not True:
+        raise MdpConfigurationError("MDP: stable locator capture requires packed THD batches.")
+    if torch.distributed.get_world_size(group=group) != 1:
+        raise MdpConfigurationError("MDP: stable locator capture currently requires TP=1.")
+    try:
+        return validate_locator_dataset_root(getattr(args, "energon_path", None))
+    except ValueError as error:
+        raise MdpConfigurationError(f"MDP: invalid locator dataset root: {error}") from error
+
+
+def _freeze_batch_vision_locators(data, *, dataset_root, locator_operations):
+    """Freeze descriptors in native document/image order without materializing bytes."""
+    locators = []
+    for document in data:
+        descriptors = document.get("image_descriptors", ())
+        grids = document["image_grid_thw"].tolist()
+        for descriptor, grid in zip(descriptors, grids, strict=True):
+            height = descriptor.get("height")
+            width = descriptor.get("width")
+            if (height is None) != (width is None):
+                raise ValueError(
+                    "locator descriptor declares both decoded height and width or neither"
+                )
+            dimensions = None if height is None else (height, width)
+            locators.append(
+                locator_operations.freeze_vision_locator(
+                    descriptor,
+                    dataset_root=dataset_root,
+                    grid_thw=tuple(grid),
+                    declared_dimensions=dimensions,
+                )
+            )
+    return tuple(locators)
+
+
+def get_batch(
+    data_iterator: Iterator[list[Dict[str, Any]]],
+    *,
+    locator_operations=None,
+    expected_locator_arch=None,
+):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
 
     group = get_tensor_model_parallel_group()
+    locator_root = _locator_capture_root(
+        args, group, locator_operations, expected_locator_arch
+    )
+    vision_locators = ()
+    static_locators = _static_locator_capture(args)
     # Single-member TP group: skip the device flag tensor and the broadcast
     # entirely. Behavior-identical, and it keeps the MDP window-capture
     # prefetch thread free of NCCL calls (--mdp-overlap-window-capture).
@@ -854,25 +1075,66 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
             data = next(data_iterator)
         except StopIteration:
             return None
+        if locator_root is None:
+            data = _prepare_energon_batch(data, args)
+            if static_locators:
+                vision_locators = tuple(
+                    locator for document in data for locator in document["vision_locators"]
+                )
+        else:
+            from examples.multimodal_dev.data.energon.materializer import prepare_energon_batch
+
+            data = prepare_energon_batch(data, args=args, materialize_pixels=False)
+            vision_locators = _freeze_batch_vision_locators(
+                data, dataset_root=locator_root, locator_operations=locator_operations
+            )
     else:
         if get_tensor_model_parallel_rank() == 0:
+            source_error = None
+            source_traceback = None
             try:
                 data = next(data_iterator)
-                has_data = torch.tensor([1], dtype=torch.uint8, device=device)
             except StopIteration:
-                has_data = torch.tensor([0], dtype=torch.uint8, device=device)
                 data = None
+                status_value = 0
+            except BaseException as exc:
+                data = None
+                source_error = exc
+                source_traceback = exc.__traceback__
+                status_value = 2
+            else:
+                try:
+                    data = _prepare_energon_batch(data, args)
+                except BaseException as exc:
+                    source_error = exc
+                    source_traceback = exc.__traceback__
+                    status_value = 2
+                else:
+                    status_value = 1
+            status = torch.tensor([status_value], dtype=torch.uint8, device=device)
         else:
-            has_data = torch.empty(1, dtype=torch.uint8, device=device)
+            status = torch.empty(1, dtype=torch.uint8, device=device)
             data = None
 
         src = get_tensor_model_parallel_src_rank()
-        torch.distributed.broadcast(has_data, src, group=group)
+        torch.distributed.broadcast(status, src, group=group)
 
-        if has_data.item() == 0:
+        status_value = int(status.item())
+        if status_value == 0:
             return None
+        if status_value == 2:
+            if get_tensor_model_parallel_rank() == 0:
+                raise source_error.with_traceback(source_traceback)
+            raise RuntimeError(
+                "TP source fetch or Energon materialization failed before native pack broadcast"
+            )
+        if status_value != 1:
+            raise RuntimeError(f"invalid TP source batch status {status_value}")
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
+    locator_pack_options = (
+        {"include_vision_pixels": False} if locator_root is not None or static_locators else {}
+    )
     batch = pack_or_pad_batch(
         data,
         args.use_packed_sequence,
@@ -880,7 +1142,21 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
         device=device,
         with_vision_sidecar=getattr(args, "mdp_enable", False),
         pad_to_multiple=quantized_row_alignment(args),
+        **locator_pack_options,
     )
+    if locator_root is not None or static_locators:
+        pixel_values = batch.pop("pixel_values", None)
+        if pixel_values is not None and pixel_values.numel() != 0:
+            from megatron.core.mdp.errors import MdpConfigurationError
+
+            raise MdpConfigurationError(
+                "MDP: stable locator capture forbids an ambiguous pixel carrier."
+            )
+        batch["vision_locators"] = vision_locators
+        if static_locators:
+            from megatron.core.mdp.protocols import VisionCaptureMode
+
+            batch["vision_capture_mode"] = VisionCaptureMode.STABLE_LOCATOR_CATALOG
 
     # Fix shapes produced by default_collate.
     if "position_ids" in batch and batch["position_ids"] is not None:
@@ -929,26 +1205,37 @@ def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool =
 
     The iterator yields immutable ``MdpMicrobatchRecord`` objects captured in
     P1. Pixels never reach the decoder: the first PP stage receives the
-    pre-encoded detached leaf from endpoint storage instead.  The EP-overlap
-    path builds a decoder-only schedule plan from that same leaf.
+    pre-encoded detached leaf from endpoint storage or the active repeated-D4
+    replay owner. The EP-overlap path builds a decoder-only schedule plan from
+    that same leaf.
     """
     record = next(data_iterator)
     batch = dict(record.model_payload)
 
+    vision_items = record.vision_items
+    iteration_vision_items = getattr(data_iterator, "iteration_vision_items", None)
+    if callable(iteration_vision_items):
+        vision_items = iteration_vision_items(record)
     _accumulate_workload_stats(
         model,
         record.decoder_packed_seq_params,
-        vision_items=record.vision_items,
+        vision_items=vision_items,
         real_cu_seqlens=batch.get("flops_cu_seqlens"),
     )
 
     vision_embeddings = None
     if is_pipeline_first_stage() and not record.text_only:
-        vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
+        if runtime.config.dynamic_encoder_cp:
+            leaf_getter = getattr(data_iterator, "vision_embedding_leaf", None)
+            if not callable(leaf_getter):
+                raise RuntimeError("MDP: repeated-D4 replay iterator must expose its vision leaf")
+            vision_embeddings = leaf_getter(record)
+        else:
+            vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
         if vision_embeddings is None:
             raise RuntimeError(
                 f"MDP: microbatch {record.microbatch_id} has vision items but no "
-                "leaf in endpoint storage; P3 embedding routing did not complete"
+                "decoder leaf; embedding routing did not complete"
             )
 
     model_inputs = dict(

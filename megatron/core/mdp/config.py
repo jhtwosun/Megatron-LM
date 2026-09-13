@@ -32,6 +32,8 @@ class MdpConfig:
     enable: bool = False
     encoder_cp: int = 1
     encoder_max_payload_rows: Optional[int] = None
+    encoder_fuse_across_microbatches: bool = True
+    encoder_assignment_policy: str = "lpt"
     encoder_recompute_granularity: Optional[str] = None
     encoder_recompute_method: Optional[str] = None
     encoder_recompute_num_layers: Optional[int] = None
@@ -44,6 +46,8 @@ class MdpConfig:
     overlap_window_capture: bool = False
     greedy_packing: bool = False
     greedy_packing_approximate_resume: bool = False
+    dynamic_encoder_cp: bool = False
+    min_dynamic_encoder_cp_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -76,6 +80,8 @@ class MdpCompatibilityOptions:
     # args.reuse_grad_buf_for_mxfp8_param_ag. Rejected outright under MDP; see
     # validate_mdp_config for the composite-optimizer mechanism.
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
+    dynamic_context_parallel: bool = False
+    min_dynamic_context_parallel_size: int = 1
     sequence_parallel: bool = False
     sequence_packing_scheduler: Optional[str] = None
     thd_static_packing: bool = False
@@ -121,17 +127,44 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
     groups or model weights. Raises :class:`MdpConfigurationError` with the option,
     its current value, the violated condition, and a suggested value when one exists.
     """
+
     if not config.enable:
         return
 
+    if config.greedy_packing and config.dynamic_encoder_cp:
+        _reject(
+            "greedy_packing",
+            True,
+            "disabled with dynamic_encoder_cp",
+            "Dynamic encoder source capture does not use the greedy sample stream.",
+            "False",
+        )
+
     # --- MdpConfig field validation ---
-    if config.encoder_cp != 1:
+    if config.encoder_assignment_policy not in ("lpt", "round_robin"):
+        _reject(
+            "encoder_assignment_policy",
+            config.encoder_assignment_policy,
+            "lpt or round_robin",
+            "Encoder assignment policy must be explicit.",
+            "lpt",
+        )
+    if config.encoder_assignment_policy == "round_robin" and (
+        config.dynamic_encoder_cp or options.dynamic_context_parallel or config.pixel_locality
+    ):
+        _reject(
+            "encoder_assignment_policy",
+            "round_robin",
+            "static CP without pixel_locality",
+            "Round robin is a cost-blind static control, without locality preferences.",
+            "lpt",
+        )
+    if config.encoder_cp < 1:
         _reject(
             "encoder_cp",
             config.encoder_cp,
-            "encoder_cp == 1",
-            "Encoder context parallelism is a registered extension hook, not an "
-            "implemented capability.",
+            "encoder_cp >= 1",
+            "Encoder context parallelism must have a positive group size.",
             "1",
         )
     if config.encoder_max_payload_rows is not None and config.encoder_max_payload_rows <= 0:
@@ -141,6 +174,24 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "None or a positive integer",
             "The chunk cap is measured in patch rows.",
             "None",
+        )
+    if type(config.encoder_fuse_across_microbatches) is not bool:
+        _reject(
+            "encoder_fuse_across_microbatches",
+            config.encoder_fuse_across_microbatches,
+            "an exact boolean",
+            "Encoder fusion boundaries must be deterministic across ranks.",
+            "True",
+        )
+    if not config.encoder_fuse_across_microbatches and (
+        config.dynamic_encoder_cp or options.dynamic_context_parallel
+    ):
+        _reject(
+            "encoder_fuse_across_microbatches",
+            False,
+            "True for dynamic CP",
+            "The microbatch boundary control applies only to static encoder chunks.",
+            "True",
         )
     granularity = config.encoder_recompute_granularity
     if granularity not in ENCODER_RECOMPUTE_GRANULARITIES:
@@ -214,17 +265,125 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "plan mismatch degrades from a diagnosable error into a collective hang.",
             "1",
         )
-    if config.overlap_window_capture and options.tensor_parallel_size != 1:
+    if type(config.dynamic_encoder_cp) is not bool:
+        _reject(
+            "dynamic_encoder_cp",
+            config.dynamic_encoder_cp,
+            "an exact bool",
+            "Dynamic encoder-CP activation must not use truthy aliases.",
+            "False",
+        )
+    if type(options.dynamic_context_parallel) is not bool:
+        _reject(
+            "dynamic_context_parallel",
+            options.dynamic_context_parallel,
+            "an exact bool",
+            "Dynamic decoder-CP activation must not use truthy aliases.",
+            "False",
+        )
+    if type(config.min_dynamic_encoder_cp_size) is not int:
+        _reject(
+            "min_dynamic_encoder_cp_size",
+            config.min_dynamic_encoder_cp_size,
+            "an exact integer",
+            "Dynamic encoder-CP planning requires an unambiguous group size.",
+            "1",
+        )
+    if not config.dynamic_encoder_cp and config.min_dynamic_encoder_cp_size != 1:
+        _reject(
+            "min_dynamic_encoder_cp_size",
+            config.min_dynamic_encoder_cp_size,
+            "1 when dynamic_encoder_cp == False",
+            "A disabled dynamic encoder has no selectable minimum group size.",
+            "1",
+        )
+    if config.dynamic_encoder_cp:
+        if config.min_dynamic_encoder_cp_size not in (1, 2, 4):
+            _reject(
+                "min_dynamic_encoder_cp_size",
+                config.min_dynamic_encoder_cp_size,
+                "one of (1, 2, 4) when dynamic_encoder_cp == True",
+                "Repeated-D4 exposes only its nested E1, E2, and E4 encoder groups.",
+            )
+        if options.dynamic_context_parallel and (
+            type(options.min_dynamic_context_parallel_size) is not int
+            or options.min_dynamic_context_parallel_size not in (1, 2, 4)
+        ):
+            _reject(
+                "min_dynamic_context_parallel_size",
+                options.min_dynamic_context_parallel_size,
+                "one of (1, 2, 4) for joint repeated-D4",
+                "The decoder may select only the nested CP1, CP2, and CP4 groups.",
+            )
+        topology = (
+            options.tensor_parallel_size,
+            options.pipeline_parallel_size,
+            options.context_parallel_size,
+            config.encoder_cp,
+            options.virtual_pipeline_parallel_size,
+            options.expert_parallel_size,
+        )
+        supported_ep = (1, 4) if options.dynamic_context_parallel else (1, 4, 8)
+        if topology[:5] != (1, 1, 4, 4, None) or topology[5] not in supported_ep:
+            _reject(
+                "dynamic_encoder_cp",
+                config.dynamic_encoder_cp,
+                f"TP1/PP1/CP4/ECP4, VPP disabled, and EP in {supported_ep}",
+                "Only fixed decoder CP may use native EP8 across encoder domains.",
+            )
+        if options.sequence_parallel:
+            _reject(
+                "sequence_parallel",
+                options.sequence_parallel,
+                "False for repeated-D4",
+                "Contiguous decoder Dynamic-CP plus sequence parallelism is not validated.",
+                "False",
+            )
+        overlaps = {
+            "overlap_window_capture": config.overlap_window_capture,
+            "overlap_grad_reduce": options.overlap_grad_reduce,
+            "overlap_param_gather": options.overlap_param_gather,
+            "overlap_moe_expert_parallel_comm": options.overlap_moe_expert_parallel_comm,
+        }
+        for option, value in overlaps.items():
+            if value:
+                _reject(
+                    option,
+                    value,
+                    "False for repeated-D4",
+                    "Repeated-D4 has not established collective ordering with overlap.",
+                    "False",
+                )
+    if config.overlap_window_capture and (
+        options.tensor_parallel_size != 1 or config.encoder_cp != 1
+    ):
         _reject(
             "overlap_window_capture",
             config.overlap_window_capture,
-            "tensor_parallel_size == 1",
-            "The capture path performs a TP broadcast per microbatch; running it "
-            "on the prefetch thread concurrently with the schedule's NCCL calls "
-            "is only validated without tensor parallelism.",
+            "tensor_parallel_size == 1 and encoder_cp == 1",
+            "TP broadcast or encoder-CP failure consensus would issue NCCL from "
+            "the prefetch thread concurrently with the schedule's collectives.",
             "False",
         )
     _validate_packing(config, options)
+
+    if options.dynamic_context_parallel and not config.dynamic_encoder_cp:
+        topology = (
+            options.tensor_parallel_size,
+            options.expert_parallel_size,
+            options.pipeline_parallel_size,
+            options.context_parallel_size,
+            config.encoder_cp,
+            options.virtual_pipeline_parallel_size,
+        )
+        if topology != (1, 1, 1, 1, 1, None) or config.overlap_window_capture:
+            _reject(
+                "dynamic_context_parallel",
+                options.dynamic_context_parallel,
+                "configured TP/EP/PP/CP/ECP are 1, VPP is disabled, and window capture is disabled",
+                "The concrete D3 composition has not validated wider configured topology or "
+                "overlapped source-window capture.",
+            )
 
     # --- parallel dimensions and rank mapping preconditions ---
     if options.rank_order != SUPPORTED_RANK_ORDER:
@@ -236,21 +395,20 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "has not been validated against other orders.",
             SUPPORTED_RANK_ORDER,
         )
-    if options.tensor_parallel_size != 1:
+    if options.tensor_parallel_size < 1:
         _reject(
             "tensor_parallel_size",
             options.tensor_parallel_size,
-            "TP == 1",
-            "The current MDP support matrix requires TP=1.",
+            "decoder TP >= 1",
+            "The decoder tensor-parallel dimension must be positive.",
             "1",
         )
-    if options.context_parallel_size != 1:
+    if options.context_parallel_size < 1:
         _reject(
             "context_parallel_size",
             options.context_parallel_size,
-            "decoder CP == 1",
-            "Decoder context parallelism is a registered extension hook, not an "
-            "implemented capability.",
+            "decoder CP >= 1",
+            "The decoder context-parallel dimension must be positive.",
             "1",
         )
     model_parallel = (
@@ -265,6 +423,19 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "world_size % (TP * PP * CP) == 0",
             f"TP * PP * CP = {model_parallel} must evenly divide the world size to "
             "form outer data-parallel planning groups.",
+        )
+    physical_encoder_domain = (
+        options.tensor_parallel_size
+        * options.pipeline_parallel_size
+        * options.context_parallel_size
+    )
+    if physical_encoder_domain % config.encoder_cp != 0:
+        _reject(
+            "encoder_cp",
+            config.encoder_cp,
+            "encoder_cp divides TP * PP * CP",
+            f"TP * PP * CP = {physical_encoder_domain} physical ranks must split "
+            "into equal logical encoder workers.",
         )
     if options.overlap_moe_expert_parallel_comm:
         if options.expert_parallel_size <= 1:

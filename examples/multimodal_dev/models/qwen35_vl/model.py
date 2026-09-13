@@ -64,6 +64,7 @@ class Qwen35VLModel(MultimodalModel):
         post_process: bool = True,
         vp_stage: Optional[int] = None,
         build_vision_encoder: bool = True,
+        rotary_percent: float = ROTARY_PERCENT,
     ):
         if vision_spec is None:
             vision_spec = get_qwen35_vl_vision_spec()
@@ -102,7 +103,7 @@ class Qwen35VLModel(MultimodalModel):
             max_sequence_length=max_sequence_length,
             image_token_id=image_token_id,
             position_embedding_type="mrope",
-            rotary_percent=ROTARY_PERCENT,
+            rotary_percent=rotary_percent,
             rotary_base=ROTARY_BASE,
             mrope_section=language_config.mrope_section,
             mtp_block_spec=mtp_block_spec,

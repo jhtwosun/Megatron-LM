@@ -57,6 +57,10 @@ schedule model list.
 
 ## Support matrix (v1)
 
+This section describes the original static-runtime baseline. Later stacked
+extensions add capabilities without redefining that historical baseline; their
+narrower activation boundary is recorded below.
+
 Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP=1`,
 `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
 `calculate_per_token_loss=True`, bf16 main path (fp16 covered by
@@ -136,3 +140,49 @@ endpoints + multi-slice routes for decoder CP, the typed encoder configuration
 + row-capacity policy for encoder FP8, and the unified buffer allocator
 for full-iteration CUDA graphs. The hooks guarantee no breaking schema change is
 needed later; they do not mean the capability is implemented.
+
+### Current Dynamic-CP activation boundary
+
+The static runtime now has tested routing/runtime contracts for decoder TP and
+CP, encoder CP, and unequal encoder/decoder CP.  These tests do not widen the
+Dynamic-CP production composition by themselves.
+
+The two Dynamic-CP flags select exactly four configuration modes:
+
+| `--dynamic-context-parallel` | `--mdp-dynamic-encoder-cp` | Composition | Locked configured topology |
+|---|---|---|---|
+| off | off | Existing static MDP runtime | Static support matrix above |
+| on | off | D3 decoder Dynamic-CP | `TP1/EP1/PP1/CP1/ECP1`, VPP disabled; window-capture overlap disabled |
+| off | on | Repeated-D4 with fixed decoder CP4 and dynamic encoder E1/E2/E4 | `TP1/PP1/CP4/ECP4`, `EP1` or domain-local `EP4`, VPP and sequence parallelism disabled |
+| on | on | Repeated-D4 with independently selected decoder CP1/CP2/CP4 and encoder E1/E2/E4 | Same repeated-D4 topology |
+
+D3 selects a per-record contiguous decoder CP group inside its WORLD DP pool.
+Repeated-D4 operates inside each four-rank domain. Its minimum encoder choice is
+set by `--mdp-min-dynamic-encoder-cp-size`; the joint mode uses the native
+`--min-dynamic-context-parallel-size` for the decoder minimum. Repeated-D4
+rejects window-capture, decoder gradient-reduce, decoder parameter-gather, and
+MoE expert-communication overlap, and rejects evaluation before iterator,
+schedule, finalizer, or model mutation. Virtual pipeline parallelism must be
+disabled.
+
+Exact Qwen3.5-VL and Nemotron Omni adapter classes are registered for the
+repeated-D4 path. Qwen3-VL is deliberately not registered; subclassing or
+structural similarity is not authorization. Recoverable adapter validation can
+fail before process-group construction. Once process-group or model collective
+construction begins, a failure is task-fatal and the process must be restarted;
+the implementation does not promise an in-process retry.
+
+These repeated-D4 paths are validation candidates, not a production-support
+claim. Actual two-domain world-eight optimizer parity, failure/retry, cleanup,
+and collective-ordering validation remains required. D3 currently has only
+Qwen3.5-VL one-node CP1/CP2 one-step parity evidence; Qwen3-VL DeepStack remains
+restricted to selected CP1. VPP, wider configured topology, MTP, checkpoint
+resume, long-run, real-data training, memory-limit, and throughput claims remain
+open unless separately evidenced.
+
+Outside repeated-D4, the model registry also contains an image-only Qwen3-VL
+DeepStack adapter; Nemotron Omni also has broader model-side integration. A
+generic Energon descriptor/materialization boundary is present as well. Those
+additions have model/loader contract evidence only where stated in their tests;
+none authorizes Qwen3-VL for repeated-D4, proves repeated-D4 real-data training,
+or establishes a blanket production-support claim.

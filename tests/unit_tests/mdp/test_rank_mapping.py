@@ -35,6 +35,85 @@ def test_design_doc_example_w8_pp2():
     endpoint_view = rank_map.view(1)
     assert endpoint_view.lane_id == 1
     assert endpoint_view.my_worker_id == 0
+    assert endpoint_view.decoder_endpoint_id == 0
+
+
+def test_decoder_cp2_endpoints_are_pp0_ranks_with_one_canonical_source():
+    rank_map = build_rank_map(_spec(world_size=8, pp=2, cp=2))
+    assert rank_map.planning_groups() == ((0, 1, 4, 5), (2, 3, 6, 7))
+
+    for outer_dp_rank, expected_endpoints in enumerate(((0, 1), (2, 3))):
+        assert rank_map.decoder_endpoint_ranks(outer_dp_rank) == expected_endpoints
+        assert rank_map.endpoint_rank(outer_dp_rank) == expected_endpoints[0]
+        for endpoint_id, rank in enumerate(expected_endpoints):
+            view = rank_map.view(rank)
+            assert view.decoder_endpoint_id == endpoint_id
+            assert view.endpoint_rank == expected_endpoints[0]
+            assert view.lane_id == (outer_dp_rank if endpoint_id == 0 else None)
+        for rank in rank_map.planning_groups()[outer_dp_rank][2:]:
+            assert rank_map.view(rank).decoder_endpoint_id is None
+
+
+def test_decoder_tp2_endpoints_and_data_sources_follow_native_rank_order():
+    rank_map = build_rank_map(_spec(world_size=8, tp=2, pp=2, cp=2))
+
+    assert rank_map.planning_groups() == ((0, 1, 2, 3, 4, 5, 6, 7),)
+    assert rank_map.decoder_endpoint_ranks(0) == (0, 2)
+    assert rank_map.data_loader_source_worker_ids(0) == (0, 2, 4, 6)
+    assert tuple(rank_map.tp_group_ranks(rank) for rank in range(8)) == (
+        (0, 1),
+        (0, 1),
+        (2, 3),
+        (2, 3),
+        (4, 5),
+        (4, 5),
+        (6, 7),
+        (6, 7),
+    )
+
+    for endpoint_id, endpoint_rank in enumerate((0, 2)):
+        view = rank_map.view(endpoint_rank)
+        assert view.decoder_endpoint_id == endpoint_id
+        assert view.endpoint_rank == 0
+        assert view.lane_id == (0 if endpoint_id == 0 else None)
+    for follower_rank in (1, 3, 4, 5, 6, 7):
+        assert rank_map.view(follower_rank).decoder_endpoint_id is None
+
+
+def test_decoder_tp2_dp2_noncontiguous_topology_is_a_complete_partition():
+    rank_map = build_rank_map(_spec(world_size=16, tp=2, pp=2, cp=2))
+
+    assert rank_map.planning_groups() == ((0, 1, 2, 3, 8, 9, 10, 11), (4, 5, 6, 7, 12, 13, 14, 15))
+    assert tuple(rank_map.decoder_endpoint_ranks(dp) for dp in range(2)) == ((0, 2), (4, 6))
+    assert tuple(rank_map.data_loader_source_worker_ids(dp) for dp in range(2)) == (
+        (0, 2, 4, 6),
+        (0, 2, 4, 6),
+    )
+
+    planning_partition = [rank for group in rank_map.planning_groups() for rank in group]
+    tp_partition = {rank_map.tp_group_ranks(rank) for rank in range(rank_map.spec.world_size)}
+    assert sorted(planning_partition) == list(range(16))
+    assert len(planning_partition) == len(set(planning_partition))
+    assert sorted(rank for group in tp_partition for rank in group) == list(range(16))
+    assert all(len(group) == 2 for group in tp_partition)
+
+    for outer_dp_rank, planning_group in enumerate(rank_map.planning_groups()):
+        endpoints = rank_map.decoder_endpoint_ranks(outer_dp_rank)
+        assert rank_map.endpoint_rank(outer_dp_rank) == endpoints[0]
+        assert all(rank in planning_group for rank in endpoints)
+        workers = [
+            rank_map.worker_ranks(outer_dp_rank, worker_id)
+            for worker_id in range(rank_map.num_workers_per_group)
+        ]
+        assert sorted(rank for worker in workers for rank in worker) == sorted(planning_group)
+        for endpoint_id, endpoint_rank in enumerate(endpoints):
+            assert rank_map.view(endpoint_rank).decoder_endpoint_id == endpoint_id
+
+
+def test_tp1_data_sources_preserve_every_existing_logical_worker():
+    rank_map = build_rank_map(_spec(world_size=8, tp=1, pp=2, cp=2))
+    assert rank_map.data_loader_source_worker_ids(0) == (0, 1, 2, 3)
+    assert rank_map.decoder_endpoint_ranks(0) == (0, 1)
 
 
 def test_groups_form_disjoint_world_partition():
@@ -63,6 +142,30 @@ def test_worker_ranks_is_the_single_resolution_point():
         rank_map.worker_ranks(0, 2)
 
 
+@pytest.mark.parametrize("encoder_cp", (1, 2, 4))
+def test_worker_leader_is_the_first_physical_rank(encoder_cp):
+    rank_map = build_rank_map(
+        _spec(world_size=8, pp=2, cp=2, encoder_cp=encoder_cp)
+    )
+    for outer_dp_rank in range(len(rank_map.planning_groups())):
+        for worker_id in range(rank_map.num_workers_per_group):
+            assert rank_map.worker_leader_rank(outer_dp_rank, worker_id) == (
+                rank_map.worker_ranks(outer_dp_rank, worker_id)[0]
+            )
+
+
+def test_tp2_ecp3_data_source_requires_the_worker_leader_to_be_tp0():
+    rank_map = build_rank_map(
+        _spec(world_size=6, tp=2, pp=3, cp=1, encoder_cp=3)
+    )
+
+    assert rank_map.worker_ranks(0, 0) == (0, 1, 2)
+    assert rank_map.worker_ranks(0, 1) == (3, 4, 5)
+    assert rank_map.tp_group_ranks(3) == (2, 3)
+    assert rank_map.tp_group_ranks(4) == (4, 5)
+    assert rank_map.data_loader_source_worker_ids(0) == (0,)
+
+
 def test_extension_hook_encoder_cp2():
     # encoder_cp=2 over CP=2, PP=2: 4 workers' ranks collapse to 2 logical
     # workers of 2 ranks each; assignment-visible worker ids are unchanged
@@ -88,6 +191,46 @@ def test_extension_hook_encoder_cp2():
     assert seen == set(range(16))
 
 
+@pytest.mark.parametrize(
+    ("tp", "pp", "decoder_cp", "encoder_cp"),
+    [
+        (1, 1, 1, 1),
+        (1, 2, 1, 2),
+        (1, 1, 2, 2),
+        (1, 2, 2, 4),
+        (2, 1, 1, 2),
+        (2, 1, 2, 4),
+        (2, 2, 1, 4),
+        (2, 3, 1, 3),
+        (2, 3, 1, 6),
+    ],
+)
+def test_independent_encoder_decoder_cp_topology_matrix(tp, pp, decoder_cp, encoder_cp):
+    world_size = tp * pp * decoder_cp
+    rank_map = build_rank_map(
+        _spec(
+            world_size=world_size,
+            tp=tp,
+            pp=pp,
+            cp=decoder_cp,
+            encoder_cp=encoder_cp,
+        )
+    )
+
+    assert rank_map.spec.cp == decoder_cp
+    assert rank_map.spec.encoder_cp == encoder_cp
+    for outer_dp_rank, planning_group in enumerate(rank_map.planning_groups()):
+        workers = tuple(
+            rank_map.worker_ranks(outer_dp_rank, worker_id)
+            for worker_id in range(rank_map.num_workers_per_group)
+        )
+        assert all(len(worker) == encoder_cp for worker in workers)
+        assert tuple(rank for worker in workers for rank in worker) == planning_group
+        assert tuple(worker[0] for worker in workers) == tuple(
+            planning_group[index] for index in range(0, len(planning_group), encoder_cp)
+        )
+
+
 def test_local_view_has_no_global_lists():
     # O(W^2) guard: a view carries only its own group, not all groups.
     rank_map = build_rank_map(_spec(world_size=8, pp=2))
@@ -98,11 +241,11 @@ def test_local_view_has_no_global_lists():
 @pytest.mark.parametrize(
     "kwargs, match",
     [
-        (dict(tp=2, world_size=16), "tp"),
         (dict(world_size=6, pp=4), "world_size"),
         (dict(encoder_cp=3, world_size=16, cp=2), "encoder_cp"),
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),
         (dict(pp=0), "pp"),
+        (dict(cp=0), "cp"),
     ],
 )
 def test_invalid_specs_rejected(kwargs, match):

@@ -62,6 +62,25 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_gdn_cp_partition_mode(packed_seq_params: Optional[PackedSeqParams]) -> str:
+    """Return the input CP layout used by chunkwise GDN.
+
+    Non-packed inputs retain the native attention zigzag contract. Packed THD
+    inputs may explicitly declare that they are already contiguous, as the MDP
+    Dynamic-CP path does.
+    """
+    if packed_seq_params is None or packed_seq_params.qkv_format != 'thd':
+        return "zigzag"
+
+    mode = packed_seq_params.cp_partition_mode
+    if type(mode) is not str or mode not in ("zigzag", "contiguous"):
+        raise ValueError(
+            "GDN packed THD cp_partition_mode must be exactly 'zigzag' or "
+            f"'contiguous', got {mode!r}."
+        )
+    return mode
+
+
 @dataclass
 class GatedDeltaNetSubmodules:
     """
@@ -350,6 +369,7 @@ class GatedDeltaNet(MegatronModule):
         # CUDA-graph-unsafe `torch.distributed.new_group` on every forward.
         base_cp_group = pg_collection.cp if pg_collection is not None else self.pg_collection.cp
         cp_group = resolve_cp_group(base_cp_group, packed_seq_params)
+        cp_partition_mode = _resolve_gdn_cp_partition_mode(packed_seq_params)
         if self.config.linear_cp_mode == "chunkwise":
             cp_group_chunkwise = cp_group
             cp_group_headwise = None
@@ -393,14 +413,14 @@ class GatedDeltaNet(MegatronModule):
                 packed_seq_params.cu_seqlens_q,
                 seq_len_global,
                 "cu_seqlens_q",
-                cp_size=self.cp_size,
+                cp_size=cp_group.size(),
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
                 seq_len_global,
                 "cu_seqlens_kv",
-                cp_size=self.cp_size,
+                cp_size=cp_group.size(),
             )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
@@ -462,6 +482,7 @@ class GatedDeltaNet(MegatronModule):
                     cu_seqlens_q,
                     packed_seq_params,
                     chunkwise_cp_context,
+                    cp_partition_mode,
                 )
 
             out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
@@ -477,6 +498,7 @@ class GatedDeltaNet(MegatronModule):
                 cu_seqlens_q,
                 packed_seq_params,
                 chunkwise_cp_context,
+                cp_partition_mode,
             )
 
         return out, out_bias
@@ -493,6 +515,7 @@ class GatedDeltaNet(MegatronModule):
         cu_seqlens_q,
         packed_seq_params,
         chunkwise_cp_context,
+        cp_partition_mode,
     ):
         """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> gated norm -> out_proj).
 
@@ -515,7 +538,7 @@ class GatedDeltaNet(MegatronModule):
         # all-to-all — no full-sequence gather required.
         # TODO: Move CP layout ownership to a model/region-level scheduler so hybrid models can
         # enter contiguous layout before GDN regions instead of paying module-local conversions.
-        if cp_size_chunkwise > 1:
+        if cp_size_chunkwise > 1 and cp_partition_mode == "zigzag":
             nvtx_range_push(suffix="zigzag_to_contiguous")
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 qkvzba = zigzag_to_contiguous_chunks(
@@ -626,7 +649,7 @@ class GatedDeltaNet(MegatronModule):
         # layers and loss computation expect.
         # TODO: The planned CP layout refactor should keep consecutive GDN layers contiguous and
         # restore zigzag only at SDPA/canonical-layout boundaries.
-        if cp_size_chunkwise > 1:
+        if cp_size_chunkwise > 1 and cp_partition_mode == "zigzag":
             nvtx_range_push(suffix="contiguous_to_zigzag")
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 norm_out = contiguous_to_zigzag_chunks(
