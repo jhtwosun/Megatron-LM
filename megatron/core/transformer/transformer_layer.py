@@ -995,6 +995,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
 
+        if self.config.thd_static_packing:
+            if micro_batch_size != 1 or seq_length != (
+                self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+            ):
+                raise ValueError("static THD capture shape does not match configured budget")
+            if not isinstance(self.self_attention, IdentityOp) and (
+                not self.config.cuda_graph_scope or CudaGraphScope.attn in self.config.cuda_graph_scope
+            ):
+                cu = torch.full((self.config.thd_max_packed_sequences + 1,), seq_length,
+                                dtype=torch.int32, device=torch.cuda.current_device())
+                cu[0] = 0
+                for key in ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded",
+                            "cu_seqlens_kv_padded"):
+                    static_inputs[key] = cu.clone()
+            return static_inputs
+
         if not isinstance(self.self_attention, IdentityOp) and (
             not self.config.cuda_graph_scope or CudaGraphScope.attn in self.config.cuda_graph_scope
         ):
@@ -1035,6 +1051,38 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 submodules += [self.mlp.shared_experts]
         return submodules
 
+    def _decompose_static_thd(self, kwargs):
+        packed = kwargs.pop("packed_seq_params", None)
+        if packed is None:
+            return
+        if not self.config.thd_static_packing or packed.qkv_format != "thd":
+            raise ValueError("packed attention graph requires opt-in static THD")
+        if kwargs.get("attention_mask") is not None:
+            raise ValueError("static THD graph captures causal attention without an explicit mask")
+        # TE graph input metadata must contain tensors, not optional Python None.
+        for key in list(kwargs):
+            if kwargs[key] is None:
+                kwargs.pop(key)
+        for key in ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded",
+                    "cu_seqlens_kv_padded"):
+            value = getattr(packed, key)
+            if value is None or value.shape != (self.config.thd_max_packed_sequences + 1,):
+                raise ValueError("static THD graph metadata capacity mismatch")
+            kwargs[key] = value
+
+    def _reconstruct_static_thd(self, kwargs):
+        if "cu_seqlens_q" not in kwargs:
+            return
+        if not self.config.thd_static_packing:
+            raise ValueError("THD graph tensors require opt-in static THD")
+        tensors = {key: kwargs.pop(key) for key in (
+            "cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded", "cu_seqlens_kv_padded")}
+        maximum = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        kwargs["packed_seq_params"] = PackedSeqParams(
+            qkv_format="thd", max_seqlen_q=maximum, max_seqlen_kv=maximum,
+            **tensors)
+        kwargs.setdefault("attention_mask", None)
+
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """
         CUDA Graph capture for this layer using TE interface.
@@ -1043,6 +1091,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
+        self._reconstruct_static_thd(kwargs)
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
@@ -1102,6 +1151,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             args = (hidden_states,)
             kwargs = {}
 
+        if self.config.thd_static_packing:
+            self._decompose_static_thd(kwargs)
         assert (kwargs.get('inference_context') is None) and (
             kwargs.get('packed_seq_params') is None
         ), (

@@ -79,6 +79,9 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
         mdp_loader_prepartition_encoder_stage: bool = True,
         mdp_loader_prepartition_materialize: bool = True,
         mdp_lpt_hidden_size: int = 1152,
+        thd_static_packing: bool = False,
+        thd_max_packed_sequences: int = 32,
+        report_workload_geometry: bool = False,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -106,6 +109,11 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
             mdp_loader_prepartition_materialize
         )
         self.mdp_lpt_hidden_size = int(mdp_lpt_hidden_size)
+        self.thd_static_packing = bool(thd_static_packing)
+        self.thd_max_packed_sequences = int(thd_max_packed_sequences)
+        self.report_workload_geometry = bool(report_workload_geometry)
+        if self.thd_static_packing and self.thd_max_packed_sequences < 2:
+            raise ValueError("static THD requires a real slot and a reserved dummy slot")
         self._pixel_dim = 3 * self.temporal_patch_size * self.patch_size * self.patch_size
 
     @staticmethod
@@ -926,6 +934,31 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
             return torch.zeros(0, self._pixel_dim, dtype=torch.float32)
         return torch.cat(local_pixels, dim=0)
 
+    def _static_thd_metadata(self, out):
+        if not self.thd_static_packing:
+            return out
+        cu = out["cu_seqlens"].tolist()
+        cap = self.thd_max_packed_sequences
+        if len(cu) - 1 > cap - 1:
+            raise ValueError("static THD real documents exceed reserved capacity")
+        if cu[-1] < self.seq_length:
+            if bool(out["loss_mask"][cu[-1]:].any()):
+                raise ValueError("static THD tail must have zero loss")
+            cu.append(self.seq_length)
+        if cu[-1] != self.seq_length or any(
+            (b - a) % (2 * self.cp_size) for a, b in zip(cu, cu[1:])
+        ):
+            raise ValueError("static THD boundaries violate CP/global budget")
+        cu.extend([self.seq_length] * (cap + 1 - len(cu)))
+        out["cu_seqlens"] = torch.tensor(cu, dtype=torch.int32, device="cpu")
+        out["cu_seqlens_padded"] = out["cu_seqlens"].clone()
+        out["max_seqlen"] = torch.tensor(self.seq_length, dtype=torch.int32, device="cpu")
+        for key in ("image_cu_seqlens", "pixel_cu_seqlens"):
+            values = out[key].tolist()
+            values.extend([values[-1]] * (cap + 1 - len(values)))
+            out[key] = torch.tensor(values, dtype=torch.int32, device="cpu")
+        return out
+
     @stateless
     def pack_selected_samples(self, samples):
         if not samples:
@@ -972,6 +1005,15 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
         image_grid_thw = (
             torch.cat(grid_parts, dim=0) if grid_parts else torch.zeros(0, 3, dtype=torch.long)
         )
+        geometry = None
+        if self.report_workload_geometry:
+            grids = image_grid_thw.tolist()
+            geometry = torch.tensor(
+                [sum(content_lens), sum(n * n for n in content_lens),
+                 sum(t * h * w for t, h, w in grids),
+                 sum(t * (h * w) ** 2 for t, h, w in grids)],
+                dtype=torch.int64, device="cpu",
+            )
 
         position_parts = [
             self._position_ids_for_doc(doc["input_ids"], doc["image_grid_thw"]) for doc in docs
@@ -1027,7 +1069,9 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
         out["max_seqlen"] = torch.tensor(max(padded_seg_lens), dtype=torch.int32)
         out["image_cu_seqlens"] = torch.tensor(image_cu, dtype=torch.int32)
         out["pixel_cu_seqlens"] = torch.tensor(pixel_cu, dtype=torch.int32)
-        return out
+        if geometry is not None:
+            out["_reference_flops_geometry"] = geometry
+        return self._static_thd_metadata(out)
 
     @stateless
     def batch(self, samples):

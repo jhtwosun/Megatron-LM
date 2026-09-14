@@ -898,6 +898,10 @@ class TransformerConfig(ModelParallelConfig):
     excluding optimizer) is enabled.
     "transformer_engine": capture the CUDA graph using TE make_graphed_callables()."""
 
+    thd_static_packing: bool = False
+    """Opt-in fixed-capacity THD metadata for the reference-aligned data path."""
+    thd_max_packed_sequences: int = 32
+    """Total THD slots, including an optional zero-loss tail sequence."""
     cuda_graph_scope: Union[str, CudaGraphScope, List[str], List[CudaGraphScope]] = "full"
     """Determines the CUDA graphs capturing scope.
     When cuda_graph_impl is set to "transformer_engine", valid values are "attn", "mlp", "moe",
@@ -1134,6 +1138,13 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        if self.thd_static_packing:
+            if (self.thd_max_packed_sequences < 2 or self.max_seqlen_per_dp_cp_rank is None
+                    or self.max_seqlen_per_dp_cp_rank <= 0):
+                raise ValueError("static THD requires positive local budget and >=2 slots")
+            if self.max_seqlen_per_dp_cp_rank % 2:
+                raise ValueError("static THD local token budget must support CP zigzag")
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

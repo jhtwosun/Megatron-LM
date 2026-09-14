@@ -29,14 +29,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MEGATRON_LM_PATH="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-export NVTE_FWD_LAYERNORM_SM_MARGIN=16
-export NVTE_BWD_LAYERNORM_SM_MARGIN=16
-export NVLINK_DOMAIN_SIZE=72
+export NVTE_FWD_LAYERNORM_SM_MARGIN=${NVTE_FWD_LAYERNORM_SM_MARGIN:-16}
+export NVTE_BWD_LAYERNORM_SM_MARGIN=${NVTE_BWD_LAYERNORM_SM_MARGIN:-16}
+export NVLINK_DOMAIN_SIZE=${NVLINK_DOMAIN_SIZE:-72}
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NVTE_FUSED_ATTN=1
-export NVTE_NORM_FWD_USE_CUDNN=1
-export NVTE_NORM_BWD_USE_CUDNN=1
 export PYTHONWARNINGS=ignore
 : ${NCCL_DEBUG:=VERSION}
 export NCCL_DEBUG
@@ -484,7 +482,7 @@ run_benchmark() {
     # --- Assemble & run ---
     local cmd=(
         ${nsys_cmd[@]+"${nsys_cmd[@]}"}
-        torchrun "${dist_args[@]}"
+        python -m torch.distributed.run "${dist_args[@]}"
         "$MEGATRON_LM_PATH/examples/multimodal_dev/pretrain_multimodal.py"
         "${training_args[@]}"
         ${fp8_args[@]+"${fp8_args[@]}"}

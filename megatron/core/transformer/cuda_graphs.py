@@ -1917,6 +1917,14 @@ class TECudaGraphHelper:
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
+                if self.config.thd_static_packing and hasattr(
+                    transformer_module, "get_static_thd_rotary_pos_emb"
+                ):
+                    if self.seq_length not in rotary_pos_emb_cache:
+                        rotary_pos_emb_cache[self.seq_length] = (
+                            transformer_module.get_static_thd_rotary_pos_emb(self.seq_length)
+                        )
+                    return rotary_pos_emb_cache[self.seq_length]
                 if (
                     transformer_module.position_embedding_type == 'rope'
                     and not self.config.multi_latent_attention

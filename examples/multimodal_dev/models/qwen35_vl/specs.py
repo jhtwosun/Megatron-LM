@@ -6,9 +6,14 @@ Provides ModuleSpec builders that define the transformer layer composition.
 Both the standalone and MIMO training paths import from here.
 """
 
+import dataclasses
+import math
 from typing import Optional
 
+import torch.nn.functional as F
+
 from examples.multimodal_dev.models.base import _NO_CP_GROUP
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
@@ -137,6 +142,33 @@ def get_qwen35_vl_language_spec(
     )
 
 
+class PaddedHeadDimDotProductAttention(TEDotProductAttention):
+    """Reference fast-pass attention-only padding; projections keep their real size.
+
+    Adapted from BestJuly 5885d65a9c, qwen35_vl/specs.py. Zero padding
+    preserves QK products only if softmax scaling retains the real head size.
+    """
+
+    def __init__(self, config, *args, **kwargs):
+        self._real_kv = config.kv_channels
+        self._pad_kv = 128 if self._real_kv == 72 else self._real_kv
+        self._pad_width = self._pad_kv - self._real_kv
+        if self._pad_width:
+            config = dataclasses.replace(config, kv_channels=self._pad_kv)
+            if kwargs.get("softmax_scale") is None:
+                kwargs["softmax_scale"] = 1.0 / math.sqrt(self._real_kv)
+        super().__init__(config, *args, **kwargs)
+
+    def forward(self, query, key, value, *args, **kwargs):
+        if not self._pad_width:
+            return super().forward(query, key, value, *args, **kwargs)
+        query, key, value = (F.pad(t, (0, self._pad_width)) for t in (query, key, value))
+        out = super().forward(query, key, value, *args, **kwargs)
+        return out.view(*out.shape[:-1], -1, self._pad_kv)[..., :self._real_kv].reshape(
+            *out.shape[:-1], -1
+        )
+
+
 def get_qwen35_vl_vision_spec() -> ModuleSpec:
     """ModuleSpec for vision encoder transformer layers.
 
@@ -149,4 +181,5 @@ def get_qwen35_vl_vision_spec() -> ModuleSpec:
     """
     spec = get_vit_layer_with_transformer_engine_spec()
     spec.submodules.self_attention.module = Qwen35VLVisionSelfAttention
+    spec.submodules.self_attention.submodules.core_attention = PaddedHeadDimDotProductAttention
     return spec
