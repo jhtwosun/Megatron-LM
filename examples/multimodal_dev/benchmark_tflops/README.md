@@ -314,3 +314,9 @@ choices; it does not claim exact reference parity or attribute gains to one
 library. Runtime changes include static THD graph metadata, graph-safe RoPE,
 vision attention padding for the native72-dim head, and reporting counters.
 Keep these changes distinct from the FLOPs-accounting correction itself.
+
+## Owned-campaign supplement
+
+See the [2026-09-15 owned-campaign catalog and GB300 evidence](gb300_20260915/README.md).
+This ongoing draft preserves original observations and marks corrected accounting
+unavailable until native-boundary and historical-input evidence is sufficient.
