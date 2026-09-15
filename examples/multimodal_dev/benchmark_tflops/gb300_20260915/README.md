@@ -11,7 +11,7 @@ This is a new current-thread supplement on PR131 head `bbba1001543a9c99a26ae8a83
 - [Data distributions and configurations](data-and-configs.md): generator versus prepared-corpus versus consumed-geometry evidence, source/data pins, and known gaps.
 - [Evidence fingerprints](evidence-fingerprints.md): retained result and raw-log SHA-256 values. Raw logs, media, and private filesystem paths are intentionally not bundled.
 - [Completed four-way profile evidence](profile-summary.md): finalized packing/latest continuation, process-aware phase observations, and explicit capture/configuration limitations. Diagnostic only, not a speed ranking.
-- Accounting utilities and tests are being prepared separately and are excluded from this initial documentation-only draft. Their existence or unit-test success alone does not establish historical boundary replay.
+- [Scoped accounting utilities](accounting-utilities.md): seven standard-library tests and native formula equivalence checks; historical native replay remains unexecuted. Tool availability does not establish corrected rates or historical boundary identity.
 
 ## Accepted historical records
 
