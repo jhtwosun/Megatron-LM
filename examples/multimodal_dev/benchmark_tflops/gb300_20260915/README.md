@@ -9,6 +9,7 @@ This is a new current-thread supplement on PR131 head `bbba1001543a9c99a26ae8a83
 - [Entire owned-campaign catalog](campaign-wide-catalog.md): archived and active namespaces,231 result artifacts,351 experiment directories, duplicate/failure/unknown distinctions and correction gaps.
 - [Data distributions and configurations](data-and-configs.md): generator versus prepared-corpus versus consumed-geometry evidence, source/data pins, and known gaps.
 - [Evidence fingerprints](evidence-fingerprints.md): retained result and raw-log SHA-256 values. Raw logs, media, and private filesystem paths are intentionally not bundled.
+- [Completed four-way profile evidence](profile-summary.md): finalized packing/latest continuation, process-aware phase observations, and explicit capture/configuration limitations. Diagnostic only, not a speed ranking.
 - Accounting utilities and tests are being prepared separately and are excluded from this initial documentation-only draft. Their existence or unit-test success alone does not establish historical boundary replay.
 
 ## Accepted historical records
@@ -70,6 +71,7 @@ The PR7/PR131 executed native FLOP function has identical extracted-source SHA-2
 |750305 fixed8× CP1/CP2 profiles|Both20-step producers completed; four finalized SQLite files and16 workers per cell|Diagnostic summaries only; configured capture5–8 implies displayed6–8 from source, not explicit iteration NVTX anchors|
 |752159 baseline and nonfused MDP profiles|Both20-step producers completed; integrity/stability/16-worker gates passed|Reviewed process-aware summaries; no global wall-time fractions or pacing-rank proof|
 |752159 packing/latest profiles|Outer2-hour timeout; packing before iteration1, no finalized trace; latest not started|No result or comparison|
+|753568 packing /753569 latest continuation|Both20-step producers completed0:0; eight finalized SQLite files passed integrity/stability,16 workers per cell|[Reviewed diagnostic summaries](profile-summary.md); LR/evaluation/rack differences disclosed, no percentage speedup or global pacing claim|
 |751915 MDP|Stopped after iteration8 with collective watchdog; human-authorized cleanup/retry|Failure diagnosis only; its completed baseline remains standalone|
 |749264|Intentional pending-job supersession|No measurement|
 |749875|Missing NVTX helper import|Failed profile attempt, no timing result|
