@@ -7,6 +7,7 @@ This is a new current-thread supplement on PR131 head `bbba1001543a9c99a26ae8a83
 ## Reading guide
 
 - [Entire owned-campaign catalog](campaign-wide-catalog.md): archived and active namespaces,231 result artifacts,351 experiment directories, duplicate/failure/unknown distinctions and correction gaps.
+- [Per-experiment recorded details](per-experiment.md) and [machine-readable fields](per-experiment.json): all 231 artifacts, recorded stack/recipe fields, provisional attempt groups, fingerprints, and missing references. These are descriptive records, not 231 newly verified successes; five ambiguous world-size products are explicitly flagged.
 - [Data distributions and configurations](data-and-configs.md): generator versus prepared-corpus versus consumed-geometry evidence, source/data pins, and known gaps.
 - [Evidence fingerprints](evidence-fingerprints.md): retained result and raw-log SHA-256 values. Raw logs, media, and private filesystem paths are intentionally not bundled.
 - [Completed four-way profile evidence](profile-summary.md): finalized packing/latest continuation, process-aware phase observations, and explicit capture/configuration limitations. Diagnostic only, not a speed ranking.
