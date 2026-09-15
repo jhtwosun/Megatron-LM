@@ -24,3 +24,9 @@ These SHA-256 fingerprints identify original retained artifacts. They do not mak
 |EXP-PR7-FOURWAY-752159-pr7_packing| `227e65333842503b28823e3ea836cb75b1853e85e05c0875de7119296cff00b2` | `dd03ff43f27204797384e299d46e64b876667fdaf106c13da86fc51599c38bba` |
 
 Prepared dataset, tokenizer revision, and preflight fingerprints are listed in [data-and-configs.md](data-and-configs.md). Recorded early argument values and final resolved model values must remain distinct. This manifest was generated from the owned inventory and accepted JSON bytes; no external artifacts were fetched.
+
+## Historical log retrieval limits
+
+A bounded metadata-only audit covered the 231 catalog artifacts. For 189 historical references, exact filenames were absent at all three checked, known owned locations (567 unique checks, all `ENOENT`). Another 38 previously located owned-campaign references were deliberately not rechecked; four artifacts have no log reference and are not counted as proved file absence. No new candidate logs were found, and no permission failures occurred in these checks.
+
+This is a retrieval limitation at those three locations, not evidence that no backup exists elsewhere. No broad filesystem or peer-worktree search was performed. Original timing rows and resolved runtime arguments remain necessary: recovered source definitions alone cannot establish corrected historical rates. The private coverage receipt has SHA-256 `c8e3c73ceff9cfe341801963020051e7c8a441b9cdd9b79be84f74a7b9721fa6`; its host paths and raw records are not published.

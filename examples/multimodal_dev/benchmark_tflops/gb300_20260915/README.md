@@ -12,6 +12,7 @@ This is a new current-thread supplement on PR131 head `bbba1001543a9c99a26ae8a83
 - [Evidence fingerprints](evidence-fingerprints.md): retained result and raw-log SHA-256 values. Raw logs, media, and private filesystem paths are intentionally not bundled.
 - [Completed four-way profile evidence](profile-summary.md): finalized packing/latest continuation, process-aware phase observations, and explicit capture/configuration limitations. Diagnostic only, not a speed ranking.
 - [Scoped accounting utilities](accounting-utilities.md): seven standard-library tests and native formula equivalence checks; historical native replay remains unexecuted. Tool availability does not establish corrected rates or historical boundary identity.
+- [Ongoing qualification status](24h-progress.md): eight-cell CPU gate, low-work model qualification, high-count OOM, and unstarted cells. No new sweep performance result is claimed.
 
 ## Accepted historical records
 
