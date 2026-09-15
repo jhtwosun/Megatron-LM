@@ -1,5 +1,9 @@
 # PR7 workload-aware TFLOPs reproduction (mock and real Energon)
 
+For the updated native Megatron padded-THD accounting method and historical
+correction ledger, read [Native accounting](NATIVE_ACCOUNTING.md). The original
+content estimator below remains separately labeled; it is not padding-aware.
+
 This is an experimental reproduction snapshot stacked on
 [PR7](https://github.com/jhtwosun/Megatron-LM/pull/7),
 base `e1484af4f5e9e5723105f731fb555dba9a32fecb`.
@@ -51,7 +55,8 @@ still not an exact integer archive. No loss/backward normalization is changed.
 
 See [workload_flops.py](workload_flops.py) for the executable formula.
 FMA=2, training=3*forward, causal attention uses the half-square convention.
-For the **full PR7 Qwen3-VL** model:
+For the **PR7 Qwen3/Qwen3.5-VL hybrid benchmark configuration** (not the official
+canonical Qwen3-VL architecture):
 
 - Decoder L=48, H=2048, Q projection=4096, KV projection=512, 128 experts,
   top-k=8, expert FFN=768, no shared expert, padded vocab=248448.
