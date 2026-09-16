@@ -92,8 +92,9 @@ shape also do not necessarily change a quantized cache key.
 
 Observed propagation: first attention preparation delay -> embedding gather
 wait -> next pack same-stream wait -> window-delivery skew -> decoder EP wait.
-Direct backend plan-build logging is the remaining confirmation, not another
-claim that NCCL bandwidth or encoder arithmetic is intrinsically slow.
+Direct backend plan-build logging was the remaining confirmation at this
+stage; it is addressed below, not by asserting intrinsically slow NCCL
+bandwidth or encoder arithmetic.
 
 Follow-up provenance:
 
@@ -105,3 +106,63 @@ Allocation422830 ended normally after9:06. Initial read-only query step1 failed
 its original/recompute phase-count assertion; the corrected original-sidecar
 filter passed in step2. Other analysis steps passed. This is not a new GPU or
 portable-wrapper qualification, nor an end-to-end speedup result.
+
+## Backend confirmation: first-use attention plan preparation
+
+Diagnostic job422896 repeated the unchanged eight-step real-data recipe with
+cuDNN9.25 backend logging on ranks0,1,12,13. Training and export exited zero;
+all eight updates had finite loss/gradient norm, no skipped/NaN updates, and
+exact T/U/R/A workload-summary equality with422790. All16 loaded TE/cuDNN
+library path/hash sets matched. This is instrumentation, not a speed result.
+
+The backend evidence now supports **first-use vision attention execution-plan
+preparation** as the cause of the localized producer stalls, rather than
+encoder arithmetic or image decoding in those intervals. Among36 original
+vision packs on the four logged ranks,14 first native attention calls exceeded
+10ms. Every one had its largest same-thread backend timestamp gap between an
+execution-plan `cudnnBackendFinalize` descriptor record and its following
+`CUDNN_STATUS_SUCCESS` record.
+
+| Rank / step / pack | First native query ms | Plan-Finalize record gap ms |
+|---|---:|---:|
+|0 /5 /0|881.508|869.708|
+|1 /5 /1|805.569|794.428|
+|13 /6 /1|888.526|875.781|
+|12 /7 /0|939.164|926.616|
+
+Across all14 cases the record gaps were794.428–926.616ms. They are observed
+timestamp separations, **not independently measured API or pure compilation
+durations**. There was no cuDNN interval table in the Nsight exports despite
+the advertised tracing option. Same PID/TID, file order, native NVTX ranges,
+and realtime/monotonic brackets were checked. The conservative1000ppm clock
+envelope makes some records overlap a query boundary; these are retained as
+boundary-ambiguous, not silently treated as fully contained. Restricting to
+fully contained records alone can incorrectly hide the long gap.
+
+File-order analysis separates execution-plan finalization from per-execution
+variant-pack finalization. Each of the14 slow packs has exactly one plan
+Finalize descriptor record before27 Execute descriptor records. The other22
+packs have no plan Finalize descriptor record and still have27 Execute
+descriptor records. Within every pack, all27 printed execution-plan sections
+have the same fingerprint and there is no intervening plan Finalize record.
+This corroborates prepare-once/repeated-execution behavior; text equality is
+not a literal plan-handle identity or an instrumented TE cache-hit event.
+
+Combined with the earlier dependency tracing, the explanation is:
+
+`rank-local attention-plan preparation -> late vision producer -> embedding
+AllGather waits -> delayed next pack/window -> decoder EP arrival waits`.
+
+FLOP-based balancing estimates arithmetic, not rank-local first-use plan
+preparation. Equal or similar planned FLOPs therefore need not produce equal
+arrival times for heterogeneous vision packs. This does not establish an
+exact TE cache key/miss event, identify the internal compiler component, or
+explain every later-microbatch stall. It also does not prove a fix or an
+end-to-end speedup. Cache-key-aware warmup/bucketing would be a subsequent
+optimization experiment, not a result of this diagnostic.
+
+Raw confirmation artifacts:
+`slurm_logs/pr7_cudnn_confirm_20260916/422896/` (real traces, per-rank library
+logs, loaded-library identities, extracted and reduced records). Analysis
+scripts are retained in the campaign's
+`EXP-PR7-CUDNN-ANALYSIS-20260916` packet, separate from the portable wrapper.
