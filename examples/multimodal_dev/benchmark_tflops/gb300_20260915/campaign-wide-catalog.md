@@ -6,6 +6,10 @@ This is a metadata and documentary evidence catalog, not a completed accounting 
 
 ## Coverage and counting
 
+The counts below describe the retained 231-artifact historical inventory. New accepted fixed-input sweep results are published separately; 231 is not the total count of all current results. Historical corrected rates remain unavailable rather than being inferred from newer inputs or reused geometry.
+
+See the [new corrected-accounting snapshot](sweep-corrected-snapshot-20260916.md) for separately accepted formal cells and current incomplete configurations.
+
 | Namespace | Result-location JSONs | Experiment directories | Directories unlinked to result config references |
 |---|---:|---:|---:|
 |Active campaign after April29 numbering reset|204|315|132|

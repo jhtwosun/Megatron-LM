@@ -1,10 +1,12 @@
 # GB300 experiment and accounting supplement — 2026-09-15
 
-**Working draft. Corrected accounting is not yet established.** This catalog preserves historical observed timings and legacy native TFLOPs estimates. Every corrected-rate entry is `null` until the executed formula, resolved arguments, consumed inputs, and final attention boundaries have adequate proof. Null means unavailable, not zero or no work.
+**Working draft: historical correction gaps remain explicit.** The 231-artifact historical catalog preserves observed timings and original legacy native TFLOPs estimates; its corrected rates remain `null` where executed formula, resolved arguments, consumed inputs and final attention boundaries lack sufficient proof. Newly accepted fixed-input sweep accounting is a separate dated snapshot, not a retroactive correction of those historical records. Null means unavailable, not zero or no work. Corrected native modeled decoder TFLOPs is not total VLM work or hardware-counter throughput.
 
 This is a new current-thread supplement on PR131 head `bbba1001543a9c99a26ae8a8370b40e005c80d80`. It does not replace the separate historical ledger in [NATIVE_ACCOUNTING.md](../NATIVE_ACCOUNTING.md), and does not import that ledger's experiment inputs. Measured source bases and adaptations are distinct from this documentation branch.
 
 ## Reading guide
+
+- [New accepted corrected-accounting snapshot](sweep-corrected-snapshot-20260916.md) and [machine-readable rates and proof digests](sweep-corrected-snapshot-20260916.json): four formal fixed-input cells, corrected native modeled decoder rates with primary/supplemental windows, separate pending/OOM configurations and explicit accounting limits.
 
 - [Entire owned-campaign catalog](campaign-wide-catalog.md): archived and active namespaces,231 result artifacts,351 experiment directories, duplicate/failure/unknown distinctions and correction gaps.
 - [Per-experiment recorded details](per-experiment.md) and [machine-readable fields](per-experiment.json): all 231 artifacts, recorded stack/recipe fields, provisional attempt groups, fingerprints, and missing references. These are descriptive records, not 231 newly verified successes; five ambiguous world-size products are explicitly flagged.
@@ -12,7 +14,7 @@ This is a new current-thread supplement on PR131 head `bbba1001543a9c99a26ae8a83
 - [Evidence fingerprints](evidence-fingerprints.md): retained result and raw-log SHA-256 values. Raw logs, media, and private filesystem paths are intentionally not bundled.
 - [Completed four-way profile evidence](profile-summary.md): finalized packing/latest continuation, process-aware phase observations, and explicit capture/configuration limitations. Diagnostic only, not a speed ranking.
 - [Scoped accounting utilities](accounting-utilities.md): seven standard-library tests and native formula equivalence checks; historical native replay remains unexecuted. Tool availability does not establish corrected rates or historical boundary identity.
-- [Ongoing qualification status](24h-progress.md): eight-cell CPU gate, low-work model qualification, high-count OOM, and unstarted cells. No new sweep performance result is claimed.
+- [Ongoing qualification status](24h-progress.md): fixed-input sweep progress, both high-work OOM outcomes, corrected Mantis native/model qualification, newly submitted formal pair and bounded PixMo preparation. Pending runs have no numerical results.
 
 ## Accepted historical records
 
@@ -88,4 +90,4 @@ For750305, vision-forward CP2 has additional NCCL activity; summed launches and 
 
 ## Publication boundaries
 
-This package is a transparent draft, not a completed accounting correction. No measured source, original accepted JSON, historical ledger, or raw log is overwritten. Corrected columns remain null pending proof and independent review. No checkpoint/model-weight download, new training run, or external publication is implied by these documents.
+This package is a transparent draft, not a completed campaign-wide accounting correction. No measured source, original accepted JSON, historical ledger, or raw log is overwritten. Historical corrected columns remain null pending proof and independent review; the separate new snapshot contains only accepted scoped decoder-model rates. Publishing these documents does not itself download checkpoints or dispatch additional training.

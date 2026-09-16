@@ -1,0 +1,279 @@
+{
+  "schema_version": 1,
+  "status": "accepted_cells_snapshot_incomplete_campaign",
+  "scope": "Four accepted fixed-image mock cells only; existing campaign-wide catalog remains separate.",
+  "metrics_scope": "Exact sealed native decoder modeled FLOPs divided by whole VLM step time and GPU count. Not total VLM FLOPs, hardware utilization, or encoder-only throughput.",
+  "configuration": {
+    "model": "PR7/PR131 hybrid VLM (configured model_arch=qwen3vl)",
+    "hardware": "16 GB300 GPUs",
+    "world_size": 16,
+    "global_batch_size": 64,
+    "micro_batch_size": 1,
+    "sequence_length": 16384,
+    "tensor_parallel": 1,
+    "pipeline_parallel": 2,
+    "decoder_context_parallel": 2,
+    "data_parallel": 4,
+    "expert_parallel": 8,
+    "expert_tensor_parallel": 1,
+    "encoder_context_parallel": 1,
+    "precision": "BF16",
+    "padded_vocabulary": 248448,
+    "kv_channels": 128,
+    "sequence_parallel_requested": true,
+    "sequence_parallel_effective": false,
+    "documents_per_packed_bin": 4,
+    "raw_sample_tokens": 4096,
+    "thd_static_max_segments": 32,
+    "initial_consumed_samples": 0,
+    "eval_iterations": 0,
+    "decoder_layers": 48,
+    "vision_layers": 27,
+    "decoder_hidden_size": 2048,
+    "experts": 128
+  },
+  "window_rules": {
+    "primary": [
+      4,
+      20
+    ],
+    "primary_samples": 17,
+    "supplemental": [
+      10,
+      20
+    ],
+    "supplemental_samples": 11,
+    "legacy_verifier_window_label": "10-50 is a stale raw label; actual available window is 10-20",
+    "missing_memory": "null means unavailable, not zero"
+  },
+  "accepted_cells": [
+    {
+      "image_count_per_raw_sample": 1,
+      "square_image_size_px": 224,
+      "status": "accepted_completed_formal_cell",
+      "total_iterations": 20,
+      "windows": {
+        "4-20": {
+          "samples": 17,
+          "median_step_ms": 6475.1,
+          "modeled_decoder_mean_tflops_per_gpu_s": 243.9545569345829,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 243.66289227393145
+        },
+        "10-20": {
+          "samples": 11,
+          "median_step_ms": 6477.4,
+          "modeled_decoder_mean_tflops_per_gpu_s": 241.84400667533885,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 241.50780372397972
+        }
+      },
+      "global_per_iteration_geometry": {
+        "Tpad": 1048576,
+        "Upad": 4294967296,
+        "R": 50176,
+        "A": 9834496
+      },
+      "peak_memory_gib": null,
+      "legacy_native_logged_tflops_per_gpu_s": {
+        "actual_window": [
+          10,
+          20
+        ],
+        "mean": 386.7636,
+        "not_corrected_decoder_metric": true
+      },
+      "evidence_sha256": {
+        "native_accounting": "5e5b1bc9049099940dd103d6dd533ddcdc142d7959ad968835c2a0e34939629d",
+        "canonical_verifier": "a51605695806917b097a0321e276e2bf93a8ce6b8138f7d0387dbfc933f8f018",
+        "source_seal": "9239e622e91bf9e21c726a598e13c1b1fabc02d8d4a48591eb5ddb7cf1e55ceb",
+        "native_function": "d900fc09ea21b6aa42e3879cb47f729650c64e6076116faf86dd34b7e3dabd8e"
+      },
+      "job_id": 758245,
+      "training_step_id": "758245.1",
+      "experiment_id": "EXP-PR131-SWEEP-COUNT1_SIZE224-758245"
+    },
+    {
+      "image_count_per_raw_sample": 1,
+      "square_image_size_px": 448,
+      "status": "accepted_completed_formal_cell",
+      "total_iterations": 20,
+      "windows": {
+        "4-20": {
+          "samples": 17,
+          "median_step_ms": 6586.1,
+          "modeled_decoder_mean_tflops_per_gpu_s": 240.8134065699021,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 240.45180478398294
+        },
+        "10-20": {
+          "samples": 11,
+          "median_step_ms": 6586.1,
+          "modeled_decoder_mean_tflops_per_gpu_s": 239.29149918062404,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 238.84199770007194
+        }
+      },
+      "global_per_iteration_geometry": {
+        "Tpad": 1048576,
+        "Upad": 4294967296,
+        "R": 200704,
+        "A": 157351936
+      },
+      "peak_memory_gib": null,
+      "legacy_native_logged_tflops_per_gpu_s": {
+        "actual_window": [
+          10,
+          20
+        ],
+        "mean": 382.6727,
+        "not_corrected_decoder_metric": true
+      },
+      "evidence_sha256": {
+        "native_accounting": "3510eb3d16512785847adfeee8b8cd02f3ed498bde8891962ca35eb911828844",
+        "canonical_verifier": "8b9a7cc7c109b8e51c1f3fb7bd0113dd3b7fe2d605cd7442ddd30e2a71062c4b",
+        "source_seal": "9239e622e91bf9e21c726a598e13c1b1fabc02d8d4a48591eb5ddb7cf1e55ceb",
+        "native_function": "d900fc09ea21b6aa42e3879cb47f729650c64e6076116faf86dd34b7e3dabd8e"
+      },
+      "job_id": 758245,
+      "training_step_id": "758245.3",
+      "experiment_id": "EXP-PR131-SWEEP-COUNT1_SIZE448-758245"
+    },
+    {
+      "image_count_per_raw_sample": 1,
+      "square_image_size_px": 896,
+      "status": "accepted_completed_formal_cell",
+      "total_iterations": 20,
+      "windows": {
+        "4-20": {
+          "samples": 17,
+          "median_step_ms": 7245.8,
+          "modeled_decoder_mean_tflops_per_gpu_s": 217.26982511640725,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 217.09080629044738
+        },
+        "10-20": {
+          "samples": 11,
+          "median_step_ms": 7245.8,
+          "modeled_decoder_mean_tflops_per_gpu_s": 217.1378180111032,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 216.9077285812115
+        }
+      },
+      "global_per_iteration_geometry": {
+        "Tpad": 1048576,
+        "Upad": 4294967296,
+        "R": 802816,
+        "A": 2517630976
+      },
+      "peak_memory_gib": null,
+      "legacy_native_logged_tflops_per_gpu_s": {
+        "actual_window": [
+          10,
+          20
+        ],
+        "mean": 347.2455,
+        "not_corrected_decoder_metric": true
+      },
+      "evidence_sha256": {
+        "native_accounting": "fd60b8a402bfa5de69b987f5b9112a71f4fb7a9d10025d2852ac9da343388c7e",
+        "canonical_verifier": "574cffda0fc15128004b108a3d7fea2fa90132e475685881fa403c25b58d320d",
+        "source_seal": "9239e622e91bf9e21c726a598e13c1b1fabc02d8d4a48591eb5ddb7cf1e55ceb",
+        "native_function": "d900fc09ea21b6aa42e3879cb47f729650c64e6076116faf86dd34b7e3dabd8e"
+      },
+      "job_id": 758245,
+      "training_step_id": "758245.5",
+      "experiment_id": "EXP-PR131-SWEEP-COUNT1_SIZE896-758245"
+    },
+    {
+      "image_count_per_raw_sample": 2,
+      "square_image_size_px": 448,
+      "status": "accepted_completed_formal_cell",
+      "total_iterations": 20,
+      "windows": {
+        "4-20": {
+          "samples": 17,
+          "median_step_ms": 6702.8,
+          "modeled_decoder_mean_tflops_per_gpu_s": 235.94659885815537,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 235.68707493576005
+        },
+        "10-20": {
+          "samples": 11,
+          "median_step_ms": 6806,
+          "modeled_decoder_mean_tflops_per_gpu_s": 233.91063085740672,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 233.5795303070923
+        }
+      },
+      "global_per_iteration_geometry": {
+        "Tpad": 1048576,
+        "Upad": 4294967296,
+        "R": 401408,
+        "A": 314703872
+      },
+      "peak_memory_gib": null,
+      "legacy_native_logged_tflops_per_gpu_s": {
+        "actual_window": [
+          10,
+          20
+        ],
+        "mean": 374.0636,
+        "not_corrected_decoder_metric": true
+      },
+      "evidence_sha256": {
+        "native_accounting": "61919b5c5dae97adc019df7a85ecd73a25a1a8b3c5594652c47a372896b5d2aa",
+        "canonical_verifier": "18a8bf923b255478b680b868f8660797c901f0ab930224d8090356dc8e9d2660",
+        "source_seal": "9239e622e91bf9e21c726a598e13c1b1fabc02d8d4a48591eb5ddb7cf1e55ceb",
+        "native_function": "d900fc09ea21b6aa42e3879cb47f729650c64e6076116faf86dd34b7e3dabd8e"
+      },
+      "job_id": 758245,
+      "training_step_id": "758245.7",
+      "experiment_id": "EXP-PR131-SWEEP-COUNT2_SIZE448-758245"
+    }
+  ],
+  "pending_formal_cells": [
+    {
+      "image_count_per_raw_sample": 4,
+      "square_image_size_px": 448,
+      "status": "not_yet_accepted_at_snapshot",
+      "corrected_tflops": null
+    },
+    {
+      "image_count_per_raw_sample": 8,
+      "square_image_size_px": 448,
+      "status": "not_yet_accepted_at_snapshot",
+      "corrected_tflops": null
+    }
+  ],
+  "qualification_failures": [
+    {
+      "image_count_per_raw_sample": 16,
+      "square_image_size_px": 448,
+      "status": "qualification_cuda_oom",
+      "corrected_tflops": null
+    },
+    {
+      "image_count_per_raw_sample": 1,
+      "square_image_size_px": 1792,
+      "status": "qualification_cuda_oom",
+      "corrected_tflops": null
+    }
+  ],
+  "data_readiness": [
+    {
+      "dataset": "Preserved Mantis subset",
+      "source_rows": 256,
+      "train_rows": 236,
+      "validation_rows": 20,
+      "status": "Previously qualified native subset; not whole Mantis; original bytes preserved",
+      "new_performance_claim": false
+    },
+    {
+      "dataset": "PixMo",
+      "source_revision": "d887597bf4af2bc61a4210071a8cef898287e6fb",
+      "verified_download_files": 111,
+      "native_qualified_prefix_rows": [
+        32,
+        512
+      ],
+      "status": "Bounded native preservation fixtures only; not whole-native corpus or blend readiness",
+      "new_performance_claim": false
+    }
+  ],
+  "historical_rule": "Existing archived/current catalog is preserved. Unsupported corrected historical values remain null; legacy rates must not populate corrected columns.",
+  "comparison_rule": "One completed run per cell, with image size intentionally varied. No run-variance or statistical-winner claim.",
+  "frozen_at_utc": "2026-09-16T03:11:57Z"
+}
