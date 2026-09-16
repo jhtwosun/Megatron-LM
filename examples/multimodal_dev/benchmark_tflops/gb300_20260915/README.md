@@ -1,162 +1,180 @@
-# GB300 experiment and accounting supplement — 2026-09-15
+# GB300 experiment results and accounting — 2026-09-16
 
-**Working draft: historical correction gaps remain explicit.** The 231-artifact historical catalog preserves observed timings and original legacy native TFLOPs estimates; its corrected rates remain `null` where executed formula, resolved arguments, consumed inputs and final attention boundaries lack sufficient proof. Newly accepted fixed-input sweep accounting is a separate dated snapshot, not a retroactive correction of those historical records. Null means unavailable, not zero or no work. Corrected native modeled decoder TFLOPs is not total VLM work or hardware-counter throughput.
+**Read first.** This Draft is the results/reporting supplement to PR131, based on `bbba1001543a9c99a26ae8a8370b40e005c80d80`. It covers this team's own campaign: 231 historical result artifacts, six newly accepted fixed-input cells, five older encoder-CP pairs, four-way measurements/profiles, real Mantis and two loader run orders. These are overlapping evidence groups, **not additive counts of successful experiments**. Historical failures, incomplete transfers and unavailable corrections remain explicit.
 
-This is a new current-thread supplement on PR131 head `bbba1001543a9c99a26ae8a8370b40e005c80d80`. It does not replace the separate historical ledger in [NATIVE_ACCOUNTING.md](../NATIVE_ACCOUNTING.md), and does not import that ledger's experiment inputs. Measured source bases and adaptations are distinct from this documentation branch.
+The report uses [PR7](https://github.com/jhtwosun/Megatron-LM/pull/7) as a presentation reference; results below retain their own sources and evidence. This documentation branch does not imply that every measured source adaptation is contained in PR131 or this PR. The separate [native accounting ledger](../NATIVE_ACCOUNTING.md) retains its own scope.
 
-## Reading guide
+## What changed, and why
 
-The analysis below groups the entire owned campaign by research question and separates model/hardware/data cohorts. The appendix assigns all 231 historical artifacts exactly once using recorded fields; it does not guess intent from experiment numbers. Of these records, 160 omit the provider, 69 explicitly concern real data and only two explicitly name mock providers. Unknown does not mean mock. Recorded world64 is historical GB200 campaign context, not a per-attempt hardware receipt; five products of 128/256 remain unvalidated. The 141 directories without linked results are unknown, not failures.
+| Workstream | Implemented / tested change | Measured question | Current conclusion |
+|---|---|---|---|
+|Encoder CP and bridge buffers|Contiguous frame partitioning, loader owner/local slicing, group/device/dtype/stream-keyed scratch reuse with owned clones|Does encoder CP2 help versus CP1?|Five ordered pairs completed; CP2 had larger observed step medians. Scratch reuse was enabled in both arms, so its isolated benefit remains unknown|
+|MDP and fusion|Ordinary vision → nonfused ownership → fused-window execution → later source revision|How do mode/source changes affect whole-step time?|Four cells completed in one allocation; lower recorded times along the progression, without repeated causal attribution|
+|Fixed-input image sweep|Preserved decoder boundaries while changing images per raw sample or image side|How much extra whole-step work does vision introduce?|Six formal cells accepted; 16×448 and 1×1792 OOM during qualification|
+|Mantis loader|Shared restore-key correctness repair; candidate alone omits unused JSON/base64 when raw descriptors already exist|Does removing serialization reduce equal-work step time?|36 native tests and model qualifications passed; two orders show small, window-sensitive differences, not a stable winner|
+|Whole real-data preparation|Pinned downloads and bounded native PixMo conversion fixtures|Can the requested full native blend be prepared?|Selected transfers/fixtures partly complete; whole-native Mantis/M4/PixMo blend remains unmet|
 
-| Research question | What the evidence teaches | Confidence and next action |
+## Common model, execution and accounting
+
+| Measured source family | Used for | Source boundary |
 |---|---|---|
-|Does decoder CP/longer sequence help the text model?|CP2 has larger observed step times at the archived short-sequence anchors; longer sequences change work as well as time|Historical configuration-level evidence, not corrected rates: recover exact source/runtime before a new matched sequence×CP sweep|
-|Which parallelism/precision/dispatcher stack is efficient?|Recorded EP scaling is nonmonotonic; many later comparisons also change source/data/sequence|Do not crown a global best stack; replay one-variable matched anchors with all effective settings|
-|Does encoder CP plus buffer reuse improve the vision workload?|The implementation and tests exist; measured CP2 pairs were slower, not the requested repeated ≥5% win|Keep correctness evidence, isolate buffer reuse and image-ownership effects before further optimization|
-|How much does image workload cost?|Six fixed-input cells establish increasing whole-step cost with image count/size; both highest-work qualifications OOM|Strong scoped workload evidence; choose feasible shapes, not a decoder-TF ranking across unequal vision work|
-|What changes with MDP/fused vision?|One owned four-way job records lower step times along the mode/source progression; traces expose communication/wait tails|Descriptive, not a repeated causal ranking; attribute waits before another code change|
-|What does real input preparation/dataloader work change?|Mantis content occupancy differs from mock; native/model gates and two run orders show small, window-sensitive timing differences|Protect exact input parity and repeat matched pairs before claiming a stable gain; whole-native blend remains unmet|
-|Which failures and profiles guide priorities?|OOM is a capacity boundary; interpreter/grid/restore failures are correctness or harness gates, not performance results|Retain failures, separate startup/export effects, and avoid hardware-utilization claims from overlapping event sums|
+|PR7 `e1484af4f5e9e5723105f731fb555dba9a32fecb` lineage|Ordinary/nonfused/fused comparison arms|Original per-job source and normalization receipts apply|
+|Older PR131 `57a5c2239242340cad5c22a8dd3fec18b16015e9` lineage|Encoder CP / bridge-buffer pairs; PR131 four-way arm and original Mantis|CP/buffer overlays and native grid/NVTX compatibility overlays are distinct, not one shared source tree|
+|PR131 `bbba1001543a9c99a26ae8a8370b40e005c80d80` lineage|New fixed sweep and Mantis loader ablation|Separate fixed-receipt/grid compatibility and shared restore-key / candidate serialization overlays retain their own seals|
 
-- [New accepted corrected-accounting snapshot](sweep-corrected-snapshot-20260916.md) and [machine-readable rates and proof digests](sweep-corrected-snapshot-20260916.json): six formal fixed-input cells, corrected native modeled decoder rates with primary/supplemental windows, separate OOM configurations and explicit accounting limits.
+The publication branch is documentation, not the measured source tree or a claim that these implementation overlays have merged.
 
-- [Entire owned-campaign catalog](campaign-wide-catalog.md): archived and active namespaces,231 result artifacts,351 experiment directories, duplicate/failure/unknown distinctions and correction gaps.
-- [Per-experiment recorded details](per-experiment.md) and [machine-readable fields](per-experiment.json): all 231 artifacts, recorded stack/recipe fields, provisional attempt groups, fingerprints, and missing references. These are descriptive records, not 231 newly verified successes; five ambiguous world-size products are explicitly flagged.
-- [Data distributions and configurations](data-and-configs.md): generator versus prepared-corpus versus consumed-geometry evidence, source/data pins, and known gaps.
-- [Evidence fingerprints](evidence-fingerprints.md): retained result and raw-log SHA-256 values. Raw logs, media, and private filesystem paths are intentionally not bundled.
-- [Completed four-way profile evidence](profile-summary.md): finalized packing/latest continuation, process-aware phase observations, and explicit capture/configuration limitations. Diagnostic only, not a speed ranking.
-- [Scoped accounting utilities](accounting-utilities.md): seven standard-library tests and native formula equivalence checks; historical native replay remains unexecuted. Tool availability does not establish corrected rates or historical boundary identity.
-- [Ongoing qualification status](24h-progress.md): completed fixed-input sweep, both Mantis run orders including recovered measurements from job 758592, both high-work OOM outcomes, native/model qualification and bounded PixMo preparation. Unexecuted work has no numerical results.
+### Model and hardware cohorts
 
-## Results and analysis at a glance — 2026-09-16
-
-Six fixed-input formal cells completed in job 758245; two larger workloads failed interactive qualification with CUDA OOM. Both corrected Mantis dataloader variants passed descriptive pair checks in job 758425 and reverse-order job 758592. The latter retains its failed outer harness receipt, with model measurements recovered through separate post-run validation as explained below. No stable winner or corrected nonstatic rate is invented. The 231 historical result artifacts below remain an audit inventory, not 231 new successes or a combined total including these new cells.
-
-### A. Text-model validation: decoder CP and sequence scaling
-
-**Purpose and controls.** Eleven explicitly text-labelled artifacts belong to two distinct cohorts: five archived `qwen3_30b_a3b` records and six later `qwen3` records. Both record world64/GBS512, but model/source namespaces and dispatcher differ; they must not be pooled with the 175 hybrid-labelled records or current 16-GB300 VLM cells. The archived sequence/CP anchor records TP1/PP1/EP8, no recorded recompute/FP8/graphs and HybridEP. The later text cohort records sequence8192, EP8 and all-to-all.
-
-**Representative observations.** In `qwen3-phase4-final`, EXP-040/041 (artifact-001/002) record 4K CP1/CP2 steps of 4122.6/10899.2 ms; EXP-042/043 (artifact-003/004) record CP1 at 8K/16K of 4602.4/8023.3 ms. In `active-reset-20260429`, text CP1 EXP-070/072/076v2 (artifact-088/090/094) spans 7870.3–8492.8 ms, while CP2 EXP-071v3/073v4/075v2 (artifact-089/091/093) spans 12849.0–13120.9 ms. These are retained artifact observations, not freshly reconstructed runtime parity proofs or corrected rates.
-
-**Interpretation and action.** CP execution and efficient CP are different questions: at these short anchors, sharding did not automatically reduce step time. Sequence growth changes tokens/attention work, so a larger legacy TF number alone is not an optimization result. Before choosing a text CP/sequence frontier, bind original runtime/source, validate memory across ranks and repeat equal-work comparisons within each cohort; do not transfer the VLM encoder conclusions to text attention.
-
-### B. Parallelism, dispatcher, precision and memory stack
-
-**Purpose and controls.** The historical active cohort spans decoder CP1/2/4/8, EP choices, all-to-all versus HybridEP, FP8 and recompute. The 204 active-namespace artifacts record 108 HybridEP and 90 all-to-all dispatchers, with six unspecified; 17 have FP8 hybrid recorded. This describes tested configurations, not an isolated dispatcher or precision experiment. Unknown inherited graph/overlap/offload flags remain unknown.
-
-**Representative observations.** These contrasts come from actual recorded YAML differences in `active-reset-20260429`, not an inference from experiment numbers. All record world64/GBS512/MBS1, TP1/PP1, HybridEP and one 224-pixel image; source/runtime/variance proof is still incomplete.
-
-| Recorded contrast | Sequence / CP / EP | Recorded variable | Step median A → B ms |
-|---|---|---|---:|
-|EXP-000 → EXP-016 (artifact-028 → 040)|4096 / CP1 / EP8 → 32|EP only in the recorded configuration|5571.7 → 4798.6|
-|EXP-019 → EXP-025 (artifact-043 → 047)|16384 / CP1 / EP32|FP8 off → hybrid with mxfp8 recipe|12071.7 → 11922.6|
-|EXP-039 → EXP-044 (artifact-055 → 060)|16384 / CP2 / EP32, THD enabled|FP8 off → hybrid with mxfp8 recipe|17831.3 → 15783.4|
-
-Related EP4/16/64 anchors EXP-014/015/017 (artifact-038/039/041) record 6459.3/5039.7/8235.7 ms. This is a nonmonotonic observational pattern, not a source/runtime-verified universal EP sweep. Precision differences are small in the CP1 anchor and larger in the CP2/THD anchor; CP/DP and THD also differ between those anchors, so there is no blanket FP8 benefit. Recompute at larger sequence is a feasibility change, not a free throughput improvement.
-
-**Interpretation and action.** No single leaderboard ordering survives arbitrary changes in sequence, data, CP, source or hardware cohort. Preserve the useful hypothesis—communication and memory trade-offs depend on shape—but test one knob at a time at a fixed world/GBS/input/precision anchor. Recover actual graph, overlap and offload settings before endorsing an archived stack. The five 128/256 topology products stay quarantined, not larger-GPU successes.
-
-### C. Encoder CP: implemented, qualified and measured, but no demonstrated win
-
-**Purpose and implementation.** The older owned encoder-CP branch implemented contiguous frame partitioning and loader-side owner/local-slice selection, preserving stock TE full-attention padding while leaving decoder zigzag behavior unchanged. A bridge scratch pool keyed by communication group/device/dtype/stream with owned output clones was implemented and tested for outputs/gradients. Full 27-vision/48-decoder twenty-step runs qualified this path. CPU full-image materialization still precedes local slicing and can duplicate work. These changes are not ported into the latest `bbba100` source merely by publishing this report.
-
-The controlled encoder-CP pair is job 749724: its supplemental 10–20 step medians are 4358.8 ms (CP1) and 4538.4 ms (CP2). Separate image-area pairs at 1×/2×/4×/8× used jobs 750008/750020/750022/750023, with their own paired allocations and logged memory coverage. Those area multipliers are **not** the new side-length/image-count sweep above. Their retained supplemental medians are listed below; primary and supplemental windows must not be mixed into one percentage claim. At fixed 16 GPUs, increasing encoder CP also changes image ownership across the fixed inner-DP group, so it does not simply halve all per-rank vision work or memory. Corrected historical rates remain unavailable until historical input/backend boundaries are established.
-
-**Interpretation and action.** CP2 was observed slower in these single ordered pairs. Both arms already had scratch reuse enabled; there was no scratch-only ablation or whole-patch versus unmodified-source experiment. Therefore implemented correctness does not imply isolated buffer speedup, and the requested ≥5% advantage over CP-off across three independent pairs remains unachieved. Next isolate CPU owner materialization, per-rank image assignment and communication cost while preserving exact image/gradient parity; then run the required repeated matched pairs, rather than assuming CP halves compute.
-
-### D. Vision workload: image size, count and packing
-
-**Purpose and controls.** Determine the cost and capacity of image work independently of the decoder token budget. The archived `qwen35vl-phase0-3` cohort has 22 records at world64/GBS512/CP1/EP16; its 4K single-image sides224–1344, EXP-002–006 (artifact-007–011), record 7038.2–7381.6 ms. At 16K, pack2/4/8 EXP-027/028/029 (artifact-023/024/025) record 13610.3/13522.8/14057.6 ms. These older image/packing observations motivate shape-aware accounting, but are not equal-model/hardware comparisons with the new sweep. The new six-cell experiment below holds its decoder work and full stack fixed while explicitly changing vision workload.
-
-This is the PR7/PR131 hybrid VLM configured as `model_arch=qwen3vl`, not a claim of official model equivalence: 48 decoder layers, 27 vision layers, decoder hidden size 2048, 128 experts, padded vocabulary 248448 and KV channels 128. The common stack is 16 GB300 GPUs, BF16, TP1/PP2/decoder CP2/DP4/EP8/ETP1, encoder CP1, MBS1/GBS64, sequence length 16384, HybridEP (32 SMs, chunks 128), distributed optimizer, MDP fused-window retain with cap 131072, no CUDA graphs, no recomputation, no MTP and effective gradient/parameter overlap disabled. Sequence parallel is requested but effectively false at TP1. All formal cells use 20 iterations, LR warmup/decay 2/20, evaluation 0 and random initialization without checkpoint loading.
-
-Images below are **per raw sample**. Four raw 4096-token documents fill each packed bin, so image count per bin is four times the table count. Static attention metadata has 32 segments (33 cumulative endpoints), with four real segments and repeated terminal endpoints. The primary window is iterations 4–20 (17 samples); supplemental 10–20 (11 samples) is separately preserved in JSON.
-
-| Images/raw sample | Side length | Outcome | Primary median step ms | Corrected decoder TFLOPs/GPU/s mean | Pooled decoder TFLOPs/GPU/s |
-|---:|---:|---|---:|---:|---:|
-|1|224|Formal accepted|6475.1|243.9546|243.6629|
-|1|448|Formal accepted|6586.1|240.8134|240.4518|
-|1|896|Formal accepted|7245.8|217.2698|217.0908|
-|2|448|Formal accepted|6702.8|235.9466|235.6871|
-|4|448|Formal accepted|6955.6|225.9198|225.6909|
-|8|448|Formal accepted|7966.6|198.2781|198.2379|
-|16|448|Qualification OOM|unavailable|unavailable|unavailable|
-|1|1792|Qualification OOM|unavailable|unavailable|unavailable|
-
-These corrected numbers execute the sealed **native decoder model** using resolved arguments and verified input boundaries, divided by whole-VLM step time and 16 GPUs. They exclude changing vision FLOPs and are not hardware-counter throughput. Global decoder moments remain Tpad=1,048,576 and Upad=4,294,967,296 per step. As image work increases, step time rises while decoder-only rates fall; this does **not** prove that GPU compute utilization falls. Image count/size are workload axes, not equal-work optimization pairs. One run per cell does not establish variance or a statistical winner. Peak memory is unavailable; a legacy zero sentinel is not zero memory use.
-
-**Action.** Use observed step time and the two OOM boundaries to select feasible workloads. Retain per-bin image/attention moments for future encoder accounting. Do not downscale failed shapes and relabel them the same cell, or compare decoder-only rates as if vision work were constant.
-
-**Why total pixels alone are insufficient.** Four 448-pixel images and one 896-pixel image have the same global raw-patch sum R=802816 and decoder T/U, but per-image attention moment A is 629407744 versus 2517630976 (four times larger); observed steps are 6955.6 versus 7245.8 ms. Eight 448-pixel images instead have R=1605632 and A=1258815488: more patch work but lower A than one 896-pixel image, with a 7966.6 ms step. This is consistent with distinct patch-linear and per-image quadratic attention costs, not an isolated causal proof: image count, fusion distribution and other shape effects also differ. A one-axis pixel or image-count model cannot explain every cell.
-
-### E. MDP, fused vision and source revision
-
-**Purpose and controls.** Separate ordinary vision, nonfused MDP, fused-window packing and later source revision within one physical allocation and common decoder stack. This is a different axis from encoder CP above. The five catalog records with explicit MDP mode and no graph scope include one standalone baseline plus the four cells of job 752159; only the latter constitute the four-way set.
-
-Within the single four-way measurement job 752159, native variable-mock median steps were 13804.5 ms (ordinary PR7), 11479.4 ms (nonfused MDP PR7), 9820.5 ms (fused PR7) and 8901.4 ms (fused PR131), all in iterations 10–50. These are observed whole-step timings with declared mode/source axes, not encoder-only savings. Exact historical consumed geometry is unarchived, and PR-specific normalization environment differences remain disclosed. Standalone baseline 751915 must not be substituted into this set. No repeated/randomized variance estimate or categorical winner is claimed.
-
-**Interpretation and action.** Fusion changes scheduling/ownership and amortizes invocation boundaries, not necessarily image count. The progression supports investigating packing and communication, but the latest-source axis bundles code changes and cannot attribute a causal gain to one function. Preserve variable-mock identity limitations, inspect the process-aware phase evidence below, and repeat controlled source/mode pairs before promoting a winner.
-
-### F. Real data: distribution, packing, loader correctness and preparation
-
-**Purpose and controls.** The historical real-labelled cohort contains 69 artifacts including six failed/partial records; accepted rows are not one uniform corpus or sampler. Explicit dataset/provider identity, token distribution and actual packing must be held constant before treating a step-time difference as an optimization. `pack_samples_per_item` can be source-index stride, not a universal document cap.
-
-**Distribution evidence.** The protected Mantis training slice has native token median 838, p90 2520 and maximum 3221; image-count frequencies for 1/2/3/4 images are 126/31/37/42 records. The measured per-pack content mean is about 10493 tokens within a 16384 budget (~64% content occupancy), not TE compute utilization. Nemotron's prepared token median is 6335 and has only preparation/CPU packing proof, not a model-training result. Mock recipe equality likewise does not prove unarchived historical consumed order. These distributions explain why static GBS×sequence TF estimates are not portable between datasets.
-
-The original 256-record Mantis slice remains separately protected (236 train, 20 validation; evaluation disabled), not replaced by whole Mantis or a blend. Historical formal run 752807 has a 7221.1 ms primary 4–20 median; real conversations/images differ from mock, so this is not a matched-work speedup comparison. Its corrected nonstatic decoder rate remains unavailable.
-
-The loader candidate removes an unused JSON/base64 image-descriptor copy only when raw descriptors are already handed off. The original eager baseline's missing restore-key bug was separately corrected in **both** new variants. A test-only tuple/list ownership correction preserved exact payload/FIFO checks. V5 passed 36 native tests, including all four DP streams and save-two/restore-two/four-owner pixel checks; both variants passed clean ten-step model qualification. Formal job 758425 then completed and passed individual verification for baseline and candidate twenty-step runs on the same 16 GPUs. All logged argument keys/values match except output directory; all twenty logged T/U/R/A moments match. World size 16, GBS 64, MBS 1, full stack and measurement windows are identical.
-
-| Formal job / order | Window | Samples | Corrected eager baseline median ms | JSON-omitting candidate median ms | Observed step reduction |
-|---|---|---:|---:|---:|---:|
-|758425: baseline → candidate|Primary 4–20|17|7498.3|7306.2|2.5619%|
-|758425: baseline → candidate|Supplemental 10–20|11|7318.8|7306.2|0.1722%|
-|758592: candidate → baseline; postcheck recovery|Primary 4–20|17|8977.5|8845.0|1.4759%|
-|758592: candidate → baseline; postcheck recovery|Supplemental 10–20|11|9004.5|8776.7|2.5298%|
-
-The candidate has smaller observed medians in both orders, but the reductions are small and window-sensitive: 0.17–2.56% across these four summaries. These are **two descriptive matched pairs on different allocations/racks**, not a stable winner or causal speedup. Raw times are not pooled across jobs; no variance estimate or confidence interval follows from two orders. Within each job, all logged arguments except output directory and all twenty geometry moments agree. All-step moments and bounded native input parity do not replace an archive of every consumed token/image. Corrected native rates remain null because final nonstatic attended boundaries are not archived; peak memory is unavailable. Historical run 752807 is not either pair's baseline. Quiescent loader restore is not proof of live-prefetch or training-checkpoint resume.
-
-**Recovered measurement evidence, not a clean outer job.** Reverse job 758592 retains outer/batch `FAILED 1:0`; both training steps independently completed `0:0`. The reverse wrapper left its source alias pointing at baseline, then checked that directory against the candidate manifest. A separate correct-root read-only check verified all 2527 baseline files, 2530 candidate files, prepared data and tokenizer; original before-check evidence also passed. Both individual evaluators and independent order/log/argument/geometry/window checks passed. These recovered model measurements are valid for the scoped descriptive table, while the failed outer receipt and original after-check remain preserved. No source/model change, training rerun or blanket clean-job claim was used to recover them.
-
-Whole-source transfer status is Mantis 35/36, M4 40/41, PixMo 111/111 and backing frames 17/17 **files** (16 TAR archives plus README). Failed partial downloads are preserved. PixMo 32-row, 512-row and 4096-row native fixtures passed; the last included all 4096 rows with zero exclusions and verified output hashes/image-conversation parity. These are not full-corpus preparation or training. An approximate 118–132 minute full-preparation estimate exceeds the remaining autonomy budget, so whole preparation is deferred rather than claimed complete. The estimate includes fixture/import effects and is not a guaranteed steady-state bound. M4 temporal/frame mapping remains unqualified; the requested whole-native 1:1:1 blend is unmet. Missing data or denied/failed attempts are not silently replaced by a successful small slice.
-
-### G. Profiles and failures: distinguish observed cost from causal bottleneck
-
-**Purpose.** Locate phase ownership and tails without converting overlapping trace sums into a false critical path. Diagnostic profiles are separate from unprofiled throughput measurements; failures answer feasibility/correctness questions rather than providing low-performance samples.
-
-Four completed profile cells have integrity/stability and 16-worker coverage. Baseline/nonfused profiles came from job 752159; fused PR7/latest continuations came from 753568/753569. The latter use LR/evaluation 2/20/0 rather than 5/50/default and different racks. Capture 5–8 maps to displayed 6–8 only by source inference, not explicit iteration anchors.
-
-| Profile cell | Worker kernel span s | Selected vision ranges/node | Forward-bridge kernel sums, nodes 0–3, s |
-|---|---:|---|---|
-|Ordinary PR7|64.43–64.60|Named outer range absent; vision executes|not applicable|
-|Nonfused MDP PR7|66.83–66.98|192|2.870 / 20.881 / 9.467 / 5.976|
-|Fused PR7|40.10–40.23|48|0.319 / 0.466 / 1.785 / 0.715|
-|Fused PR131|47.98–48.10|48|0.738 / 0.885 / 2.476 / 4.096|
-
-Process-aware CUDA API/kernel correlation matched all 4,220,973 packing kernels and 4,277,998 latest kernels. HybridEP/NCCL and synchronization events show substantial tails, but overlapping event sums cannot become wall-time fractions, global utilization or cross-node critical paths. A waiting rank is not necessarily the cause. The 192→48 count describes fusion granularity, not four times less image work. Interpolation-associated GPU sums are small compared with their enclosing CPU ranges; remaining host time includes unattributed work/profiler overhead. Thus traces motivate scoped hypotheses, not a proven pacing rank or automatic cache/kernel rewrite.
-
-### Completion limits and next gates
-
-Prioritized improvements follow from the evidence, not from assumed bottlenecks:
-
-1. Use the completed loader order check to bound expectations: next require repeated matched observations before expanding an optimization whose small observed reduction depends strongly on window selection.
-2. Test encoder owner-only CPU materialization to avoid duplicate full-image processing, with exact pixel/order and gradient parity as hard acceptance gates.
-3. Isolate bridge scratch reuse in an on/off ablation separate from encoder CP; both older CP arms already reused buffers.
-4. Add explicit step anchors and process-aware communication ownership before claiming a critical path or optimizing a wait-heavy phase.
-
-These are proposed tests and validation gates, not already implemented features or proven causal bottlenecks.
-
-| Requirement area | Established | Remaining / unavailable |
+| Cohort | Model identity / hardware | Execution boundary |
 |---|---|---|
-|Campaign publication/accounting|231 historical artifacts retained; six new formal corrected decoder-model cells|Historical correction remains unavailable without original boundary/identity proof|
-|Fixed-image workload sweep|Six lower cells accepted; both high-work OOM outcomes retained|No formal timing for failed shapes; no variance-based winner|
-|Profiling and analysis|Four finalized four-way profiles; process-aware attribution and explicit caveats|Global pacing/critical path and unprofiled causal validation remain unknown|
-|Encoder CP optimization|Historical controlled CP pairs and diagnostic profiles|New optimized encoder CP versus CP-off achieving at least 5% across three independent pairs was not performed|
-|Whole real-data preparation/blend|Verified selected transfers, preserved Mantis256, bounded PixMo fixtures through 4096 rows|Whole-native Mantis/M4/PixMo blend and full temporal semantics unmet; full preparation deferred beyond remaining budget|
-|Reproducibility utilities/replay|Guarded published utilities, tests and pinned replay plan|Historical replay/backend/input-identity proof not established by this snapshot|
-|Dataloader correctness/efficiency|Shared restore repair, native/model gates and two descriptive matched pairs; reverse outer harness failure retained|Run variance/causal improvement unproven; no corrected nonstatic rate or broad resume claim|
+|Current GB300 VLM measurements|PR7/PR131 hybrid VLM, configured `model_arch=qwen3vl`; 48 decoder layers, hidden 2048, 128 experts; 27 vision layers; padded vocabulary 248448, KV channels 128|16 GB300 GPUs. Not an unqualified claim of official canonical Qwen3-VL equivalence|
+|Archived text anchors|Five `qwen3_30b_a3b` and six later `qwen3` artifacts|Recorded world64/GBS512; historical GB200 campaign context, not new per-attempt hardware proof|
+|Historical VL/hybrid catalog|22 archived `qwen35_vl`, 175 hybrid-labelled, 19 current `qwen3vl`, four model-unknown artifacts|Different model/source/data cohorts; no cross-cohort speed ranking. Five recorded 128/256 topology products remain unvalidated|
 
-The campaign is not fully complete. All unstarted, failed, partial and unavailable outcomes remain part of the record. Supporting documents retain exact hashes, schemas and per-window details; this README is the consolidated results/analysis entry point.
+Current 16-GPU common parallelism is TP1/PP2/decoder CP2/DP4/EP8/ETP1, MBS1/GBS64, sequence 16384, BF16 and random initialization without checkpoint loading. Source/runtime receipts belong to each job. The new fixed sweep and loader pairs use HybridEP (32 SMs, chunks 128), distributed optimizer, fused-window **retain** with cap 131072, no CUDA graphs/recompute/MTP, effective gradient/parameter overlap off, and effective sequence parallel false at TP1. Encoder CP is 1 unless explicitly varied. Earlier four-way mode/source and encoder-CP cells retain their original stack; the new settings are not retroactively assigned to them.
+
+| Quantity | Definition / publication rule |
+|---|---|
+|Step time|Median measured whole-VLM optimizer-step wall time; primary performance fact|
+|Window|New 20-step runs: primary 4–20 (17 samples), supplemental 10–20 (11). Older four-way: 10–50 (41). Older CP table: supplemental 10–20. Never combine these into one percentage|
+|Corrected native decoder TFLOPs/GPU/s|Sealed native decoder formula with resolved arguments and verified final padded boundaries, divided by original whole-step time and world size; available for the six new fixed cells only|
+|Mean versus pooled corrected rate|Mean averages stepwise rates; pooled divides total modeled work by total elapsed time. Neither is a step-time median|
+|Legacy / useful-content estimates|Different numerators; preserved in [machine-readable historical audit](per-experiment.json), not relabelled as corrected native rates|
+|Unavailable / null|Missing proof, not zero work. Historical/nonstatic corrected rates and comprehensive peak memory remain unavailable|
+|Interpretation|Decoder-only modeled work excludes varying vision work; not hardware counters, utilization, MFU or convergence evidence|
+
+## Completed mock measurements: MDP / fused-window / source
+
+One physical allocation, job **752159**, with native variable mock inputs, world16/GBS64/MBS1 and the decoder topology above. These four rows share the original 50-step protocol. Mode/source and PR-specific normalization environment differences are the declared axes. All four measurement cells completed; the outer job later reached TIMEOUT during a separate packing-profile startup. Measurement completion is not a clean outer-job claim.
+
+| Job | Source / vision mode | Status / total steps | Window | Median step ms | Corrected decoder TF/GPU |
+|---|---|---|---|---:|---|
+|752159|PR7 / ordinary, MDP off|Completed / 50|10–50|13804.5|unavailable|
+|752159|PR7 / MDP nonfused|Completed / 50|10–50|11479.4|unavailable|
+|752159|PR7 / fused-window retain|Completed / 50|10–50|9820.5|unavailable|
+|752159|PR131 / fused-window retain|Completed / 50|10–50|8901.4|unavailable|
+
+**Analysis.** The lower whole-step times motivate fusion/ownership investigation, but do not isolate one function or encoder-only savings. Exact historical consumed geometry is not archived; generator recipe equality is not input-identity proof. No repeated/randomized variance estimate exists. Standalone baseline 751915 (14961 ms) is separate and must not replace the ordinary row.
+
+## Encoder CP and buffer reuse: five completed pairs
+
+Older owned source implements contiguous real-frame partitioning, loader owner/local slicing and stock TE full-attention padding; decoder zigzag behavior is unchanged. Output/gradient and full 27-vision/48-decoder model tests passed. Scratch reuse is **on in both arms**, with attention/router/preprocess graph scopes and graph warmup2. This differs from the graph-free new sweep and loader stack. CPU full-image materialization still occurs before local slicing. This code is not automatically ported to latest `bbba100`.
+
+| Paired job | Workload / intended axis | Status | Window | Encoder CP1 median ms | Encoder CP2 median ms | Corrected decoder TF/GPU |
+|---|---|---|---|---:|---:|---|
+|749724|Variable reference / encoder CP|Both completed|10–20|4358.8|4538.4|unavailable|
+|750008|Fixed image area 1× / encoder CP|Both completed|10–20|4144.3|4293.5|unavailable|
+|750020|Fixed image area 2× / encoder CP|Both completed|10–20|4151.5|4267.2|unavailable|
+|750022|Fixed image area 4× / encoder CP|Both completed|10–20|4574.4|4806.8|unavailable|
+|750023|Fixed image area 8× / encoder CP|Both completed|10–20|5571.4|6054.7|unavailable|
+
+**Analysis.** CP2 had larger observed medians in every pair. Each job is one ordered comparison on the same allocation; different image-area jobs are not identical workloads. Increasing encoder CP changes ownership within the fixed inner-DP group, not simply half of every rank's work. The area multipliers above are not the new image-count/side-length axis below. No scratch-only ablation, whole-patch versus unmodified-source comparison, or repeated ≥5% encoder-CP win was established. Next separate owner-only CPU materialization and scratch on/off, with exact pixel/order/gradient parity before timing.
+
+## Fixed-input image count / size: six accepted cells and two OOM boundaries
+
+Job **758245**, unchanged sealed PR131-derived stack, 20 iterations/eval0, LR warmup/decay 2/20. Each raw sample has a 4096-token document; four documents fill each 16384-token bin. Image counts are **per raw sample**, so each packed bin has four times the table count. Static THD has 32 slots (33 endpoints), four real segments and repeated terminal endpoints.
+
+| Job / step | Images × side | Status | Window | Median step ms | Corrected decoder TF/GPU mean | Corrected decoder TF/GPU pooled |
+|---|---|---|---|---:|---:|---:|
+|758245.1|1 × 224|Formal accepted|4–20|6475.1|243.9546|243.6629|
+|758245.3|1 × 448|Formal accepted|4–20|6586.1|240.8134|240.4518|
+|758245.5|1 × 896|Formal accepted|4–20|7245.8|217.2698|217.0908|
+|758245.7|2 × 448|Formal accepted|4–20|6702.8|235.9466|235.6871|
+|758245.9|4 × 448|Formal accepted|4–20|6955.6|225.9198|225.6909|
+|758245.11|8 × 448|Formal accepted|4–20|7966.6|198.2781|198.2379|
+|753812.4|16 × 448|Qualification OOM|No accepted window|unavailable|unavailable|unavailable|
+|758212.10|1 × 1792|Qualification OOM|No accepted window|unavailable|unavailable|unavailable|
+
+Global decoder moments are constant: Tpad=1,048,576 and Upad=4,294,967,296 per step. Rates count **decoder only**, not total vision+decoder. Supplemental windows and proof digests are in the [six-cell snapshot](sweep-corrected-snapshot-20260916.md) and [JSON](sweep-corrected-snapshot-20260916.json).
+
+**Analysis.** Extra vision work increases whole-step time and lowers the constant-work decoder rate; that is not falling hardware utilization or an optimization ranking. Four 448 images and one 896 image have equal raw-patch sum R=802816, but attention moment A=629407744 versus 2517630976 (4×); observed steps are 6955.6 versus 7245.8 ms. Eight 448 images have more patches (R=1605632) but lower A=1258815488 than one 896 image, at 7966.6 ms. Patch-linear and per-image quadratic work both matter; this is consistent with attention cost, not isolated causal proof. OOM cells were not silently downscaled into successful replacements.
+
+## Real Mantis: protected slice, not a full blend
+
+Same current model/world16/GBS64/MBS1, but real conversations/images are a different workload from mock. The original Mantis256 slice remains separately protected: **236 train / 20 validation**, eval0. Native image bounds are 200704–1003520 pixels, workers0, packing buffer16 and `max_samples_per_sequence=4`; this knob is not asserted to be a universal four-document cap. Nonstatic attention differs from the fixed mock layout.
+
+| Job / source | Dataset | Status | Window | Median step ms | Corrected decoder TF/GPU |
+|---|---|---|---|---:|---|
+|752807 / original eager path|Protected Mantis256|Formal completed|4–20|7221.1|unavailable|
+|752807 / same run, supplemental|Same slice|Not a second experiment|10–20|7221.1|unavailable|
+
+| Distribution / preparation evidence | Observed result | Limit |
+|---|---|---|
+|Mantis training tokens|Median 838; p90 2520; maximum 3221|Prepared rows, not fixed mock tokens|
+|Mantis images per training row|1/2/3/4 images: 126/31/37/42 rows|236 training records; not images per consumed packed bin|
+|Mantis consumed content|Mean about 10493 tokens per 16384-budget pack (~64%)|Content occupancy, not TE compute utilization|
+|Nemotron preparation|Prepared token median 6335|CPU preparation/packing only, no model result|
+|Selected source downloads|Mantis 35/36; M4 40/41; PixMo 111/111; backing frames 17/17 files|Backing set is 16 TAR archives + README; partial downloads preserved|
+|PixMo native fixtures|32, 512 and 4096 rows passed; 4096 included / zero excluded with hashes and image/conversation parity|Not full-corpus preparation or training|
+|Whole-native 1:1:1 blend|Unmet; M4 temporal mapping unqualified|Full preparation deferred; approximate 118–132 min estimate exceeded remaining budget|
+
+**Analysis.** Static GBS×sequence estimates over-credit short content when substituted for actual workload accounting. Mantis speed is not a mock loader-speed comparison. Small-corpus repetition and packing change effective work; neither prepared row counts nor recipe equality prove historical consumed identity.
+
+## Dataloader ablation: eager descriptors versus omitted unused JSON
+
+Both new variants share the independently attributed restore-key correctness repair. Only the candidate omits JSON/base64 serialization when the raw-descriptor handoff exists; fallback/empty paths remain covered. V5 passed **36 native tests**, including all four DP streams, save-two/restore-two and four-owner pixel checks; both variants passed ten-step model qualification. Formal pairs use the same qualified source/runtime/data/stack within each job; all logged arguments except output directory and all twenty T/U/R/A moments agree. Historical 752807 is **not** the corrected baseline.
+
+| Job / order | Status | Window / samples | Eager baseline median ms | Candidate median ms | Observed reduction | Corrected decoder TF/GPU |
+|---|---|---|---:|---:|---:|---|
+|758425 / baseline → candidate|Clean formal pair|4–20 / 17|7498.3|7306.2|2.5619%|unavailable|
+|758425 / same pair|Supplemental|10–20 / 11|7318.8|7306.2|0.1722%|unavailable|
+|758592 / candidate → baseline|Recovered model measurements; outer failed|4–20 / 17|8977.5|8845.0|1.4759%|unavailable|
+|758592 / same pair|Supplemental|10–20 / 11|9004.5|8776.7|2.5298%|unavailable|
+
+**Failure recovery.** Job 758592 retains outer/batch `FAILED 1:0`; both training steps completed `0:0`. The reverse wrapper ended with a baseline source alias then checked it against the candidate manifest. A separate correct-root read-only check passed all 2527 baseline files, 2530 candidate files, prepared data and tokenizer; original before-check evidence passed. Individual evaluators plus independent order/log/argument/geometry/window review accepted only the scoped model measurements. No source/model edit or training rerun erased the failed receipt.
+
+**Analysis.** Candidate medians are smaller in both orders, but the 0.17–2.56% differences depend on the window. One pair per order on different racks/allocations does not establish variance, a stable winner or causal I/O speedup. Do not pool raw times across jobs. Bounded parity and equal moments do not archive every consumed token/image or final nonstatic attended boundary; corrected rates and peak memory stay unavailable. Quiescent restore is not live-prefetch or training-checkpoint resume proof.
+
+## Historical campaign panels: recorded configuration evidence
+
+These anchors are retained observations, not newly reconstructed source/runtime parity. Their detailed original windows and all 231 rows remain in the appendices and [recorded per-experiment details](per-experiment.md). Corrected rates are unavailable throughout this panel. Do not compare recorded world64 historical GB200 context with the new world16 GB300 measurements.
+
+| Namespace / recorded contrast | Common recorded config | Variable | Median step A → B ms | Corrected decoder TF/GPU |
+|---|---|---|---:|---|
+|qwen3-phase4-final EXP-040 → 041 (artifacts 001/002)|Text, TP1/PP1/EP8, GBS512, sequence4096|Decoder CP1 → 2|4122.6 → 10899.2|unavailable|
+|qwen3-phase4-final EXP-042 → 043 (003/004)|Text, CP1/EP8, GBS512|Sequence8192 → 16384|4602.4 → 8023.3|unavailable|
+|active-reset-20260429 EXP-000 → 016 (028/040)|Hybrid, TP1/PP1/CP1, GBS512/MBS1, sequence4096, HybridEP, image224|EP8 → 32 only in recorded YAML|5571.7 → 4798.6|unavailable|
+|active-reset-20260429 EXP-019 → 025 (043/047)|Hybrid, CP1/EP32, GBS512, sequence16384, image224|FP8 off → hybrid / mxfp8|12071.7 → 11922.6|unavailable|
+|active-reset-20260429 EXP-039 → 044 (055/060)|Hybrid, CP2/EP32, GBS512, sequence16384, THD enabled, image224|FP8 off → hybrid / mxfp8|17831.3 → 15783.4|unavailable|
+|Archived qwen35_vl EXP-027/028/029 (023/024/025)|CP1/EP16, sequence16384|Pack2 / 4 / 8|13610.3 / 13522.8 / 14057.6|unavailable|
+
+**Analysis.** EP effects are nonmonotonic: related active EXP-014/015/017 (EP4/16/64) record 6459.3/5039.7/8235.7 ms. FP8 differences are small in the CP1 anchor and larger in CP2/THD; CP/DP and THD differ across those anchors, so there is no universal FP8 gain. Text CP execution does not imply short-sequence efficiency. Longer sequence changes work, not just throughput. Graph/overlap/dispatcher/recompute changes outside these specific contrasts remain separate axes, not silently controlled variables.
+
+Catalog uncertainty is preserved: 160 providers unspecified, 69 real-labelled and two explicitly mock; unspecified is not mock. The active namespace has 108 HybridEP, 90 all-to-all and six unspecified dispatchers. Four model-unknown artifacts are failures; two partial artifacts have known hybrid labels. The 141 unlinked experiment directories are unknown, not failures. The category index assigns all 231 artifacts once, with explicit cross-references rather than invented experiment intent.
+
+## Completed profiles: diagnostic evidence, not throughput benchmarks
+
+All four cells have finalized SQLite integrity/stability and **16 GPU-worker** coverage. Ordinary/nonfused used 752159; fused continuations used 753568/753569, different racks and LR/eval 2/20/0 instead of 5/50/default. Capture 5–8 maps to displayed 6–8 only by source inference: no explicit iteration anchors.
+
+| Profile job / cell | Status | Worker kernel span s | Selected vision ranges/node | Forward-bridge kernel sums by node 0–3, s |
+|---|---|---:|---|---|
+|752159 / ordinary PR7|Finalized, integrity PASS|64.43–64.60|Named outer range absent; vision executes|not applicable|
+|752159 / nonfused PR7|Finalized, integrity PASS|66.83–66.98|192|2.870 / 20.881 / 9.467 / 5.976|
+|753568 / fused PR7|Finalized, integrity PASS|40.10–40.23|48|0.319 / 0.466 / 1.785 / 0.715|
+|753569 / fused PR131|Finalized, integrity PASS|47.98–48.10|48|0.738 / 0.885 / 2.476 / 4.096|
+
+**Analysis.** Process-aware CUDA correlations matched 4,220,973 packing and 4,277,998 latest kernels. HybridEP/NCCL and synchronization tails are observed, but event sums overlap: no wall-time fractions, global utilization or cross-node critical path follow. A waiting rank is not necessarily causal. The 192→48 range count is fusion granularity, not four times less image work. Interpolation-associated GPU sums are small relative to CPU envelopes; remaining host time includes unattributed work/profiler overhead. [Detailed profile report](profile-summary.md) retains denominators and source/capture caveats.
+
+## Failure disposition and remaining gates
+
+| Attempt / condition | Disposition | What is and is not established |
+|---|---|---|
+|753812.4 / 16 images × 448|Qualification CUDA OOM|No formal metric for this shape|
+|758212.10 / 1 image × 1792|Qualification CUDA OOM|No formal metric for this shape|
+|754294 / original native loader|Eight synthetic tests passed; first real DP0 restore failed|Original missing-key bug preserved; no model launched in that attempt|
+|758212 / v4 loader probe|Ten tests passed; tuple/list ownership assertion failed|Test inspector corrected separately; exact fingerprint/FIFO gates retained in v5|
+|758592 / reverse final source check|Outer failed; independent correct-root recovery accepted model measurements|Both training steps completed; not a clean outer job|
+|Mantis/M4 whole source transfer|35/36 and 40/41 selected files complete|Partials retained; no full-native/blend claim|
+|Historical catalog gaps|Missing source/runtime/input/boundary proof and five topology ambiguities|No corrected rates invented; unlinked directories are not presumed failed|
+
+Priorities are concrete gates, not proven bottlenecks: repeat matched loader pairs; test encoder owner-only CPU materialization with exact pixel/order/gradient parity; isolate scratch reuse on/off; add explicit step anchors and process-aware communication ownership. Whole-native preparation and temporal semantics remain required before a full real-data blend. The requested repeated ≥5% encoder-CP win is **not achieved**.
+
+## Reproducibility and review
+
+The [six-cell JSON](sweep-corrected-snapshot-20260916.json) and [evidence fingerprints](evidence-fingerprints.md) preserve accepted accounting and provenance. [Data/configuration details](data-and-configs.md), [progress/failures](24h-progress.md), [historical catalog](campaign-wide-catalog.md) and [per-experiment JSON](per-experiment.json) retain scope and unavailable fields. [Accounting utilities](accounting-utilities.md) have seven standard-library tests and native formula equivalence checks; historical replay remains unexecuted.
+
+No raw logs, private paths, media, credentials or multi-gigabyte traces are bundled. Independent primary reviews passed; the external second-model service was unavailable, so no external agreement is claimed. The campaign is not fully complete. The following unchanged appendices preserve historical timings, category membership and every historical record.
 
 <details>
 <summary>Historical timing, pairing and correction audit notes</summary>
