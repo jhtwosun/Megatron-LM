@@ -39,7 +39,43 @@ Original ON job **758245** and new OFF job **759971** both completed all six 20-
 
 **Failure disposition.** The initial OFF qualification selected the wrong generic-mock route and failed before iteration1. Explicit `mock_mdp` preserved the original fixed reference dataset with MDP off. Corrected five-step qualification passed, but its320-sample shuffle domain differs from the formal1280-sample domain; qualification-prefix parity was not claimed. All six20-step formal comparisons subsequently passed actual320-bin identity. The known16×448 and1×1792 OOM boundaries were not rerun.
 
-**Real-data follow-up:** the separately protected Mantis256 four-way job **760138** is running; its four real-data results remain pending and are not replaced by this mock comparison.
+## Protected Mantis256: completed real-data four-way
+
+Formal job **760138**, steps 1–4, completed all four real-data arms on the same 16-GPU allocation: TP1/PP2/decoderCP2/EP8/ETP1, MBS1/GBS64/sequence16384, 20 steps/eval0 and primary iterations 4–20 (17 samples). The separately protected Mantis256 slice remains 236 train / 20 validation, unchanged tokenizer/data; this is not mock input or a whole-native dataset claim. Source families remain PR7 `e1484af4` and PR131 `57a5c223`, with reviewed native-reporting/all-rank-memory overlays. PR7 received only the missing Energon geometry flag/provider/producer backport; no loader-serialization or restore-key optimization was added.
+
+| Job.step | Real-data arm | Median step ms | Scheduled tok/s global (per GPU) | PR131 encoder TF/GPU | PR131 decoder TF/GPU | PR131 total TF/GPU | Megatron fixed decoder TF/GPU | Peak allocated / reserved GB |
+|---|---|---|---|---|---|---|---|---|
+| 760138.1 | PR7 ordinary / MDP off | 22938.0 | 45713.5 (2857.1) | 9.052 | 39.298 | 48.350 | 110.676 | 133.171 / 138.664 |
+| 760138.2 | PR7 MDP nonfused | 19071.1 | 54982.5 (3436.4) | 10.900 | 47.319 | 58.220 | 133.288 | 161.015 / 162.785 |
+| 760138.3 | PR7 fused-window retain | 9906.3 | 105849.4 (6615.6) | 21.074 | 91.488 | 112.562 | 257.518 | 161.031 / 176.712 |
+| 760138.4 | PR131 fused-window retain | 7944.0 | 131996.0 (8249.7) | 26.381 | 114.527 | 140.908 | 322.429 | 181.995 / 183.851 |
+
+**Consumed-work evidence.** All 17 per-step global T/U/R/A tuples are exactly equal across the four arms. Their common primary means are T=671573.176471 content tokens, U=1190615801.294080 squared document lengths, R=1129626.352941 vision patch tokens and A=1255037406.117647 vision attention moment. This establishes matching logged geometry, not identical image/token contents: no exact real-data consumed-sample hash ledger was collected. Full runtime dumps and source/data/tokenizer seals were reviewed; source/environment families still differ between PR7 and PR131.
+
+**Analysis.** Recorded median wall time decreases from ordinary to MDP nonfused to fused execution in this sequential cohort. PR7 fused has a larger reserved-memory peak than PR7 nonfused despite similar allocated peaks; reservation is not live tensor use. PR131 fused has the lowest observed median and higher allocated memory than the PR7 arms. These are observed mode/source trade-offs, not isolated causal gains: one ordered cohort, source/environment differences and absent exact-content identity prevent a replicated winner claim. Encoder/decoder/total rates are native modeled whole-step means, not hardware utilization; memory is the maximum lifetime allocator peak across all 16 ranks, including initialization, not only iterations 4–20. Supplemental 10–20 receipts remain separate.
+
+**Disposition.** All four scheduler steps and the outer job completed 0:0; native/canonical gates, all 16 memory receipts and post-run input seals passed. The user requested direct formal measurement rather than separate new-path qualification. Original data, sources, historical results and the previous Mantis 759796 result remain preserved; the latter is a separate allocation, not an extra replicate of this cohort.
+
+## What changes between mock and real input?
+
+Compare only the **PR131 fused arms**: variable-image mock job 759791 versus protected Mantis256 job 760138. Both use the same PR131 source family/model and native helper, world16/GBS64/MBS1/sequence16384, 20 steps/eval0 and iterations 4–20. Scheduled capacity is 1,048,576 tokens per optimizer step in both. Values below are mean **global logical optimizer-step sums across the workload**, not sums duplicated over CP/PP/GPU replicas. Divide logged mean-per-bin geometry by no extra GPU factor: the native collector multiplies it by GBS once.
+
+| Work per optimizer step | Mock759791 | Real760138 | Real / Mock |
+|---|---:|---:|---:|
+| Decoder useful-content tokens T | 982,919.65 | 671,573.18 | 0.6832× |
+| Encoder pre-merge patch rows R | 1,906,992.24 | 1,129,626.35 | 0.5924× |
+| Patch rows per packed training bin R/64 | 29,796.75 | 17,650.41 | 0.5924× |
+| Derived merged image-token positions R/4 | 476,748.06 | 282,406.59 | 0.5924× |
+| Derived image-token fraction R/(4T) | 48.50% | 42.05% | 0.8670× |
+| Decoder forward+backward modeled TFLOP/step | 20,224.40 | 14,406.42 | 0.7123× |
+| Encoder forward+backward modeled TFLOP/step | 5,249.87 | 3,318.54 | 0.6321× |
+| Encoder+decoder modeled TFLOP/step | 25,474.27 | 17,724.96 | 0.6958× |
+| Encoder / decoder work ratio | 25.96% | 23.04% | 0.8874× |
+| Encoder share of combined modeled work | 20.61% | 18.72% | 0.9085× |
+
+**Definitions.** TFLOP/step is work, not TFLOPs/GPU/s: apply exact PR131 `training_flops(T,U,R,A)` (FMA=2, conventional training=3×forward), then divide by 1e12, without dividing by step time or GPU count. Fractions are ratios of window totals, not averages of per-step ratios. Spatial merge 2×2 makes the derived repeated image-token count R/4; this excludes vision start/end delimiters and is not an independent token-ID census. T includes image tokens. R/64 is per packed training bin, not per image or raw document. Geometry comes from 12E-formatted logs, not an exact integer-boundary archive.
+
+**Interpretation.** This real slice has less content and fewer total patch rows than this mock workload (Real/Mock 0.6832 and 0.5924), and lower modeled total work (0.6958). However, its mean squared-length moments U and A are larger (1.1756× and 1.0684×); total token/patch counts alone do not describe attention work. These are dataset-shape differences, not measured speedups or GPU-utilization claims. The comparison does not establish that real data is generally smaller, or that encoder CP benefits only long video.
 
 Historical fixed ON job758245 was separately reprocessed through the exact PR131 native helper using its retained T/U/R/A and per-step durations. The six resulting component tuples numerically match the earlier fixed-shape table; this fixed-shape coincidence does not generalize to variable inputs. Original canonical/historical JSON files remain unchanged.
 
