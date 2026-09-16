@@ -37,6 +37,9 @@ Current 16-GPU common parallelism is TP1/PP2/decoder CP2/DP4/EP8/ETP1, MBS1/GBS6
 | Quantity | Definition / publication rule |
 |---|---|
 |Step time|Median measured whole-VLM optimizer-step wall time; primary performance fact|
+|Scheduled global tok/s|`GBS × configured sequence length × 1000 / median step ms`; capacity-normalized at the reported median, not actual useful/content tokens, not a mean of stepwise rates, and no GPU-count multiplier|
+|Per-GPU tok/s / component units|Parentheses divide the global rate by 16 only for independently validated current 16-GPU runs. Historical configuration-only world values yield per-GPU N/A. TF/GPU means TFLOPs/GPU/s; encoder, decoder and total columns share whole-step time, not encoder-only elapsed time|
+|Encoder / decoder / encoder + decoder TF|Six fixed cells have useful-content encoder matmul estimates plus accepted attended-padded native decoder rates. Their sum is a mixed modeled total, not uniformly executed or hardware FLOPs. Encoder estimates omit real attention head-width padding from 72 to 128 and non-matmul work. Other unproved components stay N/A|
 |Window|New 20-step runs: primary 4–20 (17 samples), supplemental 10–20 (11). Older four-way: 10–50 (41). Older CP table: supplemental 10–20. Never combine these into one percentage|
 |Corrected native decoder TFLOPs/GPU/s|Sealed native decoder formula with resolved arguments and verified final padded boundaries, divided by original whole-step time and world size; available for the six new fixed cells only|
 |Mean versus pooled corrected rate|Mean averages stepwise rates; pooled divides total modeled work by total elapsed time. Neither is a step-time median|
@@ -48,12 +51,12 @@ Current 16-GPU common parallelism is TP1/PP2/decoder CP2/DP4/EP8/ETP1, MBS1/GBS6
 
 One physical allocation, job **752159**, with native variable mock inputs, world16/GBS64/MBS1 and the decoder topology above. These four rows share the original 50-step protocol. Mode/source and PR-specific normalization environment differences are the declared axes. All four measurement cells completed; the outer job later reached TIMEOUT during a separate packing-profile startup. Measurement completion is not a clean outer-job claim.
 
-| Job | Source / vision mode | Status / total steps | Window | Median step ms | Corrected decoder TF/GPU |
-|---|---|---|---|---:|---|
-|752159|PR7 / ordinary, MDP off|Completed / 50|10–50|13804.5|unavailable|
-|752159|PR7 / MDP nonfused|Completed / 50|10–50|11479.4|unavailable|
-|752159|PR7 / fused-window retain|Completed / 50|10–50|9820.5|unavailable|
-|752159|PR131 / fused-window retain|Completed / 50|10–50|8901.4|unavailable|
+| Job | Source / vision mode | Status / total steps | Window | Median step ms | Scheduled tok/s global (per GPU) | Encoder modeled TF/GPU mean | Decoder native TF/GPU mean | Encoder + decoder modeled TF/GPU mean |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 752159 | PR7 / ordinary, MDP off | Completed / 50 | 10–50 | 13804.5 | 75959.0 (4747.4) | N/A | unavailable | N/A |
+| 752159 | PR7 / MDP nonfused | Completed / 50 | 10–50 | 11479.4 | 91344.1 (5709.0) | N/A | unavailable | N/A |
+| 752159 | PR7 / fused-window retain | Completed / 50 | 10–50 | 9820.5 | 106774.2 (6673.4) | N/A | unavailable | N/A |
+| 752159 | PR131 / fused-window retain | Completed / 50 | 10–50 | 8901.4 | 117799.0 (7362.4) | N/A | unavailable | N/A |
 
 **Analysis.** The lower whole-step times motivate fusion/ownership investigation, but do not isolate one function or encoder-only savings. Exact historical consumed geometry is not archived; generator recipe equality is not input-identity proof. No repeated/randomized variance estimate exists. Standalone baseline 751915 (14961 ms) is separate and must not replace the ordinary row.
 
@@ -61,13 +64,13 @@ One physical allocation, job **752159**, with native variable mock inputs, world
 
 Older owned source implements contiguous real-frame partitioning, loader owner/local slicing and stock TE full-attention padding; decoder zigzag behavior is unchanged. Output/gradient and full 27-vision/48-decoder model tests passed. Scratch reuse is **on in both arms**, with attention/router/preprocess graph scopes and graph warmup2. This differs from the graph-free new sweep and loader stack. CPU full-image materialization still occurs before local slicing. This code is not automatically ported to latest `bbba100`.
 
-| Paired job | Workload / intended axis | Status | Window | Encoder CP1 median ms | Encoder CP2 median ms | Corrected decoder TF/GPU |
-|---|---|---|---|---:|---:|---|
-|749724|Variable reference / encoder CP|Both completed|10–20|4358.8|4538.4|unavailable|
-|750008|Fixed image area 1× / encoder CP|Both completed|10–20|4144.3|4293.5|unavailable|
-|750020|Fixed image area 2× / encoder CP|Both completed|10–20|4151.5|4267.2|unavailable|
-|750022|Fixed image area 4× / encoder CP|Both completed|10–20|4574.4|4806.8|unavailable|
-|750023|Fixed image area 8× / encoder CP|Both completed|10–20|5571.4|6054.7|unavailable|
+| Paired job | Workload / intended axis | Status | Window | Encoder CP1 median ms | Encoder CP2 median ms | Scheduled tok/s global (per GPU): CP1 / CP2 | Encoder modeled TF/GPU mean | Decoder native TF/GPU mean | Encoder + decoder modeled TF/GPU mean |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 749724 | Variable reference / encoder CP | Both completed | 10–20 | 4358.8 | 4538.4 | 240565.3 (15035.3) / 231045.3 (14440.3) | N/A | unavailable | N/A |
+| 750008 | Fixed image area 1× / encoder CP | Both completed | 10–20 | 4144.3 | 4293.5 | 253016.4 (15813.5) / 244224.1 (15264.0) | N/A | unavailable | N/A |
+| 750020 | Fixed image area 2× / encoder CP | Both completed | 10–20 | 4151.5 | 4267.2 | 252577.6 (15786.1) / 245729.3 (15358.1) | N/A | unavailable | N/A |
+| 750022 | Fixed image area 4× / encoder CP | Both completed | 10–20 | 4574.4 | 4806.8 | 229227.0 (14326.7) / 218144.3 (13634.0) | N/A | unavailable | N/A |
+| 750023 | Fixed image area 8× / encoder CP | Both completed | 10–20 | 5571.4 | 6054.7 | 188206.9 (11762.9) / 173183.8 (10824.0) | N/A | unavailable | N/A |
 
 **Analysis.** CP2 had larger observed medians in every pair. Each job is one ordered comparison on the same allocation; different image-area jobs are not identical workloads. Increasing encoder CP changes ownership within the fixed inner-DP group, not simply half of every rank's work. The area multipliers above are not the new image-count/side-length axis below. No scratch-only ablation, whole-patch versus unmodified-source comparison, or repeated ≥5% encoder-CP win was established. Next separate owner-only CPU materialization and scratch on/off, with exact pixel/order/gradient parity before timing.
 
@@ -75,18 +78,18 @@ Older owned source implements contiguous real-frame partitioning, loader owner/l
 
 Job **758245**, unchanged sealed PR131-derived stack, 20 iterations/eval0, LR warmup/decay 2/20. Each raw sample has a 4096-token document; four documents fill each 16384-token bin. Image counts are **per raw sample**, so each packed bin has four times the table count. Static THD has 32 slots (33 endpoints), four real segments and repeated terminal endpoints.
 
-| Job / step | Images × side | Status | Window | Median step ms | Corrected decoder TF/GPU mean | Corrected decoder TF/GPU pooled |
-|---|---|---|---|---:|---:|---:|
-|758245.1|1 × 224|Formal accepted|4–20|6475.1|243.9546|243.6629|
-|758245.3|1 × 448|Formal accepted|4–20|6586.1|240.8134|240.4518|
-|758245.5|1 × 896|Formal accepted|4–20|7245.8|217.2698|217.0908|
-|758245.7|2 × 448|Formal accepted|4–20|6702.8|235.9466|235.6871|
-|758245.9|4 × 448|Formal accepted|4–20|6955.6|225.9198|225.6909|
-|758245.11|8 × 448|Formal accepted|4–20|7966.6|198.2781|198.2379|
-|753812.4|16 × 448|Qualification OOM|No accepted window|unavailable|unavailable|unavailable|
-|758212.10|1 × 1792|Qualification OOM|No accepted window|unavailable|unavailable|unavailable|
+| Job / step | Images × side | Status | Window | Median step ms | Scheduled tok/s global (per GPU) | Encoder modeled TF/GPU mean | Decoder native TF/GPU mean | Encoder + decoder modeled TF/GPU mean | Corrected decoder TF/GPU pooled |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 758245.1 | 1 × 224 | Formal accepted | 4–20 | 6475.1 | 161939.7 (10121.2) | 1.2528 | 243.9546 | 245.2073 | 243.6629 |
+| 758245.3 | 1 × 448 | Formal accepted | 4–20 | 6586.1 | 159210.5 (9950.7) | 5.3647 | 240.8134 | 246.1781 | 240.4518 |
+| 758245.5 | 1 × 896 | Formal accepted | 4–20 | 7245.8 | 144715.0 (9044.7) | 25.3971 | 217.2698 | 242.6669 | 217.0908 |
+| 758245.7 | 2 × 448 | Formal accepted | 4–20 | 6702.8 | 156438.5 (9777.4) | 10.5125 | 235.9466 | 246.4591 | 235.6871 |
+| 758245.9 | 4 × 448 | Formal accepted | 4–20 | 6955.6 | 150752.8 (9422.0) | 20.1315 | 225.9198 | 246.0513 | 225.6909 |
+| 758245.11 | 8 × 448 | Formal accepted | 4–20 | 7966.6 | 131621.5 (8226.3) | 35.3368 | 198.2781 | 233.6148 | 198.2379 |
+| 753812.4 | 16 × 448 | Qualification OOM | No accepted window | unavailable | N/A | N/A | unavailable | N/A | unavailable |
+| 758212.10 | 1 × 1792 | Qualification OOM | No accepted window | unavailable | N/A | N/A | unavailable | N/A | unavailable |
 
-Global decoder moments are constant: Tpad=1,048,576 and Upad=4,294,967,296 per step. Rates count **decoder only**, not total vision+decoder. Supplemental windows and proof digests are in the [six-cell snapshot](sweep-corrected-snapshot-20260916.md) and [JSON](sweep-corrected-snapshot-20260916.json).
+Global decoder moments are constant: Tpad=1,048,576 and Upad=4,294,967,296 per step. **Encoder is a useful-content matmul model; decoder is the accepted padded-native model; E+D is their mixed modeled sum**, computed before rounding over the same 17 steps and world16 denominator. The encoder omits actual 72→128 attention head-width padding, non-matmul operations and exact backward instruction differences; none of these columns measures hardware utilization or encoder-only throughput. The [six-cell snapshot](sweep-corrected-snapshot-20260916.md) gives the encoder formula/source hashes. Original [decoder JSON](sweep-corrected-snapshot-20260916.json) and its supplemental windows remain unchanged.
 
 **Analysis.** Extra vision work increases whole-step time and lowers the constant-work decoder rate; that is not falling hardware utilization or an optimization ranking. Four 448 images and one 896 image have equal raw-patch sum R=802816, but attention moment A=629407744 versus 2517630976 (4×); observed steps are 6955.6 versus 7245.8 ms. Eight 448 images have more patches (R=1605632) but lower A=1258815488 than one 896 image, at 7966.6 ms. Patch-linear and per-image quadratic work both matter; this is consistent with attention cost, not isolated causal proof. OOM cells were not silently downscaled into successful replacements.
 
@@ -94,10 +97,10 @@ Global decoder moments are constant: Tpad=1,048,576 and Upad=4,294,967,296 per s
 
 Same current model/world16/GBS64/MBS1, but real conversations/images are a different workload from mock. The original Mantis256 slice remains separately protected: **236 train / 20 validation**, eval0. Native image bounds are 200704–1003520 pixels, workers0, packing buffer16 and `max_samples_per_sequence=4`; this knob is not asserted to be a universal four-document cap. Nonstatic attention differs from the fixed mock layout.
 
-| Job / source | Dataset | Status | Window | Median step ms | Corrected decoder TF/GPU |
-|---|---|---|---|---:|---|
-|752807 / original eager path|Protected Mantis256|Formal completed|4–20|7221.1|unavailable|
-|752807 / same run, supplemental|Same slice|Not a second experiment|10–20|7221.1|unavailable|
+| Job / source | Dataset | Status | Window | Median step ms | Scheduled tok/s global (per GPU) | Encoder modeled TF/GPU mean | Decoder native TF/GPU mean | Encoder + decoder modeled TF/GPU mean |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 752807 / original eager path | Protected Mantis256 | Formal completed | 4–20 | 7221.1 | 145210.0 (9075.6) | N/A | unavailable | N/A |
+| 752807 / same run, supplemental | Same slice | Not a second experiment | 10–20 | 7221.1 | 145210.0 (9075.6) | N/A | unavailable | N/A |
 
 | Distribution / preparation evidence | Observed result | Limit |
 |---|---|---|
@@ -115,12 +118,12 @@ Same current model/world16/GBS64/MBS1, but real conversations/images are a diffe
 
 Both new variants share the independently attributed restore-key correctness repair. Only the candidate omits JSON/base64 serialization when the raw-descriptor handoff exists; fallback/empty paths remain covered. V5 passed **36 native tests**, including all four DP streams, save-two/restore-two and four-owner pixel checks; both variants passed ten-step model qualification. Formal pairs use the same qualified source/runtime/data/stack within each job; all logged arguments except output directory and all twenty T/U/R/A moments agree. Historical 752807 is **not** the corrected baseline.
 
-| Job / order | Status | Window / samples | Eager baseline median ms | Candidate median ms | Observed reduction | Corrected decoder TF/GPU |
-|---|---|---|---:|---:|---:|---|
-|758425 / baseline → candidate|Clean formal pair|4–20 / 17|7498.3|7306.2|2.5619%|unavailable|
-|758425 / same pair|Supplemental|10–20 / 11|7318.8|7306.2|0.1722%|unavailable|
-|758592 / candidate → baseline|Recovered model measurements; outer failed|4–20 / 17|8977.5|8845.0|1.4759%|unavailable|
-|758592 / same pair|Supplemental|10–20 / 11|9004.5|8776.7|2.5298%|unavailable|
+| Job / order | Status | Window / samples | Eager baseline median ms | Candidate median ms | Observed reduction | Scheduled tok/s global (per GPU): baseline / candidate | Encoder modeled TF/GPU mean | Decoder native TF/GPU mean | Encoder + decoder modeled TF/GPU mean |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 758425 / baseline → candidate | Clean formal pair | 4–20 / 17 | 7498.3 | 7306.2 | 2.5619% | 139841.8 (8740.1) / 143518.7 (8969.9) | N/A | unavailable | N/A |
+| 758425 / same pair | Supplemental | 10–20 / 11 | 7318.8 | 7306.2 | 0.1722% | 143271.6 (8954.5) / 143518.7 (8969.9) | N/A | unavailable | N/A |
+| 758592 / candidate → baseline | Recovered model measurements; outer failed | 4–20 / 17 | 8977.5 | 8845.0 | 1.4759% | 116800.4 (7300.0) / 118550.1 (7409.4) | N/A | unavailable | N/A |
+| 758592 / same pair | Supplemental | 10–20 / 11 | 9004.5 | 8776.7 | 2.5298% | 116450.2 (7278.1) / 119472.7 (7467.0) | N/A | unavailable | N/A |
 
 **Failure recovery.** Job 758592 retains outer/batch `FAILED 1:0`; both training steps completed `0:0`. The reverse wrapper ended with a baseline source alias then checked it against the candidate manifest. A separate correct-root read-only check passed all 2527 baseline files, 2530 candidate files, prepared data and tokenizer; original before-check evidence passed. Individual evaluators plus independent order/log/argument/geometry/window review accepted only the scoped model measurements. No source/model edit or training rerun erased the failed receipt.
 
@@ -130,14 +133,14 @@ Both new variants share the independently attributed restore-key correctness rep
 
 These anchors are retained observations, not newly reconstructed source/runtime parity. Their detailed original windows and all 231 rows remain in the appendices and [recorded per-experiment details](per-experiment.md). Corrected rates are unavailable throughout this panel. Do not compare recorded world64 historical GB200 context with the new world16 GB300 measurements.
 
-| Namespace / recorded contrast | Common recorded config | Variable | Median step A → B ms | Corrected decoder TF/GPU |
-|---|---|---|---:|---|
-|qwen3-phase4-final EXP-040 → 041 (artifacts 001/002)|Text, TP1/PP1/EP8, GBS512, sequence4096|Decoder CP1 → 2|4122.6 → 10899.2|unavailable|
-|qwen3-phase4-final EXP-042 → 043 (003/004)|Text, CP1/EP8, GBS512|Sequence8192 → 16384|4602.4 → 8023.3|unavailable|
-|active-reset-20260429 EXP-000 → 016 (028/040)|Hybrid, TP1/PP1/CP1, GBS512/MBS1, sequence4096, HybridEP, image224|EP8 → 32 only in recorded YAML|5571.7 → 4798.6|unavailable|
-|active-reset-20260429 EXP-019 → 025 (043/047)|Hybrid, CP1/EP32, GBS512, sequence16384, image224|FP8 off → hybrid / mxfp8|12071.7 → 11922.6|unavailable|
-|active-reset-20260429 EXP-039 → 044 (055/060)|Hybrid, CP2/EP32, GBS512, sequence16384, THD enabled, image224|FP8 off → hybrid / mxfp8|17831.3 → 15783.4|unavailable|
-|Archived qwen35_vl EXP-027/028/029 (023/024/025)|CP1/EP16, sequence16384|Pack2 / 4 / 8|13610.3 / 13522.8 / 14057.6|unavailable|
+| Namespace / recorded contrast | Common recorded config | Variable | Median step A → B ms | Scheduled tok/s global (per GPU): listed order | Encoder modeled TF/GPU mean | Decoder native TF/GPU mean | Encoder + decoder modeled TF/GPU mean |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3-phase4-final EXP-040 → 041 (artifacts 001/002) | Text, TP1/PP1/EP8, GBS512, sequence4096 | Decoder CP1 → 2 | 4122.6 → 10899.2 | 508696.5 (N/A) / 192413.4 (N/A) | N/A | unavailable | N/A |
+| qwen3-phase4-final EXP-042 → 043 (003/004) | Text, CP1/EP8, GBS512 | Sequence8192 → 16384 | 4602.4 → 8023.3 | 911329.7 (N/A) / 1045530.9 (N/A) | N/A | unavailable | N/A |
+| active-reset-20260429 EXP-000 → 016 (028/040) | Hybrid, TP1/PP1/CP1, GBS512/MBS1, sequence4096, HybridEP, image224 | EP8 → 32 only in recorded YAML | 5571.7 → 4798.6 | 376393.6 (N/A) / 437034.1 (N/A) | N/A | unavailable | N/A |
+| active-reset-20260429 EXP-019 → 025 (043/047) | Hybrid, CP1/EP32, GBS512, sequence16384, image224 | FP8 off → hybrid / mxfp8 | 12071.7 → 11922.6 | 694898.6 (N/A) / 703588.8 (N/A) | N/A | unavailable | N/A |
+| active-reset-20260429 EXP-039 → 044 (055/060) | Hybrid, CP2/EP32, GBS512, sequence16384, THD enabled, image224 | FP8 off → hybrid / mxfp8 | 17831.3 → 15783.4 | 470442.9 (N/A) / 531483.0 (N/A) | N/A | unavailable | N/A |
+| Archived qwen35_vl EXP-027/028/029 (023/024/025) | CP1/EP16, sequence16384 | Pack2 / 4 / 8 | 13610.3 / 13522.8 / 14057.6 | 616342.6 (N/A) / 620330.7 (N/A) / 596731.2 (N/A) | N/A | unavailable | N/A |
 
 **Analysis.** EP effects are nonmonotonic: related active EXP-014/015/017 (EP4/16/64) record 6459.3/5039.7/8235.7 ms. FP8 differences are small in the CP1 anchor and larger in CP2/THD; CP/DP and THD differ across those anchors, so there is no universal FP8 gain. Text CP execution does not imply short-sequence efficiency. Longer sequence changes work, not just throughput. Graph/overlap/dispatcher/recompute changes outside these specific contrasts remain separate axes, not silently controlled variables.
 
@@ -147,12 +150,12 @@ Catalog uncertainty is preserved: 160 providers unspecified, 69 real-labelled an
 
 All four cells have finalized SQLite integrity/stability and **16 GPU-worker** coverage. Ordinary/nonfused used 752159; fused continuations used 753568/753569, different racks and LR/eval 2/20/0 instead of 5/50/default. Capture 5–8 maps to displayed 6–8 only by source inference: no explicit iteration anchors.
 
-| Profile job / cell | Status | Worker kernel span s | Selected vision ranges/node | Forward-bridge kernel sums by node 0–3, s |
-|---|---|---:|---|---|
-|752159 / ordinary PR7|Finalized, integrity PASS|64.43–64.60|Named outer range absent; vision executes|not applicable|
-|752159 / nonfused PR7|Finalized, integrity PASS|66.83–66.98|192|2.870 / 20.881 / 9.467 / 5.976|
-|753568 / fused PR7|Finalized, integrity PASS|40.10–40.23|48|0.319 / 0.466 / 1.785 / 0.715|
-|753569 / fused PR131|Finalized, integrity PASS|47.98–48.10|48|0.738 / 0.885 / 2.476 / 4.096|
+| Profile job / cell | Status | Worker kernel span s | Selected vision ranges/node | Forward-bridge kernel sums by node 0–3, s | Scheduled tok/s global (per GPU) | Encoder modeled TF/GPU mean | Decoder native TF/GPU mean | Encoder + decoder modeled TF/GPU mean |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 752159 / ordinary PR7 | Finalized, integrity PASS | 64.43–64.60 | Named outer range absent; vision executes | not applicable | N/A | N/A | N/A | N/A |
+| 752159 / nonfused PR7 | Finalized, integrity PASS | 66.83–66.98 | 192 | 2.870 / 20.881 / 9.467 / 5.976 | N/A | N/A | N/A | N/A |
+| 753568 / fused PR7 | Finalized, integrity PASS | 40.10–40.23 | 48 | 0.319 / 0.466 / 1.785 / 0.715 | N/A | N/A | N/A | N/A |
+| 753569 / fused PR131 | Finalized, integrity PASS | 47.98–48.10 | 48 | 0.738 / 0.885 / 2.476 / 4.096 | N/A | N/A | N/A | N/A |
 
 **Analysis.** Process-aware CUDA correlations matched 4,220,973 packing and 4,277,998 latest kernels. HybridEP/NCCL and synchronization tails are observed, but event sums overlap: no wall-time fractions, global utilization or cross-node critical path follow. A waiting rank is not necessarily causal. The 192→48 range count is fusion granularity, not four times less image work. Interpolation-associated GPU sums are small relative to CPU envelopes; remaining host time includes unattributed work/profiler overhead. [Detailed profile report](profile-summary.md) retains denominators and source/capture caveats.
 
@@ -183,26 +186,26 @@ No raw logs, private paths, media, credentials or multi-gigabyte traces are bund
 
 Each row below comes from an accepted legacy result artifact. Step time is the median in the stated window; native TFLOPs is the legacy verifier arithmetic mean, not a hardware measurement or median. The old raw label `iters 10-50` sometimes describes only the filter: a20-step run has actual10–20 coverage (11 samples), while10–50 has41 samples. These are separate experiments unless explicitly paired.
 
-| Result identifier | Actual window | GBS | Step median ms | Legacy native TFLOPs/GPU mean | Corrected decoder TFLOPs/GPU |
-|---|---|---:|---:|---:|---|
-| EXP-PR131-ENCODER-CP1-GB300 | 10–20 | 64 | 4170.2 | 601.9 | null |
-| EXP-PR131-ENCODER-CP1-PAIR749724-GB300 | 10–20 | 64 | 4358.8 | 578.1364 | null |
-| EXP-PR131-ENCODER-CP2-PAIR749724-GB300 | 10–20 | 64 | 4538.4 | 551.1273 | null |
-| EXP-PR131-IMAGE1X-CP1-GB300 | 10–20 | 64 | 4144.3 | 603.5182 | null |
-| EXP-PR131-IMAGE1X-CP2-GB300 | 10–20 | 64 | 4293.5 | 583.2 | null |
-| EXP-PR131-IMAGE2X-CP1-GB300 | 10–20 | 64 | 4151.5 | 594.5636 | null |
-| EXP-PR131-IMAGE2X-CP2-GB300 | 10–20 | 64 | 4267.2 | 578.5545 | null |
-| EXP-PR131-IMAGE4X-CP1-GB300 | 10–20 | 64 | 4574.4 | 542.6 | null |
-| EXP-PR131-IMAGE4X-CP2-GB300 | 10–20 | 64 | 4806.8 | 512.7182 | null |
-| EXP-PR131-IMAGE8X-CP1-GB300 | 10–20 | 64 | 5571.4 | 452.8364 | null |
-| EXP-PR131-IMAGE8X-CP2-GB300 | 10–20 | 64 | 6054.7 | 414.6909 | null |
-| EXP-PR131-MANTIS16-752807-20-GB300-legacy-window | 10–20 | 64 | 7221.1 | 341.0182 | null |
-| EXP-PR131-TFLOPS16-SEQ4096-GBS256 | 10–50 | 256 | 7296 | 217.3512 | null |
-| EXP-PR7-FOURWAY-751915-pr7_baseline | 10–50 | 64 | 14961 | 162.1098 | null |
-| EXP-PR7-FOURWAY-752159-pr131_latest | 10–50 | 64 | 8901.4 | 285.1317 | null |
-| EXP-PR7-FOURWAY-752159-pr7_baseline | 10–50 | 64 | 13804.5 | 176.2098 | null |
-| EXP-PR7-FOURWAY-752159-pr7_mdp | 10–50 | 64 | 11479.4 | 209.8732 | null |
-| EXP-PR7-FOURWAY-752159-pr7_packing | 10–50 | 64 | 9820.5 | 241.1366 | null |
+| Result identifier | Actual window | GBS | Step median ms | Legacy native TFLOPs/GPU mean | Scheduled tok/s global (per GPU) | Encoder modeled TF/GPU mean | Decoder native TF/GPU mean | Encoder + decoder modeled TF/GPU mean |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| EXP-PR131-ENCODER-CP1-GB300 | 10–20 | 64 | 4170.2 | 601.9 | 251445.0 (15715.3) | N/A | null | N/A |
+| EXP-PR131-ENCODER-CP1-PAIR749724-GB300 | 10–20 | 64 | 4358.8 | 578.1364 | 240565.3 (15035.3) | N/A | null | N/A |
+| EXP-PR131-ENCODER-CP2-PAIR749724-GB300 | 10–20 | 64 | 4538.4 | 551.1273 | 231045.3 (14440.3) | N/A | null | N/A |
+| EXP-PR131-IMAGE1X-CP1-GB300 | 10–20 | 64 | 4144.3 | 603.5182 | 253016.4 (15813.5) | N/A | null | N/A |
+| EXP-PR131-IMAGE1X-CP2-GB300 | 10–20 | 64 | 4293.5 | 583.2 | 244224.1 (15264.0) | N/A | null | N/A |
+| EXP-PR131-IMAGE2X-CP1-GB300 | 10–20 | 64 | 4151.5 | 594.5636 | 252577.6 (15786.1) | N/A | null | N/A |
+| EXP-PR131-IMAGE2X-CP2-GB300 | 10–20 | 64 | 4267.2 | 578.5545 | 245729.3 (15358.1) | N/A | null | N/A |
+| EXP-PR131-IMAGE4X-CP1-GB300 | 10–20 | 64 | 4574.4 | 542.6 | 229227.0 (14326.7) | N/A | null | N/A |
+| EXP-PR131-IMAGE4X-CP2-GB300 | 10–20 | 64 | 4806.8 | 512.7182 | 218144.3 (13634.0) | N/A | null | N/A |
+| EXP-PR131-IMAGE8X-CP1-GB300 | 10–20 | 64 | 5571.4 | 452.8364 | 188206.9 (11762.9) | N/A | null | N/A |
+| EXP-PR131-IMAGE8X-CP2-GB300 | 10–20 | 64 | 6054.7 | 414.6909 | 173183.8 (10824.0) | N/A | null | N/A |
+| EXP-PR131-MANTIS16-752807-20-GB300-legacy-window | 10–20 | 64 | 7221.1 | 341.0182 | 145210.0 (9075.6) | N/A | null | N/A |
+| EXP-PR131-TFLOPS16-SEQ4096-GBS256 | 10–50 | 256 | 7296 | 217.3512 | 143719.3 (8982.5) | N/A | null | N/A |
+| EXP-PR7-FOURWAY-751915-pr7_baseline | 10–50 | 64 | 14961 | 162.1098 | 70087.3 (4380.5) | N/A | null | N/A |
+| EXP-PR7-FOURWAY-752159-pr131_latest | 10–50 | 64 | 8901.4 | 285.1317 | 117799.0 (7362.4) | N/A | null | N/A |
+| EXP-PR7-FOURWAY-752159-pr7_baseline | 10–50 | 64 | 13804.5 | 176.2098 | 75959.0 (4747.4) | N/A | null | N/A |
+| EXP-PR7-FOURWAY-752159-pr7_mdp | 10–50 | 64 | 11479.4 | 209.8732 | 91344.1 (5709.0) | N/A | null | N/A |
+| EXP-PR7-FOURWAY-752159-pr7_packing | 10–50 | 64 | 9820.5 | 241.1366 | 106774.2 (6673.4) | N/A | null | N/A |
 
 Mantis job752807 also has a primary4–20 window (17 samples): step median7221.1ms and legacy native TFLOPs mean342.55882352941177. Its10–20 row above is a supplemental representation of the same run, not another experiment. Corrected padded-attention rates remain null. Existing useful-content decoder/vision estimates are distinct model outputs and are not silently relabelled as corrected native rates.
 
@@ -363,238 +366,238 @@ All 231 historical artifacts are listed below, including failed/partial records 
 <details>
 <summary>Show all 231 historical artifact records</summary>
 
-| Artifact | Namespace / experiment | Model | World / GBS / seq | Window | Status | Corrected decoder TF / step ms | Missing references |
-|---|---|---|---|---|---|---|---|
-| artifact-001 | qwen3-phase4-final / EXP-040 | qwen3_30b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 4122.6 | source_pin, dataset, owned_original_log |
-| artifact-002 | qwen3-phase4-final / EXP-041 | qwen3_30b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 10899.2 | source_pin, dataset, owned_original_log |
-| artifact-003 | qwen3-phase4-final / EXP-042 | qwen3_30b_a3b | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 4602.4 | source_pin, dataset, owned_original_log |
-| artifact-004 | qwen3-phase4-final / EXP-043 | qwen3_30b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 8023.3 | source_pin, dataset, owned_original_log |
-| artifact-005 | qwen3-phase4-final / EXP-045 | qwen3_30b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 5048.1 | source_pin, dataset, owned_original_log |
-| artifact-006 | qwen35vl-phase0-3 / EXP-001 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7126.1 | source_pin, dataset, owned_original_log |
-| artifact-007 | qwen35vl-phase0-3 / EXP-002 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7038.2 | source_pin, dataset, owned_original_log |
-| artifact-008 | qwen35vl-phase0-3 / EXP-003 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7091.9 | source_pin, dataset, owned_original_log |
-| artifact-009 | qwen35vl-phase0-3 / EXP-004 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7115 | source_pin, dataset, owned_original_log |
-| artifact-010 | qwen35vl-phase0-3 / EXP-005 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7121.6 | source_pin, dataset, owned_original_log |
-| artifact-011 | qwen35vl-phase0-3 / EXP-006 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7381.6 | source_pin, dataset, owned_original_log |
-| artifact-012 | qwen35vl-phase0-3 / EXP-007 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7147.8 | source_pin, dataset, owned_original_log |
-| artifact-013 | qwen35vl-phase0-3 / EXP-008 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7173.3 | source_pin, dataset, owned_original_log |
-| artifact-014 | qwen35vl-phase0-3 / EXP-009 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7433 | source_pin, dataset, owned_original_log |
-| artifact-015 | qwen35vl-phase0-3 / EXP-010 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7233.3 | source_pin, dataset, owned_original_log |
-| artifact-016 | qwen35vl-phase0-3 / EXP-011 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7114.9 | source_pin, dataset, owned_original_log |
-| artifact-017 | qwen35vl-phase0-3 / EXP-012 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7275.5 | source_pin, dataset, owned_original_log |
-| artifact-018 | qwen35vl-phase0-3 / EXP-013 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7147.4 | source_pin, dataset, owned_original_log |
-| artifact-019 | qwen35vl-phase0-3 / EXP-014 | qwen35_vl_35b_a3b | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 8207.4 | source_pin, dataset, owned_original_log |
-| artifact-020 | qwen35vl-phase0-3 / EXP-015 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 13603.2 | source_pin, dataset, owned_original_log |
-| artifact-021 | qwen35vl-phase0-3 / EXP-017 | qwen35_vl_35b_a3b | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 9247.5 | source_pin, dataset, owned_original_log |
-| artifact-022 | qwen35vl-phase0-3 / EXP-019 | qwen35_vl_35b_a3b | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 9761.4 | source_pin, dataset, owned_original_log |
-| artifact-023 | qwen35vl-phase0-3 / EXP-027 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 13610.3 | source_pin, dataset, owned_original_log |
-| artifact-024 | qwen35vl-phase0-3 / EXP-028 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 13522.8 | source_pin, dataset, owned_original_log |
-| artifact-025 | qwen35vl-phase0-3 / EXP-029 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 14057.6 | source_pin, dataset, owned_original_log |
-| artifact-026 | qwen35vl-phase0-3 / EXP-030 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 13736.7 | source_pin, dataset, owned_original_log |
-| artifact-027 | qwen35vl-phase0-3 / EXP-031 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 13874.9 | source_pin, dataset, owned_original_log |
-| artifact-028 | active-reset-20260429 / EXP-000 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 5571.7 | source_pin, dataset, owned_original_log |
-| artifact-029 | active-reset-20260429 / EXP-003 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 5622.4 | source_pin, dataset, owned_original_log |
-| artifact-030 | active-reset-20260429 / EXP-004 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 5641.7 | source_pin, dataset, owned_original_log |
-| artifact-031 | active-reset-20260429 / EXP-005 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 5676.3 | source_pin, dataset, owned_original_log |
-| artifact-032 | active-reset-20260429 / EXP-006 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 5907.8 | source_pin, dataset, owned_original_log |
-| artifact-033 | active-reset-20260429 / EXP-009 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14081 | source_pin, dataset, owned_original_log |
-| artifact-034 | active-reset-20260429 / EXP-010 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14127.4 | source_pin, dataset, owned_original_log |
-| artifact-035 | active-reset-20260429 / EXP-011 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 5673.8 | source_pin, dataset, owned_original_log |
-| artifact-036 | active-reset-20260429 / EXP-012 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 5701.7 | source_pin, dataset, owned_original_log |
-| artifact-037 | active-reset-20260429 / EXP-013 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 5929.4 | source_pin, dataset, owned_original_log |
-| artifact-038 | active-reset-20260429 / EXP-014 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 6459.3 | source_pin, dataset, owned_original_log |
-| artifact-039 | active-reset-20260429 / EXP-015 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 5039.7 | source_pin, dataset, owned_original_log |
-| artifact-040 | active-reset-20260429 / EXP-016 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 4798.6 | source_pin, dataset, owned_original_log |
-| artifact-041 | active-reset-20260429 / EXP-017 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 8235.7 | source_pin, dataset, owned_original_log |
-| artifact-042 | active-reset-20260429 / EXP-018 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 6543.8 | source_pin, dataset, owned_original_log |
-| artifact-043 | active-reset-20260429 / EXP-019 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 12071.7 | source_pin, dataset, owned_original_log |
-| artifact-044 | active-reset-20260429 / EXP-020 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 17526.6 | source_pin, dataset, owned_original_log |
-| artifact-045 | active-reset-20260429 / EXP-022 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14041.9 | source_pin, dataset, owned_original_log |
-| artifact-046 | active-reset-20260429 / EXP-023 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 13997.9 | source_pin, dataset, owned_original_log |
-| artifact-047 | active-reset-20260429 / EXP-025 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 11922.6 | source_pin, dataset, owned_original_log |
-| artifact-048 | active-reset-20260429 / EXP-026 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 26334 | source_pin, dataset, owned_original_log |
-| artifact-049 | active-reset-20260429 / EXP-030 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 13641.7 | source_pin, dataset, owned_original_log |
-| artifact-050 | active-reset-20260429 / EXP-034 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14306.8 | source_pin, dataset, owned_original_log |
-| artifact-051 | active-reset-20260429 / EXP-035 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14285.8 | source_pin, dataset, owned_original_log |
-| artifact-052 | active-reset-20260429 / EXP-036 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 12880.5 | source_pin, dataset, owned_original_log |
-| artifact-053 | active-reset-20260429 / EXP-037 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14443.3 | source_pin, dataset, owned_original_log |
-| artifact-054 | active-reset-20260429 / EXP-038 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 12962.2 | source_pin, dataset, owned_original_log |
-| artifact-055 | active-reset-20260429 / EXP-039 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 17831.3 | source_pin, dataset, owned_original_log |
-| artifact-056 | active-reset-20260429 / EXP-040fix | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 13116.5 | source_pin, dataset, owned_original_log |
-| artifact-057 | active-reset-20260429 / EXP-041 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 14144.4 | source_pin, dataset, owned_original_log |
-| artifact-058 | active-reset-20260429 / EXP-042 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 31439.4 | source_pin, dataset, owned_original_log |
-| artifact-059 | active-reset-20260429 / EXP-043 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 32123.9 | source_pin, dataset, owned_original_log |
-| artifact-060 | active-reset-20260429 / EXP-044 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 15783.4 | source_pin, dataset, owned_original_log |
-| artifact-061 | active-reset-20260429 / EXP-045 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 31838.2 | source_pin, dataset, owned_original_log |
-| artifact-062 | active-reset-20260429 / EXP-046 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 35844.35 | source_pin, dataset, owned_original_log |
-| artifact-063 | active-reset-20260429 / EXP-047 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 42757.35 | source_pin, dataset, owned_original_log |
-| artifact-064 | active-reset-20260429 / EXP-048 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 14448 | source_pin, dataset, owned_original_log |
-| artifact-065 | active-reset-20260429 / EXP-050 | qwen3vl_hybrid | 64 / 512 / 65536 | iters 10-50 | accepted_measurement_artifact | unavailable / 78602.7 | source_pin, dataset, owned_original_log |
-| artifact-066 | active-reset-20260429 / EXP-051 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 16329.4 | source_pin, dataset, owned_original_log |
-| artifact-067 | active-reset-20260429 / EXP-052 | qwen3vl_hybrid | 64 / 512 / 65536 | iters 10-50 | accepted_measurement_artifact | unavailable / 78768.7 | source_pin, dataset, owned_original_log |
-| artifact-068 | active-reset-20260429 / EXP-052v4 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 14720.7 | source_pin, dataset, owned_original_log |
-| artifact-069 | active-reset-20260429 / EXP-052v5 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 15284.7 | source_pin, dataset, owned_original_log |
-| artifact-070 | active-reset-20260429 / EXP-052v6 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 19015.7 | source_pin, dataset, owned_original_log |
-| artifact-071 | active-reset-20260429 / EXP-052v7 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 23585 | source_pin, dataset, owned_original_log |
-| artifact-072 | active-reset-20260429 / EXP-053 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 17829.7 | source_pin, dataset, owned_original_log |
-| artifact-073 | active-reset-20260429 / EXP-054 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 27097.2 | source_pin, dataset, owned_original_log |
-| artifact-074 | active-reset-20260429 / EXP-054final2 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14320.5 | source_pin, dataset, owned_original_log |
-| artifact-075 | active-reset-20260429 / EXP-055fix | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14484.3 | source_pin, dataset, owned_original_log |
-| artifact-076 | active-reset-20260429 / EXP-056fix | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14559.8 | source_pin, dataset, owned_original_log |
-| artifact-077 | active-reset-20260429 / EXP-057 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 14607.4 | source_pin, dataset, owned_original_log |
-| artifact-078 | active-reset-20260429 / EXP-057fix | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 17197.1 | source_pin, dataset, owned_original_log |
-| artifact-079 | active-reset-20260429 / EXP-058 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 17447.6 | source_pin, dataset, owned_original_log |
-| artifact-080 | active-reset-20260429 / EXP-059 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 22661.6 | source_pin, dataset, owned_original_log |
-| artifact-081 | active-reset-20260429 / EXP-059fix | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14781.2 | source_pin, dataset, owned_original_log |
-| artifact-082 | active-reset-20260429 / EXP-060 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 21716.5 | source_pin, dataset, owned_original_log |
-| artifact-083 | active-reset-20260429 / EXP-060fix | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 15080.2 | source_pin, dataset, owned_original_log |
-| artifact-084 | active-reset-20260429 / EXP-061 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 25262.5 | source_pin, dataset, owned_original_log |
-| artifact-085 | active-reset-20260429 / EXP-062 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 18005.2 | source_pin, dataset, owned_original_log |
-| artifact-086 | active-reset-20260429 / EXP-064 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 25716.6 | source_pin, dataset, owned_original_log |
-| artifact-087 | active-reset-20260429 / EXP-065 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 30494.7 | source_pin, dataset, owned_original_log |
-| artifact-088 | active-reset-20260429 / EXP-070 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 7870.3 | source_pin, dataset, owned_original_log |
-| artifact-089 | active-reset-20260429 / EXP-071v3 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 12849 | source_pin, dataset, owned_original_log |
-| artifact-090 | active-reset-20260429 / EXP-072 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 8492.8 | source_pin, dataset, owned_original_log |
-| artifact-091 | active-reset-20260429 / EXP-073v4 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 13120.9 | source_pin, dataset, owned_original_log |
-| artifact-092 | active-reset-20260429 / EXP-074 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 14605.8 | source_pin, dataset, owned_original_log |
-| artifact-093 | active-reset-20260429 / EXP-075v2 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 12940.2 | source_pin, dataset, owned_original_log |
-| artifact-094 | active-reset-20260429 / EXP-076v2 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 7898.4 | source_pin, dataset, owned_original_log |
-| artifact-095 | active-reset-20260429 / EXP-077v8 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 18222.9 | source_pin, dataset, owned_original_log |
-| artifact-096 | active-reset-20260429 / EXP-078v7 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 22086.1 | source_pin, dataset, owned_original_log |
-| artifact-097 | active-reset-20260429 / EXP-079v4 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 23821.8 | source_pin, dataset, owned_original_log |
-| artifact-098 | active-reset-20260429 / EXP-080v2 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 21897.1 | source_pin, dataset, owned_original_log |
-| artifact-099 | active-reset-20260429 / EXP-080v3 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 25362 | source_pin, dataset, owned_original_log |
-| artifact-100 | active-reset-20260429 / EXP-083 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 30574.6 | source_pin, dataset, owned_original_log |
-| artifact-101 | active-reset-20260429 / EXP-084 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 28523.6 | source_pin, dataset, owned_original_log |
-| artifact-102 | active-reset-20260429 / EXP-085 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 26482 | source_pin, dataset, owned_original_log |
-| artifact-103 | active-reset-20260429 / EXP-090 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 25778.7 | source_pin, dataset |
-| artifact-104 | active-reset-20260429 / EXP-092 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 28645.7 | source_pin, dataset |
-| artifact-105 | active-reset-20260429 / EXP-093 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 29205.2 | source_pin, dataset |
-| artifact-106 | active-reset-20260429 / EXP-094 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 29468.1 | source_pin, dataset |
-| artifact-107 | active-reset-20260429 / EXP-095-mock | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 30386.5 | source_pin, dataset |
-| artifact-108 | active-reset-20260429 / EXP-096-mock | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 25822.6 | source_pin, dataset |
-| artifact-109 | active-reset-20260429 / EXP-099 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 51933.2 | source_pin, dataset |
-| artifact-110 | active-reset-20260429 / EXP-107 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 36753.9 | source_pin, dataset |
-| artifact-111 | active-reset-20260429 / EXP-108-partial | qwen3vl_hybrid | None / 512 / 8192 | null | recorded_partial_verifier_skipped | unavailable / None | world, config, owned_original_log |
-| artifact-112 | active-reset-20260429 / EXP-109-partial | qwen3vl_hybrid | None / 512 / 8192 | null | recorded_partial_verifier_skipped | unavailable / None | world, config, owned_original_log |
-| artifact-113 | active-reset-20260429 / EXP-110 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 43765.7 | source_pin |
-| artifact-114 | active-reset-20260429 / EXP-115 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 29843.7 | source_pin, dataset |
-| artifact-115 | active-reset-20260429 / EXP-116 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 42351 | source_pin, dataset |
-| artifact-116 | active-reset-20260429 / EXP-117 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 41108.8 | source_pin, dataset |
-| artifact-117 | active-reset-20260429 / EXP-118 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 34720.8 | source_pin |
-| artifact-118 | active-reset-20260429 / EXP-119 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 34952.8 | source_pin |
-| artifact-119 | active-reset-20260429 / EXP-121 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 30781.8 | source_pin, dataset |
-| artifact-120 | active-reset-20260429 / EXP-123 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 30178.5 | source_pin, dataset |
-| artifact-121 | active-reset-20260429 / EXP-124 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 30510.5 | source_pin, dataset |
-| artifact-122 | active-reset-20260429 / EXP-125 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 35031.7 | source_pin |
-| artifact-123 | active-reset-20260429 / EXP-126 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 34833 | source_pin |
-| artifact-124 | active-reset-20260429 / EXP-133 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 39248.4 | source_pin, owned_original_log |
-| artifact-125 | active-reset-20260429 / EXP-134 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 39167.4 | source_pin, owned_original_log |
-| artifact-126 | active-reset-20260429 / EXP-135 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 34612.5 | source_pin, owned_original_log |
-| artifact-127 | active-reset-20260429 / EXP-136 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 8623.8 | source_pin, owned_original_log |
-| artifact-128 | active-reset-20260429 / EXP-137 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 8573.6 | source_pin, owned_original_log |
-| artifact-129 | active-reset-20260429 / EXP-138 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 16604.5 | source_pin, owned_original_log |
-| artifact-130 | active-reset-20260429 / EXP-140 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 8642.3 | source_pin, owned_original_log |
-| artifact-131 | active-reset-20260429 / EXP-141 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 8623.6 | source_pin, owned_original_log |
-| artifact-132 | active-reset-20260429 / EXP-142 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 8600.1 | source_pin, owned_original_log |
-| artifact-133 | active-reset-20260429 / EXP-143 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 9798.4 | source_pin, owned_original_log |
-| artifact-134 | active-reset-20260429 / EXP-152 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 40201.1 | source_pin, owned_original_log |
-| artifact-135 | active-reset-20260429 / EXP-153 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 39094.8 | source_pin, owned_original_log |
-| artifact-136 | active-reset-20260429 / EXP-154 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 39059.1 | source_pin, owned_original_log |
-| artifact-137 | active-reset-20260429 / EXP-160 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 43294.6 | source_pin, owned_original_log |
-| artifact-138 | active-reset-20260429 / EXP-161 | qwen3vl_hybrid | 128 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 70202.5 | source_pin, owned_original_log |
-| artifact-139 | active-reset-20260429 / EXP-162 | qwen3vl_hybrid | 128 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 69757.1 | source_pin, owned_original_log |
-| artifact-140 | active-reset-20260429 / EXP-163 | qwen3vl_hybrid | 128 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 79219.1 | source_pin, owned_original_log |
-| artifact-141 | active-reset-20260429 / EXP-164 | qwen3vl_hybrid | 256 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 117029.9 | source_pin, owned_original_log |
-| artifact-142 | active-reset-20260429 / EXP-165 | qwen3vl_hybrid | 256 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 116344.2 | source_pin, owned_original_log |
-| artifact-143 | active-reset-20260429 / EXP-172 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 16590.9 | source_pin, owned_original_log |
-| artifact-144 | active-reset-20260429 / EXP-180 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 16261.4 | source_pin, owned_original_log |
-| artifact-145 | active-reset-20260429 / EXP-182 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 16264.8 | source_pin, owned_original_log |
-| artifact-146 | active-reset-20260429 / EXP-185 | qwen3vl_hybrid | 64 / 512 / 65536 | iters 10-50 | accepted_measurement_artifact | unavailable / 163754.3 | source_pin, owned_original_log |
-| artifact-147 | active-reset-20260429 / EXP-200 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 8590.2 | source_pin, owned_original_log |
-| artifact-148 | active-reset-20260429 / UNKNOWN | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 9005.8 | source_pin, owned_original_log |
-| artifact-149 | active-reset-20260429 / UNKNOWN | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 8997.7 | source_pin, owned_original_log |
-| artifact-150 | active-reset-20260429 / UNKNOWN | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 8992.3 | source_pin, owned_original_log |
-| artifact-151 | active-reset-20260429 / EXP-207 | null | None / None / None | null | recorded_failed | unavailable / None | model, world, gbs, config, owned_original_log, sequence_length |
-| artifact-152 | active-reset-20260429 / EXP-208 | null | None / None / None | null | recorded_failed | unavailable / None | model, world, gbs, config, owned_original_log, sequence_length |
-| artifact-153 | active-reset-20260429 / UNKNOWN | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 9457.1 | source_pin, owned_original_log |
-| artifact-154 | active-reset-20260429 / UNKNOWN | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 9436.5 | source_pin, owned_original_log |
-| artifact-155 | active-reset-20260429 / EXP-212 | null | None / None / None | null | recorded_failed | unavailable / None | model, world, gbs, config, owned_original_log, sequence_length |
-| artifact-156 | active-reset-20260429 / EXP-213 | null | None / None / None | null | recorded_failed | unavailable / None | model, world, gbs, config, owned_original_log, sequence_length |
-| artifact-157 | active-reset-20260429 / EXP-230 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 8997.7 | source_pin, owned_original_log |
-| artifact-158 | active-reset-20260429 / EXP-231 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 21999.4 | source_pin, owned_original_log |
-| artifact-159 | active-reset-20260429 / EXP-232 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 39437.9 | source_pin, owned_original_log |
-| artifact-160 | active-reset-20260429 / EXP-233 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 21879.8 | source_pin, owned_original_log |
-| artifact-161 | active-reset-20260429 / EXP-234 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 15493.8 | source_pin, owned_original_log |
-| artifact-162 | active-reset-20260429 / EXP-235 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 16037.8 | source_pin, owned_original_log |
-| artifact-163 | active-reset-20260429 / EXP-236 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 39472.2 | source_pin, owned_original_log |
-| artifact-164 | active-reset-20260429 / EXP-237 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 21755.2 | source_pin, owned_original_log |
-| artifact-165 | active-reset-20260429 / EXP-238 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 16106.6 | source_pin, owned_original_log |
-| artifact-166 | active-reset-20260429 / EXP-239 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 17300.3 | source_pin, owned_original_log |
-| artifact-167 | active-reset-20260429 / EXP-240 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 26962.8 | source_pin, owned_original_log |
-| artifact-168 | active-reset-20260429 / EXP-241 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 16635.4 | source_pin, owned_original_log |
-| artifact-169 | active-reset-20260429 / EXP-246 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 21298.8 | source_pin, owned_original_log |
-| artifact-170 | active-reset-20260429 / EXP-247 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 36418.5 | source_pin, owned_original_log |
-| artifact-171 | active-reset-20260429 / EXP-248 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 20604 | source_pin, owned_original_log |
-| artifact-172 | active-reset-20260429 / EXP-249 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 35310.2 | source_pin, owned_original_log |
-| artifact-173 | active-reset-20260429 / EXP-250 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 10447.2 | source_pin, owned_original_log |
-| artifact-174 | active-reset-20260429 / EXP-251 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 10350.8 | source_pin, owned_original_log |
-| artifact-175 | active-reset-20260429 / EXP-254 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 40251.2 | source_pin, owned_original_log |
-| artifact-176 | active-reset-20260429 / EXP-255 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 26562.5 | source_pin, owned_original_log |
-| artifact-177 | active-reset-20260429 / EXP-256 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 44493.4 | source_pin, owned_original_log |
-| artifact-178 | active-reset-20260429 / EXP-257 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 29317.1 | source_pin, owned_original_log |
-| artifact-179 | active-reset-20260429 / EXP-258 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 45307.5 | source_pin, owned_original_log |
-| artifact-180 | active-reset-20260429 / EXP-259 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 28021.9 | source_pin, owned_original_log |
-| artifact-181 | active-reset-20260429 / EXP-261 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 12263.3 | source_pin, owned_original_log |
-| artifact-182 | active-reset-20260429 / EXP-263 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 33465.9 | source_pin, owned_original_log |
-| artifact-183 | active-reset-20260429 / EXP-264 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 36513 | source_pin, owned_original_log |
-| artifact-184 | active-reset-20260429 / EXP-265 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 28602.9 | source_pin, owned_original_log |
-| artifact-185 | active-reset-20260429 / EXP-PR131-ENCODER-CP1-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 4170.2 | source_pin, dataset |
-| artifact-186 | active-reset-20260429 / EXP-PR131-ENCODER-CP1-PAIR749724-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 4358.8 | source_pin, dataset |
-| artifact-187 | active-reset-20260429 / EXP-PR131-ENCODER-CP2-PAIR749724-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 4538.4 | source_pin, dataset |
-| artifact-188 | active-reset-20260429 / EXP-PR131-IMAGE1X-CP1-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 4144.3 | source_pin, dataset |
-| artifact-189 | active-reset-20260429 / EXP-PR131-IMAGE1X-CP2-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 4293.5 | source_pin, dataset |
-| artifact-190 | active-reset-20260429 / EXP-PR131-IMAGE2X-CP1-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 4151.5 | source_pin, dataset |
-| artifact-191 | active-reset-20260429 / EXP-PR131-IMAGE2X-CP2-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 4267.2 | source_pin, dataset |
-| artifact-192 | active-reset-20260429 / EXP-PR131-IMAGE4X-CP1-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 4574.4 | source_pin, dataset |
-| artifact-193 | active-reset-20260429 / EXP-PR131-IMAGE4X-CP2-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 4806.8 | source_pin, dataset |
-| artifact-194 | active-reset-20260429 / EXP-PR131-IMAGE8X-CP1-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 5571.4 | source_pin, dataset |
-| artifact-195 | active-reset-20260429 / EXP-PR131-IMAGE8X-CP2-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 6054.7 | source_pin, dataset |
-| artifact-196 | active-reset-20260429 / EXP-PR131-MANTIS16-752807-20-GB300-legacy-window | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 7221.1 | source_pin |
-| artifact-197 | active-reset-20260429 / EXP-PR131-MANTIS16-752807-20-GB300 | qwen3vl | 16 / 64 / 16384 | [4, 20] | accepted_measurement_artifact | unavailable / 7221.1 | source_pin |
-| artifact-198 | active-reset-20260429 / EXP-PR131-TFLOPS16-SEQ4096-GBS256 | qwen3vl | 16 / 256 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 7296 | source_pin |
-| artifact-199 | active-reset-20260429 / EXP-PR7-FOURWAY-751915-pr7_baseline | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 14961 | source_pin, dataset |
-| artifact-200 | active-reset-20260429 / EXP-PR7-FOURWAY-752159-pr131_latest | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 8901.4 | source_pin, dataset |
-| artifact-201 | active-reset-20260429 / EXP-PR7-FOURWAY-752159-pr7_baseline | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 13804.5 | source_pin, dataset |
-| artifact-202 | active-reset-20260429 / EXP-PR7-FOURWAY-752159-pr7_mdp | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 11479.4 | source_pin, dataset |
-| artifact-203 | active-reset-20260429 / EXP-PR7-FOURWAY-752159-pr7_packing | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 9820.5 | source_pin, dataset |
-| artifact-204 | active-reset-20260429 / EXP-bridge1 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14362.6 | source_pin, dataset, owned_original_log |
-| artifact-205 | active-reset-20260429 / EXP-bridge2 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14587.7 | source_pin, dataset, owned_original_log |
-| artifact-206 | active-reset-20260429 / EXP-va1 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 21436.9 | source_pin, dataset, owned_original_log |
-| artifact-207 | active-reset-20260429 / EXP-va2 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 36553.8 | source_pin, dataset, owned_original_log |
-| artifact-208 | active-reset-20260429 / EXP-va3 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 24283.3 | source_pin, dataset, owned_original_log |
-| artifact-209 | active-reset-20260429 / EXP-va4 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14570.9 | source_pin, dataset, owned_original_log |
-| artifact-210 | active-reset-20260429 / EXP-va5 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 25380.7 | source_pin, dataset, owned_original_log |
-| artifact-211 | active-reset-20260429 / EXP-va6 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 39772.5 | source_pin, dataset, owned_original_log |
-| artifact-212 | active-reset-20260429 / EXP-varimg2 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | unavailable / 14669.1 | source_pin, dataset, owned_original_log |
-| artifact-213 | active-reset-20260429 / EXP-varlen3 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 19456.8 | source_pin, dataset, owned_original_log |
-| artifact-214 | active-reset-20260429 / EXP-varlen6 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 21527.7 | source_pin, dataset, owned_original_log |
-| artifact-215 | active-reset-20260429 / EXP-vb1 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 22704.8 | source_pin, dataset, owned_original_log |
-| artifact-216 | active-reset-20260429 / EXP-vb2 | qwen3vl_hybrid | 64 / 512 / 24576 | iters 10-50 | accepted_measurement_artifact | unavailable / 27402.5 | source_pin, dataset, owned_original_log |
-| artifact-217 | active-reset-20260429 / EXP-vb3 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 33112.4 | source_pin, dataset, owned_original_log |
-| artifact-218 | active-reset-20260429 / EXP-vb4 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 36434.1 | source_pin, dataset, owned_original_log |
-| artifact-219 | active-reset-20260429 / EXP-vb5 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 46711 | source_pin, dataset, owned_original_log |
-| artifact-220 | active-reset-20260429 / EXP-vb6 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 27917.1 | source_pin, dataset, owned_original_log |
-| artifact-221 | active-reset-20260429 / EXP-vc1 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 22355.7 | source_pin, dataset, owned_original_log |
-| artifact-222 | active-reset-20260429 / EXP-vc3 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 43032 | source_pin, dataset, owned_original_log |
-| artifact-223 | active-reset-20260429 / EXP-vc4 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | unavailable / 18243.3 | source_pin, dataset, owned_original_log |
-| artifact-224 | active-reset-20260429 / EXP-vc5 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 22295.7 | source_pin, dataset, owned_original_log |
-| artifact-225 | active-reset-20260429 / EXP-vc6 | qwen3vl_hybrid | 64 / 512 / 24576 | iters 10-50 | accepted_measurement_artifact | unavailable / 41377.8 | source_pin, dataset, owned_original_log |
-| artifact-226 | active-reset-20260429 / EXP-vd1 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 26621.8 | source_pin, dataset, owned_original_log |
-| artifact-227 | active-reset-20260429 / EXP-vd2 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 27288.4 | source_pin, dataset, owned_original_log |
-| artifact-228 | active-reset-20260429 / EXP-vd3 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 38304 | source_pin, dataset, owned_original_log |
-| artifact-229 | active-reset-20260429 / EXP-vd4 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | unavailable / 51145.1 | source_pin, dataset, owned_original_log |
-| artifact-230 | active-reset-20260429 / EXP-vd5 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | unavailable / 28451.8 | source_pin, dataset, owned_original_log |
-| artifact-231 | active-reset-20260429 / EXP-vd6 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | unavailable / 25960.6 | source_pin, dataset, owned_original_log |
+| Artifact | Namespace / experiment | Model | World / GBS / seq | Window | Status | Median step ms | Missing references | Scheduled tok/s global (per GPU) | Encoder modeled TF/GPU mean | Decoder native TF/GPU mean | Encoder + decoder modeled TF/GPU mean |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| artifact-001 | qwen3-phase4-final / EXP-040 | qwen3_30b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 4122.6 | source_pin, dataset, owned_original_log | 508696.5 (N/A) | N/A | unavailable | N/A |
+| artifact-002 | qwen3-phase4-final / EXP-041 | qwen3_30b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 10899.2 | source_pin, dataset, owned_original_log | 192413.4 (N/A) | N/A | unavailable | N/A |
+| artifact-003 | qwen3-phase4-final / EXP-042 | qwen3_30b_a3b | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 4602.4 | source_pin, dataset, owned_original_log | 911329.7 (N/A) | N/A | unavailable | N/A |
+| artifact-004 | qwen3-phase4-final / EXP-043 | qwen3_30b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 8023.3 | source_pin, dataset, owned_original_log | 1045530.9 (N/A) | N/A | unavailable | N/A |
+| artifact-005 | qwen3-phase4-final / EXP-045 | qwen3_30b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 5048.1 | source_pin, dataset, owned_original_log | 415433.9 (N/A) | N/A | unavailable | N/A |
+| artifact-006 | qwen35vl-phase0-3 / EXP-001 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7126.1 | source_pin, dataset, owned_original_log | 294291.7 (N/A) | N/A | unavailable | N/A |
+| artifact-007 | qwen35vl-phase0-3 / EXP-002 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7038.2 | source_pin, dataset, owned_original_log | 297967.1 (N/A) | N/A | unavailable | N/A |
+| artifact-008 | qwen35vl-phase0-3 / EXP-003 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7091.9 | source_pin, dataset, owned_original_log | 295710.9 (N/A) | N/A | unavailable | N/A |
+| artifact-009 | qwen35vl-phase0-3 / EXP-004 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7115 | source_pin, dataset, owned_original_log | 294750.8 (N/A) | N/A | unavailable | N/A |
+| artifact-010 | qwen35vl-phase0-3 / EXP-005 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7121.6 | source_pin, dataset, owned_original_log | 294477.6 (N/A) | N/A | unavailable | N/A |
+| artifact-011 | qwen35vl-phase0-3 / EXP-006 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7381.6 | source_pin, dataset, owned_original_log | 284105.3 (N/A) | N/A | unavailable | N/A |
+| artifact-012 | qwen35vl-phase0-3 / EXP-007 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7147.8 | source_pin, dataset, owned_original_log | 293398.2 (N/A) | N/A | unavailable | N/A |
+| artifact-013 | qwen35vl-phase0-3 / EXP-008 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7173.3 | source_pin, dataset, owned_original_log | 292355.3 (N/A) | N/A | unavailable | N/A |
+| artifact-014 | qwen35vl-phase0-3 / EXP-009 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7433 | source_pin, dataset, owned_original_log | 282140.7 (N/A) | N/A | unavailable | N/A |
+| artifact-015 | qwen35vl-phase0-3 / EXP-010 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7233.3 | source_pin, dataset, owned_original_log | 289930.2 (N/A) | N/A | unavailable | N/A |
+| artifact-016 | qwen35vl-phase0-3 / EXP-011 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7114.9 | source_pin, dataset, owned_original_log | 294755.0 (N/A) | N/A | unavailable | N/A |
+| artifact-017 | qwen35vl-phase0-3 / EXP-012 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7275.5 | source_pin, dataset, owned_original_log | 288248.5 (N/A) | N/A | unavailable | N/A |
+| artifact-018 | qwen35vl-phase0-3 / EXP-013 | qwen35_vl_35b_a3b | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 7147.4 | source_pin, dataset, owned_original_log | 293414.7 (N/A) | N/A | unavailable | N/A |
+| artifact-019 | qwen35vl-phase0-3 / EXP-014 | qwen35_vl_35b_a3b | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 8207.4 | source_pin, dataset, owned_original_log | 511039.3 (N/A) | N/A | unavailable | N/A |
+| artifact-020 | qwen35vl-phase0-3 / EXP-015 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 13603.2 | source_pin, dataset, owned_original_log | 616664.3 (N/A) | N/A | unavailable | N/A |
+| artifact-021 | qwen35vl-phase0-3 / EXP-017 | qwen35_vl_35b_a3b | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 9247.5 | source_pin, dataset, owned_original_log | 453560.9 (N/A) | N/A | unavailable | N/A |
+| artifact-022 | qwen35vl-phase0-3 / EXP-019 | qwen35_vl_35b_a3b | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 9761.4 | source_pin, dataset, owned_original_log | 429682.6 (N/A) | N/A | unavailable | N/A |
+| artifact-023 | qwen35vl-phase0-3 / EXP-027 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 13610.3 | source_pin, dataset, owned_original_log | 616342.6 (N/A) | N/A | unavailable | N/A |
+| artifact-024 | qwen35vl-phase0-3 / EXP-028 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 13522.8 | source_pin, dataset, owned_original_log | 620330.7 (N/A) | N/A | unavailable | N/A |
+| artifact-025 | qwen35vl-phase0-3 / EXP-029 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 14057.6 | source_pin, dataset, owned_original_log | 596731.2 (N/A) | N/A | unavailable | N/A |
+| artifact-026 | qwen35vl-phase0-3 / EXP-030 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 13736.7 | source_pin, dataset, owned_original_log | 610671.3 (N/A) | N/A | unavailable | N/A |
+| artifact-027 | qwen35vl-phase0-3 / EXP-031 | qwen35_vl_35b_a3b | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 13874.9 | source_pin, dataset, owned_original_log | 604588.7 (N/A) | N/A | unavailable | N/A |
+| artifact-028 | active-reset-20260429 / EXP-000 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 5571.7 | source_pin, dataset, owned_original_log | 376393.6 (N/A) | N/A | unavailable | N/A |
+| artifact-029 | active-reset-20260429 / EXP-003 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 5622.4 | source_pin, dataset, owned_original_log | 372999.4 (N/A) | N/A | unavailable | N/A |
+| artifact-030 | active-reset-20260429 / EXP-004 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 5641.7 | source_pin, dataset, owned_original_log | 371723.4 (N/A) | N/A | unavailable | N/A |
+| artifact-031 | active-reset-20260429 / EXP-005 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 5676.3 | source_pin, dataset, owned_original_log | 369457.6 (N/A) | N/A | unavailable | N/A |
+| artifact-032 | active-reset-20260429 / EXP-006 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 5907.8 | source_pin, dataset, owned_original_log | 354980.2 (N/A) | N/A | unavailable | N/A |
+| artifact-033 | active-reset-20260429 / EXP-009 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14081 | source_pin, dataset, owned_original_log | 148934.9 (N/A) | N/A | unavailable | N/A |
+| artifact-034 | active-reset-20260429 / EXP-010 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14127.4 | source_pin, dataset, owned_original_log | 148445.7 (N/A) | N/A | unavailable | N/A |
+| artifact-035 | active-reset-20260429 / EXP-011 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 5673.8 | source_pin, dataset, owned_original_log | 369620.4 (N/A) | N/A | unavailable | N/A |
+| artifact-036 | active-reset-20260429 / EXP-012 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 5701.7 | source_pin, dataset, owned_original_log | 367811.7 (N/A) | N/A | unavailable | N/A |
+| artifact-037 | active-reset-20260429 / EXP-013 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 5929.4 | source_pin, dataset, owned_original_log | 353687.1 (N/A) | N/A | unavailable | N/A |
+| artifact-038 | active-reset-20260429 / EXP-014 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 6459.3 | source_pin, dataset, owned_original_log | 324671.7 (N/A) | N/A | unavailable | N/A |
+| artifact-039 | active-reset-20260429 / EXP-015 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 5039.7 | source_pin, dataset, owned_original_log | 416126.4 (N/A) | N/A | unavailable | N/A |
+| artifact-040 | active-reset-20260429 / EXP-016 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 4798.6 | source_pin, dataset, owned_original_log | 437034.1 (N/A) | N/A | unavailable | N/A |
+| artifact-041 | active-reset-20260429 / EXP-017 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 8235.7 | source_pin, dataset, owned_original_log | 254641.6 (N/A) | N/A | unavailable | N/A |
+| artifact-042 | active-reset-20260429 / EXP-018 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 6543.8 | source_pin, dataset, owned_original_log | 640958.5 (N/A) | N/A | unavailable | N/A |
+| artifact-043 | active-reset-20260429 / EXP-019 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 12071.7 | source_pin, dataset, owned_original_log | 694898.6 (N/A) | N/A | unavailable | N/A |
+| artifact-044 | active-reset-20260429 / EXP-020 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 17526.6 | source_pin, dataset, owned_original_log | 119655.4 (N/A) | N/A | unavailable | N/A |
+| artifact-045 | active-reset-20260429 / EXP-022 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14041.9 | source_pin, dataset, owned_original_log | 149349.6 (N/A) | N/A | unavailable | N/A |
+| artifact-046 | active-reset-20260429 / EXP-023 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 13997.9 | source_pin, dataset, owned_original_log | 149819.0 (N/A) | N/A | unavailable | N/A |
+| artifact-047 | active-reset-20260429 / EXP-025 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 11922.6 | source_pin, dataset, owned_original_log | 703588.8 (N/A) | N/A | unavailable | N/A |
+| artifact-048 | active-reset-20260429 / EXP-026 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 26334 | source_pin, dataset, owned_original_log | 637093.3 (N/A) | N/A | unavailable | N/A |
+| artifact-049 | active-reset-20260429 / EXP-030 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 13641.7 | source_pin, dataset, owned_original_log | 153731.0 (N/A) | N/A | unavailable | N/A |
+| artifact-050 | active-reset-20260429 / EXP-034 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14306.8 | source_pin, dataset, owned_original_log | 146584.3 (N/A) | N/A | unavailable | N/A |
+| artifact-051 | active-reset-20260429 / EXP-035 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14285.8 | source_pin, dataset, owned_original_log | 146799.8 (N/A) | N/A | unavailable | N/A |
+| artifact-052 | active-reset-20260429 / EXP-036 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 12880.5 | source_pin, dataset, owned_original_log | 162816.0 (N/A) | N/A | unavailable | N/A |
+| artifact-053 | active-reset-20260429 / EXP-037 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14443.3 | source_pin, dataset, owned_original_log | 145199.0 (N/A) | N/A | unavailable | N/A |
+| artifact-054 | active-reset-20260429 / EXP-038 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 12962.2 | source_pin, dataset, owned_original_log | 161789.8 (N/A) | N/A | unavailable | N/A |
+| artifact-055 | active-reset-20260429 / EXP-039 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 17831.3 | source_pin, dataset, owned_original_log | 470442.9 (N/A) | N/A | unavailable | N/A |
+| artifact-056 | active-reset-20260429 / EXP-040fix | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 13116.5 | source_pin, dataset, owned_original_log | 319773.1 (N/A) | N/A | unavailable | N/A |
+| artifact-057 | active-reset-20260429 / EXP-041 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 14144.4 | source_pin, dataset, owned_original_log | 296534.6 (N/A) | N/A | unavailable | N/A |
+| artifact-058 | active-reset-20260429 / EXP-042 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 31439.4 | source_pin, dataset, owned_original_log | 533636.6 (N/A) | N/A | unavailable | N/A |
+| artifact-059 | active-reset-20260429 / EXP-043 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 32123.9 | source_pin, dataset, owned_original_log | 522265.9 (N/A) | N/A | unavailable | N/A |
+| artifact-060 | active-reset-20260429 / EXP-044 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 15783.4 | source_pin, dataset, owned_original_log | 531483.0 (N/A) | N/A | unavailable | N/A |
+| artifact-061 | active-reset-20260429 / EXP-045 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 31838.2 | source_pin, dataset, owned_original_log | 526952.4 (N/A) | N/A | unavailable | N/A |
+| artifact-062 | active-reset-20260429 / EXP-046 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 35844.35 | source_pin, dataset, owned_original_log | 234028.7 (N/A) | N/A | unavailable | N/A |
+| artifact-063 | active-reset-20260429 / EXP-047 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 42757.35 | source_pin, dataset, owned_original_log | 392382.0 (N/A) | N/A | unavailable | N/A |
+| artifact-064 | active-reset-20260429 / EXP-048 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 14448 | source_pin, dataset, owned_original_log | 290303.4 (N/A) | N/A | unavailable | N/A |
+| artifact-065 | active-reset-20260429 / EXP-050 | qwen3vl_hybrid | 64 / 512 / 65536 | iters 10-50 | accepted_measurement_artifact | 78602.7 | source_pin, dataset, owned_original_log | 426886.5 (N/A) | N/A | unavailable | N/A |
+| artifact-066 | active-reset-20260429 / EXP-051 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 16329.4 | source_pin, dataset, owned_original_log | 256856.0 (N/A) | N/A | unavailable | N/A |
+| artifact-067 | active-reset-20260429 / EXP-052 | qwen3vl_hybrid | 64 / 512 / 65536 | iters 10-50 | accepted_measurement_artifact | 78768.7 | source_pin, dataset, owned_original_log | 425986.9 (N/A) | N/A | unavailable | N/A |
+| artifact-068 | active-reset-20260429 / EXP-052v4 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 14720.7 | source_pin, dataset, owned_original_log | 284925.6 (N/A) | N/A | unavailable | N/A |
+| artifact-069 | active-reset-20260429 / EXP-052v5 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 15284.7 | source_pin, dataset, owned_original_log | 274411.9 (N/A) | N/A | unavailable | N/A |
+| artifact-070 | active-reset-20260429 / EXP-052v6 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 19015.7 | source_pin, dataset, owned_original_log | 220570.6 (N/A) | N/A | unavailable | N/A |
+| artifact-071 | active-reset-20260429 / EXP-052v7 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 23585 | source_pin, dataset, owned_original_log | 177837.8 (N/A) | N/A | unavailable | N/A |
+| artifact-072 | active-reset-20260429 / EXP-053 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 17829.7 | source_pin, dataset, owned_original_log | 470485.1 (N/A) | N/A | unavailable | N/A |
+| artifact-073 | active-reset-20260429 / EXP-054 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 27097.2 | source_pin, dataset, owned_original_log | 619149.4 (N/A) | N/A | unavailable | N/A |
+| artifact-074 | active-reset-20260429 / EXP-054final2 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14320.5 | source_pin, dataset, owned_original_log | 146444.0 (N/A) | N/A | unavailable | N/A |
+| artifact-075 | active-reset-20260429 / EXP-055fix | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14484.3 | source_pin, dataset, owned_original_log | 144787.9 (N/A) | N/A | unavailable | N/A |
+| artifact-076 | active-reset-20260429 / EXP-056fix | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14559.8 | source_pin, dataset, owned_original_log | 144037.1 (N/A) | N/A | unavailable | N/A |
+| artifact-077 | active-reset-20260429 / EXP-057 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 14607.4 | source_pin, dataset, owned_original_log | 287135.6 (N/A) | N/A | unavailable | N/A |
+| artifact-078 | active-reset-20260429 / EXP-057fix | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 17197.1 | source_pin, dataset, owned_original_log | 243896.0 (N/A) | N/A | unavailable | N/A |
+| artifact-079 | active-reset-20260429 / EXP-058 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 17447.6 | source_pin, dataset, owned_original_log | 480788.6 (N/A) | N/A | unavailable | N/A |
+| artifact-080 | active-reset-20260429 / EXP-059 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 22661.6 | source_pin, dataset, owned_original_log | 740336.8 (N/A) | N/A | unavailable | N/A |
+| artifact-081 | active-reset-20260429 / EXP-059fix | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14781.2 | source_pin, dataset, owned_original_log | 141879.7 (N/A) | N/A | unavailable | N/A |
+| artifact-082 | active-reset-20260429 / EXP-060 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 21716.5 | source_pin, dataset, owned_original_log | 772556.2 (N/A) | N/A | unavailable | N/A |
+| artifact-083 | active-reset-20260429 / EXP-060fix | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 15080.2 | source_pin, dataset, owned_original_log | 139066.6 (N/A) | N/A | unavailable | N/A |
+| artifact-084 | active-reset-20260429 / EXP-061 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 25262.5 | source_pin, dataset, owned_original_log | 664115.4 (N/A) | N/A | unavailable | N/A |
+| artifact-085 | active-reset-20260429 / EXP-062 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 18005.2 | source_pin, dataset, owned_original_log | 465899.2 (N/A) | N/A | unavailable | N/A |
+| artifact-086 | active-reset-20260429 / EXP-064 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 25716.6 | source_pin, dataset, owned_original_log | 163097.1 (N/A) | N/A | unavailable | N/A |
+| artifact-087 | active-reset-20260429 / EXP-065 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 30494.7 | source_pin, dataset, owned_original_log | 550168.3 (N/A) | N/A | unavailable | N/A |
+| artifact-088 | active-reset-20260429 / EXP-070 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 7870.3 | source_pin, dataset, owned_original_log | 532928.1 (N/A) | N/A | unavailable | N/A |
+| artifact-089 | active-reset-20260429 / EXP-071v3 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 12849 | source_pin, dataset, owned_original_log | 326430.4 (N/A) | N/A | unavailable | N/A |
+| artifact-090 | active-reset-20260429 / EXP-072 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 8492.8 | source_pin, dataset, owned_original_log | 493865.9 (N/A) | N/A | unavailable | N/A |
+| artifact-091 | active-reset-20260429 / EXP-073v4 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 13120.9 | source_pin, dataset, owned_original_log | 319665.9 (N/A) | N/A | unavailable | N/A |
+| artifact-092 | active-reset-20260429 / EXP-074 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 14605.8 | source_pin, dataset, owned_original_log | 287167.0 (N/A) | N/A | unavailable | N/A |
+| artifact-093 | active-reset-20260429 / EXP-075v2 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 12940.2 | source_pin, dataset, owned_original_log | 324129.8 (N/A) | N/A | unavailable | N/A |
+| artifact-094 | active-reset-20260429 / EXP-076v2 | qwen3 | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 7898.4 | source_pin, dataset, owned_original_log | 531032.1 (N/A) | N/A | unavailable | N/A |
+| artifact-095 | active-reset-20260429 / EXP-077v8 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 18222.9 | source_pin, dataset, owned_original_log | 230166.7 (N/A) | N/A | unavailable | N/A |
+| artifact-096 | active-reset-20260429 / EXP-078v7 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 22086.1 | source_pin, dataset, owned_original_log | 189907.0 (N/A) | N/A | unavailable | N/A |
+| artifact-097 | active-reset-20260429 / EXP-079v4 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 23821.8 | source_pin, dataset, owned_original_log | 176070.0 (N/A) | N/A | unavailable | N/A |
+| artifact-098 | active-reset-20260429 / EXP-080v2 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 21897.1 | source_pin, dataset, owned_original_log | 191546.1 (N/A) | N/A | unavailable | N/A |
+| artifact-099 | active-reset-20260429 / EXP-080v3 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 25362 | source_pin, dataset, owned_original_log | 165377.5 (N/A) | N/A | unavailable | N/A |
+| artifact-100 | active-reset-20260429 / EXP-083 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 30574.6 | source_pin, dataset, owned_original_log | 137182.6 (N/A) | N/A | unavailable | N/A |
+| artifact-101 | active-reset-20260429 / EXP-084 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 28523.6 | source_pin, dataset, owned_original_log | 147046.8 (N/A) | N/A | unavailable | N/A |
+| artifact-102 | active-reset-20260429 / EXP-085 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 26482 | source_pin, dataset, owned_original_log | 158383.2 (N/A) | N/A | unavailable | N/A |
+| artifact-103 | active-reset-20260429 / EXP-090 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 25778.7 | source_pin, dataset | 162704.2 (N/A) | N/A | unavailable | N/A |
+| artifact-104 | active-reset-20260429 / EXP-092 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 28645.7 | source_pin, dataset | 146420.0 (N/A) | N/A | unavailable | N/A |
+| artifact-105 | active-reset-20260429 / EXP-093 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 29205.2 | source_pin, dataset | 143615.0 (N/A) | N/A | unavailable | N/A |
+| artifact-106 | active-reset-20260429 / EXP-094 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 29468.1 | source_pin, dataset | 142333.7 (N/A) | N/A | unavailable | N/A |
+| artifact-107 | active-reset-20260429 / EXP-095-mock | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 30386.5 | source_pin, dataset | 138031.8 (N/A) | N/A | unavailable | N/A |
+| artifact-108 | active-reset-20260429 / EXP-096-mock | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 25822.6 | source_pin, dataset | 162427.6 (N/A) | N/A | unavailable | N/A |
+| artifact-109 | active-reset-20260429 / EXP-099 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 51933.2 | source_pin, dataset | 80763.4 (N/A) | N/A | unavailable | N/A |
+| artifact-110 | active-reset-20260429 / EXP-107 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 36753.9 | source_pin, dataset | 114118.6 (N/A) | N/A | unavailable | N/A |
+| artifact-111 | active-reset-20260429 / EXP-108-partial | qwen3vl_hybrid | None / 512 / 8192 | null | recorded_partial_verifier_skipped | None | world, config, owned_original_log | N/A | N/A | unavailable | N/A |
+| artifact-112 | active-reset-20260429 / EXP-109-partial | qwen3vl_hybrid | None / 512 / 8192 | null | recorded_partial_verifier_skipped | None | world, config, owned_original_log | N/A | N/A | unavailable | N/A |
+| artifact-113 | active-reset-20260429 / EXP-110 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 43765.7 | source_pin | 95835.4 (N/A) | N/A | unavailable | N/A |
+| artifact-114 | active-reset-20260429 / EXP-115 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 29843.7 | source_pin, dataset | 140542.4 (N/A) | N/A | unavailable | N/A |
+| artifact-115 | active-reset-20260429 / EXP-116 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 42351 | source_pin, dataset | 99036.7 (N/A) | N/A | unavailable | N/A |
+| artifact-116 | active-reset-20260429 / EXP-117 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 41108.8 | source_pin, dataset | 102029.3 (N/A) | N/A | unavailable | N/A |
+| artifact-117 | active-reset-20260429 / EXP-118 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 34720.8 | source_pin | 120800.9 (N/A) | N/A | unavailable | N/A |
+| artifact-118 | active-reset-20260429 / EXP-119 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 34952.8 | source_pin | 119999.1 (N/A) | N/A | unavailable | N/A |
+| artifact-119 | active-reset-20260429 / EXP-121 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 30781.8 | source_pin, dataset | 136259.2 (N/A) | N/A | unavailable | N/A |
+| artifact-120 | active-reset-20260429 / EXP-123 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 30178.5 | source_pin, dataset | 138983.2 (N/A) | N/A | unavailable | N/A |
+| artifact-121 | active-reset-20260429 / EXP-124 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 30510.5 | source_pin, dataset | 137470.8 (N/A) | N/A | unavailable | N/A |
+| artifact-122 | active-reset-20260429 / EXP-125 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 35031.7 | source_pin | 119728.8 (N/A) | N/A | unavailable | N/A |
+| artifact-123 | active-reset-20260429 / EXP-126 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 34833 | source_pin | 120411.8 (N/A) | N/A | unavailable | N/A |
+| artifact-124 | active-reset-20260429 / EXP-133 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 39248.4 | source_pin, owned_original_log | 106865.6 (N/A) | N/A | unavailable | N/A |
+| artifact-125 | active-reset-20260429 / EXP-134 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 39167.4 | source_pin, owned_original_log | 107086.6 (N/A) | N/A | unavailable | N/A |
+| artifact-126 | active-reset-20260429 / EXP-135 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 34612.5 | source_pin, owned_original_log | 121178.9 (N/A) | N/A | unavailable | N/A |
+| artifact-127 | active-reset-20260429 / EXP-136 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 8623.8 | source_pin, owned_original_log | 486363.8 (N/A) | N/A | unavailable | N/A |
+| artifact-128 | active-reset-20260429 / EXP-137 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 8573.6 | source_pin, owned_original_log | 489211.5 (N/A) | N/A | unavailable | N/A |
+| artifact-129 | active-reset-20260429 / EXP-138 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 16604.5 | source_pin, owned_original_log | 505200.9 (N/A) | N/A | unavailable | N/A |
+| artifact-130 | active-reset-20260429 / EXP-140 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 8642.3 | source_pin, owned_original_log | 485322.7 (N/A) | N/A | unavailable | N/A |
+| artifact-131 | active-reset-20260429 / EXP-141 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 8623.6 | source_pin, owned_original_log | 486375.1 (N/A) | N/A | unavailable | N/A |
+| artifact-132 | active-reset-20260429 / EXP-142 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 8600.1 | source_pin, owned_original_log | 487704.1 (N/A) | N/A | unavailable | N/A |
+| artifact-133 | active-reset-20260429 / EXP-143 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 9798.4 | source_pin, owned_original_log | 428060.1 (N/A) | N/A | unavailable | N/A |
+| artifact-134 | active-reset-20260429 / EXP-152 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 40201.1 | source_pin, owned_original_log | 104333.1 (N/A) | N/A | unavailable | N/A |
+| artifact-135 | active-reset-20260429 / EXP-153 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 39094.8 | source_pin, owned_original_log | 107285.5 (N/A) | N/A | unavailable | N/A |
+| artifact-136 | active-reset-20260429 / EXP-154 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 39059.1 | source_pin, owned_original_log | 107383.5 (N/A) | N/A | unavailable | N/A |
+| artifact-137 | active-reset-20260429 / EXP-160 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 43294.6 | source_pin, owned_original_log | 193756.4 (N/A) | N/A | unavailable | N/A |
+| artifact-138 | active-reset-20260429 / EXP-161 | qwen3vl_hybrid | 128 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 70202.5 | source_pin, owned_original_log | 119491.6 (N/A) | N/A | unavailable | N/A |
+| artifact-139 | active-reset-20260429 / EXP-162 | qwen3vl_hybrid | 128 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 69757.1 | source_pin, owned_original_log | 120254.5 (N/A) | N/A | unavailable | N/A |
+| artifact-140 | active-reset-20260429 / EXP-163 | qwen3vl_hybrid | 128 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 79219.1 | source_pin, owned_original_log | 211782.5 (N/A) | N/A | unavailable | N/A |
+| artifact-141 | active-reset-20260429 / EXP-164 | qwen3vl_hybrid | 256 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 117029.9 | source_pin, owned_original_log | 143358.4 (N/A) | N/A | unavailable | N/A |
+| artifact-142 | active-reset-20260429 / EXP-165 | qwen3vl_hybrid | 256 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 116344.2 | source_pin, owned_original_log | 144203.3 (N/A) | N/A | unavailable | N/A |
+| artifact-143 | active-reset-20260429 / EXP-172 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 16590.9 | source_pin, owned_original_log | 505615.0 (N/A) | N/A | unavailable | N/A |
+| artifact-144 | active-reset-20260429 / EXP-180 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 16261.4 | source_pin, owned_original_log | 515860.1 (N/A) | N/A | unavailable | N/A |
+| artifact-145 | active-reset-20260429 / EXP-182 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 16264.8 | source_pin, owned_original_log | 515752.3 (N/A) | N/A | unavailable | N/A |
+| artifact-146 | active-reset-20260429 / EXP-185 | qwen3vl_hybrid | 64 / 512 / 65536 | iters 10-50 | accepted_measurement_artifact | 163754.3 | source_pin, owned_original_log | 204907.2 (N/A) | N/A | unavailable | N/A |
+| artifact-147 | active-reset-20260429 / EXP-200 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 8590.2 | source_pin, owned_original_log | 488266.2 (N/A) | N/A | unavailable | N/A |
+| artifact-148 | active-reset-20260429 / UNKNOWN | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 9005.8 | source_pin, owned_original_log | 465733.6 (N/A) | N/A | unavailable | N/A |
+| artifact-149 | active-reset-20260429 / UNKNOWN | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 8997.7 | source_pin, owned_original_log | 466152.9 (N/A) | N/A | unavailable | N/A |
+| artifact-150 | active-reset-20260429 / UNKNOWN | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 8992.3 | source_pin, owned_original_log | 466432.8 (N/A) | N/A | unavailable | N/A |
+| artifact-151 | active-reset-20260429 / EXP-207 | null | None / None / None | null | recorded_failed | None | model, world, gbs, config, owned_original_log, sequence_length | N/A | N/A | unavailable | N/A |
+| artifact-152 | active-reset-20260429 / EXP-208 | null | None / None / None | null | recorded_failed | None | model, world, gbs, config, owned_original_log, sequence_length | N/A | N/A | unavailable | N/A |
+| artifact-153 | active-reset-20260429 / UNKNOWN | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 9457.1 | source_pin, owned_original_log | 443508.5 (N/A) | N/A | unavailable | N/A |
+| artifact-154 | active-reset-20260429 / UNKNOWN | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 9436.5 | source_pin, owned_original_log | 444476.7 (N/A) | N/A | unavailable | N/A |
+| artifact-155 | active-reset-20260429 / EXP-212 | null | None / None / None | null | recorded_failed | None | model, world, gbs, config, owned_original_log, sequence_length | N/A | N/A | unavailable | N/A |
+| artifact-156 | active-reset-20260429 / EXP-213 | null | None / None / None | null | recorded_failed | None | model, world, gbs, config, owned_original_log, sequence_length | N/A | N/A | unavailable | N/A |
+| artifact-157 | active-reset-20260429 / EXP-230 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 8997.7 | source_pin, owned_original_log | 466152.9 (N/A) | N/A | unavailable | N/A |
+| artifact-158 | active-reset-20260429 / EXP-231 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 21999.4 | source_pin, owned_original_log | 190655.4 (N/A) | N/A | unavailable | N/A |
+| artifact-159 | active-reset-20260429 / EXP-232 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 39437.9 | source_pin, owned_original_log | 106352.1 (N/A) | N/A | unavailable | N/A |
+| artifact-160 | active-reset-20260429 / EXP-233 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 21879.8 | source_pin, owned_original_log | 191697.5 (N/A) | N/A | unavailable | N/A |
+| artifact-161 | active-reset-20260429 / EXP-234 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 15493.8 | source_pin, owned_original_log | 270708.5 (N/A) | N/A | unavailable | N/A |
+| artifact-162 | active-reset-20260429 / EXP-235 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 16037.8 | source_pin, owned_original_log | 261526.1 (N/A) | N/A | unavailable | N/A |
+| artifact-163 | active-reset-20260429 / EXP-236 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 39472.2 | source_pin, owned_original_log | 106259.7 (N/A) | N/A | unavailable | N/A |
+| artifact-164 | active-reset-20260429 / EXP-237 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 21755.2 | source_pin, owned_original_log | 192795.5 (N/A) | N/A | unavailable | N/A |
+| artifact-165 | active-reset-20260429 / EXP-238 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 16106.6 | source_pin, owned_original_log | 260409.0 (N/A) | N/A | unavailable | N/A |
+| artifact-166 | active-reset-20260429 / EXP-239 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 17300.3 | source_pin, owned_original_log | 242441.1 (N/A) | N/A | unavailable | N/A |
+| artifact-167 | active-reset-20260429 / EXP-240 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 26962.8 | source_pin, owned_original_log | 155558.9 (N/A) | N/A | unavailable | N/A |
+| artifact-168 | active-reset-20260429 / EXP-241 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 16635.4 | source_pin, owned_original_log | 252131.2 (N/A) | N/A | unavailable | N/A |
+| artifact-169 | active-reset-20260429 / EXP-246 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 21298.8 | source_pin, owned_original_log | 196926.8 (N/A) | N/A | unavailable | N/A |
+| artifact-170 | active-reset-20260429 / EXP-247 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 36418.5 | source_pin, owned_original_log | 115169.6 (N/A) | N/A | unavailable | N/A |
+| artifact-171 | active-reset-20260429 / EXP-248 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 20604 | source_pin, owned_original_log | 203567.5 (N/A) | N/A | unavailable | N/A |
+| artifact-172 | active-reset-20260429 / EXP-249 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 35310.2 | source_pin, owned_original_log | 118784.5 (N/A) | N/A | unavailable | N/A |
+| artifact-173 | active-reset-20260429 / EXP-250 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 10447.2 | source_pin, owned_original_log | 401476.4 (N/A) | N/A | unavailable | N/A |
+| artifact-174 | active-reset-20260429 / EXP-251 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 10350.8 | source_pin, owned_original_log | 405215.4 (N/A) | N/A | unavailable | N/A |
+| artifact-175 | active-reset-20260429 / EXP-254 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 40251.2 | source_pin, owned_original_log | 104203.2 (N/A) | N/A | unavailable | N/A |
+| artifact-176 | active-reset-20260429 / EXP-255 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 26562.5 | source_pin, owned_original_log | 157903.2 (N/A) | N/A | unavailable | N/A |
+| artifact-177 | active-reset-20260429 / EXP-256 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 44493.4 | source_pin, owned_original_log | 188536.0 (N/A) | N/A | unavailable | N/A |
+| artifact-178 | active-reset-20260429 / EXP-257 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 29317.1 | source_pin, owned_original_log | 286133.6 (N/A) | N/A | unavailable | N/A |
+| artifact-179 | active-reset-20260429 / EXP-258 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 45307.5 | source_pin, owned_original_log | 185148.3 (N/A) | N/A | unavailable | N/A |
+| artifact-180 | active-reset-20260429 / EXP-259 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 28021.9 | source_pin, owned_original_log | 299359.0 (N/A) | N/A | unavailable | N/A |
+| artifact-181 | active-reset-20260429 / EXP-261 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 12263.3 | source_pin, owned_original_log | 684041.7 (N/A) | N/A | unavailable | N/A |
+| artifact-182 | active-reset-20260429 / EXP-263 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 33465.9 | source_pin, owned_original_log | 250661.4 (N/A) | N/A | unavailable | N/A |
+| artifact-183 | active-reset-20260429 / EXP-264 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 36513 | source_pin, owned_original_log | 114871.5 (N/A) | N/A | unavailable | N/A |
+| artifact-184 | active-reset-20260429 / EXP-265 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 28602.9 | source_pin, owned_original_log | 146639.1 (N/A) | N/A | unavailable | N/A |
+| artifact-185 | active-reset-20260429 / EXP-PR131-ENCODER-CP1-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 4170.2 | source_pin, dataset | 251445.0 (N/A) | N/A | unavailable | N/A |
+| artifact-186 | active-reset-20260429 / EXP-PR131-ENCODER-CP1-PAIR749724-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 4358.8 | source_pin, dataset | 240565.3 (N/A) | N/A | unavailable | N/A |
+| artifact-187 | active-reset-20260429 / EXP-PR131-ENCODER-CP2-PAIR749724-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 4538.4 | source_pin, dataset | 231045.3 (N/A) | N/A | unavailable | N/A |
+| artifact-188 | active-reset-20260429 / EXP-PR131-IMAGE1X-CP1-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 4144.3 | source_pin, dataset | 253016.4 (N/A) | N/A | unavailable | N/A |
+| artifact-189 | active-reset-20260429 / EXP-PR131-IMAGE1X-CP2-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 4293.5 | source_pin, dataset | 244224.1 (N/A) | N/A | unavailable | N/A |
+| artifact-190 | active-reset-20260429 / EXP-PR131-IMAGE2X-CP1-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 4151.5 | source_pin, dataset | 252577.6 (N/A) | N/A | unavailable | N/A |
+| artifact-191 | active-reset-20260429 / EXP-PR131-IMAGE2X-CP2-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 4267.2 | source_pin, dataset | 245729.3 (N/A) | N/A | unavailable | N/A |
+| artifact-192 | active-reset-20260429 / EXP-PR131-IMAGE4X-CP1-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 4574.4 | source_pin, dataset | 229227.0 (N/A) | N/A | unavailable | N/A |
+| artifact-193 | active-reset-20260429 / EXP-PR131-IMAGE4X-CP2-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 4806.8 | source_pin, dataset | 218144.3 (N/A) | N/A | unavailable | N/A |
+| artifact-194 | active-reset-20260429 / EXP-PR131-IMAGE8X-CP1-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 5571.4 | source_pin, dataset | 188206.9 (N/A) | N/A | unavailable | N/A |
+| artifact-195 | active-reset-20260429 / EXP-PR131-IMAGE8X-CP2-GB300 | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 6054.7 | source_pin, dataset | 173183.8 (N/A) | N/A | unavailable | N/A |
+| artifact-196 | active-reset-20260429 / EXP-PR131-MANTIS16-752807-20-GB300-legacy-window | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 7221.1 | source_pin | 145210.0 (N/A) | N/A | unavailable | N/A |
+| artifact-197 | active-reset-20260429 / EXP-PR131-MANTIS16-752807-20-GB300 | qwen3vl | 16 / 64 / 16384 | [4, 20] | accepted_measurement_artifact | 7221.1 | source_pin | 145210.0 (N/A) | N/A | unavailable | N/A |
+| artifact-198 | active-reset-20260429 / EXP-PR131-TFLOPS16-SEQ4096-GBS256 | qwen3vl | 16 / 256 / 4096 | iters 10-50 | accepted_measurement_artifact | 7296 | source_pin | 143719.3 (N/A) | N/A | unavailable | N/A |
+| artifact-199 | active-reset-20260429 / EXP-PR7-FOURWAY-751915-pr7_baseline | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 14961 | source_pin, dataset | 70087.3 (N/A) | N/A | unavailable | N/A |
+| artifact-200 | active-reset-20260429 / EXP-PR7-FOURWAY-752159-pr131_latest | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 8901.4 | source_pin, dataset | 117799.0 (N/A) | N/A | unavailable | N/A |
+| artifact-201 | active-reset-20260429 / EXP-PR7-FOURWAY-752159-pr7_baseline | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 13804.5 | source_pin, dataset | 75959.0 (N/A) | N/A | unavailable | N/A |
+| artifact-202 | active-reset-20260429 / EXP-PR7-FOURWAY-752159-pr7_mdp | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 11479.4 | source_pin, dataset | 91344.1 (N/A) | N/A | unavailable | N/A |
+| artifact-203 | active-reset-20260429 / EXP-PR7-FOURWAY-752159-pr7_packing | qwen3vl | 16 / 64 / 16384 | iters 10-50 | accepted_measurement_artifact | 9820.5 | source_pin, dataset | 106774.2 (N/A) | N/A | unavailable | N/A |
+| artifact-204 | active-reset-20260429 / EXP-bridge1 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14362.6 | source_pin, dataset, owned_original_log | 146014.8 (N/A) | N/A | unavailable | N/A |
+| artifact-205 | active-reset-20260429 / EXP-bridge2 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14587.7 | source_pin, dataset, owned_original_log | 143761.7 (N/A) | N/A | unavailable | N/A |
+| artifact-206 | active-reset-20260429 / EXP-va1 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 21436.9 | source_pin, dataset, owned_original_log | 293487.2 (N/A) | N/A | unavailable | N/A |
+| artifact-207 | active-reset-20260429 / EXP-va2 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 36553.8 | source_pin, dataset, owned_original_log | 172115.0 (N/A) | N/A | unavailable | N/A |
+| artifact-208 | active-reset-20260429 / EXP-va3 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 24283.3 | source_pin, dataset, owned_original_log | 259085.7 (N/A) | N/A | unavailable | N/A |
+| artifact-209 | active-reset-20260429 / EXP-va4 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14570.9 | source_pin, dataset, owned_original_log | 143927.4 (N/A) | N/A | unavailable | N/A |
+| artifact-210 | active-reset-20260429 / EXP-va5 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 25380.7 | source_pin, dataset, owned_original_log | 247883.5 (N/A) | N/A | unavailable | N/A |
+| artifact-211 | active-reset-20260429 / EXP-va6 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 39772.5 | source_pin, dataset, owned_original_log | 158186.1 (N/A) | N/A | unavailable | N/A |
+| artifact-212 | active-reset-20260429 / EXP-varimg2 | qwen3vl_hybrid | 64 / 512 / 4096 | iters 10-50 | accepted_measurement_artifact | 14669.1 | source_pin, dataset, owned_original_log | 142963.9 (N/A) | N/A | unavailable | N/A |
+| artifact-213 | active-reset-20260429 / EXP-varlen3 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 19456.8 | source_pin, dataset, owned_original_log | 323355.1 (N/A) | N/A | unavailable | N/A |
+| artifact-214 | active-reset-20260429 / EXP-varlen6 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 21527.7 | source_pin, dataset, owned_original_log | 292249.3 (N/A) | N/A | unavailable | N/A |
+| artifact-215 | active-reset-20260429 / EXP-vb1 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 22704.8 | source_pin, dataset, owned_original_log | 369464.1 (N/A) | N/A | unavailable | N/A |
+| artifact-216 | active-reset-20260429 / EXP-vb2 | qwen3vl_hybrid | 64 / 512 / 24576 | iters 10-50 | accepted_measurement_artifact | 27402.5 | source_pin, dataset, owned_original_log | 459188.5 (N/A) | N/A | unavailable | N/A |
+| artifact-217 | active-reset-20260429 / EXP-vb3 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 33112.4 | source_pin, dataset, owned_original_log | 506674.7 (N/A) | N/A | unavailable | N/A |
+| artifact-218 | active-reset-20260429 / EXP-vb4 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 36434.1 | source_pin, dataset, owned_original_log | 230240.6 (N/A) | N/A | unavailable | N/A |
+| artifact-219 | active-reset-20260429 / EXP-vb5 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 46711 | source_pin, dataset, owned_original_log | 359170.6 (N/A) | N/A | unavailable | N/A |
+| artifact-220 | active-reset-20260429 / EXP-vb6 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 27917.1 | source_pin, dataset, owned_original_log | 300482.8 (N/A) | N/A | unavailable | N/A |
+| artifact-221 | active-reset-20260429 / EXP-vc1 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 22355.7 | source_pin, dataset, owned_original_log | 281425.1 (N/A) | N/A | unavailable | N/A |
+| artifact-222 | active-reset-20260429 / EXP-vc3 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 43032 | source_pin, dataset, owned_original_log | 146204.1 (N/A) | N/A | unavailable | N/A |
+| artifact-223 | active-reset-20260429 / EXP-vc4 | qwen3vl_hybrid | 64 / 512 / 8192 | iters 10-50 | accepted_measurement_artifact | 18243.3 | source_pin, dataset, owned_original_log | 229909.3 (N/A) | N/A | unavailable | N/A |
+| artifact-224 | active-reset-20260429 / EXP-vc5 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 22295.7 | source_pin, dataset, owned_original_log | 282182.5 (N/A) | N/A | unavailable | N/A |
+| artifact-225 | active-reset-20260429 / EXP-vc6 | qwen3vl_hybrid | 64 / 512 / 24576 | iters 10-50 | accepted_measurement_artifact | 41377.8 | source_pin, dataset, owned_original_log | 304098.1 (N/A) | N/A | unavailable | N/A |
+| artifact-226 | active-reset-20260429 / EXP-vd1 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 26621.8 | source_pin, dataset, owned_original_log | 236327.2 (N/A) | N/A | unavailable | N/A |
+| artifact-227 | active-reset-20260429 / EXP-vd2 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 27288.4 | source_pin, dataset, owned_original_log | 230554.2 (N/A) | N/A | unavailable | N/A |
+| artifact-228 | active-reset-20260429 / EXP-vd3 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 38304 | source_pin, dataset, owned_original_log | 438001.7 (N/A) | N/A | unavailable | N/A |
+| artifact-229 | active-reset-20260429 / EXP-vd4 | qwen3vl_hybrid | 64 / 512 / 32768 | iters 10-50 | accepted_measurement_artifact | 51145.1 | source_pin, dataset, owned_original_log | 328031.7 (N/A) | N/A | unavailable | N/A |
+| artifact-230 | active-reset-20260429 / EXP-vd5 | qwen3vl_hybrid | 64 / 512 / 12288 | iters 10-50 | accepted_measurement_artifact | 28451.8 | source_pin, dataset, owned_original_log | 221126.8 (N/A) | N/A | unavailable | N/A |
+| artifact-231 | active-reset-20260429 / EXP-vd6 | qwen3vl_hybrid | 64 / 512 / 16384 | iters 10-50 | accepted_measurement_artifact | 25960.6 | source_pin, dataset, owned_original_log | 323128.4 (N/A) | N/A | unavailable | N/A |
 
 </details>
