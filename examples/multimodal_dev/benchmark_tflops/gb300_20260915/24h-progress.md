@@ -1,6 +1,6 @@
 # Ongoing qualification status
 
-As of 2026-09-15 18:12 UTC. This is an incomplete work log, not a completed sweep or performance result. The fixed-input work below is distinct from historical variable-mock measurements.
+As of 2026-09-16 02:32 UTC. This is an incomplete work log, not a completed sweep or performance result. The fixed-input work below is distinct from historical variable-mock measurements.
 
 | Attempt | Observed outcome | Evidence limit |
 |---|---|---|
@@ -34,3 +34,20 @@ The corrected production diff, regression tests and source/data/tokenizer seals 
 |Corrected full native Mantis test|`c9d11f8229683585c467763505b988a93c48d60326b8ae882e33d66d07cdae99`|
 
 These fingerprints identify retained private artifacts; neither their source changes nor raw manifests are bundled here. No corrected rate, new throughput measurement, or performance improvement is claimed. A future pair requires the same corrected baseline, workload, world size 16 / GBS 64 / MBS 1 and complete stack, with primary iterations 4–20 and supplemental iterations 10–20. Historical run 752807 cannot substitute for that matched baseline.
+
+## Data deadline and preserved fallback
+
+The data-readiness deadline was 2026-09-15 21:32:06 UTC. All owned download handles are now terminal. The remaining transfers ended on their configured deadline; shell exit zero records receipt completion, not successful completion of every file. Partial downloads were preserved, not deleted or silently accepted.
+
+| Pinned source selection | Verified files | Remaining failed file / preserved bytes |
+|---|---:|---|
+|Mantis-Instruct|35 / 36|llava_665k_multi/train_images.zip / 42,547,065,657 bytes|
+|M4-Instruct|40 / 41|TQA.zip / 8,237,613,056 bytes|
+|PixMo|111 / 111|None in the selected manifest|
+|ShareGPTVideo backing frames|17 / 17|None: 16 frame TAR archives plus README, not 17 media archives|
+
+Receipt hashes, exact manifest membership, sizes and recorded verified LFS digests were independently checked. This review did not rehash hundreds of gigabytes. Transfer completion alone does not establish native eligibility: whole-source preparation and the requested 1:1:1 native blend remain unmet, and M4 frame grouping, order, temporal semantics and annotation mapping remain unqualified. Native preparation and corrected-runtime execution denials remain active.
+
+The fallback is the **existing, separately preserved 256-record Mantis slice**, comprising 236 training and 20 validation records from llava_665k_multi, with evaluation disabled (`eval_iters=0`). It has not been overwritten, replaced by whole Mantis, or relabelled as a full-source blend. Prior qualification 752786 and formal run 752807 apply to that same standalone slice; this deadline decision is not a new formal run or performance result. Its selected ZIP members have CRC/local-SHA checks, not an authenticated whole-source ZIP hash. The demonstrated original loader restore failure also prevents a blanket checkpoint-resume claim.
+
+The retained deadline receipt has SHA-256 `70de1bdabe4238bce5d4654e05f87bca8cf7ad30f80ae82e98df0dbff18a1ef9`; the slice preparation receipt has SHA-256 `fdfa1e70b139be8f53d4bbff421600114fcd2e0a7c0f8c13e2d5b642bbafccbe`. These identify evidence without exposing private paths. No data conversion, download restart or training dispatch accompanies this update.
