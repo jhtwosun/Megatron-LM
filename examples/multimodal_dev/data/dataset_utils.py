@@ -26,6 +26,9 @@ class RawSample:
     images: List[Image.Image]
     text: str
     image_descriptors: Optional[List[Dict]] = None
+    reference_input_ids: Optional[torch.Tensor] = None
+    reference_labels: Optional[torch.Tensor] = None
+    reference_loss_mask: Optional[torch.Tensor] = None
 
 
 _ZIP_FILE_CACHE: Dict[str, zipfile.ZipFile] = {}

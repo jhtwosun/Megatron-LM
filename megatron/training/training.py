@@ -2183,7 +2183,12 @@ def train_step(
                 torch.distributed.all_reduce(
                     val, group=mpu.get_data_parallel_group(with_context_parallel=True)
                 )
-                loss_reduced[key] = val[0] / val[1]
+                if key.startswith("ref_geom_"):
+                    # Geometry is a per-packed-item mean, not a supervised-token loss.
+                    # Keep integer collective sums exact, then retain float64 ratio precision.
+                    loss_reduced[key] = val[0].double() / val[1].double()
+                else:
+                    loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()
@@ -2260,6 +2265,10 @@ def training_log(
     got_nan = False
     for key in loss_dict:
         if not skipped_iter:
+            if key.startswith("ref_geom_"):
+                previous = total_loss_dict.get(key, torch.zeros_like(loss_dict[key], dtype=torch.float64))
+                total_loss_dict[key] = previous.double() + loss_dict[key].double()
+                continue
             total_loss_dict[key] = (
                 total_loss_dict.get(key, torch.tensor([0.0], dtype=torch.float, device='cuda'))
                 + loss_dict[key]
@@ -2526,9 +2535,13 @@ def training_log(
                     max(1, total_loss_dict[advanced_iters_key])
                 )
                 if avg >= 0.0:
-                    log_string += ' {}: {:.6E} |'.format(key, avg)
+                    if key.startswith("ref_geom_"):
+                        log_string += ' {}: {:.12E} |'.format(key, avg)
+                    else:
+                        log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
-                    total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
+                    dtype = torch.float64 if key.startswith("ref_geom_") else torch.float
+                    total_loss_dict[key] = torch.tensor([0.0], dtype=dtype, device='cuda')
         if args.num_experts is not None and moe_log_string:
             log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'

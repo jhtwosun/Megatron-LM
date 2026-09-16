@@ -197,6 +197,9 @@ def _task_encoder(
         mdp_loader_prepartition_encoder_stage=layout.prepartition_encoder_stage,
         mdp_loader_prepartition_materialize=bool(materialize),
         mdp_lpt_hidden_size=int(getattr(args, "vision_hidden_size", 1152)),
+        thd_static_packing=bool(getattr(args, "thd_static_packing", False)),
+        thd_max_packed_sequences=int(getattr(args, "thd_max_packed_sequences", 32)),
+        report_workload_geometry=bool(getattr(args, "energon_report_workload_geometry", False)),
     )
 
 

@@ -149,6 +149,11 @@ def add_multimodal_args(parser):
         help="Energon worker prefetch factor",
     )
     group.add_argument(
+        "--energon-report-workload-geometry",
+        action="store_true",
+        help="Report retained content and global vision geometry without changing training loss",
+    )
+    group.add_argument(
         "--pack-samples-per-item",
         type=int,
         default=1,

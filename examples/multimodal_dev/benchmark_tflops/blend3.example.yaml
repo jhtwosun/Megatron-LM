@@ -1,0 +1,25 @@
+# Replace all dataset paths with the paths inside your container.
+__module__: megatron.energon
+__class__: MetadatasetV2
+splits:
+  train:
+    blend:
+      - weight: 1
+        path: /data/qwen35-energon-lazy-mantis
+        subflavors:
+          crude_type: qwen35
+          source_dataset: mantis
+      - weight: 1
+        path: /data/qwen35-energon-lazy-m4
+        subflavors:
+          crude_type: qwen35
+          source_dataset: m4
+      - weight: 1
+        path: /data/qwen35-energon-lazy-pixmo
+        subflavors:
+          crude_type: qwen35
+          source_dataset: pixmo
+  val:
+    path: /data/LLaVA-Pretrain/wds
+  test:
+    path: /data/LLaVA-Pretrain/wds

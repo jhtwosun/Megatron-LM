@@ -219,50 +219,35 @@ def _apply_rotary_pos_emb_thd(
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
-
-    # Handle two different frequency tensor formats:
-    # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
-    #    -> Use offset-based mapping for exact positional correspondence
-    # 2. Otherwise: freqs contains only max sequence length positions
-    #    -> Use traditional mapping without offsets (map first :seqlen part)
-    if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]:
-        # CASE 1: Exact mapping with offsets
-        # Build packed freqs in one pass, then apply once to the whole packed tensor
-        sequence_splits = torch.split(t, seqlens)
-        freq_slices = []
-        for i, x in enumerate(sequence_splits):
-            # cu_seqlens[i] is the starting offset of this sequence in the original batch
-            seq_start_offset = cu_seqlens[i].item()
-            freq_slices.append(
-                _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
-            )
-
-        freqs_packed = torch.cat(freq_slices, dim=0)
-
-        return _apply_rotary_pos_emb_bshd(
-            t.unsqueeze(1),
-            freqs_packed,
-            rotary_interleaved=rotary_interleaved,
-            mla_rotary_interleaved=mla_rotary_interleaved,
-            mscale=mscale,
-        ).squeeze(1)
-    else:
-        # CASE 2: Traditional mapping without offsets
-        # Build packed freqs for all sequences using the standard mapping, then apply once
-        sequence_splits = torch.split(t, seqlens)
-        freqs_packed = torch.cat(
-            [_get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs) for x in sequence_splits],
-            dim=0,
+    # Tensorized mapping follows the reference MDP fast-pass implementation.
+    # Keep the original full-frequency-table convention instead of inspecting
+    # CUDA boundaries on the host: replay must accept new layouts in one graph.
+    global_cu = cu_seqlens.to(torch.int64)
+    local_lengths = (global_cu[1:] - global_cu[:-1]) // cp_size
+    local_cu = torch.cat((global_cu.new_zeros(1), local_lengths.cumsum(0)))
+    token_pos = torch.arange(t.shape[0], device=t.device, dtype=torch.int64)
+    # right=True skips zero-length entries in fixed-capacity packed metadata.
+    seq_idx = torch.searchsorted(local_cu, token_pos, right=True) - 1
+    local_pos = token_pos - local_cu[seq_idx]
+    if cp_size > 1:
+        half = local_lengths[seq_idx] // 2
+        freq_pos = torch.where(
+            local_pos < half,
+            cp_rank * half + local_pos,
+            local_lengths[seq_idx] * cp_size - (cp_rank + 1) * half + local_pos - half,
         )
-
-        return _apply_rotary_pos_emb_bshd(
-            t.unsqueeze(1),
-            freqs_packed,
-            rotary_interleaved=rotary_interleaved,
-            mla_rotary_interleaved=mla_rotary_interleaved,
-            mscale=mscale,
-        ).squeeze(1)
+    else:
+        freq_pos = local_pos
+    freq_pos = freq_pos + torch.where(
+        global_cu[-1] == freqs.shape[0], global_cu[seq_idx], 0
+    )
+    return _apply_rotary_pos_emb_bshd(
+        t.unsqueeze(1),
+        freqs[freq_pos],
+        rotary_interleaved=rotary_interleaved,
+        mla_rotary_interleaved=mla_rotary_interleaved,
+        mscale=mscale,
+    ).squeeze(1)
 
 
 def apply_rotary_pos_emb(

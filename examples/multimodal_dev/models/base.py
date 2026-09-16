@@ -433,6 +433,29 @@ class MultimodalModel(MegatronModule):
         if dependency.requires_grad:
             dependency.backward()
 
+    @property
+    def decoder(self):
+        return self.language_model.decoder
+
+    @property
+    def mtp(self):
+        return self.language_model.mtp
+
+    @property
+    def rotary_pos_emb(self):
+        return self.language_model.rotary_pos_emb
+
+    @property
+    def position_embedding_type(self):
+        return self.language_model.position_embedding_type
+
+    def get_static_thd_rotary_pos_emb(self, seq_length):
+        """Capture frequencies use the same unsliced global MRoPE shape as THD runtime."""
+        positions = torch.arange(seq_length, device=self.rotary_pos_emb.inv_freq.device)
+        positions = positions.view(1, 1, -1).expand(3, 1, -1)
+        return self.rotary_pos_emb(positions, self.language_model.config.mrope_section,
+                                   cp_group=_NO_CP_GROUP)
+
     def set_input_tensor(self, input_tensor):
         """Route pipeline input tensors to the language decoder."""
         if not isinstance(input_tensor, list):

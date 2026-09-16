@@ -85,8 +85,18 @@ class Qwen35VLDataset(Dataset):
         seed: int = 0,
         subsets: Optional[Sequence[str]] = None,
         split: str = "train",
+        thd_static_packing: bool = False,
+        thd_max_packed_sequences: int = 32,
+        max_seqlen_per_dp_cp_rank: Optional[int] = None,
     ):
         self.seq_length = int(seq_length)
+        self.thd_static_packing = bool(thd_static_packing)
+        self.thd_max_packed_sequences = int(thd_max_packed_sequences)
+        if self.thd_static_packing:
+            if self.thd_max_packed_sequences < 2:
+                raise ValueError("static THD requires a real-document and tail slot")
+            if not max_seqlen_per_dp_cp_rank or max_seqlen_per_dp_cp_rank * cp_size != self.seq_length:
+                raise ValueError("static THD local/CP/global token budgets disagree")
         self.vocab_size = int(vocab_size)
         self.image_token_id = int(image_token_id)
         self.video_token_id = int(video_token_id)
@@ -286,6 +296,7 @@ class Qwen35VLDataset(Dataset):
         input_ids: torch.Tensor,
         segment_lens: Sequence[int],
         content_lens: Sequence[int],
+        reference_docs: Optional[Sequence[dict]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if len(segment_lens) != len(content_lens):
             raise RuntimeError(
@@ -325,6 +336,15 @@ class Qwen35VLDataset(Dataset):
             loss_mask[offset:] = 0.0
         loss_mask[-1] = 0.0
         labels[loss_mask == 0.0] = -100
+        if reference_docs is not None:
+            if len(reference_docs) != len(segment_lens):
+                raise ValueError("reference document count mismatch")
+            offset = 0
+            for doc, seg_len, content_len in zip(reference_docs, segment_lens, content_lens):
+                if "reference_labels" in doc:
+                    labels[offset:offset + content_len] = doc["reference_labels"]
+                    loss_mask[offset:offset + content_len] = doc["reference_loss_mask"]
+                offset += seg_len
         return labels, loss_mask
 
     def _prepartition_assignment_tensor(self, assignment: Dict[int, Sequence[Tuple[int, int]]]):
@@ -478,6 +498,7 @@ class Qwen35VLDataset(Dataset):
         return backend[li]
 
     def _build_doc(self, raw: RawSample) -> dict:
+        reference = self._reference_content(raw)
         per_image_grid_thw: List[List[int]] = []
         per_image_patches: List[torch.Tensor] = []
         per_image_patch_count: List[int] = []
@@ -544,17 +565,30 @@ class Qwen35VLDataset(Dataset):
             image_block_cost += this_cost
 
         text_budget = max(0, self.seq_length - image_block_cost)
-        text_tokens_full = self._text_to_tokens(raw.text)
+        text_tokens_full = (self._text_to_tokens(raw.text) if reference is None
+                            else torch.empty(0, dtype=torch.long))
         text_tokens = text_tokens_full[:text_budget]
         parts = []
         for n_tok in per_image_token_count:
             parts.append(self._image_block(n_tok))
         if int(text_tokens.numel()) > 0:
             parts.append(text_tokens)
-        if not parts:
+        if not parts and reference is None:
             raise ValueError("empty multimodal sample")
 
-        real_input_ids = torch.cat(parts)
+        real_input_ids = torch.cat(parts) if reference is None else reference[0]
+        if reference is not None:
+            if len(per_image_grid_thw) != len(raw.image_descriptors or []):
+                raise ValueError("reference images must not be dropped or truncated")
+            starts = (real_input_ids == self.vision_start_token_id).nonzero().flatten().tolist()
+            if len(starts) != len(per_image_token_count):
+                raise ValueError("reference image-start count mismatch")
+            for start, count in zip(starts, per_image_token_count):
+                span = real_input_ids[start + 1:start + 1 + count]
+                if span.numel() != count or not bool((span == self.image_token_id).all()):
+                    raise ValueError("reference image-placeholder ordering mismatch")
+            if int((real_input_ids == self.image_token_id).sum()) != sum(per_image_token_count):
+                raise ValueError("reference image-placeholder count mismatch")
         real_len = int(real_input_ids.numel())
         if real_len > self.seq_length:
             raise RuntimeError(
@@ -573,7 +607,7 @@ class Qwen35VLDataset(Dataset):
         else:
             image_grid_thw = torch.zeros(0, 3, dtype=torch.long)
 
-        return {
+        result = {
             "input_ids": real_input_ids,
             "real_len": int(real_len),
             "content_len": int(real_len),
@@ -583,6 +617,40 @@ class Qwen35VLDataset(Dataset):
             "num_patches": int(sum(per_image_patch_count)),
             "_mdp_image_descriptors": per_image_descriptors,
         }
+        if reference is not None:
+            result["reference_labels"] = reference[1]
+            result["reference_loss_mask"] = reference[2]
+        return result
+
+    def _reference_content(self, raw: RawSample):
+        values = (raw.reference_input_ids, raw.reference_labels, raw.reference_loss_mask)
+        if all(value is None for value in values):
+            return None
+        if any(value is None for value in values):
+            raise ValueError("reference IDs, labels and mask must be supplied together")
+        if any(not isinstance(value, torch.Tensor) or value.device.type != "cpu"
+               or value.ndim != 1 for value in values):
+            raise ValueError("reference content requires one-dimensional CPU tensors")
+        ids, labels, mask = values
+        if not (0 < ids.numel() == labels.numel() == mask.numel() <= self.seq_length):
+            raise ValueError("reference content length mismatch or truncation")
+        if ids.dtype != torch.long or labels.dtype != torch.long:
+            raise ValueError("reference IDs and labels require int64")
+        if mask.dtype != torch.float32:
+            raise ValueError("reference loss mask requires float32")
+        if not bool(torch.isfinite(mask).all()) or not bool(((mask == 0) | (mask == 1)).all()):
+            raise ValueError("reference loss mask must be finite binary values")
+        if raw.images:
+            raise ValueError("reference content requires descriptor-owned pixels")
+        for desc in raw.image_descriptors or []:
+            grid = desc.get("grid_thw", [])
+            if len(grid) != 3 or any(not isinstance(v, int) or v <= 0 for v in grid):
+                raise ValueError("invalid reference temporal/spatial grid")
+            if grid[1] % self.spatial_merge_size or grid[2] % self.spatial_merge_size:
+                raise ValueError("reference spatial grid must be merge divisible")
+        if mask[-1] != 0 or labels[-1] != 0:
+            raise ValueError("reference final token must have zero label/loss")
+        return values
 
     def _finalize_container(self, doc: dict) -> dict:
         S = self.seq_length
@@ -609,6 +677,7 @@ class Qwen35VLDataset(Dataset):
             input_ids,
             [real_total],
             [content_len],
+            reference_docs=[doc],
         )
 
         if int(doc["pixel_values"].shape[0]) > 0:
@@ -662,7 +731,8 @@ class Qwen35VLDataset(Dataset):
             out["pixel_cu_seqlens"] = torch.tensor(
                 [0, int(doc["num_patches"])], dtype=torch.int32,
             )
-        return out
+        self._reference_geometry(out, [doc])
+        return self._static_thd_metadata(out)
 
     def _position_ids_for_doc(self, input_ids: torch.Tensor,
                                    image_grid_thw: torch.Tensor) -> torch.Tensor:
@@ -734,6 +804,7 @@ class Qwen35VLDataset(Dataset):
             input_ids,
             real_lens,
             content_lens,
+            reference_docs=docs,
         )
 
         pixel_parts = [
@@ -828,6 +899,49 @@ class Qwen35VLDataset(Dataset):
             out["max_seqlen"] = torch.tensor(max(padded_seg_lens), dtype=torch.int32)
             out["image_cu_seqlens"] = torch.tensor(image_cu, dtype=torch.int32)
             out["pixel_cu_seqlens"] = torch.tensor(pixel_cu, dtype=torch.int32)
+        self._reference_geometry(out, docs)
+        return self._static_thd_metadata(out)
+
+    @staticmethod
+    def _reference_geometry(out, docs):
+        """Original global content/grid geometry, never padded tokens or owner-local pixels."""
+        is_reference = ["reference_labels" in doc for doc in docs]
+        if not any(is_reference):
+            return
+        if not all(is_reference):
+            raise ValueError("mixed reference/non-reference geometry is not supported")
+        lengths = [int(doc["content_len"]) for doc in docs]
+        rows = [row for doc in docs for row in doc["image_grid_thw"].tolist()]
+        out["_reference_flops_geometry"] = torch.tensor([
+            sum(lengths), sum(length * length for length in lengths),
+            sum(t * h * w for t, h, w in rows),
+            sum(t * (h * w) ** 2 for t, h, w in rows),
+        ], dtype=torch.int64, device="cpu")
+
+    def _static_thd_metadata(self, out):
+        """Pad decoder metadata only; dummy slots never create vision items."""
+        if not getattr(self, "thd_static_packing", False):
+            return out
+        cu = out["cu_seqlens"].tolist()
+        cap = self.thd_max_packed_sequences
+        if len(cu) - 1 > cap - 1:
+            raise ValueError("static THD real documents exceed reserved capacity")
+        if cu[-1] < self.seq_length:
+            if bool(out["loss_mask"][cu[-1]:].any()):
+                raise ValueError("static THD tail must have zero loss")
+            cu.append(self.seq_length)
+        if cu[-1] != self.seq_length or any((b - a) % (2 * self.cp_size)
+                                          for a, b in zip(cu, cu[1:])):
+            raise ValueError("static THD boundaries violate CP/global budget")
+        cu.extend([self.seq_length] * (cap + 1 - len(cu)))
+        out["cu_seqlens"] = torch.tensor(cu, dtype=torch.int32)
+        out["cu_seqlens_padded"] = out["cu_seqlens"].clone()
+        out["max_seqlen"] = torch.tensor(self.seq_length, dtype=torch.int32)
+        # Real image-index ownership is unaffected by repeats of the final count.
+        for key in ("image_cu_seqlens", "pixel_cu_seqlens"):
+            values = out[key].tolist()
+            values.extend([values[-1]] * (cap + 1 - len(values)))
+            out[key] = torch.tensor(values, dtype=torch.int32)
         return out
 
     def _build_packed_item(self, idx) -> dict:
@@ -841,6 +955,9 @@ class Qwen35VLDataset(Dataset):
         used = 0
 
         for off in range(scan_span):
+            if (getattr(self, "thd_static_packing", False)
+                    and len(docs) >= self.thd_max_packed_sequences - 1):
+                break
             raw_idx = start + off
             raw = self._fetch_raw(raw_idx)
             doc = self._build_doc(raw)
@@ -1011,6 +1128,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         prepartition_encoder_stage = True
 
     kwargs = dict(
+        thd_static_packing=getattr(args, "thd_static_packing", False),
+        thd_max_packed_sequences=getattr(args, "thd_max_packed_sequences", 32),
+        max_seqlen_per_dp_cp_rank=getattr(args, "max_seqlen_per_dp_cp_rank", None),
         backend=backend,
         root=root,
         seq_length=getattr(args, "total_seq_length", 4096),

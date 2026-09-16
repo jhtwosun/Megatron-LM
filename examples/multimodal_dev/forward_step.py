@@ -515,7 +515,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
 # Loss
 # -------------------------------------------------------------------
 
-def loss_func(loss_mask, output_tensor):
+def loss_func(loss_mask, output_tensor, reference_geometry=None):
     """Compute masked language model loss."""
     losses = output_tensor.float()
     loss_mask = loss_mask.contiguous().view(-1).float()
@@ -526,7 +526,14 @@ def loss_func(loss_mask, output_tensor):
         [total_loss.clone().detach().view(1), total_tokens.view(1)],
     )
 
-    return (total_loss, total_tokens, {"lm loss": reporting_loss})
+    reporting = {"lm loss": reporting_loss}
+    if reference_geometry is not None:
+        if reference_geometry.dtype != torch.int64 or reference_geometry.numel() != 4:
+            raise ValueError("reference FLOPs geometry requires four int64 counts")
+        geometry = reference_geometry.detach().reshape(4).to(device=output_tensor.device)
+        for key, value in zip(("T", "U", "R", "A"), geometry.unbind()):
+            reporting["ref_geom_" + key] = torch.stack((value, torch.ones_like(value)))
+    return (total_loss, total_tokens, reporting)
 
 
 # -------------------------------------------------------------------
@@ -873,6 +880,11 @@ def forward_step(data_iterator, model, return_schedule_plan=False):
     if batch is None:
         return None, None
 
+    if batch.get("_reference_flops_geometry") is not None:
+        if (args.micro_batch_size != 1
+                or getattr(args, "virtual_pipeline_model_parallel_size", None) not in (None, 0)):
+            raise ValueError("reference geometry reporting is qualified only for MBS1/VPP0")
+
     pixel_values = batch.get("pixel_values", None)
     image_grid_thw = batch.get("image_grid_thw", None)
     if (
@@ -962,4 +974,5 @@ def forward_step(data_iterator, model, return_schedule_plan=False):
                 cp_size=cp_size, cp_rank=cp_rank,
             )
 
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(loss_func, loss_mask,
+                                  reference_geometry=batch.get("_reference_flops_geometry"))

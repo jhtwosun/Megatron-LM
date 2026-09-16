@@ -1,0 +1,33 @@
+{
+  "source_job": 418323,
+  "data": "mock",
+  "world_size": 16,
+  "gbs": 64,
+  "window": [
+    4,
+    20
+  ],
+  "samples": 17,
+  "mean": {
+    "step_ms": 4568.55294117647,
+    "legacy_tflops_gpu": 558.1058823529412,
+    "decoder_modeled_tflops_gpu": 292.11026254039797,
+    "vision_modeled_tflops_gpu": 16.332789662849795,
+    "total_modeled_tflops_gpu": 308.44305220324776
+  },
+  "median": {
+    "step_ms": 4417.4,
+    "legacy_tflops_gpu": 574.0,
+    "decoder_modeled_tflops_gpu": 300.51541904592375,
+    "vision_modeled_tflops_gpu": 16.469293621181983,
+    "total_modeled_tflops_gpu": 317.37854316975995
+  },
+  "definition": "Useful content matmul model, FMA2, training3xforward; whole VLM step denominator",
+  "excluded": [
+    "padding",
+    "router",
+    "norm/RoPE/softmax",
+    "optimizer FLOPs",
+    "kernel internal recomputation"
+  ]
+}

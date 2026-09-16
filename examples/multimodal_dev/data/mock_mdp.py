@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 from typing import Optional
 
@@ -23,12 +24,18 @@ class MockBackend:
             "test": 200_000,
         }
         self.seed = 1729 + split_offsets.get(split, 300_000)
+        self.reference = None
+        if os.environ.get("PR7_REFERENCE_MOCK_CONFIG"):
+            from examples.multimodal_dev.data.reference_mock import ReferenceMock
+            self.reference = ReferenceMock(os.environ["PR7_REFERENCE_MOCK_CONFIG"], split)
 
     def __len__(self) -> int:
         return self.max_samples
 
     def __getitem__(self, idx: int) -> RawSample:
         idx = int(idx) % self.max_samples
+        if self.reference is not None:
+            return self.reference[idx]
         rng = random.Random(self.seed + idx)
 
         num_images = rng.randint(1, 6)
