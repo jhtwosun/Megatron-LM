@@ -4,6 +4,26 @@
 
 The report uses [PR7](https://github.com/jhtwosun/Megatron-LM/pull/7) as a presentation reference; results below retain their own sources and evidence. This documentation branch does not imply that every measured source adaptation is contained in PR131 or this PR. The separate [native accounting ledger](../NATIVE_ACCOUNTING.md) retains its own scope.
 
+## New 20-step reruns: PR131-native components and all-rank memory
+
+These reruns retain the original four mock arms and separately preserved Mantis256 (236 train / 20 validation examples; eval0), not the later loader-serialization candidate. New isolated overlays reuse **exact PR131 `bbba100` `workload_flops.py` and `collect_workload.py`**, plus all-rank allocator recording. Measured model sources remain PR7 `e1484af4` and older PR131 `57a5c223`; the reporting backport is not a model/source-family replacement. Each formal cell uses 20 total steps, LR warmup/decay 2/20, world16/GBS64/MBS1 and primary iterations 4–20; supplemental 10–20 is retained separately. Do not compare these windows/horizons to the older 50-step table as an isolated speedup.
+
+**Accounting follows PR131 itself.** Encoder, useful-content decoder and their sum are arithmetic means of the native per-step component rates over the whole VLM optimizer-step duration. The separate raw Megatron fixed-shape decoder rate is retained, not substituted for useful-content decoder. Prepadding content T/U and global image-grid R/A use PR131's count-normalized aggregation; no custom final-CU correction is applied. The native helper excludes padding/non-matmul work and uses the 3×forward convention, so these are modeled rates, not executed hardware FLOPs or utilization. Peak memory is the maximum across **all 16 ranks**, allocator lifetime including initialization and training, without resets; allocated and reserved are distinct decimal GB.
+
+| Job | Original workload / mode | Status | Median step ms | Scheduled tok/s global (per GPU) | PR131 workload encoder TF/GPU | PR131 workload decoder TF/GPU | PR131 workload total TF/GPU | Megatron native fixed-shape decoder TF/GPU | Peak allocated / reserved GB |
+|---|---|---|---|---|---|---|---|---|---|
+| 759791 | PR7 ordinary / MDP off | Completed 20; verified cell | 13374.4 | 78401.7 (4900.1) | 23.092 | 88.958 | 112.051 | 178.435 | 162.536 / 187.102 |
+| 759791 | PR7 MDP nonfused | Completed 20; verified cell | 10643.4 | 98518.9 (6157.4) | 28.949 | 111.495 | 140.444 | 223.647 | 201.152 / 203.705 |
+| 759791 | PR7 fused-window retain | Completed 20; verified cell | 8116.1 | 129197.0 (8074.8) | 38.552 | 148.500 | 187.052 | 297.876 | 202.550 / 241.433 |
+| 759791 | PR131 fused-window retain | Completed 20; verified cell | 8128.1 | 129006.3 (8062.9) | 40.167 | 154.736 | 194.902 | 310.376 | 233.772 / 235.101 |
+| 759796 | Original Mantis256 / PR131 fused | Completed 20; verified cell | 8677.1 | 120844.1 (7552.8) | 22.967 | 99.693 | 122.660 | 281.282 | 181.995 / 183.744 |
+
+Both formal jobs completed successfully. Consumed geometry is not identical across all modes: rates and timings are descriptive, not an isolated MDP/packing gain; interpret each row with its actual consumed work. Mantis is a different dataset and is not a fifth matched mock arm. Modeled rates are not hardware utilization. The PR7 fused row has higher observed allocator reservation than its nonfused row; reserved memory is not live tensor allocation. No repeated randomized causal estimate is claimed from this ordered rerun.
+
+**Additional fixed-image MDP-off baseline requested:** formal job **759971** is submitted for the six matched successful fixed cells (1×224, 1×448, 1×896, 2×448, 4×448, 8×448); results remain pending. The two known OOM boundary cells are excluded. An initial qualification selected the wrong generic-mock route and failed before iteration1; explicit `mock_mdp` routing preserves the original fixed reference dataset with encoder MDP off. Corrected five-step qualification completed. Its 320-sample shuffle domain differs from historical 20-step/1280-sample ON runs, so no qualification-prefix identity is claimed. The 20-step formal OFF runs must pass actual 320-bin-per-DP descriptor/tensor identity against historical ON, alongside runtime and memory gates, before a matched comparison is accepted.
+
+Historical fixed ON job758245 was separately reprocessed through the exact PR131 native helper using its retained T/U/R/A and per-step durations. The six resulting component tuples numerically match the earlier fixed-shape table; this fixed-shape coincidence does not generalize to variable inputs. Original canonical/historical JSON files remain unchanged.
+
 ## What changed, and why
 
 | Workstream | Implemented / tested change | Measured question | Current conclusion |
@@ -39,15 +59,18 @@ Current 16-GPU common parallelism is TP1/PP2/decoder CP2/DP4/EP8/ETP1, MBS1/GBS6
 |Step time|Median measured whole-VLM optimizer-step wall time; primary performance fact|
 |Scheduled global tok/s|`GBS × configured sequence length × 1000 / median step ms`; capacity-normalized at the reported median, not actual useful/content tokens, not a mean of stepwise rates, and no GPU-count multiplier|
 |Per-GPU tok/s / component units|Parentheses divide the global rate by 16 only for independently validated current 16-GPU runs. Historical configuration-only world values yield per-GPU N/A. TF/GPU means TFLOPs/GPU/s; encoder, decoder and total columns share whole-step time, not encoder-only elapsed time|
-|Encoder / decoder / encoder + decoder TF|Six fixed cells have useful-content encoder matmul estimates plus accepted attended-padded native decoder rates. Their sum is a mixed modeled total, not uniformly executed or hardware FLOPs. Encoder estimates omit real attention head-width padding from 72 to 128 and non-matmul work. Other unproved components stay N/A|
+|Current PR131-native encoder / decoder / total TF|The new reruns use the exact pinned PR131 useful-content helper and collector for all three components. Rates exclude padding and non-matmul work (including encoder attention head-width padding72→128), use whole-step time, and are not hardware FLOPs. Raw Megatron fixed decoder remains a separate column|
+|Historical fixed-cell accounting|The six older fixed cells retain their originally published attended-padded decoder proof and encoder estimate. Exact PR131-native reaggregation independently gives the same numerical component tuples for these fixed inputs; that coincidence does not change variable-input semantics or overwrite historical JSON|
 |Window|New 20-step runs: primary 4–20 (17 samples), supplemental 10–20 (11). Older four-way: 10–50 (41). Older CP table: supplemental 10–20. Never combine these into one percentage|
 |Corrected native decoder TFLOPs/GPU/s|Sealed native decoder formula with resolved arguments and verified final padded boundaries, divided by original whole-step time and world size; available for the six new fixed cells only|
 |Mean versus pooled corrected rate|Mean averages stepwise rates; pooled divides total modeled work by total elapsed time. Neither is a step-time median|
 |Legacy / useful-content estimates|Different numerators; preserved in [machine-readable historical audit](per-experiment.json), not relabelled as corrected native rates|
-|Unavailable / null|Missing proof, not zero work. Historical/nonstatic corrected rates and comprehensive peak memory remain unavailable|
+|Unavailable / null|Missing proof, not zero work. Historical/nonstatic final-boundary corrections and historical all-rank peaks remain unavailable where not captured. New rerun native content rates and complete lifetime allocator peaks are reported separately above|
 |Interpretation|Decoder-only modeled work excludes varying vision work; not hardware counters, utilization, MFU or convergence evidence|
 
 ## Completed mock measurements: MDP / fused-window / source
+
+The [new 20-step reruns above](#new-20-step-reruns-pr131-native-components-and-all-rank-memory) add exact PR131-native component rates and all-rank allocator peaks; the older measurement history below is retained unchanged.
 
 One physical allocation, job **752159**, with native variable mock inputs, world16/GBS64/MBS1 and the decoder topology above. These four rows share the original 50-step protocol. Mode/source and PR-specific normalization environment differences are the declared axes. All four measurement cells completed; the outer job later reached TIMEOUT during a separate packing-profile startup. Measurement completion is not a clean outer-job claim.
 
@@ -94,6 +117,8 @@ Global decoder moments are constant: Tpad=1,048,576 and Upad=4,294,967,296 per s
 **Analysis.** Extra vision work increases whole-step time and lowers the constant-work decoder rate; that is not falling hardware utilization or an optimization ranking. Four 448 images and one 896 image have equal raw-patch sum R=802816, but attention moment A=629407744 versus 2517630976 (4×); observed steps are 6955.6 versus 7245.8 ms. Eight 448 images have more patches (R=1605632) but lower A=1258815488 than one 896 image, at 7966.6 ms. Patch-linear and per-image quadratic work both matter; this is consistent with attention cost, not isolated causal proof. OOM cells were not silently downscaled into successful replacements.
 
 ## Real Mantis: protected slice, not a full blend
+
+The original protected slice now has a [new 20-step native-accounting/memory rerun](#new-20-step-reruns-pr131-native-components-and-all-rank-memory), separate from the historical Mantis and loader-ablation results below.
 
 Same current model/world16/GBS64/MBS1, but real conversations/images are a different workload from mock. The original Mantis256 slice remains separately protected: **236 train / 20 validation**, eval0. Native image bounds are 200704–1003520 pixels, workers0, packing buffer16 and `max_samples_per_sequence=4`; this knob is not asserted to be a universal four-document cap. Nonstatic attention differs from the fixed mock layout.
 
