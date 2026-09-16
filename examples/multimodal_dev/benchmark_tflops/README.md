@@ -1,5 +1,10 @@
 # PR7 workload-aware TFLOPs reproduction (mock and real Energon)
 
+For opt-in window/layer identities and independently bracketed rank clocks,
+see [arrival diagnostics](diagnostics/README.md). This is a separate diagnostic
+add-on, not a change to the accounting formulas or a standalone qualification
+of the historical Bridge data pipeline.
+
 For the updated native Megatron padded-THD accounting method and historical
 correction ledger, read [Native accounting](NATIVE_ACCOUNTING.md). The original
 content estimator below remains separately labeled; it is not padding-aware.
