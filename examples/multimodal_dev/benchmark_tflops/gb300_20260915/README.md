@@ -20,7 +20,26 @@ These reruns retain the original four mock arms and separately preserved Mantis2
 
 Both formal jobs completed successfully. Consumed geometry is not identical across all modes: rates and timings are descriptive, not an isolated MDP/packing gain; interpret each row with its actual consumed work. Mantis is a different dataset and is not a fifth matched mock arm. Modeled rates are not hardware utilization. The PR7 fused row has higher observed allocator reservation than its nonfused row; reserved memory is not live tensor allocation. No repeated randomized causal estimate is claimed from this ordered rerun.
 
-**Additional fixed-image MDP-off baseline requested:** formal job **759971** is submitted for the six matched successful fixed cells (1×224, 1×448, 1×896, 2×448, 4×448, 8×448); results remain pending. The two known OOM boundary cells are excluded. An initial qualification selected the wrong generic-mock route and failed before iteration1; explicit `mock_mdp` routing preserves the original fixed reference dataset with encoder MDP off. Corrected five-step qualification completed. Its 320-sample shuffle domain differs from historical 20-step/1280-sample ON runs, so no qualification-prefix identity is claimed. The 20-step formal OFF runs must pass actual 320-bin-per-DP descriptor/tensor identity against historical ON, alongside runtime and memory gates, before a matched comparison is accepted.
+## Fixed-input MDP ON/OFF: six completed matched-shape pairs
+
+Original ON job **758245** and new OFF job **759971** both completed all six 20-step cells. Primary window is **4–20** (17 samples), world16/GBS64/MBS1/sequence16384; counts are images per raw document, with four documents per packed bin. Every paired value below is ordered **ON / OFF**. Component TF/GPU means TFLOPs/GPU/s from the exact PR131 native helper; step times are medians. Scheduled token rates are capacity-normalized, not useful-content tokens.
+
+| Images × side | Step ms ON / OFF | OFF step change | Scheduled tok/s global (per GPU), ON / OFF | Encoder TF/GPU ON / OFF | Decoder TF/GPU ON / OFF | Total TF/GPU ON / OFF | Megatron fixed decoder TF/GPU ON / OFF | OFF peak allocated / reserved GB |
+|---|---|---|---|---|---|---|---|---|
+| 1 × 224 | 6475.1 / 6781.7 | +4.74% | 161939.7 (10121.2) / 154618.5 (9663.7) | 1.253 / 1.188 | 243.955 / 231.303 | 245.207 / 232.491 | 390.135 / 369.900 | 79.820 / 81.856 |
+| 1 × 448 | 6586.1 / 6997.7 | +6.25% | 159210.5 (9950.7) / 149845.8 (9365.4) | 5.365 / 5.023 | 240.813 / 225.473 | 246.178 / 230.496 | 385.106 / 360.582 | 85.970 / 87.510 |
+| 1 × 896 | 7245.8 / 7426.2 | +2.49% | 144715.0 (9044.7) / 141199.5 (8825.0) | 25.397 / 24.786 | 217.270 / 212.041 | 242.667 / 236.826 | 347.453 / 339.088 | 110.569 / 112.091 |
+| 2 × 448 | 6702.8 / 7108.1 | +6.05% | 156438.5 (9777.4) / 147518.5 (9219.9) | 10.513 / 9.928 | 235.947 / 222.823 | 246.459 / 232.750 | 377.318 / 356.329 | 94.169 / 95.657 |
+| 4 × 448 | 6955.6 / 7343.4 | +5.58% | 150752.8 (9422.0) / 142791.6 (8924.5) | 20.132 / 19.180 | 225.920 / 215.239 | 246.051 / 234.419 | 361.288 / 344.206 | 110.568 / 111.860 |
+| 8 × 448 | 7966.6 / 8733.2 | +9.62% | 131621.5 (8226.3) / 120067.8 (7504.2) | 35.337 / 32.127 | 198.278 / 180.269 | 233.615 / 212.396 | 317.082 / 288.282 | 143.369 / 144.236 |
+
+**Input and stack evidence.** All six formal pairs passed exact ordered 320-bin-per-logical-DP descriptor and input/label/loss-mask/position tensor-hash comparisons, validating all16 ON producer replicas and8 OFF PP0 producers. PP1 delivery is source-proved broadcast, not independently recorded consumer hashes; unrecorded pixel bytes are not asserted. All17 primary T/U/R/A rows match in each pair. All770 logged runtime fields were compared per pair: only MDP enabled, fused window, its sequence cap (131072→0), explicit provider routing (`mock`→`mock_mdp`) and the output directory differ; the other765 fields match. OFF additionally includes the new allocator-memory hook. ON all-rank lifetime memory is unavailable, not zero.
+
+**Analysis.** OFF step medians are higher in all six observations (+2.49% to +9.62%); this supports further testing of the combined MDP/fused path, not an isolated MDP or fusion effect. The difference is not monotonic in image side/count. Separate allocations, instrumentation differences and one ordered observation per cell preclude a stable causal winner or variance claim. Rates use whole-step time and native modeled work, not hardware utilization.
+
+**Failure disposition.** The initial OFF qualification selected the wrong generic-mock route and failed before iteration1. Explicit `mock_mdp` preserved the original fixed reference dataset with MDP off. Corrected five-step qualification passed, but its320-sample shuffle domain differs from the formal1280-sample domain; qualification-prefix parity was not claimed. All six20-step formal comparisons subsequently passed actual320-bin identity. The known16×448 and1×1792 OOM boundaries were not rerun.
+
+**Real-data follow-up:** the separately protected Mantis256 four-way job **760138** is running; its four real-data results remain pending and are not replaced by this mock comparison.
 
 Historical fixed ON job758245 was separately reprocessed through the exact PR131 native helper using its retained T/U/R/A and per-step durations. The six resulting component tuples numerically match the earlier fixed-shape table; this fixed-shape coincidence does not generalize to variable inputs. Original canonical/historical JSON files remain unchanged.
 
