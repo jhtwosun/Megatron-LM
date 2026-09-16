@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "status": "accepted_cells_snapshot_incomplete_campaign",
-  "scope": "Four accepted fixed-image mock cells only; existing campaign-wide catalog remains separate.",
+  "scope": "Six accepted fixed-image mock cells; enclosing sweep completed successfully. Existing campaign-wide catalog remains separate.",
   "metrics_scope": "Exact sealed native decoder modeled FLOPs divided by whole VLM step time and GPU count. Not total VLM FLOPs, hardware utilization, or encoder-only throughput.",
   "configuration": {
     "model": "PR7/PR131 hybrid VLM (configured model_arch=qwen3vl)",
@@ -222,22 +222,97 @@
       "job_id": 758245,
       "training_step_id": "758245.7",
       "experiment_id": "EXP-PR131-SWEEP-COUNT2_SIZE448-758245"
-    }
-  ],
-  "pending_formal_cells": [
+    },
     {
       "image_count_per_raw_sample": 4,
       "square_image_size_px": 448,
-      "status": "not_yet_accepted_at_snapshot",
-      "corrected_tflops": null
+      "status": "accepted_completed_formal_cell",
+      "total_iterations": 20,
+      "windows": {
+        "4-20": {
+          "samples": 17,
+          "median_step_ms": 6955.6,
+          "modeled_decoder_mean_tflops_per_gpu_s": 225.9197556277975,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 225.69091334256606
+        },
+        "10-20": {
+          "samples": 11,
+          "median_step_ms": 7015.1,
+          "modeled_decoder_mean_tflops_per_gpu_s": 224.77409986456644,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 224.48808805791438
+        }
+      },
+      "global_per_iteration_geometry": {
+        "Tpad": 1048576,
+        "Upad": 4294967296,
+        "R": 802816,
+        "A": 629407744
+      },
+      "peak_memory_gib": null,
+      "legacy_native_logged_tflops_per_gpu_s": {
+        "actual_window": [
+          10,
+          20
+        ],
+        "mean": 359.4545,
+        "not_corrected_decoder_metric": true
+      },
+      "evidence_sha256": {
+        "native_accounting": "7f280f548c093793605cd6c4b79206b517f77cb252a77b9a89ea6d0f5591517b",
+        "canonical_verifier": "c171a1af274def662d90131d4080bb7589c609e7e5abd8e7f17c293e0fe24703",
+        "source_seal": "9239e622e91bf9e21c726a598e13c1b1fabc02d8d4a48591eb5ddb7cf1e55ceb",
+        "native_function": "d900fc09ea21b6aa42e3879cb47f729650c64e6076116faf86dd34b7e3dabd8e"
+      },
+      "job_id": 758245,
+      "training_step_id": "758245.9",
+      "experiment_id": "EXP-PR131-SWEEP-COUNT4_SIZE448-758245"
     },
     {
       "image_count_per_raw_sample": 8,
       "square_image_size_px": 448,
-      "status": "not_yet_accepted_at_snapshot",
-      "corrected_tflops": null
+      "status": "accepted_completed_formal_cell",
+      "total_iterations": 20,
+      "windows": {
+        "4-20": {
+          "samples": 17,
+          "median_step_ms": 7966.6,
+          "modeled_decoder_mean_tflops_per_gpu_s": 198.27805575129233,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 198.23792018326142
+        },
+        "10-20": {
+          "samples": 11,
+          "median_step_ms": 7929.2,
+          "modeled_decoder_mean_tflops_per_gpu_s": 199.03956604652316,
+          "modeled_decoder_pooled_tflops_per_gpu_s": 198.99539120750958
+        }
+      },
+      "global_per_iteration_geometry": {
+        "Tpad": 1048576,
+        "Upad": 4294967296,
+        "R": 1605632,
+        "A": 1258815488
+      },
+      "peak_memory_gib": null,
+      "legacy_native_logged_tflops_per_gpu_s": {
+        "actual_window": [
+          10,
+          20
+        ],
+        "mean": 318.3,
+        "not_corrected_decoder_metric": true
+      },
+      "evidence_sha256": {
+        "native_accounting": "ced961f5aa4ecb54646eee7ed75a9b00e7d8c3ef3af5060d875b1dbc0f046f43",
+        "canonical_verifier": "11492b13cbf2cfb98fdc006de2401fa295c5d7efcddcc33fd973c2e8d408b8bd",
+        "source_seal": "9239e622e91bf9e21c726a598e13c1b1fabc02d8d4a48591eb5ddb7cf1e55ceb",
+        "native_function": "d900fc09ea21b6aa42e3879cb47f729650c64e6076116faf86dd34b7e3dabd8e"
+      },
+      "job_id": 758245,
+      "training_step_id": "758245.11",
+      "experiment_id": "EXP-PR131-SWEEP-COUNT8_SIZE448-758245"
     }
   ],
+  "pending_formal_cells": [],
   "qualification_failures": [
     {
       "image_count_per_raw_sample": 16,
@@ -274,6 +349,7 @@
     }
   ],
   "historical_rule": "Existing archived/current catalog is preserved. Unsupported corrected historical values remain null; legacy rates must not populate corrected columns.",
-  "comparison_rule": "One completed run per cell, with image size intentionally varied. No run-variance or statistical-winner claim.",
-  "frozen_at_utc": "2026-09-16T03:11:57Z"
+  "comparison_rule": "Image count and size are explicit workload axes. Decoder-only rates omit changing encoder work and do not establish a matched-workload TFLOPs winner. One run per cell; no run-variance or statistical-winner claim.",
+  "frozen_at_utc": "2026-09-16T03:25:45Z",
+  "formal_sweep_status": "COMPLETED 0:0; all six formal cells accepted"
 }

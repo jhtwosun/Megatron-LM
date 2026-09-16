@@ -1,6 +1,6 @@
 # Ongoing qualification status
 
-As of 2026-09-16 03:10 UTC. This is an incomplete work log, not a completed sweep. The fixed-input work below is distinct from historical variable-mock measurements. Explicit user exception approval reopened the reviewed execution gates; earlier denials remain historical facts, not current blanket prohibitions.
+As of 2026-09-16 03:30 UTC. The six-cell formal sweep and first dataloader pair completed; the whole campaign remains incomplete. The fixed-input work below is distinct from historical variable-mock measurements. Explicit user exception approval reopened the reviewed execution gates; earlier denials remain historical facts, not current blanket prohibitions.
 
 | Attempt | Observed outcome | Evidence limit |
 |---|---|---|
@@ -14,7 +14,7 @@ The successful low-work cell used 16 GB300 GPUs, TP1/PP2/decoder-CP2/EP8/ETP1, M
 
 The low-cell generated-input audit checked 320 records per rank, ordered sampler indices, four replicated CP/PP copies per logical DP stream, and matching tensor/descriptor hashes. This establishes the scoped qualification evidence, not historical replay identity or a corrected historical TFLOPs rate. The qualification allocation was intentionally released after terminal steps; no jobs were left occupying resources for this attempt.
 
-Formal job 758245 is running six lower-work cells in sequence: 1×224, 1×448, 1×896, 2×448, 4×448 and 8×448. The known 16×448 and 1×1792 OOM configurations are excluded, not relabelled successful. At this snapshot the first four cells completed their 20 training iterations; later cells remain in progress. Only separately accepted evaluator outputs may supply numerical results. Existing completed four-way profiles are separately summarized in [profile-summary.md](profile-summary.md); historical accounting replay and broader data preparation remain incomplete.
+Formal job 758245 completed six lower-work cells in sequence: 1×224, 1×448, 1×896, 2×448, 4×448 and 8×448. All six completed twenty iterations and passed individual evaluator gates; the outer job and all steps exited 0:0. The known 16×448 and 1×1792 OOM configurations are excluded, not relabelled successful. Accepted numerical results and accounting limitations appear in the consolidated README and snapshot. Existing completed four-way profiles are separately summarized in [profile-summary.md](profile-summary.md); historical accounting replay and broader data preparation remain incomplete.
 
 ## Mantis dataloader preservation investigation
 
@@ -28,7 +28,7 @@ The first corrected native attempt in allocation 758212 passed ten tests, then f
 
 V5 then passed **36 native tests**, including 15 focused tests and nearby regressions: all four logical DP streams, distinct-pack FIFO, exact tensor/descriptor/geometry fingerprints, four-owner pixels and native save-two/restore-two behavior. Both corrected baseline and candidate subsequently completed ten ordered finite training iterations with zero skipped/NaN iterations, evaluation disabled, no fatal errors in all node logs, clean steps .7/.8 and passing post-run source/data/tokenizer seals. These are interactive qualification results, not throughput measurements. Quiescent loader save/restore does not establish live-prefetch or training-checkpoint resume.
 
-Formal paired job **758425 is submitted**: corrected baseline then candidate, twenty iterations each, on the same sixteen GPUs with evaluation disabled. No numerical result is claimed while it is pending or running. The original standalone 256-record Mantis dataset remains separately preserved.
+Formal paired job **758425 completed**: corrected baseline then candidate, twenty iterations each, on the same sixteen GPUs with evaluation disabled. Both individual evaluators passed; all logged arguments except output directory and all twenty logged geometry moments agree. The primary median steps were 7498.3 and 7306.2 ms; supplemental medians were 7318.8 and 7306.2 ms. These are descriptive single-pair observations with unknown variance, not a causal speedup or stable winner. The original standalone 256-record Mantis dataset remains separately preserved.
 
 | Artifact | SHA-256 |
 |---|---|
@@ -37,7 +37,7 @@ Formal paired job **758425 is submitted**: corrected baseline then candidate, tw
 |Corrected JSON-omitting candidate task encoder|`4ae6f52e6cbfec673eb1a6dbeb1295e89a3211d4379879f3e5b5461b6cf8c247`|
 |V5 full native Mantis test|`f16316ace2ffea3baf728c05a5e6743aaa7fedcac1d44dc1f41d2810cb3d0162`|
 
-These fingerprints identify retained private artifacts; neither their source changes nor raw manifests are bundled here. No corrected rate, new throughput measurement, or performance improvement is claimed for this dataloader comparison. A completed pair requires the same corrected baseline, workload, world size 16 / GBS 64 / MBS 1 and complete stack, with primary iterations 4–20 and supplemental iterations 10–20. Historical run 752807 cannot substitute for that matched baseline.
+These fingerprints identify retained private artifacts; neither their source changes nor raw manifests are bundled here. Corrected nonstatic native rates and complete consumed-input identity remain unavailable for this dataloader comparison. The descriptive pair holds world size 16 / GBS 64 / MBS 1 and complete stack constant, with primary iterations 4–20 and supplemental iterations 10–20. Historical run 752807 cannot substitute for that matched baseline.
 
 ## Data deadline and preserved fallback
 
