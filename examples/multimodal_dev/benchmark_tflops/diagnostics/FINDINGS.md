@@ -52,5 +52,56 @@ Provenance hashes (private raw data are not embedded):
 
 Independent primary review passed. The configured second-model service returned
 empty content, so no second-model agreement is claimed. No optimization or
-controlled intervention was tested; the unresolved866ms path is the next
-diagnostic target, not a demonstrated fix.
+controlled intervention was tested. The follow-up below narrows the formerly
+unresolved866ms path; no optimization fix has been tested.
+
+## Read-only follow-up: first attention preparation call (422830)
+
+Existing traces were analyzed on an allocated CPU node; no new training ran.
+The866.145ms interval was not GPU idle: an867.225ms embedding AllGather occupied
+the same stream as the subsequent vision GEMM. The host's863.430ms
+`cuKernelSetAttribute` interval overlaps downstream waiting; this does not
+establish the API's internal blocking mechanism. Pack identity matching locates
+the awaited producer on rank1's
+previous vision pack. Another883ms interval similarly overlaps stream
+synchronization and a previous-pack AllGather awaiting rank13.
+
+Following those dependencies back reveals the slow producers' first vision
+attention call, inside `FusedAttnFunc` -> `nvte_flash_attn_fwd`:
+
+| Rank / step / pack | First native call ms | Max of remaining53 calls ms |
+|---|---:|---:|
+|0 /5 /0|865.420026|0.166273|
+|1 /5 /1|817.709461|0.159552|
+|13 /6 /1|861.705313|0.243969|
+|12 /7 /0|919.782773|0.239521|
+|6 /5 /0, fast reference|0.016544|0.154593|
+
+The54 ranges are workspace-query plus execution calls across27 vision layers,
+not54 layers or GPU kernels. Position interpolation was31–34ms and vision
+RoPE10–12ms in the earliest slow-producer cases, not the approximately0.9s origin.
+
+The retained TE2.18 torch source calls native attention first with an unallocated
+workspace, then allocates and executes. The [v2.18 common source](https://github.com/NVIDIA/TransformerEngine/blob/v2.18/transformer_engine/common/fused_attn/fused_attn_f16_arbitrary_seqlen.cu)
+looks up a thread-local descriptor cache and, on a miss, builds the cuDNN graph
+and execution plans before returning the workspace size. This strongly supports
+first-use graph/plan preparation for a newly encountered attention descriptor.
+It is not yet a directly recorded cache miss or plan-build interval; matching
+versioned source alone does not prove loaded binary identity. Changes in image
+shape also do not necessarily change a quantized cache key.
+
+Observed propagation: first attention preparation delay -> embedding gather
+wait -> next pack same-stream wait -> window-delivery skew -> decoder EP wait.
+Direct backend plan-build logging is the remaining confirmation, not another
+claim that NCCL bandwidth or encoder arithmetic is intrinsically slow.
+
+Follow-up provenance:
+
+- gap.json:66ec7008970dd2ef560ec8ffa34e173e41a104684d6a91bc69066c12b2723a3c
+- pack-chain.json:5e6382798f679dac6f923d235ec2968803d37f86d830b69dab2a971452fa6943
+- vision-attention.json:eb1bd46686912b58f29869f57532e73ac5dfa1ff5431e109ecc0c9f0005a7d0d
+
+Allocation422830 ended normally after9:06. Initial read-only query step1 failed
+its original/recompute phase-count assertion; the corrected original-sidecar
+filter passed in step2. Other analysis steps passed. This is not a new GPU or
+portable-wrapper qualification, nor an end-to-end speedup result.
