@@ -15,7 +15,7 @@ The analysis below groups the entire owned campaign by research question and sep
 |Does encoder CP plus buffer reuse improve the vision workload?|The implementation and tests exist; measured CP2 pairs were slower, not the requested repeated ≥5% win|Keep correctness evidence, isolate buffer reuse and image-ownership effects before further optimization|
 |How much does image workload cost?|Six fixed-input cells establish increasing whole-step cost with image count/size; both highest-work qualifications OOM|Strong scoped workload evidence; choose feasible shapes, not a decoder-TF ranking across unequal vision work|
 |What changes with MDP/fused vision?|One owned four-way job records lower step times along the mode/source progression; traces expose communication/wait tails|Descriptive, not a repeated causal ranking; attribute waits before another code change|
-|What does real input preparation/dataloader work change?|Mantis content occupancy differs from mock; a correctness repair and serialization omission passed native/model gates and one formal pair|Protect exact input parity; reverse/repeated order before claiming a stable gain; whole-native blend remains unmet|
+|What does real input preparation/dataloader work change?|Mantis content occupancy differs from mock; native/model gates and two run orders show small, window-sensitive timing differences|Protect exact input parity and repeat matched pairs before claiming a stable gain; whole-native blend remains unmet|
 |Which failures and profiles guide priorities?|OOM is a capacity boundary; interpreter/grid/restore failures are correctness or harness gates, not performance results|Retain failures, separate startup/export effects, and avoid hardware-utilization claims from overlapping event sums|
 
 - [New accepted corrected-accounting snapshot](sweep-corrected-snapshot-20260916.md) and [machine-readable rates and proof digests](sweep-corrected-snapshot-20260916.json): six formal fixed-input cells, corrected native modeled decoder rates with primary/supplemental windows, separate OOM configurations and explicit accounting limits.
@@ -26,11 +26,11 @@ The analysis below groups the entire owned campaign by research question and sep
 - [Evidence fingerprints](evidence-fingerprints.md): retained result and raw-log SHA-256 values. Raw logs, media, and private filesystem paths are intentionally not bundled.
 - [Completed four-way profile evidence](profile-summary.md): finalized packing/latest continuation, process-aware phase observations, and explicit capture/configuration limitations. Diagnostic only, not a speed ranking.
 - [Scoped accounting utilities](accounting-utilities.md): seven standard-library tests and native formula equivalence checks; historical native replay remains unexecuted. Tool availability does not establish corrected rates or historical boundary identity.
-- [Ongoing qualification status](24h-progress.md): completed fixed-input sweep and first Mantis pair, both high-work OOM outcomes, native/model qualification and bounded PixMo preparation. Pending probes have no numerical results.
+- [Ongoing qualification status](24h-progress.md): completed fixed-input sweep, both Mantis run orders including recovered measurements from job 758592, both high-work OOM outcomes, native/model qualification and bounded PixMo preparation. Unexecuted work has no numerical results.
 
 ## Results and analysis at a glance — 2026-09-16
 
-Six fixed-input formal cells completed in job 758245; two larger workloads failed interactive qualification with CUDA OOM. Both corrected Mantis dataloader variants completed formal job 758425 and passed descriptive pair checks; no stable winner or corrected nonstatic rate is invented. The 231 historical result artifacts below remain an audit inventory, not 231 new successes or a combined total including these new cells.
+Six fixed-input formal cells completed in job 758245; two larger workloads failed interactive qualification with CUDA OOM. Both corrected Mantis dataloader variants passed descriptive pair checks in job 758425 and reverse-order job 758592. The latter retains its failed outer harness receipt, with model measurements recovered through separate post-run validation as explained below. No stable winner or corrected nonstatic rate is invented. The 231 historical result artifacts below remain an audit inventory, not 231 new successes or a combined total including these new cells.
 
 ### A. Text-model validation: decoder CP and sequence scaling
 
@@ -107,14 +107,16 @@ The original 256-record Mantis slice remains separately protected (236 train, 20
 
 The loader candidate removes an unused JSON/base64 image-descriptor copy only when raw descriptors are already handed off. The original eager baseline's missing restore-key bug was separately corrected in **both** new variants. A test-only tuple/list ownership correction preserved exact payload/FIFO checks. V5 passed 36 native tests, including all four DP streams and save-two/restore-two/four-owner pixel checks; both variants passed clean ten-step model qualification. Formal job 758425 then completed and passed individual verification for baseline and candidate twenty-step runs on the same 16 GPUs. All logged argument keys/values match except output directory; all twenty logged T/U/R/A moments match. World size 16, GBS 64, MBS 1, full stack and measurement windows are identical.
 
-| Mantis pair window | Samples | Corrected eager baseline median ms | JSON-omitting candidate median ms | Observed step reduction |
-|---|---:|---:|---:|---:|
-|Primary 4–20|17|7498.3|7306.2|2.5619%|
-|Supplemental 10–20|11|7318.8|7306.2|0.1722%|
+| Formal job / order | Window | Samples | Corrected eager baseline median ms | JSON-omitting candidate median ms | Observed step reduction |
+|---|---|---:|---:|---:|---:|
+|758425: baseline → candidate|Primary 4–20|17|7498.3|7306.2|2.5619%|
+|758425: baseline → candidate|Supplemental 10–20|11|7318.8|7306.2|0.1722%|
+|758592: candidate → baseline; postcheck recovery|Primary 4–20|17|8977.5|8845.0|1.4759%|
+|758592: candidate → baseline; postcheck recovery|Supplemental 10–20|11|9004.5|8776.7|2.5298%|
 
-These are descriptive observations from **one ordered pair**, not a stable winner or causal speedup. The window sensitivity is visible; run-to-run variance is unknown. All-step logged moments and bounded native input parity do not replace an archive of every consumed token/image. Corrected native rates remain null because final nonstatic attended boundaries are not archived; peak memory is unavailable. Historical run 752807 is not this pair's baseline. Quiescent loader restore is not proof of live-prefetch or training-checkpoint resume.
+The candidate has smaller observed medians in both orders, but the reductions are small and window-sensitive: 0.17–2.56% across these four summaries. These are **two descriptive matched pairs on different allocations/racks**, not a stable winner or causal speedup. Raw times are not pooled across jobs; no variance estimate or confidence interval follows from two orders. Within each job, all logged arguments except output directory and all twenty geometry moments agree. All-step moments and bounded native input parity do not replace an archive of every consumed token/image. Corrected native rates remain null because final nonstatic attended boundaries are not archived; peak memory is unavailable. Historical run 752807 is not either pair's baseline. Quiescent loader restore is not proof of live-prefetch or training-checkpoint resume.
 
-**Order-sensitivity check.** Reverse-order job 758592 completed twenty training iterations for candidate and baseline, but its outer post-run validation failed. The reverse wrapper left its source alias pointing at baseline, then checked that directory against the candidate manifest. Individual encoder-file hashes remain unchanged; full read-only post-hoc source/data/tokenizer verification is pending. The reverse pair is not accepted in this snapshot and no reverse timing comparison is published. Original failure status is preserved. This check probes order sensitivity, not a justification for turning the first pair into a statistically established win.
+**Recovered measurement evidence, not a clean outer job.** Reverse job 758592 retains outer/batch `FAILED 1:0`; both training steps independently completed `0:0`. The reverse wrapper left its source alias pointing at baseline, then checked that directory against the candidate manifest. A separate correct-root read-only check verified all 2527 baseline files, 2530 candidate files, prepared data and tokenizer; original before-check evidence also passed. Both individual evaluators and independent order/log/argument/geometry/window checks passed. These recovered model measurements are valid for the scoped descriptive table, while the failed outer receipt and original after-check remain preserved. No source/model change, training rerun or blanket clean-job claim was used to recover them.
 
 Whole-source transfer status is Mantis 35/36, M4 40/41, PixMo 111/111 and backing frames 17/17 **files** (16 TAR archives plus README). Failed partial downloads are preserved. PixMo 32-row, 512-row and 4096-row native fixtures passed; the last included all 4096 rows with zero exclusions and verified output hashes/image-conversation parity. These are not full-corpus preparation or training. An approximate 118–132 minute full-preparation estimate exceeds the remaining autonomy budget, so whole preparation is deferred rather than claimed complete. The estimate includes fixture/import effects and is not a guaranteed steady-state bound. M4 temporal/frame mapping remains unqualified; the requested whole-native 1:1:1 blend is unmet. Missing data or denied/failed attempts are not silently replaced by a successful small slice.
 
@@ -137,7 +139,7 @@ Process-aware CUDA API/kernel correlation matched all 4,220,973 packing kernels 
 
 Prioritized improvements follow from the evidence, not from assumed bottlenecks:
 
-1. Finish the loader reverse-order comparison before expanding an optimization whose observed reduction depends strongly on window selection.
+1. Use the completed loader order check to bound expectations: next require repeated matched observations before expanding an optimization whose small observed reduction depends strongly on window selection.
 2. Test encoder owner-only CPU materialization to avoid duplicate full-image processing, with exact pixel/order and gradient parity as hard acceptance gates.
 3. Isolate bridge scratch reuse in an on/off ablation separate from encoder CP; both older CP arms already reused buffers.
 4. Add explicit step anchors and process-aware communication ownership before claiming a critical path or optimizing a wait-heavy phase.
@@ -152,7 +154,7 @@ These are proposed tests and validation gates, not already implemented features 
 |Encoder CP optimization|Historical controlled CP pairs and diagnostic profiles|New optimized encoder CP versus CP-off achieving at least 5% across three independent pairs was not performed|
 |Whole real-data preparation/blend|Verified selected transfers, preserved Mantis256, bounded PixMo fixtures through 4096 rows|Whole-native Mantis/M4/PixMo blend and full temporal semantics unmet; full preparation deferred beyond remaining budget|
 |Reproducibility utilities/replay|Guarded published utilities, tests and pinned replay plan|Historical replay/backend/input-identity proof not established by this snapshot|
-|Dataloader correctness/efficiency|Shared restore repair, native/model gates, accepted descriptive formal pair|Run variance/causal improvement unproven; no corrected nonstatic rate or broad resume claim|
+|Dataloader correctness/efficiency|Shared restore repair, native/model gates and two descriptive matched pairs; reverse outer harness failure retained|Run variance/causal improvement unproven; no corrected nonstatic rate or broad resume claim|
 
 The campaign is not fully complete. All unstarted, failed, partial and unavailable outcomes remain part of the record. Supporting documents retain exact hashes, schemas and per-window details; this README is the consolidated results/analysis entry point.
 

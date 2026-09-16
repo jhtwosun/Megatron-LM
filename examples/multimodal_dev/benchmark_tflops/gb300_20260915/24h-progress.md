@@ -1,6 +1,6 @@
 # Ongoing qualification status
 
-As of 2026-09-16 03:30 UTC. The six-cell formal sweep and first dataloader pair completed; the whole campaign remains incomplete. The fixed-input work below is distinct from historical variable-mock measurements. Explicit user exception approval reopened the reviewed execution gates; earlier denials remain historical facts, not current blanket prohibitions.
+As of 2026-09-16 04:00 UTC. The six-cell formal sweep and forward dataloader pair completed; reverse-order model measurements were recovered after a postcheck alias failure. The whole campaign remains incomplete. The fixed-input work below is distinct from historical variable-mock measurements. Explicit user exception approval reopened the reviewed execution gates; earlier denials remain historical facts, not current blanket prohibitions.
 
 | Attempt | Observed outcome | Evidence limit |
 |---|---|---|
@@ -29,6 +29,8 @@ The first corrected native attempt in allocation 758212 passed ten tests, then f
 V5 then passed **36 native tests**, including 15 focused tests and nearby regressions: all four logical DP streams, distinct-pack FIFO, exact tensor/descriptor/geometry fingerprints, four-owner pixels and native save-two/restore-two behavior. Both corrected baseline and candidate subsequently completed ten ordered finite training iterations with zero skipped/NaN iterations, evaluation disabled, no fatal errors in all node logs, clean steps .7/.8 and passing post-run source/data/tokenizer seals. These are interactive qualification results, not throughput measurements. Quiescent loader save/restore does not establish live-prefetch or training-checkpoint resume.
 
 Formal paired job **758425 completed**: corrected baseline then candidate, twenty iterations each, on the same sixteen GPUs with evaluation disabled. Both individual evaluators passed; all logged arguments except output directory and all twenty logged geometry moments agree. The primary median steps were 7498.3 and 7306.2 ms; supplemental medians were 7318.8 and 7306.2 ms. These are descriptive single-pair observations with unknown variance, not a causal speedup or stable winner. The original standalone 256-record Mantis dataset remains separately preserved.
+
+Reverse-order job **758592** completed both model steps `0:0` but retains outer/batch `FAILED 1:0`: its final checker compared baseline-directory bytes against the candidate manifest after the loop changed the source alias. Correct-root post-hoc checks passed all source/data/tokenizer seals without changing sources or rerunning training. Individual evaluators and independent log/order/parity checks accepted the model measurements only. Baseline/candidate primary medians were 8977.5/8845.0 ms (1.4759% observed reduction); supplemental medians were 9004.5/8776.7 ms (2.5298%). Neither order establishes a stable causal win, ≥5% gain, corrected nonstatic TFLOPs or complete memory coverage. Different allocations/racks are not pooled into one timing sample.
 
 | Artifact | SHA-256 |
 |---|---|
